@@ -31,6 +31,7 @@ import (
 	composiointeg "github.com/multica-ai/multica/server/internal/integrations/composio"
 	"github.com/multica-ai/multica/server/internal/integrations/dingtalk"
 	"github.com/multica-ai/multica/server/internal/integrations/lark"
+	"github.com/multica-ai/multica/server/internal/integrations/rongcloud"
 	"github.com/multica-ai/multica/server/internal/integrations/slack"
 	"github.com/multica-ai/multica/server/internal/integrations/telegram"
 	"github.com/multica-ai/multica/server/internal/integrations/wecom"
@@ -1205,6 +1206,28 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		slog.Info("telegram integration disabled (MULTICA_TELEGRAM_SECRET_KEY not set)")
 	}
 
+	// RongCloud (融云) integration — env-gated by MULTICA_RONGCLOUD_SECRET_KEY.
+	// This is the first webhook-based IM adapter; inbound messages arrive via
+	// POST /api/webhooks/rongcloud?inst={installation_id}.
+	var rcWebhookDispatcher http.Handler
+	if rongcloudKey, err := secretbox.LoadKey("MULTICA_RONGCLOUD_SECRET_KEY"); err == nil {
+		rcBox, err := secretbox.New(rongcloudKey)
+		if err != nil {
+			slog.Error("rongcloud integration failed to init secretbox", "error", err)
+		} else {
+			rcDispatcher := rongcloud.NewWebhookDispatcher(slog.Default())
+			rcWebhookDispatcher = rcDispatcher
+			rongcloud.RegisterRongCloud(channelRegistry, rongcloud.ChannelDeps{
+				Registrar: rcDispatcher,
+				Decrypt:   rcBox.Open,
+				Logger:    slog.Default(),
+			})
+			slog.Info("rongcloud integration enabled")
+		}
+	} else {
+		slog.Info("rongcloud integration disabled (MULTICA_RONGCLOUD_SECRET_KEY not set)")
+	}
+
 	// Composio integration (MUL-3720). Gated by COMPOSIO_API_KEY plus the
 	// composio_mcp_apps feature flag. The env var is the project-scoped key the
 	// standalone SDK authenticates Composio with (sent as x-api-key; the project
@@ -1507,6 +1530,13 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// only forward the bytes + the Stripe-Signature header; see
 	// HandleCloudBillingStripeWebhook for the rationale).
 	r.Post("/api/webhooks/stripe", h.HandleCloudBillingStripeWebhook)
+	// RongCloud webhook (no Multica auth — the dispatcher verifies the
+	// HMAC-SHA1 signature in the header; the installation is selected by the
+	// "inst" query parameter). Only registered when the RongCloud integration
+	// is enabled (MULTICA_RONGCLOUD_SECRET_KEY set).
+	if rcWebhookDispatcher != nil {
+		r.Post("/api/webhooks/rongcloud", rcWebhookDispatcher.ServeHTTP)
+	}
 
 	// Composio OAuth callback (MUL-3843). NOT under the Auth group on purpose:
 	// Composio 302-redirects the user's browser here at the end of the OAuth
