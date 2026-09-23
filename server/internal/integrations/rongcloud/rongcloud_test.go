@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 )
 
@@ -215,5 +216,115 @@ func TestSendCommandResult(t *testing.T) {
 	}
 	if content.Payload["message"] != "pong" {
 		t.Errorf("Payload[message] = %v", content.Payload["message"])
+	}
+}
+
+func TestVerifyWebhookSignatureValid(t *testing.T) {
+	appSecret := "my-secret"
+	nonce := "testnonce123456ab"
+	timestamp := "1695494400000"
+	sig := computeSignatureFromString(appSecret, nonce, timestamp)
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook?inst=id1", strings.NewReader(""))
+	req.Header.Set("rc-nonce", nonce)
+	req.Header.Set("rc-timestamp", timestamp)
+	req.Header.Set("rc-signature", sig)
+
+	if !verifyWebhookSignature(appSecret, req) {
+		t.Fatal("signature verification failed for valid signature")
+	}
+}
+
+func TestVerifyWebhookSignatureMissingNonce(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/webhook", nil)
+	req.Header.Set("rc-timestamp", "123")
+	req.Header.Set("rc-signature", "abc")
+	if verifyWebhookSignature("secret", req) {
+		t.Fatal("expected false for missing nonce")
+	}
+}
+
+func TestVerifyWebhookSignatureQueryParams(t *testing.T) {
+	appSecret := "my-secret"
+	nonce := "querynonce456789xy"
+	timestamp := "1695494400001"
+	sig := computeSignatureFromString(appSecret, nonce, timestamp)
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook?nonce="+nonce+"&timestamp="+timestamp+"&signature="+sig, nil)
+
+	if !verifyWebhookSignature(appSecret, req) {
+		t.Fatal("signature verification failed for query param signature")
+	}
+}
+
+func TestParseWebhookPayloadJSON(t *testing.T) {
+	body := `{"objectName":"command","fromUserId":"user1","toUserId":"sys","content":"{\"request_id\":\"r1\",\"service\":\"ping\"}","msgUID":"m1","msgTimeStamp":"123","conversationType":"1"}`
+	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	msg, err := parseWebhookPayload(req)
+	if err != nil {
+		t.Fatalf("parseWebhookPayload: %v", err)
+	}
+	if msg.ObjectName != "command" {
+		t.Errorf("ObjectName = %q", msg.ObjectName)
+	}
+	if msg.FromUserID != "user1" {
+		t.Errorf("FromUserID = %q", msg.FromUserID)
+	}
+	if msg.MsgUID != "m1" {
+		t.Errorf("MsgUID = %q", msg.MsgUID)
+	}
+}
+
+func TestParseWebhookPayloadForm(t *testing.T) {
+	form := url.Values{
+		"objectName":       {"RC:TxtMsg"},
+		"fromUserId":       {"user2"},
+		"content":          {`{"content":"hello"}`},
+		"msgUID":           {"m2"},
+		"conversationType": {"1"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	msg, err := parseWebhookPayload(req)
+	if err != nil {
+		t.Fatalf("parseWebhookPayload: %v", err)
+	}
+	if msg.ObjectName != "RC:TxtMsg" {
+		t.Errorf("ObjectName = %q", msg.ObjectName)
+	}
+	if msg.FromUserID != "user2" {
+		t.Errorf("FromUserID = %q", msg.FromUserID)
+	}
+}
+
+func TestWebhookDispatcher(t *testing.T) {
+	dispatcher := NewWebhookDispatcher(testLogger())
+	called := false
+	dispatcher.Register("inst-1", func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook?inst=inst-1", nil)
+	w := httptest.NewRecorder()
+	dispatcher.ServeHTTP(w, req)
+
+	if !called {
+		t.Fatal("handler not called")
+	}
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	// Unregister
+	dispatcher.Unregister("inst-1")
+	req2 := httptest.NewRequest(http.MethodPost, "/webhook?inst=inst-1", nil)
+	w2 := httptest.NewRecorder()
+	dispatcher.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusNotFound {
+		t.Errorf("after unregister status = %d, want %d", w2.Code, http.StatusNotFound)
 	}
 }
