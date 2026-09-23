@@ -84,7 +84,7 @@ func (c *rongcloudChannel) handleWebhook(w http.ResponseWriter, r *http.Request)
 	}
 
 	if isCommandMessage(msg.ObjectName) {
-		if err := c.systemHandler.handleCommand(c.ctx, msg); err != nil {
+		if err := c.systemHandler.handleCommand(r.Context(), msg); err != nil {
 			c.logger.Error("rongcloud: handle command", "error", err, "msgUID", msgID)
 			w.WriteHeader(http.StatusInternalServerError)
 			return
@@ -99,7 +99,7 @@ func (c *rongcloudChannel) handleWebhook(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if err := c.handler(c.ctx, inbound); err != nil {
+	if err := c.handler(r.Context(), inbound); err != nil {
 		c.logger.Error("rongcloud: inbound handler", "error", err, "msgUID", msgID)
 		w.WriteHeader(http.StatusInternalServerError)
 		return

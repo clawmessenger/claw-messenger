@@ -643,3 +643,114 @@ func TestFactory(t *testing.T) {
 		t.Error("handler not set from cfg.Handler")
 	}
 }
+
+// newTestWebhookChannel builds a rongcloudChannel wired with a mock RongCloud API
+// server and a capturing InboundHandler, suitable for handleWebhook integration tests.
+func newTestWebhookChannel(t *testing.T) (*rongcloudChannel, *httptest.Server) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"code":200}`)
+	}))
+
+	dispatcher := NewWebhookDispatcher(testLogger())
+	ch := &rongcloudChannel{
+		creds: credentials{
+			AppKey:       "test-key",
+			AppSecret:    "test-secret",
+			SystemNodeID: "sys-node",
+		},
+		client:        newRongCloudAPIClient("test-key", "test-secret", srv.URL, srv.Client(), testLogger()),
+		systemHandler:  newSystemHandler(newRongCloudAPIClient("test-key", "test-secret", srv.URL, srv.Client(), testLogger()), "sys-node", testLogger()),
+		registrar:      dispatcher,
+		logger:         testLogger(),
+	}
+	if err := dispatcher.Register("test-inst", ch.handleWebhook); err != nil {
+		t.Fatalf("register webhook: %v", err)
+	}
+	return ch, srv
+}
+
+// buildTextWebhookRequest constructs a form-urlencoded RongCloud text-message
+// webhook request with a valid (or overrideable) signature.
+func buildTextWebhookRequest(t *testing.T, appSecret, signatureOverride string) *http.Request {
+	t.Helper()
+	form := url.Values{
+		"objectName":       {"RC:TxtMsg"},
+		"fromUserId":       {"user1"},
+		"toUserId":         {"sys-node"},
+		"msgUID":           {"msg-1"},
+		"msgTimeStamp":     {"1234567890"},
+		"conversationType": {"1"},
+		"content":          {`{"content":"hello world"}`},
+	}
+	body := form.Encode()
+	req := httptest.NewRequest(http.MethodPost, "http://localhost/webhooks/rongcloud?inst=test-inst", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	nonce := "nonce-for-test-1"
+	timestamp := "1234567890"
+	sig := computeSignatureFromString(appSecret, nonce, timestamp)
+	if signatureOverride != "" {
+		sig = signatureOverride
+	}
+	req.Header.Set("rc-nonce", nonce)
+	req.Header.Set("rc-timestamp", timestamp)
+	req.Header.Set("rc-signature", sig)
+	return req
+}
+
+func TestHandleWebhookText(t *testing.T) {
+	ch, srv := newTestWebhookChannel(t)
+	defer srv.Close()
+
+	var captured channel.InboundMessage
+	var invoked bool
+	ch.handler = func(ctx context.Context, msg channel.InboundMessage) error {
+		captured = msg
+		invoked = true
+		return nil
+	}
+
+	req := buildTextWebhookRequest(t, "test-secret", "")
+	rr := httptest.NewRecorder()
+	ch.handleWebhook(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusOK)
+	}
+	if !invoked {
+		t.Fatal("inbound handler was not invoked")
+	}
+	if captured.Text != "hello world" {
+		t.Errorf("Text = %q, want %q", captured.Text, "hello world")
+	}
+	if captured.Source.SenderID != "user1" {
+		t.Errorf("SenderID = %q, want %q", captured.Source.SenderID, "user1")
+	}
+	if captured.Source.ChatID != "sys-node" {
+		t.Errorf("ChatID = %q, want %q", captured.Source.ChatID, "sys-node")
+	}
+}
+
+func TestHandleWebhookBadSignature(t *testing.T) {
+	ch, srv := newTestWebhookChannel(t)
+	defer srv.Close()
+
+	var invoked bool
+	ch.handler = func(ctx context.Context, msg channel.InboundMessage) error {
+		invoked = true
+		return nil
+	}
+
+	req := buildTextWebhookRequest(t, "test-secret", "deadbeef")
+	rr := httptest.NewRecorder()
+	ch.handleWebhook(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusUnauthorized)
+	}
+	if invoked {
+		t.Fatal("inbound handler should not be invoked for bad signature")
+	}
+}
