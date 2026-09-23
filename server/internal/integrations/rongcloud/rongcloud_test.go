@@ -15,6 +15,8 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+
+	"github.com/multica-ai/multica/server/internal/integrations/channel"
 )
 
 func testLogger() *slog.Logger {
@@ -326,5 +328,87 @@ func TestWebhookDispatcher(t *testing.T) {
 	dispatcher.ServeHTTP(w2, req2)
 	if w2.Code != http.StatusNotFound {
 		t.Errorf("after unregister status = %d, want %d", w2.Code, http.StatusNotFound)
+	}
+}
+
+func TestNormalizeInboundText(t *testing.T) {
+	msg := NormalizedMessage{
+		ObjectName:       objectNameText,
+		FromUserID:       "user1",
+		ToUserID:         "sys_node",
+		Content:          `{"content":"hello world"}`,
+		MsgUID:           "m1",
+		MsgTimeStamp:     "1695494400000",
+		ConversationType: "1",
+	}
+	inbound, ok := normalizeInbound(msg)
+	if !ok {
+		t.Fatal("normalizeInbound returned false")
+	}
+	if inbound.Type != channel.MsgTypeText {
+		t.Errorf("Type = %q, want text", inbound.Type)
+	}
+	if inbound.Text != "hello world" {
+		t.Errorf("Text = %q, want hello world", inbound.Text)
+	}
+	if inbound.Source.SenderID != "user1" {
+		t.Errorf("SenderID = %q", inbound.Source.SenderID)
+	}
+	if inbound.Source.ChatType != channel.ChatTypeP2P {
+		t.Errorf("ChatType = %q, want p2p", inbound.Source.ChatType)
+	}
+	if inbound.MessageID != "m1" {
+		t.Errorf("MessageID = %q", inbound.MessageID)
+	}
+	if !inbound.AddressedToBot {
+		t.Error("AddressedToBot should be true for P2P")
+	}
+}
+
+func TestNormalizeInboundCommand(t *testing.T) {
+	msg := NormalizedMessage{
+		ObjectName:       objectNameCommand,
+		FromUserID:       "user1",
+		ToUserID:         "sys_node",
+		Content:          `{"request_id":"r1","service":"ping","action":"ping"}`,
+		MsgUID:           "m2",
+		ConversationType: "1",
+	}
+	inbound, ok := normalizeInbound(msg)
+	if !ok {
+		t.Fatal("normalizeInbound returned false")
+	}
+	if inbound.MessageID != "m2" {
+		t.Errorf("MessageID = %q", inbound.MessageID)
+	}
+	if inbound.Source.SenderID != "user1" {
+		t.Errorf("SenderID = %q", inbound.Source.SenderID)
+	}
+}
+
+func TestIsCommandMessage(t *testing.T) {
+	if !isCommandMessage(objectNameCommand) {
+		t.Error("isCommandMessage(command) should be true")
+	}
+	if isCommandMessage(objectNameText) {
+		t.Error("isCommandMessage(RC:TxtMsg) should be false")
+	}
+}
+
+func TestNormalizeInboundGroupChat(t *testing.T) {
+	msg := NormalizedMessage{
+		ObjectName:       objectNameText,
+		FromUserID:       "user1",
+		ToUserID:         "group1",
+		Content:          `{"content":"hi"}`,
+		MsgUID:           "m3",
+		ConversationType: "3",
+	}
+	inbound, ok := normalizeInbound(msg)
+	if !ok {
+		t.Fatal("normalizeInbound returned false")
+	}
+	if inbound.Source.ChatType != channel.ChatTypeGroup {
+		t.Errorf("ChatType = %q, want group", inbound.Source.ChatType)
 	}
 }
