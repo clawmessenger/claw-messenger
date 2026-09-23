@@ -1,7 +1,9 @@
 package rongcloud
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"testing"
@@ -56,5 +58,44 @@ func TestCommandResultContentMarshal(t *testing.T) {
 func TestTypeRongCloudConstant(t *testing.T) {
 	if TypeRongCloud != "rongcloud" {
 		t.Errorf("TypeRongCloud = %q, want %q", TypeRongCloud, "rongcloud")
+	}
+}
+
+func TestDecodeCredentialsValid(t *testing.T) {
+	// Encrypt "my-secret" with a no-op decrypter (identity)
+	secretB64 := base64.StdEncoding.EncodeToString([]byte("my-secret"))
+	raw := json.RawMessage(`{"app_key":"app123","app_secret_encrypted":"` + secretB64 + `","system_node_id":"sys_node_1"}`)
+	creds, err := decodeCredentials(raw, func(ciphertext []byte) ([]byte, error) {
+		return ciphertext, nil // identity decrypter
+	})
+	if err != nil {
+		t.Fatalf("decodeCredentials: %v", err)
+	}
+	if creds.AppKey != "app123" {
+		t.Errorf("AppKey = %q, want app123", creds.AppKey)
+	}
+	if creds.AppSecret != "my-secret" {
+		t.Errorf("AppSecret = %q, want my-secret", creds.AppSecret)
+	}
+	if creds.SystemNodeID != "sys_node_1" {
+		t.Errorf("SystemNodeID = %q, want sys_node_1", creds.SystemNodeID)
+	}
+}
+
+func TestDecodeCredentialsMissingAppKey(t *testing.T) {
+	raw := json.RawMessage(`{"app_secret_encrypted":"dGVzdA==","system_node_id":"sys"}`)
+	_, err := decodeCredentials(raw, func(b []byte) ([]byte, error) { return b, nil })
+	if err == nil {
+		t.Fatal("expected error for missing app_key")
+	}
+}
+
+func TestDecodeCredentialsDecryptError(t *testing.T) {
+	raw := json.RawMessage(`{"app_key":"k","app_secret_encrypted":"dGVzdA==","system_node_id":"s"}`)
+	_, err := decodeCredentials(raw, func(b []byte) ([]byte, error) {
+		return nil, errors.New("decrypt failed")
+	})
+	if err == nil {
+		t.Fatal("expected error for decrypt failure")
 	}
 }
