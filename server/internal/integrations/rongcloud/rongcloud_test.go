@@ -15,7 +15,9 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/integrations/channel"
 )
 
@@ -494,5 +496,150 @@ func TestHandleCommandParseError(t *testing.T) {
 	err := handler.handleCommand(context.Background(), msg)
 	if err != nil {
 		t.Fatalf("handleCommand should handle parse error gracefully: %v", err)
+	}
+}
+
+func TestEncodeTextContent(t *testing.T) {
+	result := encodeTextContent("hello")
+	var tc textContent
+	if err := json.Unmarshal([]byte(result), &tc); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if tc.Content != "hello" {
+		t.Errorf("Content = %q, want hello", tc.Content)
+	}
+}
+
+func TestChannelType(t *testing.T) {
+	ch := &rongcloudChannel{}
+	if ch.Type() != TypeRongCloud {
+		t.Errorf("Type() = %q, want %q", ch.Type(), TypeRongCloud)
+	}
+}
+
+func TestChannelCapabilities(t *testing.T) {
+	ch := &rongcloudChannel{}
+	caps := ch.Capabilities()
+	if !caps.Has(channel.CapText) {
+		t.Error("expected CapText capability")
+	}
+}
+
+func TestChannelConnectRegistersWebhook(t *testing.T) {
+	dispatcher := NewWebhookDispatcher(testLogger())
+
+	ch := &rongcloudChannel{
+		creds: credentials{
+			AppKey:       "key",
+			AppSecret:    "secret",
+			SystemNodeID: "sys",
+		},
+		client:       newRongCloudAPIClient("key", "secret", "", nil, testLogger()),
+		systemHandler: newSystemHandler(newRongCloudAPIClient("key", "secret", "", nil, testLogger()), "sys", testLogger()),
+		registrar:     dispatcher,
+		handler:      func(ctx context.Context, msg channel.InboundMessage) error { return nil },
+		logger:        testLogger(),
+	}
+
+	// Use a config ID so the installation ID is non-empty
+	ch.cfg.ID = pgtype.UUID{Bytes: [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}, Valid: true}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- ch.Connect(ctx)
+	}()
+
+	// Give Connect time to register
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify the handler is registered
+	dispatcher.mu.RLock()
+	_, registered := dispatcher.handlers[ch.cfg.ID.String()]
+	dispatcher.mu.RUnlock()
+	if !registered {
+		t.Fatal("webhook handler not registered")
+	}
+
+	// Cancel and verify Connect returns
+	cancel()
+	err := <-done
+	if err != nil {
+		t.Fatalf("Connect returned error: %v", err)
+	}
+
+	// Verify handler is unregistered on Disconnect
+	dispatcher.mu.RLock()
+	_, stillRegistered := dispatcher.handlers[ch.cfg.ID.String()]
+	dispatcher.mu.RUnlock()
+	if stillRegistered {
+		t.Fatal("webhook handler still registered after Disconnect")
+	}
+}
+
+func TestChannelSendText(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.ParseForm()
+		if r.PostForm.Get("objectName") != objectNameText {
+			t.Errorf("objectName = %q, want %q", r.PostForm.Get("objectName"), objectNameText)
+		}
+		var tc textContent
+		json.Unmarshal([]byte(r.PostForm.Get("content")), &tc)
+		if tc.Content != "hello" {
+			t.Errorf("content = %q, want hello", tc.Content)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"code":200,"msgUID":"sent_001"}`)
+	}))
+	defer srv.Close()
+
+	ch := &rongcloudChannel{
+		creds:  credentials{AppKey: "k", AppSecret: "s", SystemNodeID: "sys"},
+		client: newRongCloudAPIClient("k", "s", srv.URL, srv.Client(), testLogger()),
+		logger: testLogger(),
+	}
+	result, err := ch.Send(context.Background(), channel.OutboundMessage{
+		ChatID: "user1",
+		Text:   "hello",
+	})
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if result.MessageID != "sent_001" {
+		t.Errorf("MessageID = %q, want sent_001", result.MessageID)
+	}
+}
+
+func TestFactory(t *testing.T) {
+	dispatcher := NewWebhookDispatcher(testLogger())
+	secretB64 := base64.StdEncoding.EncodeToString([]byte("test-secret"))
+	raw := json.RawMessage(`{"app_key":"k1","app_secret_encrypted":"` + secretB64 + `","system_node_id":"node1"}`)
+
+	factory := newRongCloudFactory(ChannelDeps{
+		Registrar: dispatcher,
+		Decrypt:   func(b []byte) ([]byte, error) { return b, nil },
+		Logger:    testLogger(),
+	})
+
+	ch, err := factory(channel.Config{
+		Type:    TypeRongCloud,
+		Raw:     raw,
+		Handler: func(ctx context.Context, msg channel.InboundMessage) error { return nil },
+	})
+	if err != nil {
+		t.Fatalf("factory: %v", err)
+	}
+	rc, ok := ch.(*rongcloudChannel)
+	if !ok {
+		t.Fatalf("expected *rongcloudChannel, got %T", ch)
+	}
+	if rc.creds.AppKey != "k1" {
+		t.Errorf("AppKey = %q", rc.creds.AppKey)
+	}
+	if rc.creds.SystemNodeID != "node1" {
+		t.Errorf("SystemNodeID = %q", rc.creds.SystemNodeID)
+	}
+	if rc.handler == nil {
+		t.Error("handler not set from cfg.Handler")
 	}
 }
