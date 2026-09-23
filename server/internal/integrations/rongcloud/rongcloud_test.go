@@ -412,3 +412,87 @@ func TestNormalizeInboundGroupChat(t *testing.T) {
 		t.Errorf("ChatType = %q, want group", inbound.Source.ChatType)
 	}
 }
+
+func TestHandleCommandPing(t *testing.T) {
+	var receivedRequestID string
+	var receivedPayload map[string]interface{}
+	var receivedToUser string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.ParseForm()
+		if r.PostForm.Get("objectName") == "command" {
+			var content CommandResultContent
+			json.Unmarshal([]byte(r.PostForm.Get("content")), &content)
+			receivedRequestID = content.RequestID
+			receivedPayload = content.Payload
+			receivedToUser = r.PostForm.Get("toUserId")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"code":200}`)
+	}))
+	defer srv.Close()
+
+	client := newRongCloudAPIClient("key", "secret", srv.URL, srv.Client(), testLogger())
+	handler := newSystemHandler(client, "sys_node", testLogger())
+
+	msg := NormalizedMessage{
+		ObjectName: objectNameCommand,
+		FromUserID: "user1",
+		Content:    `{"request_id":"req_123","service":"ping","action":"ping","params":{"echo":"hello"}}`,
+	}
+	err := handler.handleCommand(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("handleCommand: %v", err)
+	}
+	if receivedRequestID != "req_123" {
+		t.Errorf("RequestID = %q, want req_123", receivedRequestID)
+	}
+	if receivedToUser != "user1" {
+		t.Errorf("toUserId = %q, want user1", receivedToUser)
+	}
+	if receivedPayload["ok"] != true {
+		t.Errorf("Payload[ok] = %v, want true", receivedPayload["ok"])
+	}
+}
+
+func TestHandleCommandUnknownService(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"code":200}`)
+	}))
+	defer srv.Close()
+
+	client := newRongCloudAPIClient("key", "secret", srv.URL, srv.Client(), testLogger())
+	handler := newSystemHandler(client, "sys_node", testLogger())
+
+	msg := NormalizedMessage{
+		ObjectName: objectNameCommand,
+		FromUserID: "user1",
+		Content:    `{"request_id":"r1","service":"unknown_svc","action":"test","params":{}}`,
+	}
+	err := handler.handleCommand(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("handleCommand should not return error for unknown service: %v", err)
+	}
+}
+
+func TestHandleCommandParseError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"code":200}`)
+	}))
+	defer srv.Close()
+
+	client := newRongCloudAPIClient("key", "secret", srv.URL, srv.Client(), testLogger())
+	handler := newSystemHandler(client, "sys_node", testLogger())
+
+	msg := NormalizedMessage{
+		ObjectName: objectNameCommand,
+		FromUserID: "user1",
+		Content:    `not valid json`,
+	}
+	err := handler.handleCommand(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("handleCommand should handle parse error gracefully: %v", err)
+	}
+}
