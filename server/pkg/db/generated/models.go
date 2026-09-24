@@ -1302,6 +1302,127 @@ type QuickAction struct {
 	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
 }
 
+type RongcloudChatroom struct {
+	ID                  pgtype.UUID        `json:"id"`
+	WorkspaceID         pgtype.UUID        `json:"workspace_id"`
+	RongcloudChatroomID string             `json:"rongcloud_chatroom_id"`
+	OwnerUserID         pgtype.UUID        `json:"owner_user_id"`
+	HostNodeID          pgtype.UUID        `json:"host_node_id"`
+	MaxRounds           int32              `json:"max_rounds"`
+	ConversationKind    pgtype.Text        `json:"conversation_kind"`
+	Config              []byte             `json:"config"`
+	Status              string             `json:"status"`
+	CreatedAt           pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt           pgtype.Timestamptz `json:"updated_at"`
+}
+
+type RongcloudChatroomMember struct {
+	ID               pgtype.UUID        `json:"id"`
+	ChatroomID       pgtype.UUID        `json:"chatroom_id"`
+	NodeID           pgtype.UUID        `json:"node_id"`
+	MemberType       string             `json:"member_type"`
+	RoleName         pgtype.Text        `json:"role_name"`
+	RoleInstructions pgtype.Text        `json:"role_instructions"`
+	Capabilities     []byte             `json:"capabilities"`
+	Model            pgtype.Text        `json:"model"`
+	SpeakingOrder    pgtype.Int4        `json:"speaking_order"`
+	Enabled          bool               `json:"enabled"`
+	DiscussionModel  pgtype.Text        `json:"discussion_model"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
+}
+
+type RongcloudDevice struct {
+	ID                        pgtype.UUID        `json:"id"`
+	WorkspaceID               pgtype.UUID        `json:"workspace_id"`
+	OwnerUserID               pgtype.UUID        `json:"owner_user_id"`
+	NodeID                    pgtype.UUID        `json:"node_id"`
+	DeviceName                string             `json:"device_name"`
+	DeviceType                pgtype.Text        `json:"device_type"`
+	CredentialID              pgtype.Text        `json:"credential_id"`
+	CredentialSecretEncrypted pgtype.Text        `json:"credential_secret_encrypted"`
+	Status                    string             `json:"status"`
+	CreatedAt                 pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                 pgtype.Timestamptz `json:"updated_at"`
+}
+
+type RongcloudDiscussionEvent struct {
+	ID            pgtype.UUID        `json:"id"`
+	ChatroomID    pgtype.UUID        `json:"chatroom_id"`
+	WorkspaceID   pgtype.UUID        `json:"workspace_id"`
+	EventType     string             `json:"event_type"`
+	RoundNumber   int32              `json:"round_number"`
+	SpeakingOrder int32              `json:"speaking_order"`
+	NodeID        pgtype.UUID        `json:"node_id"`
+	Content       []byte             `json:"content"`
+	MsgUid        pgtype.Text        `json:"msg_uid"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+}
+
+type RongcloudNode struct {
+	ID              pgtype.UUID        `json:"id"`
+	WorkspaceID     pgtype.UUID        `json:"workspace_id"`
+	OwnerUserID     pgtype.UUID        `json:"owner_user_id"`
+	RongcloudUserID string             `json:"rongcloud_user_id"`
+	NodeID          string             `json:"node_id"`
+	AiType          pgtype.Text        `json:"ai_type"`
+	Capabilities    []byte             `json:"capabilities"`
+	DeployStatus    string             `json:"deploy_status"`
+	BindingVersion  int32              `json:"binding_version"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+}
+
+type RongcloudNodeModelCatalog struct {
+	ID          pgtype.UUID        `json:"id"`
+	WorkspaceID pgtype.UUID        `json:"workspace_id"`
+	NodeID      pgtype.UUID        `json:"node_id"`
+	ModelID     string             `json:"model_id"`
+	Provider    pgtype.Text        `json:"provider"`
+	ModelName   pgtype.Text        `json:"model_name"`
+	Config      []byte             `json:"config"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
+}
+
+type RongcloudPairingSession struct {
+	ID               pgtype.UUID        `json:"id"`
+	WorkspaceID      pgtype.UUID        `json:"workspace_id"`
+	Ticket           string             `json:"ticket"`
+	Status           string             `json:"status"`
+	ClientClaimKey   pgtype.Text        `json:"client_claim_key"`
+	IdempotencyKey   pgtype.Text        `json:"idempotency_key"`
+	CandidateNodeIds []byte             `json:"candidate_node_ids"`
+	ExpiresAt        pgtype.Timestamptz `json:"expires_at"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
+}
+
+type RongcloudSystemConfig struct {
+	ID            pgtype.UUID        `json:"id"`
+	WorkspaceID   pgtype.UUID        `json:"workspace_id"`
+	ConfigKey     string             `json:"config_key"`
+	NodeID        pgtype.UUID        `json:"node_id"`
+	Config        []byte             `json:"config"`
+	ConfigVersion int32              `json:"config_version"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+}
+
+type RongcloudUser struct {
+	ID               pgtype.UUID        `json:"id"`
+	WorkspaceID      pgtype.UUID        `json:"workspace_id"`
+	RongcloudUserID  string             `json:"rongcloud_user_id"`
+	Name             pgtype.Text        `json:"name"`
+	PortraitUri      pgtype.Text        `json:"portrait_uri"`
+	TokenEncrypted   pgtype.Text        `json:"token_encrypted"`
+	IsSystemReserved bool               `json:"is_system_reserved"`
+	IsAiNode         bool               `json:"is_ai_node"`
+	NodeType         string             `json:"node_type"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
+}
+
 type RuntimeProfile struct {
 	ID             pgtype.UUID        `json:"id"`
 	WorkspaceID    pgtype.UUID        `json:"workspace_id"`

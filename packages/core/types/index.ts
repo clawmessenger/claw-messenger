@@ -251,6 +251,22 @@ export type {
   RedeemTelegramBindingTokenResponse,
 } from "./telegram";
 export type {
+  RongCloudConfig,
+  RongCloudNode,
+  RongCloudChatroom,
+  RongCloudChatroomMember,
+  RongCloudDevice,
+  RongCloudNodeModel,
+  RongCloudPairingSession,
+  RongCloudSystemHost,
+  RongCloudDiscussionState,
+  RongCloudSpeakerInfo,
+  RongCloudDiscussionEvent,
+  RongCloudRegisterNodeResponse,
+  RongCloudEnrollDeviceResponse,
+  RongCloudConnectionSessionResponse,
+} from "./rongcloud";
+export type {
   Autopilot,
   AutopilotStatus,
   AutopilotExecutionMode,

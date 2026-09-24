@@ -1,4 +1,4 @@
-import { z } from "zod";
+﻿import { z } from "zod";
 import { normalizeIssueStatusCategory } from "../issues/config/status";
 import type {
   AgentBuilderRuntimeSwitch,
@@ -44,6 +44,11 @@ import type {
   TelegramInstallation,
   ListTelegramInstallationsResponse,
   RedeemTelegramBindingTokenResponse,
+  RongCloudConfig,
+  RongCloudNode,
+  RongCloudChatroom,
+  RongCloudSystemHost,
+  RongCloudDiscussionState,
   GroupedIssuesResponse,
   GitHubConnectResponse,
   GitHubPullRequest,
@@ -533,7 +538,7 @@ export const EMPTY_RESOURCE_LABELS_RESPONSE: ResourceLabelsResponse = {
 };
 
 // Saved issue views (MUL-4796). `query`/`display` are opaque definition
-// blobs interpreted client-side per `definition_version` — keep them as
+// blobs interpreted client-side per `definition_version` 鈥?keep them as
 // loose records so newer servers can add fields freely. `scope_type` /
 // `visibility` stay lenient strings; downstream code uses explicit `===`
 // comparisons and default branches per the API-compat rules.
@@ -696,7 +701,7 @@ export const EMPTY_LIST_PROPERTIES_RESPONSE: ListPropertiesResponse = {
 
 // Value bag: keyed by definition UUID; values are primitives or string
 // arrays (multi_select). The preprocess step drops entries with unknown
-// shapes BEFORE validation — a newer server shipping an object-shaped value
+// shapes BEFORE validation 鈥?a newer server shipping an object-shaped value
 // (future actor/relation types) must degrade to "that one property missing",
 // never fail the whole IssueSchema and blank the list via parseWithFallback.
 export const IssuePropertyValuesSchema = z.preprocess(
@@ -728,7 +733,7 @@ export const EMPTY_ISSUE_PROPERTIES_RESPONSE: IssuePropertiesResponse = {
 export interface AppConfigResponse {
   cdn_domain: string;
   // True when the CDN domain serves private content via time-bounded signed
-  // URLs (CloudFront signing) — raw storage URLs on that domain are NOT
+  // URLs (CloudFront signing) 鈥?raw storage URLs on that domain are NOT
   // publicly fetchable and must not be used as native media sources
   // (MUL-3254). Older servers omit the field; treat that as false.
   cdn_signed?: boolean;
@@ -742,13 +747,13 @@ export interface AppConfigResponse {
   workspace_creation_disabled?: boolean;
   /** Whether this deployment offers the self-hosted Git provider integration
    * (self-host only; off on the managed cloud). Absent/false hides the whole
-   * Settings → Integrations "Git providers" section. */
+   * Settings 鈫?Integrations "Git providers" section. */
   vcs_integration_available?: boolean;
   feature_flags?: Record<string, boolean>;
   /** Whether this server understands local_directory `execution_mode` and
    * gates worktree mode at save time. Absent on every server that predates this
    * capability signal, which includes the ones that silently DROPPED an unknown
-   * `execution_mode` and answered 201 — the resource then ran in place while
+   * `execution_mode` and answered 201 鈥?the resource then ran in place while
    * the user was promised isolation (#7113). Servers between that fix and this
    * signal do validate but cannot say so, and are treated as unable: the client
    * has no way to tell them apart, and only one of the two answers is safe. */
@@ -767,7 +772,7 @@ export interface AppConfigResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Schemas for the highest-risk API endpoints — those whose responses drive
+// Schemas for the highest-risk API endpoints 鈥?those whose responses drive
 // the issue detail page (timeline, comments, subscribers) and the issues
 // list. These are the surfaces that white-screened in #2143 / #2147 / #2192.
 //
@@ -782,13 +787,13 @@ export interface AppConfigResponse {
 //   - Every object schema ends with `.loose()` so unknown server-side
 //     fields pass through unchanged. zod 4's `.object()` defaults to STRIP,
 //     which would silently delete fields the schema didn't explicitly list
-//     — fine while the TS type doesn't claim them, but the moment a future
+//     鈥?fine while the TS type doesn't claim them, but the moment a future
 //     PR adds a TS field without updating the schema, the cast `as T` lies
 //     and the field shows up as `undefined` at runtime. `.loose()` removes
 //     that synchronisation hazard.
 //
 // These schemas are deliberately not typed as `z.ZodType<TimelineEntry>` /
-// `z.ZodType<Issue>` etc. — the strict TS types narrow string fields to
+// `z.ZodType<Issue>` etc. 鈥?the strict TS types narrow string fields to
 // literal unions, which would defeat the leniency above. `parseWithFallback`
 // returns the parsed value cast to the caller-supplied `T`, so the strict
 // type still flows out at the call site; the schema only guards shape.
@@ -850,7 +855,7 @@ export const ChatMessagesPageSchema = z.object({
 
 // Standalone attachment lookup (`GET /api/attachments/{id}`) is the source of
 // truth for click-time download URLs. The two fields the download flow opens
-// in a new tab — `download_url` and `url` — must be strings, otherwise we'd
+// in a new tab 鈥?`download_url` and `url` 鈥?must be strings, otherwise we'd
 // happily `window.open(undefined)`. `filename` gates the toast/title and is
 // also enforced so a missing value falls back to the empty record below.
 //
@@ -864,7 +869,7 @@ export const AttachmentResponseSchema = z.object({
   id: z.string(),
   url: z.string(),
   download_url: z.string(),
-  // Forced-attachment ("download button") URL — credential-free and, unlike
+  // Forced-attachment ("download button") URL 鈥?credential-free and, unlike
   // `download_url`, always Content-Disposition: attachment across every storage
   // mode. Optional: a server older than this field omits it, and callers fall
   // back to `download_url` / the stable endpoint. Never persisted (short-lived).
@@ -898,7 +903,7 @@ export const EMPTY_ATTACHMENT: Attachment = {
 // silently drop new fields and surface as a "field neither showed up in
 // the UI" mystery the next time the TS type adopted them but the schema
 // wasn't updated in lock-step. `.loose()` removes that synchronisation
-// hazard — the schema validates the shape it knows about and leaves the
+// hazard 鈥?the schema validates the shape it knows about and leaves the
 // rest alone.
 const TimelineEntrySchema = z.object({
   type: z.string(),
@@ -925,7 +930,7 @@ const TimelineEntrySchema = z.object({
 }).loose();
 
 // /timeline returns a flat array of TimelineEntry, oldest first. The
-// previously cursor-paginated wrapper was removed (#1929) — at observed data
+// previously cursor-paginated wrapper was removed (#1929) 鈥?at observed data
 // sizes (p99 ~30 entries per issue) paged delivery only created bugs.
 export const TimelineEntriesSchema = z.array(TimelineEntrySchema);
 
@@ -951,14 +956,14 @@ const FeatureFlagsSchema = z.preprocess(
 );
 
 /**
- * POST /api/auth/refresh — sliding session renewal (MUL-7436).
+ * POST /api/auth/refresh 鈥?sliding session renewal (MUL-7436).
  *
  * `token` is present only for clients that carry the session as a string
  * (Desktop, mobile). A cookie-authenticated browser gets the renewed session
  * as a Set-Cookie and must never be handed a readable JWT, so the field is
  * absent there rather than empty.
  *
- * `renewed: false` is the normal answer to asking early, not an error —
+ * `renewed: false` is the normal answer to asking early, not an error 鈥?
  * clients poll on a cadence and most calls land outside the renewal window.
  * `check_again_in_seconds` is that cadence: the server derives it from the
  * deployment's configured TTL, so no client hardcodes one.
@@ -1071,7 +1076,7 @@ export const CommentSchema = z.object({
 export const CommentsListSchema = z.array(CommentSchema);
 
 // Degraded placeholder for a comment response that failed schema validation.
-// The empty id is the caller's signal that nothing usable came back — the run
+// The empty id is the caller's signal that nothing usable came back 鈥?the run
 // UI treats it as "could not read the result" rather than a successful run.
 export const EMPTY_COMMENT: Comment = {
   id: "",
@@ -1098,7 +1103,7 @@ const CommentTriggerPreviewAgentSchema = z.object({
   reason: z.string().default(""),
 }).loose();
 
-// Per-target outcome of an explicit @agent / @squad mention (MUL-4525 §2).
+// Per-target outcome of an explicit @agent / @squad mention (MUL-4525 搂2).
 // target_id is required to correlate with the client's rendered mention; a
 // malformed entry (missing id) is dropped rather than failing the whole payload.
 export const CommentTriggerOutcomeSchema = z.object({
@@ -1258,7 +1263,7 @@ export const IssueSchema = z.object({
   title: z.string(),
   description: z.string().nullable(),
   status: z.string(),
-  // The canonical status whose platform behavior `status` carries — equal to
+  // The canonical status whose platform behavior `status` carries 鈥?equal to
   // `status` for the 7 built-ins, and the inherited category for a custom
   // status. Optional because only endpoints that resolve it emit it, so
   // consumers must fall back to `status` rather than treat "" as a category.
@@ -1273,8 +1278,8 @@ export const IssueSchema = z.object({
   // takes the whole response through parseWithFallback to EMPTY_LIST_ISSUES_RESPONSE,
   // so one malformed name from a mixed-version deploy would blank an entire
   // issue list. Same treatment as source_context and labels above. Nothing reads
-  // this field to make a decision — useStatusLabel resolves the label from the
-  // catalog — so dropping it costs a fallback to the key. (MUL-6749)
+  // this field to make a decision 鈥?useStatusLabel resolves the label from the
+  // catalog 鈥?so dropping it costs a fallback to the key. (MUL-6749)
   status_name: z.string().optional().catch(undefined),
   priority: z.string(),
   assignee_type: z.string().nullable(),
@@ -1319,9 +1324,9 @@ export const ListIssuesResponseSchema = z.object({
 //     id here routes an id-less body to that same failure path.
 //   - `labels` is the backend-compatibility signal the create modal reads to
 //     decide whether the backend attached labels in the create transaction
-//     (present) or predates that (absent → fall back to per-label attach).
+//     (present) or predates that (absent 鈫?fall back to per-label attach).
 //     Validate it strictly as Label[] and degrade a malformed value to
-//     `undefined` — the same as an absent field — so a wrong shape (null,
+//     `undefined` 鈥?the same as an absent field 鈥?so a wrong shape (null,
 //     object, a garbage array) can never masquerade as "handled" and suppress
 //     the fallback. Unlike the loose IssueSchema.labels (z.array(z.unknown())),
 //     the elements are fully validated. See packages/views/modals/create-issue.tsx.
@@ -1362,7 +1367,7 @@ const ProjectSchema = z.object({
   lead_id: z.string().nullable(),
   // .default(null) so a project from an older backend (frontend deploys before
   // backend) that omits these keys parses to null instead of failing the whole
-  // object — which would degrade a search/list batch to the empty fallback.
+  // object 鈥?which would degrade a search/list batch to the empty fallback.
   start_date: z.string().nullable().default(null),
   due_date: z.string().nullable().default(null),
   created_at: z.string(),
@@ -1587,7 +1592,7 @@ export const EMPTY_CLOUD_RUNTIME_NODE: CloudRuntimeNode = {
 // Workspace dashboard schemas
 //
 // The dashboard hits three independent rollup endpoints. Each returns a flat
-// array, and every field is consumed by chart / KPI math — a missing number
+// array, and every field is consumed by chart / KPI math 鈥?a missing number
 // silently degrades to NaN downstream, so we coerce missing numbers to 0.
 // String fields default to "" (no enum narrowing) to survive future model /
 // agent ID drift, and so a single null from tz-aware SQL bucketing fails
@@ -1603,7 +1608,7 @@ export const EMPTY_CLOUD_RUNTIME_NODE: CloudRuntimeNode = {
 // `.default(0)`: a backend that predates them sends nothing, and defaulting
 // those rows to "0 tokens left to estimate" would silently zero their cost.
 // `undefined` means "this backend doesn't split", and the consumer falls back
-// to the full token counts — i.e. exactly the old behaviour. A real 0 from a
+// to the full token counts 鈥?i.e. exactly the old behaviour. A real 0 from a
 // current backend means "everything here is already priced", which is a
 // different thing and must stay distinguishable.
 const CostSplitShape = {
@@ -1666,13 +1671,13 @@ const DashboardRunTimeDailySchema = z.object({
 
 export const DashboardRunTimeDailyListSchema = z.array(DashboardRunTimeDailySchema);
 
-// Failure rollups. `failure_reason` is an open string on purpose — it carries
+// Failure rollups. `failure_reason` is an open string on purpose 鈥?it carries
 // the backend's canonical taxonomy, which grows as new classifier rules land
 // (server/pkg/taskfailure). Pinning it to a z.enum would make an installed
 // desktop client drop rows for a reason its build predates; the client folds
 // unrecognised reasons into an "other" display class instead. The empty
 // string is the succeeded bucket, so `.default("")` is a meaningful default
-// only for a row that already lost its reason — such a row lands in the
+// only for a row that already lost its reason 鈥?such a row lands in the
 // denominator rather than inventing a failure that never happened.
 const DashboardFailureDailySchema = z.object({
   date: z.string().default(""),
@@ -1693,7 +1698,7 @@ export const DashboardFailureByAgentListSchema = z.array(
 );
 
 // ---------------------------------------------------------------------------
-// Runtime usage schemas — the runtime-detail page's four usage endpoints
+// Runtime usage schemas 鈥?the runtime-detail page's four usage endpoints
 // (`/api/runtimes/:id/usage*`). Same leniency rules as the dashboard
 // schemas above: numbers default to 0, strings to "", `.loose()` passes
 // unknown fields.
@@ -1752,7 +1757,7 @@ export const RuntimeUsageByHourListSchema = z.array(RuntimeUsageByHourSchema);
 // can drift while task-list consumers still validate the fields they render.
 // ---------------------------------------------------------------------------
 
-// Human attribution (MUL-4302 §9): who an agent run is accountable to, and how
+// Human attribution (MUL-4302 搂9): who an agent run is accountable to, and how
 // that human was resolved. Every field is defensive so a departed member, an
 // autopilot run (no originator), or an older backend degrades to a partial
 // object instead of a parse failure.
@@ -1870,7 +1875,7 @@ export const AgentTaskListSchema = z.array(AgentTaskSchema);
 // the UI makes about a tool's output, so it stays `.optional()` with no
 // default: a server that does not send it means "unknown", and defaulting it
 // to false would turn a missing field into an assertion that the record is
-// complete. `.catch(undefined)` keeps a malformed value that far too — without
+// complete. `.catch(undefined)` keeps a malformed value that far too 鈥?without
 // it a single bad boolean fails its row, the array fails with it, and
 // `parseWithFallback` hands the viewer an empty transcript. Degrading one
 // field to "unknown" is the correct loss; deleting the run is not. Every other
@@ -1968,7 +1973,7 @@ export const EMPTY_CHAT_SESSION_LIST: ChatSession[] = [];
 // (`GET /api/chat/sessions/{id}/draft-restores`, #5219) feed the composer
 // directly: `content` becomes the draft text, `attachments` re-bind on
 // re-send, and `id` is the consume key. A malformed response falls back to
-// an empty list — the durable row stays pending server-side, so nothing is
+// an empty list 鈥?the durable row stays pending server-side, so nothing is
 // lost by skipping a fetch.
 const ChatDraftRestoreSchema = z.object({
   id: z.string(),
@@ -2021,7 +2026,7 @@ export const SendChatMessageResponseSchema: z.ZodType<SendChatMessageResponse> =
 }).loose();
 
 // `started` is the only field the flow branches on, and a malformed response
-// must not be read as "the opening landed" — parseWithFallback's fallback says
+// must not be read as "the opening landed" 鈥?parseWithFallback's fallback says
 // it did not, which leaves the flow's own retry as the recovery path.
 export const StartMikaOnboardingResponseSchema: z.ZodType<StartMikaOnboardingResponse> = z.object({
   started: z.boolean(),
@@ -2135,7 +2140,7 @@ export const AgentBuilderRuntimeSwitchSchema = z.object({
 // runtime the caller asked for; anything else is a thrown error and no commit.
 // So the safe fallback for an unparseable SUCCESS body is the requested id, not
 // an empty one: the rebind did happen, and reporting "unknown" would leave the
-// picker showing a runtime that is no longer executing — the exact split this
+// picker showing a runtime that is no longer executing 鈥?the exact split this
 // endpoint exists to close.
 export const agentBuilderRuntimeSwitchFallback = (
   requestedRuntimeID: string,
@@ -2188,7 +2193,7 @@ export const EMPTY_SQUAD: Squad = {
   member_preview: [],
 };
 
-// Squad member status — backs the Squad detail page's Members tab. status
+// Squad member status 鈥?backs the Squad detail page's Members tab. status
 // is `string | null` (not the narrow `SquadMemberStatusValue` union) so a
 // new server-side status doesn't fail the parse; the UI defaults to a
 // neutral pill for unknown values.
@@ -2214,7 +2219,7 @@ export const SquadMemberStatusListResponseSchema = z.object({
 export const EMPTY_SQUAD_MEMBER_STATUS_LIST = { members: [] };
 
 // ---------------------------------------------------------------------------
-// Structured error body — POST /api/workspaces/:wsId/issues 409 conflict.
+// Structured error body 鈥?POST /api/workspaces/:wsId/issues 409 conflict.
 //
 // When the server detects an active issue with the same title in the same
 // workspace, it returns `{ code: "active_duplicate_issue", error, issue }`
@@ -2224,7 +2229,7 @@ export const EMPTY_SQUAD_MEMBER_STATUS_LIST = { members: [] };
 //
 // Strict guarantees:
 //   - `code` is a literal so a future server rename (e.g. `duplicate_issue`)
-//     fails the parse and falls back to a normal error toast — drift never
+//     fails the parse and falls back to a normal error toast 鈥?drift never
 //     ships as a broken duplicate UI.
 //   - `issue` is required; without an id/identifier/title the "view existing"
 //     button has nothing to point at, so we'd rather fall back than guess.
@@ -2256,7 +2261,7 @@ export interface DuplicateIssueErrorBody {
 }
 
 // ---------------------------------------------------------------------------
-// Webhook delivery schemas — backing the Autopilot Deliveries section. Enums
+// Webhook delivery schemas 鈥?backing the Autopilot Deliveries section. Enums
 // (`status`, `signature_status`, `provider`) are kept as `z.string()` so a
 // future server-side value (e.g. a Stripe provider, a new dedupe state)
 // degrades to a generic UI fallback rather than collapsing the list into
@@ -2314,7 +2319,7 @@ export const EMPTY_LIST_WEBHOOK_DELIVERIES_RESPONSE: ListWebhookDeliveriesRespon
 // `last_run_status`) stay `z.string()` so future server-side values degrade
 // to a generic UI fallback. The three derived fields (trigger_kinds /
 // next_run_at / last_run_status) are list-endpoint-only and absent on older
-// servers — optional by contract, the list renders "—" without them.
+// servers 鈥?optional by contract, the list renders "鈥? without them.
 // ---------------------------------------------------------------------------
 
 const AutopilotListItemSchema = z.object({
@@ -2407,7 +2412,7 @@ export const FALLBACK_AUTOPILOT_RUN: AutopilotRun = {
 };
 
 // Cron preview: the server is the authority on the next occurrences. No
-// `.default([])` here — a missing or reshaped field must fail validation so it
+// `.default([])` here 鈥?a missing or reshaped field must fail validation so it
 // degrades to the `next_runs: null` fallback ("preview unreadable") instead of
 // masquerading as a valid empty list ("this expression never fires").
 export const CronPreviewResponseSchema = z.object({
@@ -2445,13 +2450,13 @@ export const EMPTY_WEBHOOK_DELIVERY: WebhookDelivery = {
 };
 
 // ---------------------------------------------------------------------------
-// User (`/api/me` GET + PATCH). The auth store and Settings → Account both
-// trust this shape — a drift here would knock both surfaces out. Kept
+// User (`/api/me` GET + PATCH). The auth store and Settings 鈫?Account both
+// trust this shape 鈥?a drift here would knock both surfaces out. Kept
 // lenient by the same rules as IssueSchema: enums stay `z.string()`,
 // nullable fields are unioned with `null`, unknown server fields pass
 // through via `.loose()`. `profile_description` is the field added in
 // MUL-2406; the server emits `""` when unset (NOT NULL DEFAULT ''), so
-// the schema defaults to `""` too — keeps the type tight without
+// the schema defaults to `""` too 鈥?keeps the type tight without
 // breaking older backends that don't return the column yet.
 // ---------------------------------------------------------------------------
 
@@ -2489,7 +2494,7 @@ export const EMPTY_USER: User = {
 // Cross-workspace unread inbox summary (`/api/inbox/unread-summary` GET).
 // One entry per workspace the user belongs to that has unread items; the
 // sidebar derives the workspace-switcher dot from it. Lenient per the usual
-// rules so a future field addition can't blank the dot — on malformed JSON
+// rules so a future field addition can't blank the dot 鈥?on malformed JSON
 // parseWithFallback returns the empty list, which simply hides the dot.
 // ---------------------------------------------------------------------------
 
@@ -2511,7 +2516,7 @@ export const EMPTY_INBOX_UNREAD_SUMMARY: InboxWorkspaceUnread[] = [];
 // parses and renders (the UI's type-label lookup already tolerates unknown
 // kinds). Nullable optional fields are declared optional as well, since older
 // rows can omit them entirely. On malformed JSON parseWithFallback returns the
-// empty list — the affected view then reads as empty rather than white-
+// empty list 鈥?the affected view then reads as empty rather than white-
 // screening the inbox. Both endpoints share this boundary because they return
 // the same row shape and both feed the status/priority filter UI.
 // ---------------------------------------------------------------------------
@@ -2560,7 +2565,7 @@ export const EMPTY_INBOX_ITEMS: InboxItem[] = [];
 // ---------------------------------------------------------------------------
 // Billing schemas (cloud-billing proxy surface)
 //
-// All billing JSON we receive comes from multica-cloud verbatim — we proxy
+// All billing JSON we receive comes from multica-cloud verbatim 鈥?we proxy
 // the bytes without re-shaping. These schemas use `loose()` so a future
 // non-breaking field addition on the cloud side doesn't crash us; required
 // fields are still strictly enforced. EMPTY_* constants supply the
@@ -2652,7 +2657,7 @@ export const BillingTopupSchema = z.object({
   status: z.string(),
   tier_id: z.string().default(""),
   stripe_checkout_id: z.string().default(""),
-  // Only set after status reaches `credited` — leave optional rather
+  // Only set after status reaches `credited` 鈥?leave optional rather
   // than coerce to "" so a UI can branch on existence.
   purchase_batch_id: z.string().optional(),
   created_at: z.string(),
@@ -2734,7 +2739,7 @@ export const EMPTY_CREATE_BILLING_PORTAL_SESSION_RESPONSE: CreateBillingPortalSe
 // hold for all of them:
 //
 //  1. There is no fallback value. Callers get `null` on any parse failure and
-//     must render "unavailable" — never a synthetic Free plan, because that
+//     must render "unavailable" 鈥?never a synthetic Free plan, because that
 //     turns an upstream outage or an older cloud into a silent downgrade of a
 //     paying workspace.
 //  2. `.loose()` keeps unknown keys, so a cloud that adds fields does not break
@@ -2745,7 +2750,7 @@ export const EMPTY_CREATE_BILLING_PORTAL_SESSION_RESPONSE: CreateBillingPortalSe
 const WorkspaceSubscriptionIntervalSchema = z.enum(["month", "year"]);
 
 // Stripe hosts Checkout and Portal, so those URLs leave the app. `z.string()
-// .url()` is not enough on its own — `new URL("javascript:...")` parses — and
+// .url()` is not enough on its own 鈥?`new URL("javascript:...")` parses 鈥?and
 // the caller hands this value to location.assign, so the scheme is pinned here.
 const StripeHostedURLSchema = z.string().url().refine(
   (value) => value.startsWith("https://"),
@@ -2904,7 +2909,7 @@ const WorkspaceSubscriptionPriceSchema = (
       unit_amount: z.number().int().positive(),
       // Pinned to the slot it arrived in. Cloud validates this too, but a
       // schema that accepted a yearly Price under `month` would let the UI
-      // quote a yearly amount as a monthly one — the schema is an independent
+      // quote a yearly amount as a monthly one 鈥?the schema is an independent
       // boundary, so it checks the correspondence itself.
       interval: z.literal(expected),
       interval_count: z.literal(1),
@@ -3058,8 +3063,8 @@ const RuntimeModelServiceTierSchema = z.object({
   description: z.string().optional(),
 }).loose();
 
-// A model entry with no `id` is unselectable — `onChange(m.id)` would persist
-// an empty model — so `id` is required and a malformed entry drops the whole
+// A model entry with no `id` is unselectable 鈥?`onChange(m.id)` would persist
+// an empty model 鈥?so `id` is required and a malformed entry drops the whole
 // response to the fallback rather than rendering a dead row.
 const RuntimeModelSchema = z.object({
   id: z.string(),
@@ -3074,7 +3079,7 @@ const RuntimeModelSchema = z.object({
 
 // A row the runtime named but will not run (MUL-6961). Parsed from its own
 // top-level list, never from `models`, so nothing here can become a selectable
-// value. `id` is required for the same reason it is on RuntimeModelSchema — a
+// value. `id` is required for the same reason it is on RuntimeModelSchema 鈥?a
 // row without one cannot even be keyed in a list.
 const RuntimeUnavailableModelSchema = z.object({
   id: z.string(),
@@ -3190,9 +3195,9 @@ export const EMPTY_REDEEM_DINGTALK_BINDING_TOKEN_RESPONSE: RedeemDingTalkBinding
   dingtalk_user_id: "",
 };
 
-// WeCom smart-bot ("智能机器人" / aibot) installation responses. `.loose()` so a
+// WeCom smart-bot ("鏅鸿兘鏈哄櫒浜? / aibot) installation responses. `.loose()` so a
 // newer backend field never fails the parse on an older desktop build (see
-// CLAUDE.md → API Compatibility). Defaults are chosen so a malformed response
+// CLAUDE.md 鈫?API Compatibility). Defaults are chosen so a malformed response
 // degrades safely: `configured` defaults false (renders the "ask your operator"
 // state rather than a Connect dialog whose submit is guaranteed to fail), and a
 // missing `status` defaults to "revoked" rather than "active" so a broken read
@@ -3358,7 +3363,7 @@ export const SkillImportExistingSkillSchema = z.object({
  * `status` stays a plain string (not an enum) so a status added by a newer
  * backend still parses and its `reason` survives to the user. `z.enum` here
  * would fail the whole envelope on an unknown value, drop the server's reason
- * and leave only a generic "Import failed" — the server field is a bare
+ * and leave only a generic "Import failed" 鈥?the server field is a bare
  * `string`, so it is free to grow. `skillFromImportResult` has the default
  * branch: anything outside created/updated is treated as a failure.
  */
@@ -3379,13 +3384,13 @@ export const EMPTY_SKILL_IMPORT_RESULT: SkillImportResult = {
  *
  * This is the ONLY schema in this file that must not be `.loose()`. Everywhere
  * else, keeping unknown fields is forward-compatibility; here it would be a
- * hole in the write-only boundary — a server that regressed to returning the
+ * hole in the write-only boundary 鈥?a server that regressed to returning the
  * stored entry (or a `url` / `headers` on the summary) would have it land in
  * the parsed object and in the query cache. zod strips unknown keys by
  * default, so the client only ever holds the safe summary.
  *
  * `transport` stays a plain string (not an enum) so an unknown value from a
- * newer backend still parses — the UI has a default branch for it.
+ * newer backend still parses 鈥?the UI has a default branch for it.
  */
 export const WorkspaceMcpServerSchema = z.object({
   id: z.string().default(""),
@@ -3547,3 +3552,199 @@ export const RuntimeProfileSchema = z
     runtime_type: profile.runtime_type || profile.protocol_family,
   }));
 export const RuntimeProfileListSchema = z.array(RuntimeProfileSchema);
+
+export const RongCloudConfigSchema = z.object({
+  app_key: z.string().default(""),
+  configured: z.boolean().default(false),
+}).loose();
+
+export const EMPTY_RONGCLOUD_CONFIG: RongCloudConfig = {
+  app_key: "",
+  configured: false,
+};
+
+export const RongCloudNodeSchema = z.object({
+  id: z.string(),
+  workspace_id: z.string().default(""),
+  owner_user_id: z.string().default(""),
+  rongcloud_user_id: z.string().default(""),
+  node_id: z.string().default(""),
+  ai_type: z.string().default(""),
+  capabilities: z.array(z.string()).catch([]).default([]),
+  deploy_status: z.string().default("registered"),
+  binding_version: z.number().default(0),
+  created_at: z.string().default(""),
+  updated_at: z.string().default(""),
+}).loose();
+
+export const EMPTY_RONGCLOUD_NODE: RongCloudNode = {
+  id: "",
+  workspace_id: "",
+  owner_user_id: "",
+  rongcloud_user_id: "",
+  node_id: "",
+  ai_type: "",
+  capabilities: [],
+  deploy_status: "registered",
+  binding_version: 0,
+  created_at: "",
+  updated_at: "",
+};
+
+export const RongCloudChatroomSchema = z.object({
+  id: z.string(),
+  workspace_id: z.string().default(""),
+  rongcloud_chatroom_id: z.string().default(""),
+  owner_user_id: z.string().default(""),
+  host_node_id: z.string().default(""),
+  max_rounds: z.number().default(0),
+  conversation_kind: z.string().default(""),
+  config: z.record(z.string(), z.unknown()).catch({}).default({}),
+  status: z.string().default("active"),
+  created_at: z.string().default(""),
+  updated_at: z.string().default(""),
+}).loose();
+
+export const EMPTY_RONGCLOUD_CHATROOM: RongCloudChatroom = {
+  id: "",
+  workspace_id: "",
+  rongcloud_chatroom_id: "",
+  owner_user_id: "",
+  host_node_id: "",
+  max_rounds: 0,
+  conversation_kind: "",
+  config: {},
+  status: "active",
+  created_at: "",
+  updated_at: "",
+};
+
+export const RongCloudChatroomMemberSchema = z.object({
+  id: z.string(),
+  chatroom_id: z.string().default(""),
+  node_id: z.string().default(""),
+  member_type: z.string().default("ai"),
+  role_name: z.string().default(""),
+  role_instructions: z.string().default(""),
+  capabilities: z.record(z.string(), z.unknown()).catch({}).default({}),
+  model: z.string().default(""),
+  speaking_order: z.number().default(0),
+  enabled: z.boolean().default(true),
+  discussion_model: z.string().default(""),
+  created_at: z.string().default(""),
+  updated_at: z.string().default(""),
+}).loose();
+
+export const RongCloudDeviceSchema = z.object({
+  id: z.string(),
+  workspace_id: z.string().default(""),
+  owner_user_id: z.string().default(""),
+  node_id: z.string().default(""),
+  device_name: z.string().default(""),
+  device_type: z.string().default(""),
+  credential_id: z.string().default(""),
+  status: z.string().default("active"),
+  created_at: z.string().default(""),
+  updated_at: z.string().default(""),
+}).loose();
+
+export const RongCloudNodeModelSchema = z.object({
+  id: z.string(),
+  workspace_id: z.string().default(""),
+  node_id: z.string().default(""),
+  model_id: z.string().default(""),
+  provider: z.string().default(""),
+  model_name: z.string().default(""),
+  config: z.record(z.string(), z.unknown()).catch({}).default({}),
+  created_at: z.string().default(""),
+  updated_at: z.string().default(""),
+}).loose();
+
+export const RongCloudPairingSessionSchema = z.object({
+  id: z.string(),
+  workspace_id: z.string().default(""),
+  ticket: z.string().default(""),
+  status: z.string().default("pending"),
+  client_claim_key: z.string().default(""),
+  candidate_node_ids: z.array(z.string()).catch([]).default([]),
+  expires_at: z.string().default(""),
+  created_at: z.string().default(""),
+  updated_at: z.string().default(""),
+}).loose();
+
+export const RongCloudSystemHostSchema = z.object({
+  config_key: z.string().default("system_host"),
+  node_id: z.string().default(""),
+  config: z.record(z.string(), z.unknown()).catch({}).default({}),
+  config_version: z.number().default(0),
+}).loose();
+
+export const EMPTY_RONGCLOUD_SYSTEM_HOST: RongCloudSystemHost = {
+  config_key: "system_host",
+  node_id: "",
+  config: {},
+  config_version: 0,
+};
+
+export const RongCloudSpeakerInfoSchema = z.object({
+  node_id: z.string().default(""),
+  speaking_order: z.number().default(0),
+  role_name: z.string().default(""),
+  model: z.string().default(""),
+  rongcloud_user_id: z.string().default(""),
+  ai_type: z.string().default(""),
+}).loose();
+
+export const RongCloudDiscussionStateSchema = z.object({
+  chatroom_id: z.string().default(""),
+  workspace_id: z.string().default(""),
+  status: z.string().default("idle"),
+  current_round: z.number().default(0),
+  current_speaker: z.string().default(""),
+  host_node_id: z.string().default(""),
+  speakers: z.array(RongCloudSpeakerInfoSchema).catch([]).default([]),
+  started_at: z.string().default(""),
+  ended_at: z.string().nullable().default(null),
+}).loose();
+
+export const EMPTY_RONGCLOUD_DISCUSSION_STATE: RongCloudDiscussionState = {
+  chatroom_id: "",
+  workspace_id: "",
+  status: "idle",
+  current_round: 0,
+  current_speaker: "",
+  host_node_id: "",
+  speakers: [],
+  started_at: "",
+  ended_at: null,
+};
+
+export const RongCloudDiscussionEventSchema = z.object({
+  id: z.string(),
+  chatroom_id: z.string().default(""),
+  workspace_id: z.string().default(""),
+  event_type: z.string().default(""),
+  round_number: z.number().default(0),
+  speaking_order: z.number().default(0),
+  node_id: z.string().default(""),
+  content: z.record(z.string(), z.unknown()).catch({}).default({}),
+  msg_uid: z.string().default(""),
+  created_at: z.string().default(""),
+}).loose();
+
+export const RongCloudRegisterNodeResponseSchema = z.object({
+  node_id: z.string().default(""),
+  token: z.string().default(""),
+  capabilities: z.array(z.string()).catch([]).default([]),
+  device_credential_ticket: z.string().default(""),
+  binding_version: z.number().default(0),
+}).loose();
+
+export const RongCloudEnrollDeviceResponseSchema = z.object({
+  credential_id: z.string().default(""),
+  secret: z.string().default(""),
+}).loose();
+
+export const RongCloudConnectionSessionResponseSchema = z.object({
+  session_id: z.string().default(""),
+}).loose();

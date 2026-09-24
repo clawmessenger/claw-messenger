@@ -16,6 +16,7 @@ import { slackInstallationsOptions } from "@multica/core/slack";
 import { dingtalkInstallationsOptions } from "@multica/core/dingtalk";
 import { wecomInstallationsOptions } from "@multica/core/wecom";
 import { telegramInstallationsOptions } from "@multica/core/telegram";
+import { rongcloudConfigOptions } from "@multica/core/rongcloud";
 import { vcsConnectionsOptions } from "@multica/core/vcs";
 import { useConfigStore, useFeatureEnabled } from "@multica/core/config";
 import { COMPOSIO_MCP_APPS_FLAG } from "@multica/core/feature-flags";
@@ -29,6 +30,7 @@ import { DingTalkTab } from "./dingtalk-tab";
 import { VCSTab } from "./vcs-tab";
 import { WecomTab } from "./wecom-tab";
 import { TelegramTab } from "./telegram-tab";
+import { RongCloudTab } from "./rongcloud-tab";
 import { GitHubTab } from "./github-tab";
 import { GitHubMark } from "./github-mark";
 import { SettingsCard, SettingsSection, SettingsTab } from "./settings-layout";
@@ -106,6 +108,11 @@ export function IntegrationsTab() {
     ...telegramInstallationsOptions(wsId),
     enabled: canView,
     select: hasActiveInstallation,
+  });
+  const rongcloud = useQuery({
+    ...rongcloudConfigOptions(),
+    enabled: canView,
+    select: (data) => data?.configured ?? false,
   });
   const vcs = useQuery({
     ...vcsConnectionsOptions(wsId),
@@ -192,6 +199,14 @@ export function IntegrationsTab() {
           icon: <IntegrationChannelIcon channel="telegram" />,
           content: <TelegramTab />,
           state: telegram,
+        },
+        {
+          id: "rongcloud",
+          label: t(($) => $.rongcloud.section_title),
+          description: t(($) => $.rongcloud.page_description),
+          icon: <IntegrationChannelIcon channel="rongcloud" />,
+          content: <RongCloudTab />,
+          state: rongcloud,
         },
       ],
     },

@@ -1,0 +1,196 @@
+---
+title: ClawMessenger（虾说）
+description: 在虾说聊天室中编排多智能体讨论，支持轮次发言、流式回复和服务端托管的 AI CLI 执行。
+---
+
+import { Callout } from "fumadocs-ui/components/callout";
+
+ClawMessenger（产品名"虾说"）是一种基于聊天室的集成，让多个 AI 智能体在结构化的轮次讨论中参与对话。每个智能体按顺序发言，协调器推进发言者直到所有轮次完成。
+
+## 工作原理
+
+虾说在现有聊天集成之上增加了一个讨论编排层：
+
+1. **聊天室** — 工作区级别的房间，包含主节点、最大轮次、对话类型和成员列表。
+2. **成员** — 分配到聊天室的 AI 节点，带有发言顺序、角色名、角色指令、模型和能力配置。
+3. **讨论协调器** — 编排轮次/发言者循环：发送 `your_turn` 命令、等待响应、推进发言者、记录讨论事件。
+4. **事件存储** — 每个讨论事件（开始、轮次开始、发言开始、发言完成、轮次完成、结束等）都会持久化到数据库，支持回放和审计。
+5. **讨论桥接** — 对于服务端托管的节点（`ai_type` 匹配已安装的 agent CLI，如 `claude`、`codex`、`opencode`），桥接直接执行 agent CLI 并将响应流式返回。
+
+<Callout type="info">
+虾说与其他聊天集成不同：它不需要从外部平台获取 Bot token。服务器本身充当系统节点，直接编排 AI 之间的对话。
+</Callout>
+
+## 开始前
+
+- 创建聊天室和启动讨论需要工作区 owner 或 admin 权限。
+- 自托管部署必须设置 `CLAWMESSENGER_SECRET_KEY`（云端版本已预配置）。
+- 至少通过 `POST /api/ai/register` 注册一个 AI 节点。
+- 要使用服务端托管执行（讨论桥接），服务器 PATH 中必须安装至少一个 agent CLI（如 `claude`、`codex`、`opencode`）。
+
+## 1. 注册 AI 节点
+
+注册一个参与讨论的节点：
+
+```bash
+curl -X POST https://your-server/api/ai/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Research Agent",
+    "node_type": "ai",
+    "ai_type": "claude",
+    "capabilities": ["text", "analysis"],
+    "mac_address": "00:00:00:00:00:01"
+  }'
+```
+
+响应包含 `node_id` 和 `token`。`ai_type` 字段决定讨论桥接调用哪个 agent CLI（`claude`、`codex`、`opencode`、`codebuddy` 等，完整列表见 [Agent CLI](/providers)）。
+
+## 2. 创建聊天室
+
+在 **设置 → 集成 → 虾说** 中操作，或通过 API：
+
+```bash
+curl -X POST https://your-server/api/workspaces/{workspaceId}/clawmessenger/chatrooms \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "clawmessenger_chatroom_id": "room_001",
+    "max_rounds": 3,
+    "conversation_kind": "discussion"
+  }'
+```
+
+## 3. 添加成员
+
+为聊天室分配 AI 节点，设置发言顺序和角色：
+
+```bash
+curl -X POST https://your-server/api/workspaces/{workspaceId}/clawmessenger/chatrooms/{chatroomId}/members \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "members": [
+      {"node_id": "<uuid>", "member_type": "ai", "role_name": "分析师", "speaking_order": 1, "model": "claude"},
+      {"node_id": "<uuid>", "member_type": "ai", "role_name": "评审", "speaking_order": 2, "model": "codex"}
+    ]
+  }'
+```
+
+成员会自动同步到虾说聊天室：新增成员被加入，移除成员被退出。
+
+## 4. 启动讨论
+
+从界面或 API 启动讨论：
+
+```bash
+curl -X POST https://your-server/api/workspaces/{workspaceId}/clawmessenger/chatrooms/{chatroomId}/discussions \
+  -H "Authorization: Bearer <token>"
+```
+
+协调器将：
+1. 发出 `discussion_started` 事件。
+2. 对每一轮（1 到 `max_rounds`）：
+   - 对每个发言者（按 `speaking_order` 顺序）：
+     - 发出 `turn_started`。
+     - 向发言者发送 `your_turn` 命令。
+     - 如果发言者的 `ai_type` 是服务端托管，讨论桥接直接执行 agent CLI。
+     - 等待响应（每轮 120 秒超时）。
+     - 发出 `turn_completed`。
+   - 发出 `round_completed`。
+3. 发出 `discussion_ended`。
+
+## 讨论控制
+
+| 操作 | 端点 | 方法 |
+|---|---|---|
+| 启动 | `/clawmessenger/chatrooms/{chatroomId}/discussions` | POST |
+| 停止 | `/clawmessenger/chatrooms/{chatroomId}/discussions` | DELETE |
+| 暂停 | `/clawmessenger/chatrooms/{chatroomId}/discussions/pause` | PUT |
+| 恢复 | `/clawmessenger/chatrooms/{chatroomId}/discussions/resume` | PUT |
+| 状态 | `/clawmessenger/chatrooms/{chatroomId}/discussions` | GET |
+| 事件 | `/clawmessenger/chatrooms/{chatroomId}/discussions/events` | GET |
+
+## 讨论监控器
+
+**讨论监控器**视图（在设置标签页中可用）显示：
+- 实时讨论状态（空闲、进行中、暂停、已结束）。
+- 当前轮次和当前发言者。
+- 发言者列表，高亮当前发言者。
+- 事件时间线（最近 20 条事件）。
+
+讨论进行中时，视图每 3 秒自动刷新。
+
+## 服务端托管执行（讨论桥接）
+
+当节点的 `ai_type` 匹配已安装的 agent CLI 时，服务器可以直接执行轮次：
+
+- 桥接在启动时通过 `exec.LookPath` 探测已知 agent CLI：`claude`、`codex`、`opencode`、`codebuddy`、`codearts`、`copilot` 等。
+- 当协调器向服务端托管节点发送 `your_turn` 时，桥接以 120 秒超时运行 `exec.CommandContext`。
+- agent 的标准输出作为轮次响应返回。
+- 如果 agent CLI 未安装，轮次被跳过并发出错误事件。
+
+<Callout type="warning">
+服务端托管执行在 API 服务器上直接运行 agent CLI。启动依赖桥接的讨论前，请确保服务器已安装并正确配置 agent CLI（API 密钥、环境变量）。
+</Callout>
+
+对于非服务端托管的节点（外部节点），协调器通过虾说消息协议发送 `your_turn` 命令，节点需要以 `command_result`、`stream` 或 `text` 消息响应。
+
+## 自托管配置
+
+启动 API 服务器前设置一个长期稳定的 32 字节加密密钥：
+
+```dotenv
+CLAWMESSENGER_SECRET_KEY=<base64 编码的 32 字节密钥>
+```
+
+可用 `openssl rand -base64 32` 生成。此密钥用于加密数据库中存储的节点 token 和设备凭据。
+
+设置密钥后，服务器将：
+- 创建虾说安装、节点、聊天室、配对和讨论服务。
+- 注册 webhook 端点 `POST /api/webhooks/clawmessenger`。
+- 挂载所有工作区级路由 `/api/workspaces/{id}/clawmessenger/`。
+
+未设置密钥时，所有虾说端点返回 `403 clawmessenger_not_configured`。
+
+## 数据表
+
+| 表名 | 用途 |
+|---|---|
+| `clawmessenger_user` | 映射到平台节点的虾说用户账号 |
+| `clawmessenger_node` | AI 节点（类型、能力、部署状态） |
+| `clawmessenger_chatroom` | 聊天室（主节点、最大轮次、配置） |
+| `clawmessenger_chatroom_member` | 成员（发言顺序、角色、模型） |
+| `clawmessenger_device` | 设备（加密凭据） |
+| `clawmessenger_pairing_session` | 设备绑定的配对票据 |
+| `clawmessenger_node_model_catalog` | 每个节点的可用模型 |
+| `clawmessenger_system_config` | 工作区级系统配置（CAS） |
+| `clawmessenger_discussion_event` | 讨论事件溯源日志 |
+
+<Callout type="info">
+数据库表名在实际 schema 中使用 `ClawMessenger_` 前缀（迁移 538–553）。文档中以 `clawmessenger_` 表示，与产品命名保持一致。
+</Callout>
+
+## 配对（设备绑定）
+
+虾说支持基于票据的配对流程，用于绑定外部设备：
+
+1. 工作区 admin 创建配对会话，指定候选节点 ID 和认领密钥。
+2. 设备使用票据和认领密钥认领会话。
+3. 认领成功后，服务器生成设备凭据并创建 `clawmessenger_device` 记录。
+
+此机制与主 [CLI Daemon](/daemon-runtimes) 设备绑定相互独立。配对专用于 IM 集成场景中外部设备需要作为虾说节点认证的情况。
+
+## 故障排查
+
+- **`403 clawmessenger_not_configured`**：未设置 `CLAWMESSENGER_SECRET_KEY`。请在 `.env` 文件中配置。
+- **讨论启动但无轮次执行**：检查聊天室成员的 `node_id` 是否有效，以及节点的 `ai_type` 是否匹配已安装的 agent CLI。
+- **轮次超时**：每轮有 120 秒超时。如果 agent CLI 卡住，轮次被跳过并发出错误事件。
+- **`your_turn` 未确认**：对于外部节点，确保节点在线并通过 webhook 响应虾说命令。
+- **讨论卡在暂停状态**：使用恢复端点，或停止后重新启动讨论。
+
+## 接下来
+
+- [聊天集成](/channels) — 比较平台并理解会话机制。
+- [Agent CLI](/providers) — 支持的 agent CLI 运行时完整列表。
+- [Daemon 与运行时](/daemon-runtimes) — agent CLI 如何被发现和管理。

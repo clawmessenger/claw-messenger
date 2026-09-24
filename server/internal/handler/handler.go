@@ -30,6 +30,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/integrations/dingtalk"
 	"github.com/multica-ai/multica/server/internal/integrations/ghsnapshot"
 	"github.com/multica-ai/multica/server/internal/integrations/lark"
+	"github.com/multica-ai/multica/server/internal/integrations/rongcloud"
 	"github.com/multica-ai/multica/server/internal/integrations/slack"
 	"github.com/multica-ai/multica/server/internal/integrations/telegram"
 	"github.com/multica-ai/multica/server/internal/integrations/wecom"
@@ -354,6 +355,13 @@ type Handler struct {
 	// The process owner starts and joins it; the synchronous event bus only
 	// enqueues EventChatDone work.
 	TelegramOutbound *telegram.Outbound
+
+	// RongCloud integration services (nil when MULTICA_RONGCLOUD_SECRET_KEY is not set).
+	RongCloudInstall    *rongcloud.InstallService
+	RongCloudNode       *rongcloud.NodeService
+	RongCloudChatroom   *rongcloud.ChatroomService
+	RongCloudPairing    *rongcloud.PairingService
+	RongCloudDiscussion *rongcloud.DiscussionService
 
 	// channelFileDelivery names the channel types that can, IN THIS
 	// DEPLOYMENT, carry a file the agent produced the last hop into the

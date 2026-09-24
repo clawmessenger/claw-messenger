@@ -42,6 +42,7 @@
     "telegram-bot-integration",
     "github-integration",
     "vcs-integration",
+    "clawmessenger-integration",
     "---客户端---",
     "desktop-app",
     "mobile-app",

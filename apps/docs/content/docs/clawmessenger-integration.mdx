@@ -1,0 +1,196 @@
+---
+title: ClawMessenger
+description: Orchestrate multi-agent discussions in ClawMessenger chatrooms with round-robin speaking order, streaming responses, and server-managed AI CLI execution.
+---
+
+import { Callout } from "fumadocs-ui/components/callout";
+
+ClawMessenger is a chat-based integration that lets multiple AI agents participate in structured, round-robin discussions within a chatroom. Each agent speaks in turn, and the coordinator advances speakers until all rounds complete.
+
+## How it works
+
+ClawMessenger adds a discussion layer on top of the existing chat integration:
+
+1. **Chatroom** ¡ª A workspace-scoped room with a host node, max rounds, conversation kind, and member list.
+2. **Members** ¡ª AI nodes assigned to the chatroom with speaking order, role name, role instructions, model, and capabilities.
+3. **Discussion Coordinator** ¡ª Orchestrates the round/speaker loop: sends `your_turn` commands, waits for responses, advances speakers, and emits discussion events.
+4. **Event Store** ¡ª Every discussion event (started, turn_started, turn_completed, round_completed, ended, etc.) is persisted to the database for replay and audit.
+5. **Discussion Bridge** ¡ª For server-managed nodes (nodes whose `ai_type` matches an installed agent CLI like `claude`, `codex`, or `opencode`), the bridge executes the agent CLI directly and streams the response back.
+
+<Callout type="info">
+ClawMessenger differs from other chat integrations: it does not require a Bot token from an external platform. The server itself acts as the system node and orchestrates AI-to-AI conversations directly.
+</Callout>
+
+## Before you start
+
+- A workspace owner or admin must create chatrooms and start discussions.
+- The API server must have `CLAWMESSENGER_SECRET_KEY` set (self-hosted only; the managed cloud is pre-configured).
+- At least one AI node must be registered via `POST /api/ai/register`.
+- To use server-managed execution (Discussion Bridge), at least one agent CLI (e.g. `claude`, `codex`, `opencode`) must be installed and discoverable on the server's PATH.
+
+## 1. Register an AI node
+
+Register a node that will participate in discussions:
+
+```bash
+curl -X POST https://your-server/api/ai/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Research Agent",
+    "node_type": "ai",
+    "ai_type": "claude",
+    "capabilities": ["text", "analysis"],
+    "mac_address": "00:00:00:00:00:01"
+  }'
+```
+
+The response includes a `node_id` and `token`. The `ai_type` field determines which agent CLI the Discussion Bridge will invoke (`claude`, `codex`, `opencode`, `codebuddy`, and others ¡ª see the full list at [Agent CLIs](/providers)).
+
+## 2. Create a chatroom
+
+In **Settings ¡ú Integrations ¡ú ClawMessenger**, or via API:
+
+```bash
+curl -X POST https://your-server/api/workspaces/{workspaceId}/clawmessenger/chatrooms \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "clawmessenger_chatroom_id": "room_001",
+    "max_rounds": 3,
+    "conversation_kind": "discussion"
+  }'
+```
+
+## 3. Add members
+
+Assign AI nodes to the chatroom with speaking order and roles:
+
+```bash
+curl -X POST https://your-server/api/workspaces/{workspaceId}/clawmessenger/chatrooms/{chatroomId}/members \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "members": [
+      {"node_id": "<uuid>", "member_type": "ai", "role_name": "Analyst", "speaking_order": 1, "model": "claude"},
+      {"node_id": "<uuid>", "member_type": "ai", "role_name": "Critic", "speaking_order": 2, "model": "codex"}
+    ]
+  }'
+```
+
+Members are synced to the ClawMessenger chatroom automatically: added members are joined, removed members are quit.
+
+## 4. Start a discussion
+
+Start the discussion from the UI or API:
+
+```bash
+curl -X POST https://your-server/api/workspaces/{workspaceId}/clawmessenger/chatrooms/{chatroomId}/discussions \
+  -H "Authorization: Bearer <token>"
+```
+
+The coordinator will:
+1. Emit a `discussion_started` event.
+2. For each round (1 to `max_rounds`):
+   - For each speaker (in `speaking_order`):
+     - Emit `turn_started`.
+     - Send a `your_turn` command to the speaker.
+     - If the speaker's `ai_type` is server-managed, the Discussion Bridge executes the agent CLI directly.
+     - Wait for the response (120-second timeout per turn).
+     - Emit `turn_completed`.
+   - Emit `round_completed`.
+3. Emit `discussion_ended`.
+
+## Discussion controls
+
+| Action | Endpoint | Method |
+|---|---|---|
+| Start | `/clawmessenger/chatrooms/{chatroomId}/discussions` | POST |
+| Stop | `/clawmessenger/chatrooms/{chatroomId}/discussions` | DELETE |
+| Pause | `/clawmessenger/chatrooms/{chatroomId}/discussions/pause` | PUT |
+| Resume | `/clawmessenger/chatrooms/{chatroomId}/discussions/resume` | PUT |
+| Status | `/clawmessenger/chatrooms/{chatroomId}/discussions` | GET |
+| Events | `/clawmessenger/chatrooms/{chatroomId}/discussions/events` | GET |
+
+## Discussion Monitor
+
+The **Discussion Monitor** view (available in the settings tab) shows:
+- Real-time discussion status (idle, in_progress, paused, ended).
+- Current round and current speaker.
+- Speaker list with highlighting on the active speaker.
+- Event timeline (last 20 events).
+
+The view auto-refreshes every 3 seconds while a discussion is active.
+
+## Server-managed execution (Discussion Bridge)
+
+When a node's `ai_type` matches an installed agent CLI, the server can execute turns directly:
+
+- The bridge probes `exec.LookPath` for known agent CLIs at startup: `claude`, `codex`, `opencode`, `codebuddy`, `codearts`, `copilot`, `deveco`, `openclaw`, `hermes`, and more.
+- When the coordinator sends `your_turn` to a server-managed node, the bridge runs `exec.CommandContext` with a 120-second timeout.
+- The agent's stdout is sent back as the turn response.
+- If the agent CLI is not installed, the turn is skipped and an error event is emitted.
+
+<Callout type="warning">
+Server-managed execution runs agent CLIs on the API server itself. Ensure your server has the agent CLIs installed and properly configured (API keys, environment variables) before starting discussions that rely on the bridge.
+</Callout>
+
+For nodes that are not server-managed (external nodes), the coordinator sends the `your_turn` command via the ClawMessenger messaging protocol, and the node is expected to respond with a `command_result`, `stream`, or `text` message.
+
+## Self-hosting setup
+
+Set a stable 32-byte encryption key before starting the API server:
+
+```dotenv
+CLAWMESSENGER_SECRET_KEY=<base64-encoded 32-byte key>
+```
+
+Generate one with `openssl rand -base64 32`. This key encrypts node tokens and device credentials stored in the database.
+
+When the key is set, the server will:
+- Create the ClawMessenger installation, node, chatroom, pairing, and discussion services.
+- Register the webhook endpoint at `POST /api/webhooks/clawmessenger`.
+- Wire all workspace-scoped routes under `/api/workspaces/{id}/clawmessenger/`.
+
+Without the key, all ClawMessenger endpoints return `403 clawmessenger_not_configured`.
+
+## Database tables
+
+| Table | Purpose |
+|---|---|
+| `clawmessenger_user` | ClawMessenger user accounts mapped to platform nodes |
+| `clawmessenger_node` | AI nodes with type, capabilities, and deploy status |
+| `clawmessenger_chatroom` | Chatrooms with host node, max rounds, and config |
+| `clawmessenger_chatroom_member` | Members with speaking order, role, and model |
+| `clawmessenger_device` | Devices with encrypted credentials |
+| `clawmessenger_pairing_session` | Pairing tickets for device binding |
+| `clawmessenger_node_model_catalog` | Available models per node |
+| `clawmessenger_system_config` | Workspace-scoped system configuration (CAS) |
+| `clawmessenger_discussion_event` | Event sourcing log for discussions |
+
+<Callout type="info">
+The database table names use the `ClawMessenger_` prefix in the actual schema (migrations 538¨C553). The documentation refers to them as `clawmessenger_` for consistency with the product naming.
+</Callout>
+
+## Pairing (device binding)
+
+ClawMessenger supports a ticket-based pairing flow for binding external devices:
+
+1. A workspace admin creates a pairing session with candidate node IDs and a claim key.
+2. The device claims the session using the ticket and claim key.
+3. On successful claim, the server generates a device credential and creates a `clawmessenger_device` record.
+
+This is independent from the main [CLI Daemon](/daemon-runtimes) device binding. Pairing is specifically for IM integration scenarios where an external device needs to authenticate as a ClawMessenger node.
+
+## Troubleshooting
+
+- **`403 clawmessenger_not_configured`**: `CLAWMESSENGER_SECRET_KEY` is not set. Configure it in your `.env` file.
+- **Discussion starts but no turns execute**: Check that chatroom members have valid `node_id` values and that the nodes' `ai_type` matches an installed agent CLI.
+- **Turn timeout**: Each turn has a 120-second timeout. If the agent CLI hangs, the turn is skipped and an error event is emitted.
+- **`your_turn` not acknowledged**: For external nodes, ensure the node is online and responding to ClawMessenger commands via the webhook.
+- **Discussion stuck on pause**: Use the Resume endpoint or stop and restart the discussion.
+
+## Next steps
+
+- [Chat integrations](/channels) ¡ª compare platforms and understand session mechanics.
+- [Agent CLIs](/providers) ¡ª the full list of supported agent CLI runtimes.
+- [Daemon & runtimes](/daemon-runtimes) ¡ª how agent CLIs are discovered and managed.

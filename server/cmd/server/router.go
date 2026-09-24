@@ -31,6 +31,7 @@ import (
 	composiointeg "github.com/multica-ai/multica/server/internal/integrations/composio"
 	"github.com/multica-ai/multica/server/internal/integrations/dingtalk"
 	"github.com/multica-ai/multica/server/internal/integrations/lark"
+	"github.com/multica-ai/multica/server/internal/integrations/rongcloud"
 	"github.com/multica-ai/multica/server/internal/integrations/slack"
 	"github.com/multica-ai/multica/server/internal/integrations/telegram"
 	"github.com/multica-ai/multica/server/internal/integrations/wecom"
@@ -1205,6 +1206,41 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		slog.Info("telegram integration disabled (MULTICA_TELEGRAM_SECRET_KEY not set)")
 	}
 
+	// RongCloud (融云) integration — env-gated by MULTICA_RONGCLOUD_SECRET_KEY.
+	// This is the first webhook-based IM adapter; inbound messages arrive via
+	// POST /api/webhooks/rongcloud?inst={installation_id}.
+	var rcWebhookDispatcher http.Handler
+	if rongcloudKey, err := secretbox.LoadKey("MULTICA_RONGCLOUD_SECRET_KEY"); err == nil {
+		rcBox, err := secretbox.New(rongcloudKey)
+		if err != nil {
+			slog.Error("rongcloud integration failed to init secretbox", "error", err)
+		} else {
+			rcDispatcher := rongcloud.NewWebhookDispatcher(slog.Default())
+			rcWebhookDispatcher = rcDispatcher
+			rcRegistry := rongcloud.NewDiscussionRegistry()
+			rcBridge := rongcloud.NewDiscussionBridge(queries, slog.Default())
+			rongcloud.RegisterRongCloud(channelRegistry, rongcloud.ChannelDeps{
+				Registrar: rcDispatcher,
+				Decrypt:   rcBox.Open,
+				Logger:    slog.Default(),
+				Queries:   queries,
+				Registry:  rcRegistry,
+			})
+
+			// Phase 2a: construct service-layer dependencies.
+			rcClient := rongcloud.NewRongCloudAPIClientForServices(rcBox, queries, slog.Default())
+			h.RongCloudInstall = rongcloud.NewInstallService(queries, rcBox, slog.Default())
+			h.RongCloudNode = rongcloud.NewNodeService(queries, rcClient, rcBox, slog.Default())
+			h.RongCloudChatroom = rongcloud.NewChatroomService(queries, rcClient, slog.Default())
+			h.RongCloudPairing = rongcloud.NewPairingService(queries, rcBox, slog.Default())
+			h.RongCloudDiscussion = rongcloud.NewDiscussionService(queries, rcClient, rcRegistry, rcBridge, slog.Default())
+
+			slog.Info("rongcloud integration enabled")
+		}
+	} else {
+		slog.Info("rongcloud integration disabled (MULTICA_RONGCLOUD_SECRET_KEY not set)")
+	}
+
 	// Composio integration (MUL-3720). Gated by COMPOSIO_API_KEY plus the
 	// composio_mcp_apps feature flag. The env var is the project-scoped key the
 	// standalone SDK authenticates Composio with (sent as x-api-key; the project
@@ -1507,6 +1543,22 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// only forward the bytes + the Stripe-Signature header; see
 	// HandleCloudBillingStripeWebhook for the rationale).
 	r.Post("/api/webhooks/stripe", h.HandleCloudBillingStripeWebhook)
+	// RongCloud webhook (no Multica auth — the dispatcher verifies the
+	// HMAC-SHA1 signature in the header; the installation is selected by the
+	// "inst" query parameter). Only registered when the RongCloud integration
+	// is enabled (MULTICA_RONGCLOUD_SECRET_KEY set).
+	if rcWebhookDispatcher != nil {
+		r.Post("/api/webhooks/rongcloud", rcWebhookDispatcher.ServeHTTP)
+	}
+
+	// RongCloud public API (no auth — AI node registration and token refresh
+	// use the RongCloud node ID as credential, not the Multica session).
+	r.Get("/api/config/rongcloud", h.GetRongCloudConfig)
+	r.Post("/api/ai/register", h.RegisterRongCloudAINode)
+	r.Post("/api/claw/refresh-token/{nodeId}", h.RefreshRongCloudToken)
+	r.Post("/api/claw/device-credentials/enroll", h.EnrollDeviceCredential)
+	r.Post("/api/claw/connection-sessions", h.CreateConnectionSession)
+	r.Post("/api/claw/connection-sessions/{sessionId}/close", h.CloseConnectionSession)
 
 	// Composio OAuth callback (MUL-3843). NOT under the Auth group on purpose:
 	// Composio 302-redirects the user's browser here at the end of the OAuth
@@ -1832,6 +1884,39 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Use(middleware.RequireWorkspaceRoleFromURL(queries, "id", "owner", "admin"))
 					r.Delete("/telegram/installations/{installationId}", h.RevokeTelegramInstallation)
 					r.Post("/telegram/install", h.RegisterTelegramBot)
+				})
+
+				// RongCloud integration. Same admin/member split: listing
+				// chatrooms, nodes, and devices is member-visible; creating
+				// and deleting chatrooms are admin-only.
+				r.Group(func(r chi.Router) {
+					r.Use(middleware.RequireWorkspaceMemberFromURL(queries, "id"))
+					r.Get("/rongcloud/chatrooms", h.ListRongCloudChatrooms)
+					r.Get("/rongcloud/chatrooms/{chatroomId}", h.GetRongCloudChatroom)
+					r.Get("/rongcloud/nodes", h.ListRongCloudNodes)
+					r.Get("/rongcloud/nodes/{nodeId}/models", h.ListRongCloudNodeModels)
+					r.Get("/rongcloud/devices", h.ListRongCloudDevices)
+					r.Get("/rongcloud/system-host", h.GetRongCloudSystemHost)
+					r.Get("/rongcloud/pairing/{ticket}", h.GetRongCloudPairing)
+					r.Get("/rongcloud/chatrooms/{chatroomId}/discussions", h.GetRongCloudDiscussion)
+					r.Get("/rongcloud/chatrooms/{chatroomId}/discussions/events", h.ListRongCloudDiscussionEvents)
+				})
+				r.Group(func(r chi.Router) {
+					r.Use(middleware.RequireWorkspaceRoleFromURL(queries, "id", "owner", "admin"))
+					r.Post("/rongcloud/chatrooms", h.CreateRongCloudChatroom)
+					r.Put("/rongcloud/chatrooms/{chatroomId}", h.UpdateRongCloudChatroom)
+					r.Delete("/rongcloud/chatrooms/{chatroomId}", h.DeleteRongCloudChatroom)
+					r.Post("/rongcloud/chatrooms/{chatroomId}/members", h.SetRongCloudChatroomMembers)
+					r.Post("/rongcloud/nodes/{nodeId}/models", h.AddRongCloudNodeModel)
+					r.Delete("/rongcloud/nodes/{nodeId}", h.DeleteRongCloudNode)
+					r.Post("/rongcloud/devices", h.CreateRongCloudDevice)
+					r.Delete("/rongcloud/devices/{deviceId}", h.DeleteRongCloudDevice)
+					r.Put("/rongcloud/system-host", h.UpdateRongCloudSystemHost)
+					r.Post("/rongcloud/pairing", h.CreateRongCloudPairing)
+					r.Post("/rongcloud/chatrooms/{chatroomId}/discussions", h.StartRongCloudDiscussion)
+					r.Delete("/rongcloud/chatrooms/{chatroomId}/discussions", h.StopRongCloudDiscussion)
+					r.Put("/rongcloud/chatrooms/{chatroomId}/discussions/pause", h.PauseRongCloudDiscussion)
+					r.Put("/rongcloud/chatrooms/{chatroomId}/discussions/resume", h.ResumeRongCloudDiscussion)
 				})
 			})
 		})

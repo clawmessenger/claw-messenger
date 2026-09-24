@@ -1,0 +1,196 @@
+---
+title: ClawMessenger
+description: ClawMessenger チャットルームでラウンドロビン発言順序、ストリーミング応答、サーバー管理 AI CLI 実行によるマルチエージェントディスカッションをオーケストレーションします。
+---
+
+import { Callout } from "fumadocs-ui/components/callout";
+
+ClawMessenger は、複数の AI エージェントが構造化されたラウンドロビンディスカッションに参加できるチャットベースの連携です。各エージェントが順番に発言し、コーディネーターが発言者を進行し、すべてのラウンドが完了するまで繰り返します。
+
+## 仕組み
+
+ClawMessenger は既存のチャット連携の上にディスカッションオーケストレーション層を追加します:
+
+1. **チャットルーム** — ワークスペーススコープのルームで、ホストノード、最大ラウンド数、会話種別、メンバーリストを持ちます。
+2. **メンバー** — チャットルームに割り当てられた AI ノードで、発言順序、役割名、役割指示、モデル、機能を持ちます。
+3. **ディスカッションコーディネーター** — ラウンド/発言者ループをオーケストレーションします: `your_turn` コマンド送信、応答待機、発言者進行、ディスカッションイベント記録。
+4. **イベントストア** — すべてのディスカッションイベント（開始、ターン開始、ターン完了、ラウンド完了、終了など）がデータベースに永続化され、リプレイと監査をサポートします。
+5. **ディスカッションブリッジ** — サーバー管理ノード（`ai_type` がインストール済み agent CLI と一致するノード、例: `claude`、`codex`、`opencode`）の場合、ブリッジが agent CLI を直接実行し、応答をストリーミングします。
+
+<Callout type="info">
+ClawMessenger は他のチャット連携とは異なります: 外部プラットフォームの Bot トークンが不要です。サーバー自身がシステムノードとして機能し、AI 間の会話を直接オーケストレーションします。
+</Callout>
+
+## 始める前に
+
+- チャットルームの作成とディスカッションの開始にはワークスペースの owner または admin 権限が必要です。
+- セルフホスト環境では `CLAWMESSENGER_SECRET_KEY` を設定する必要があります（クラウド版は事前構成済み）。
+- `POST /api/ai/register` で少なくとも1つの AI ノードを登録する必要があります。
+- サーバー管理実行（ディスカッションブリッジ）を使用するには、サーバーの PATH に少なくとも1つの agent CLI（例: `claude`、`codex`、`opencode`）がインストールされている必要があります。
+
+## 1. AI ノードの登録
+
+ディスカッションに参加するノードを登録します:
+
+```bash
+curl -X POST https://your-server/api/ai/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Research Agent",
+    "node_type": "ai",
+    "ai_type": "claude",
+    "capabilities": ["text", "analysis"],
+    "mac_address": "00:00:00:00:00:01"
+  }'
+```
+
+レスポンスには `node_id` と `token` が含まれます。`ai_type` フィールドはディスカッションブリッジが呼び出す agent CLI を決定します（`claude`、`codex`、`opencode`、`codebuddy` など — 全リストは [Agent CLI](/providers) を参照）。
+
+## 2. チャットルームの作成
+
+**Settings → Integrations → ClawMessenger** で作成するか、API を使用します:
+
+```bash
+curl -X POST https://your-server/api/workspaces/{workspaceId}/clawmessenger/chatrooms \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "clawmessenger_chatroom_id": "room_001",
+    "max_rounds": 3,
+    "conversation_kind": "discussion"
+  }'
+```
+
+## 3. メンバーの追加
+
+AI ノードをチャットルームに割り当て、発言順序と役割を設定します:
+
+```bash
+curl -X POST https://your-server/api/workspaces/{workspaceId}/clawmessenger/chatrooms/{chatroomId}/members \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "members": [
+      {"node_id": "<uuid>", "member_type": "ai", "role_name": "Analyst", "speaking_order": 1, "model": "claude"},
+      {"node_id": "<uuid>", "member_type": "ai", "role_name": "Critic", "speaking_order": 2, "model": "codex"}
+    ]
+  }'
+```
+
+メンバーは ClawMessenger チャットルームに自動的に同期されます: 追加されたメンバーは join、削除されたメンバーは quit されます。
+
+## 4. ディスカッションの開始
+
+UI または API からディスカッションを開始します:
+
+```bash
+curl -X POST https://your-server/api/workspaces/{workspaceId}/clawmessenger/chatrooms/{chatroomId}/discussions \
+  -H "Authorization: Bearer <token>"
+```
+
+コーディネーターは以下を実行します:
+1. `discussion_started` イベントを発行します。
+2. 各ラウンド（1 から `max_rounds` まで）:
+   - 各発言者（`speaking_order` 順）:
+     - `turn_started` を発行します。
+     - 発言者に `your_turn` コマンドを送信します。
+     - 発言者の `ai_type` がサーバー管理の場合、ディスカッションブリッジが agent CLI を直接実行します。
+     - 応答を待機します（ターンごとに120秒のタイムアウト）。
+     - `turn_completed` を発行します。
+   - `round_completed` を発行します。
+3. `discussion_ended` を発行します。
+
+## ディスカッション制御
+
+| アクション | エンドポイント | メソッド |
+|---|---|---|
+| 開始 | `/clawmessenger/chatrooms/{chatroomId}/discussions` | POST |
+| 停止 | `/clawmessenger/chatrooms/{chatroomId}/discussions` | DELETE |
+| 一時停止 | `/clawmessenger/chatrooms/{chatroomId}/discussions/pause` | PUT |
+| 再開 | `/clawmessenger/chatrooms/{chatroomId}/discussions/resume` | PUT |
+| ステータス | `/clawmessenger/chatrooms/{chatroomId}/discussions` | GET |
+| イベント | `/clawmessenger/chatrooms/{chatroomId}/discussions/events` | GET |
+
+## ディスカションモニター
+
+**ディスカションモニター**ビュー（設定タブで利用可能）は以下を表示します:
+- リアルタイムディスカッションステータス（idle, in_progress, paused, ended）。
+- 現在のラウンドと現在の発言者。
+- 発言者リスト（アクティブな発言者をハイライト）。
+- イベントタイムライン（最新20件）。
+
+ディスカッションがアクティブな間、3秒ごとに自動更新されます。
+
+## サーバー管理実行（ディスカッションブリッジ）
+
+ノードの `ai_type` がインストール済み agent CLI と一致する場合、サーバーはターンを直接実行できます:
+
+- ブリッジは起動時に `exec.LookPath` で既知の agent CLI を検出します: `claude`、`codex`、`opencode`、`codebuddy` など。
+- コーディネーターがサーバー管理ノードに `your_turn` を送信する際、ブリッジは120秒のタイムアウトで `exec.CommandContext` を実行します。
+- agent の stdout がターン応答として返されます。
+- agent CLI がインストールされていない場合、ターンはスキップされエラーイベントが発行されます。
+
+<Callout type="warning">
+サーバー管理実行は API サーバー上で直接 agent CLI を実行します。ブリッジに依存するディスカッションを開始する前に、サーバーに agent CLI がインストールされ、適切に構成されているか（API キー、環境変数）確認してください。
+</Callout>
+
+サーバー管理でないノード（外部ノード）の場合、コーディネーターは ClawMessenger メッセージングプロトコルで `your_turn` コマンドを送信し、ノードは `command_result`、`stream`、または `text` メッセージで応答することが期待されます。
+
+## セルフホスト設定
+
+API サーバー起動前に安定した32バイトの暗号化キーを設定します:
+
+```dotenv
+CLAWMESSENGER_SECRET_KEY=<base64-encoded 32-byte key>
+```
+
+`openssl rand -base64 32` で生成できます。このキーはデータベースに保存されたノードトークンとデバイス資格情報を暗号化します。
+
+キーを設定すると、サーバーは:
+- ClawMessenger インストール、ノード、チャットルーム、ペアリング、ディスカッションサービスを作成します。
+- Webhook エンドポイント `POST /api/webhooks/clawmessenger` を登録します。
+- `/api/workspaces/{id}/clawmessenger/` 配下のすべてのワークスペーススコープのルートを接続します。
+
+キーがない場合、すべての ClawMessenger エンドポイントは `403 clawmessenger_not_configured` を返します。
+
+## データベーステーブル
+
+| テーブル | 用途 |
+|---|---|
+| `clawmessenger_user` | プラットフォームノードにマッピングされた ClawMessenger ユーザーアカウント |
+| `clawmessenger_node` | AI ノード（タイプ、機能、デプロイステータス） |
+| `clawmessenger_chatroom` | チャットルーム（ホストノード、最大ラウンド、設定） |
+| `clawmessenger_chatroom_member` | メンバー（発言順序、役割、モデル） |
+| `clawmessenger_device` | デバイス（暗号化された資格情報） |
+| `clawmessenger_pairing_session` | デバイスバインディング用ペアリングチケット |
+| `clawmessenger_node_model_catalog` | ノードごとの利用可能モデル |
+| `clawmessenger_system_config` | ワークスペーススコープのシステム設定（CAS） |
+| `clawmessenger_discussion_event` | ディスカッションイベントソーシングログ |
+
+<Callout type="info">
+データベーステーブル名は実際のスキーマでは `ClawMessenger_` プレフィックスを使用します（マイグレーション538–553）。ドキュメントでは製品命名と一致させるため `clawmessenger_` と表記しています。
+</Callout>
+
+## ペアリング（デバイスバインディング）
+
+ClawMessenger は外部デバイスをバインドするためのチケットベースのペアリングフローをサポートします:
+
+1. ワークスペース admin が候補ノード ID とクレームキーでペアリングセッションを作成します。
+2. デバイスがチケットとクレームキーを使用してセッションをクレームします。
+3. クレーム成功時、サーバーはデバイス資格情報を生成し `clawmessenger_device` レコードを作成します。
+
+これはメインの [CLI デーモン](/daemon-runtimes) デバイスバインディングとは独立しています。ペアリングは外部デバイスが ClawMessenger ノードとして認証する必要がある IM 連携シナリオに特化しています。
+
+## トラブルシューティング
+
+- **`403 clawmessenger_not_configured`**: `CLAWMESSENGER_SECRET_KEY` が設定されていません。`.env` ファイルで構成してください。
+- **ディスカッションが開始されるがターンが実行されない**: チャットルームメンバーの `node_id` が有効か、ノードの `ai_type` がインストール済み agent CLI と一致するか確認してください。
+- **ターンタイムアウト**: 各ターンには120秒のタイムアウトがあります。agent CLI がハングすると、ターンはスキップされエラーイベントが発行されます。
+- **`your_turn` 未確認**: 外部ノードの場合、ノードがオンラインで Webhook 経由で ClawMessenger コマンドに応答しているか確認してください。
+- **ディスカッションが一時停止状態でスタック**: 再開エンドポイントを使用するか、ディスカッションを停止して再開してください。
+
+## 次のステップ
+
+- [チャット連携](/channels) — プラットフォームを比較しセッションメカニズムを理解します。
+- [Agent CLI](/providers) — サポートされる agent CLI ランタイムの全リスト。
+- [デーモンとランタイム](/daemon-runtimes) — agent CLI がどのように発見され管理されるか。

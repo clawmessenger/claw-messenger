@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY IF EXISTS idx_rongcloud_node_model_catalog_node;
