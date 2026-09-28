@@ -38,6 +38,7 @@ vi.mock("@multica/core/paths", () => ({
     usage: () => "/acme/usage",
     runtimes: () => "/acme/runtimes",
     skills: () => "/acme/skills",
+    docs: () => "/acme/docs",
     settings: () => "/acme/settings",
   }),
 }));

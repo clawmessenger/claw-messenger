@@ -1435,7 +1435,7 @@
     "apps": "Authorized with your own account through Composio and enabled on agents you own.",
     "plugins": "Installed packages that can add tools, scheduled hooks, and storage, each with its own permissions."
   },
-"rongcloud": {
+  "rongcloud": {
     "section_title": "RongCloud",
     "page_description": "Multi-agent discussion via RongCloud chatrooms",
     "configured_title": "RongCloud is configured",
@@ -1496,5 +1496,32 @@
     "toast_discussion_stopped": "Discussion stopped.",
     "toast_discussion_action_success": "Discussion action completed.",
     "toast_discussion_failed": "Discussion action failed."
+  },
+  "usage_docs": {
+    "new_doc": "New document",
+    "loading": "Loading documents…",
+    "empty": "No documents yet",
+    "load_error": "Failed to load documents",
+    "no_doc_selected": "Select a document from the menu",
+    "updated_at": "Updated {{date}}",
+    "edit": "Edit",
+    "delete_confirm_title": "Delete document",
+    "delete_confirm_description": "This permanently deletes the document. This action cannot be undone.",
+    "cancel": "Cancel",
+    "confirm": "Delete",
+    "toast_created": "Document created",
+    "toast_saved": "Document saved",
+    "toast_deleted": "Document deleted",
+    "toast_save_failed": "Failed to save document",
+    "toast_delete_failed": "Failed to delete document",
+    "slug_label": "Slug",
+    "title_label": "Title",
+    "title_placeholder": "Document title",
+    "category_label": "Category",
+    "status_label": "Status",
+    "content_label": "Content (Markdown)",
+    "content_placeholder": "Write the document content in Markdown…",
+    "saving": "Saving…",
+    "save": "Save"
   }
 }

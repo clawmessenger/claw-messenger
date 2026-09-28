@@ -216,6 +216,8 @@ import type {
   RongCloudRegisterNodeResponse,
   RongCloudEnrollDeviceResponse,
   RongCloudConnectionSessionResponse,
+  UsageDoc,
+  UsageDocInput,
   Squad,
   SquadMember,
   SquadMemberStatusListResponse,
@@ -411,6 +413,8 @@ import {
   RongCloudRegisterNodeResponseSchema,
   RongCloudEnrollDeviceResponseSchema,
   RongCloudConnectionSessionResponseSchema,
+  UsageDocSchema,
+  EMPTY_USAGE_DOC,
   EMPTY_BILLING_BALANCE,
   EMPTY_BILLING_TRANSACTIONS_PAGE,
   EMPTY_BILLING_BATCHES_PAGE,
@@ -5663,6 +5667,55 @@ export class ApiClient {
       RongCloudDiscussionStateSchema,
       EMPTY_RONGCLOUD_DISCUSSION_STATE,
       { endpoint: "PUT /rongcloud/chatrooms/:id/discussions/resume" },
+    );
+  }
+
+  async listUsageDocs(workspaceId: string, includeDrafts = false): Promise<UsageDoc[]> {
+    const url = `/api/workspaces/${workspaceId}/usage-docs${includeDrafts ? "?include_drafts=1" : ""}`;
+    const raw = await this.fetch<unknown>(url);
+    const parsed = z.array(UsageDocSchema).catch([]).parse(
+      Array.isArray(raw) ? raw : [],
+    );
+    return parsed;
+  }
+
+  async getUsageDoc(workspaceId: string, slug: string): Promise<UsageDoc> {
+    const raw = await this.fetch<unknown>(
+      `/api/workspaces/${workspaceId}/usage-docs/${encodeURIComponent(slug)}`,
+    );
+    return parseWithFallback(raw, UsageDocSchema, EMPTY_USAGE_DOC, {
+      endpoint: "GET /usage-docs/:slug",
+    });
+  }
+
+  async createUsageDoc(workspaceId: string, body: UsageDocInput): Promise<UsageDoc> {
+    const raw = await this.fetch<unknown>(
+      `/api/workspaces/${workspaceId}/usage-docs`,
+      { method: "POST", body: JSON.stringify(body) },
+    );
+    return parseWithFallback(raw, UsageDocSchema, EMPTY_USAGE_DOC, {
+      endpoint: "POST /usage-docs",
+    });
+  }
+
+  async updateUsageDoc(
+    workspaceId: string,
+    docId: string,
+    body: UsageDocInput,
+  ): Promise<UsageDoc> {
+    const raw = await this.fetch<unknown>(
+      `/api/workspaces/${workspaceId}/usage-docs/${encodeURIComponent(docId)}`,
+      { method: "PUT", body: JSON.stringify(body) },
+    );
+    return parseWithFallback(raw, UsageDocSchema, EMPTY_USAGE_DOC, {
+      endpoint: "PUT /usage-docs/:id",
+    });
+  }
+
+  async deleteUsageDoc(workspaceId: string, docId: string): Promise<void> {
+    await this.fetch(
+      `/api/workspaces/${workspaceId}/usage-docs/${encodeURIComponent(docId)}`,
+      { method: "DELETE" },
     );
   }
 }

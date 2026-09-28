@@ -49,6 +49,7 @@ import type {
   RongCloudChatroom,
   RongCloudSystemHost,
   RongCloudDiscussionState,
+  UsageDoc,
   GroupedIssuesResponse,
   GitHubConnectResponse,
   IssuePullRequestsResponse,
@@ -3911,3 +3912,29 @@ export const RongCloudEnrollDeviceResponseSchema = z.object({
 export const RongCloudConnectionSessionResponseSchema = z.object({
   session_id: z.string().default(""),
 }).loose();
+
+export const UsageDocSchema = z.object({
+  id: z.string(),
+  workspace_id: z.string().optional().default(""),
+  slug: z.string().default(""),
+  title: z.string().default(""),
+  category: z.string().default("general"),
+  content: z.string().default(""),
+  sort_order: z.number().default(0),
+  status: z.string().default("draft"),
+  created_by: z.string().optional().default(""),
+  created_at: z.string().default(""),
+  updated_at: z.string().default(""),
+}).loose();
+
+export const EMPTY_USAGE_DOC: UsageDoc = {
+  id: "",
+  slug: "",
+  title: "",
+  category: "general",
+  content: "",
+  sort_order: 0,
+  status: "draft",
+  created_at: "",
+  updated_at: "",
+};

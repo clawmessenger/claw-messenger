@@ -136,6 +136,8 @@
     "./telegram": "./telegram/index.ts",
     "./telegram/queries": "./telegram/queries.ts",
     "./rongcloud": "./rongcloud/index.ts",
+    "./usage-doc": "./usage-doc/index.ts",
+    "./usage-doc/queries": "./usage-doc/queries.ts",
     "./rongcloud/queries": "./rongcloud/queries.ts",
     "./feedback": "./feedback/index.ts",
     "./feedback/mutations": "./feedback/mutations.ts",

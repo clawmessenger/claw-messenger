@@ -115,6 +115,8 @@ export function parseTabSubject(url: string): TabSubject {
       return { kind: "machine", machineId: id };
     case "skills":
       return id ? { kind: "skill", id } : { kind: "page", page: "skills" };
+    case "docs":
+      return { kind: "page", page: "docs" };
     case "settings":
       return { kind: "page", page: "settings" };
     case "attachments":

@@ -1435,7 +1435,7 @@
     "apps": "Autorisées avec votre propre compte via Composio et activées sur les agents qui vous appartiennent.",
     "plugins": "Paquets installés pouvant ajouter des outils, des hooks planifiés et du stockage, chacun avec ses propres autorisations."
   },
-"rongcloud": {
+  "rongcloud": {
     "section_title": "RongCloud",
     "page_description": "Discussion multi-agents via les salons RongCloud",
     "configured_title": "RongCloud est configuré",
@@ -1496,5 +1496,32 @@
     "toast_discussion_stopped": "Discussion arrêtée.",
     "toast_discussion_action_success": "Action de discussion terminée.",
     "toast_discussion_failed": "Échec de l'action de discussion."
+  },
+  "usage_docs": {
+    "new_doc": "Nouveau document",
+    "loading": "Chargement des documents…",
+    "empty": "Aucun document pour le moment",
+    "load_error": "Échec du chargement des documents",
+    "no_doc_selected": "Sélectionnez un document dans le menu",
+    "updated_at": "Mis à jour le {{date}}",
+    "edit": "Modifier",
+    "delete_confirm_title": "Supprimer le document",
+    "delete_confirm_description": "Cette action supprime définitivement le document. Elle est irréversible.",
+    "cancel": "Annuler",
+    "confirm": "Supprimer",
+    "toast_created": "Document créé",
+    "toast_saved": "Document enregistré",
+    "toast_deleted": "Document supprimé",
+    "toast_save_failed": "Échec de l'enregistrement",
+    "toast_delete_failed": "Échec de la suppression",
+    "slug_label": "Slug",
+    "title_label": "Titre",
+    "title_placeholder": "Titre du document",
+    "category_label": "Catégorie",
+    "status_label": "Statut",
+    "content_label": "Contenu (Markdown)",
+    "content_placeholder": "Rédigez le contenu en Markdown…",
+    "saving": "Enregistrement…",
+    "save": "Enregistrer"
   }
 }

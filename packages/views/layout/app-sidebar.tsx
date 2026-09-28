@@ -123,6 +123,7 @@ type NavKey =
   | "usage"
   | "runtimes"
   | "skills"
+  | "docs"
   | "settings";
 
 // Static schema (key only) — labels resolved at render via useT("layout"),
@@ -139,6 +140,7 @@ type NavLabelKey =
   | "usage"
   | "runtimes"
   | "skills"
+  | "docs"
   | "settings";
 
 // Nav icons are NOT declared here: they are derived from each item's
@@ -164,6 +166,7 @@ const aiTeamNav: { key: NavKey; labelKey: NavLabelKey }[] = [
 ];
 
 const utilityNav: { key: NavKey; labelKey: NavLabelKey }[] = [
+  { key: "docs", labelKey: "docs" },
   { key: "usage", labelKey: "usage" },
   { key: "settings", labelKey: "settings" },
 ];

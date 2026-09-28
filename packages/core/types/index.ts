@@ -272,6 +272,7 @@ export type {
   RongCloudEnrollDeviceResponse,
   RongCloudConnectionSessionResponse,
 } from "./rongcloud";
+export type { UsageDoc, UsageDocInput } from "./usage-doc";
 export type {
   Autopilot,
   AutopilotStatus,

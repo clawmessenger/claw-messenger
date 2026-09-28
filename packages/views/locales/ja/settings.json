@@ -1425,7 +1425,7 @@
     "apps": "自分のアカウントで Composio 経由で承認し、自分が所有するエージェントで有効にします。",
     "plugins": "インストールするとツール、定期フック、ストレージを追加でき、プラグインごとに権限を付与します。"
   },
-"rongcloud": {
+  "rongcloud": {
     "section_title": "RongCloud",
     "page_description": "RongCloudチャットルームでのマルチエージェント議論",
     "configured_title": "RongCloudが設定されています",
@@ -1486,5 +1486,32 @@
     "toast_discussion_stopped": "議論が停止されました。",
     "toast_discussion_action_success": "議論アクションが完了しました。",
     "toast_discussion_failed": "議論アクションに失敗しました。"
+  },
+  "usage_docs": {
+    "new_doc": "新規ドキュメント",
+    "loading": "ドキュメントを読み込み中…",
+    "empty": "ドキュメントはまだありません",
+    "load_error": "ドキュメントの読み込みに失敗しました",
+    "no_doc_selected": "メニューからドキュメントを選択してください",
+    "updated_at": "更新日時 {{date}}",
+    "edit": "編集",
+    "delete_confirm_title": "ドキュメントを削除",
+    "delete_confirm_description": "このドキュメントを完全に削除します。この操作は元に戻せません。",
+    "cancel": "キャンセル",
+    "confirm": "削除",
+    "toast_created": "ドキュメントを作成しました",
+    "toast_saved": "ドキュメントを保存しました",
+    "toast_deleted": "ドキュメントを削除しました",
+    "toast_save_failed": "ドキュメントの保存に失敗しました",
+    "toast_delete_failed": "ドキュメントの削除に失敗しました",
+    "slug_label": "スラッグ",
+    "title_label": "タイトル",
+    "title_placeholder": "ドキュメントのタイトル",
+    "category_label": "カテゴリ",
+    "status_label": "ステータス",
+    "content_label": "内容（Markdown）",
+    "content_placeholder": "Markdownでドキュメントを記述してください…",
+    "saving": "保存中…",
+    "save": "保存"
   }
 }

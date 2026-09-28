@@ -1951,6 +1951,21 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Put("/rongcloud/chatrooms/{chatroomId}/discussions/pause", h.PauseRongCloudDiscussion)
 					r.Put("/rongcloud/chatrooms/{chatroomId}/discussions/resume", h.ResumeRongCloudDiscussion)
 				})
+
+				// Usage docs: in-product documentation maintained by
+				// workspace admins. Reading published docs is
+				// member-visible; drafts and mutations are admin-only.
+				r.Group(func(r chi.Router) {
+					r.Use(middleware.RequireWorkspaceMemberFromURL(queries, "id"))
+					r.Get("/usage-docs", h.ListUsageDocs)
+					r.Get("/usage-docs/{slug}", h.GetUsageDoc)
+				})
+				r.Group(func(r chi.Router) {
+					r.Use(middleware.RequireWorkspaceRoleFromURL(queries, "id", "owner", "admin"))
+					r.Post("/usage-docs", h.CreateUsageDoc)
+					r.Put("/usage-docs/{docId}", h.UpdateUsageDoc)
+					r.Delete("/usage-docs/{docId}", h.DeleteUsageDoc)
+				})
 			})
 		})
 

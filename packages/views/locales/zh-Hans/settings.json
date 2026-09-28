@@ -1425,7 +1425,7 @@
     "apps": "用你自己的账号通过 Composio 授权，在你拥有的智能体上启用。",
     "plugins": "安装后可提供工具、定时 hook 和存储，每个插件单独授权。"
   },
-"rongcloud": {
+  "rongcloud": {
     "section_title": "RongCloud",
     "page_description": "通过融云聊天室进行多智能体讨论",
     "configured_title": "RongCloud 已配置",
@@ -1486,5 +1486,32 @@
     "toast_discussion_stopped": "讨论已停止。",
     "toast_discussion_action_success": "讨论操作已完成。",
     "toast_discussion_failed": "讨论操作失败。"
+  },
+  "usage_docs": {
+    "new_doc": "新建文档",
+    "loading": "正在加载文档…",
+    "empty": "暂无文档",
+    "load_error": "加载文档失败",
+    "no_doc_selected": "从左侧菜单选择一篇文档",
+    "updated_at": "更新于 {{date}}",
+    "edit": "编辑",
+    "delete_confirm_title": "删除文档",
+    "delete_confirm_description": "将永久删除该文档，且无法恢复。",
+    "cancel": "取消",
+    "confirm": "删除",
+    "toast_created": "文档已创建",
+    "toast_saved": "文档已保存",
+    "toast_deleted": "文档已删除",
+    "toast_save_failed": "保存文档失败",
+    "toast_delete_failed": "删除文档失败",
+    "slug_label": "Slug",
+    "title_label": "标题",
+    "title_placeholder": "文档标题",
+    "category_label": "分类",
+    "status_label": "状态",
+    "content_label": "内容（Markdown）",
+    "content_placeholder": "使用 Markdown 编写文档内容…",
+    "saving": "保存中…",
+    "save": "保存"
   }
 }

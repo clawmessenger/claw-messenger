@@ -50,6 +50,7 @@
     "./chat/floating-chat": "./chat/floating-chat.tsx",
     "./settings": "./settings/index.ts",
     "./settings/lark-tab": "./settings/components/lark-tab.tsx",
+    "./usage-docs": "./usage-docs/index.ts",
     "./lark": "./lark/index.ts",
     "./slack": "./slack/index.ts",
     "./dingtalk": "./dingtalk/index.ts",
