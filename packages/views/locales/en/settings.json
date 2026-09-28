@@ -1503,7 +1503,7 @@
     "empty": "No documents yet",
     "load_error": "Failed to load documents",
     "no_doc_selected": "Select a document from the menu",
-    "updated_at": "Updated {{date}}",
+    "updated_at": "Updated",
     "edit": "Edit",
     "delete_confirm_title": "Delete document",
     "delete_confirm_description": "This permanently deletes the document. This action cannot be undone.",

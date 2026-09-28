@@ -1493,7 +1493,7 @@
     "empty": "暂无文档",
     "load_error": "加载文档失败",
     "no_doc_selected": "从左侧菜单选择一篇文档",
-    "updated_at": "更新于 {{date}}",
+    "updated_at": "更新于",
     "edit": "编辑",
     "delete_confirm_title": "删除文档",
     "delete_confirm_description": "将永久删除该文档，且无法恢复。",

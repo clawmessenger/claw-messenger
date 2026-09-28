@@ -1493,7 +1493,7 @@
     "empty": "ドキュメントはまだありません",
     "load_error": "ドキュメントの読み込みに失敗しました",
     "no_doc_selected": "メニューからドキュメントを選択してください",
-    "updated_at": "更新日時 {{date}}",
+    "updated_at": "更新日時",
     "edit": "編集",
     "delete_confirm_title": "ドキュメントを削除",
     "delete_confirm_description": "このドキュメントを完全に削除します。この操作は元に戻せません。",

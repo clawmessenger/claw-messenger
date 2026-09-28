@@ -1493,7 +1493,7 @@
     "empty": "문서가 없습니다",
     "load_error": "문서를 불러오지 못했습니다",
     "no_doc_selected": "메뉴에서 문서를 선택하세요",
-    "updated_at": "업데이트 {{date}}",
+    "updated_at": "업데이트",
     "edit": "편집",
     "delete_confirm_title": "문서 삭제",
     "delete_confirm_description": "이 문서를 영구적으로 삭제합니다. 되돌릴 수 없습니다.",
