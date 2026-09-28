@@ -832,13 +832,16 @@ export function useCreateComment(issueId: string) {
       parentId,
       attachmentIds,
       suppressAgentIds,
+      steerTaskIds,
     }: {
       content: string;
       type?: string;
       parentId?: string;
       attachmentIds?: string[];
       suppressAgentIds?: string[];
-    }) => api.createComment(issueId, content, type, parentId, attachmentIds, suppressAgentIds),
+      /** Running turns this comment goes into instead of a follow-up run. */
+      steerTaskIds?: string[];
+    }) => api.createComment(issueId, content, type, parentId, attachmentIds, suppressAgentIds, steerTaskIds),
     onSuccess: (comment) => {
       if (comment.issue_revision) {
         onIssueAuxiliaryRevision(qc, wsId, issueId, comment.issue_revision);
@@ -858,15 +861,24 @@ export function useCreateComment(issueId: string) {
         attachments: comment.attachments ?? [],
         created_at: comment.created_at,
         updated_at: comment.updated_at,
+        supplements: comment.supplements,
       };
+      const steered = !!comment.supplements?.length;
       // Dedupe by id: the `comment:created` WS event may have already added
       // this entry from the broadcast path before this onSuccess fires. Skip
-      // the append if the entry is already in the cache.
+      // the append if the entry is already in the cache — but keep the
+      // steering receipts, which that broadcast predates.
       qc.setQueryData<TimelineCache>(issueKeys.timeline(issueId), (old) => {
         if (!old) return [entry];
-        if (old.some((e) => e.id === entry.id)) return old;
+        if (old.some((e) => e.id === entry.id)) {
+          return steered
+            ? old.map((e) => (e.id === entry.id && !e.supplements?.length ? { ...e, supplements: entry.supplements } : e))
+            : old;
+        }
         return sortTimelineEntriesAsc([...old, entry]);
       });
+      // A steered turn now lists this comment among its inputs.
+      if (steered) qc.invalidateQueries({ queryKey: issueKeys.tasks(issueId) });
       // Posting a comment changes the trigger answer itself (the enqueued
       // task now dedupes follow-up triggers), so cached previews for this
       // issue are stale the moment the create lands.
@@ -1205,6 +1217,18 @@ export function useCancelIssueRun(issueId: string) {
   return useMutation({
     mutationFn: (taskId: string) => api.cancelTask(issueId, taskId),
     onSuccess: () => client.invalidateQueries({ queryKey: issueKeys.tasks(issueId) }),
+  });
+}
+
+export function useRetryTaskSupplement(issueId: string) {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: ({ taskId, commentId }: { taskId: string; commentId: string }) =>
+      api.retryTaskSupplement(issueId, taskId, commentId),
+    onSettled: () => {
+      client.invalidateQueries({ queryKey: issueKeys.timeline(issueId) });
+      client.invalidateQueries({ queryKey: issueKeys.tasks(issueId) });
+    },
   });
 }
 

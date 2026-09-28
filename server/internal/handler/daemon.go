@@ -2600,23 +2600,6 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 		}
 	}
 
-	// Stored task initiator: chat tasks persist the real message sender at
-	// enqueue time (web: request user; Lark: inbound sender — NOT the chat
-	// session creator, which for Lark groups is the installer). When set, it is
-	// the authoritative initiator for this run; resolve the live name/email so
-	// the daemon can render `## Task Initiator`. Comment-triggered tasks instead
-	// resolve their initiator from the triggering comment's author below; the
-	// two paths are mutually exclusive (a task is either chat or issue-bound).
-	// See MUL-2645.
-	if task.InitiatorUserID.Valid {
-		resp.InitiatorType = "member"
-		resp.InitiatorID = uuidToString(task.InitiatorUserID)
-		if u, err := h.Queries.GetUser(r.Context(), task.InitiatorUserID); err == nil {
-			resp.InitiatorName = u.Name
-			resp.InitiatorEmail = u.Email
-		}
-	}
-
 	// Include workspace ID and repos so the daemon can set up worktrees.
 	// Project context, repo precedence and the tenant/failure rules around both
 	// live in resolveClaimProjectContext, which every claim path shares.
@@ -2848,22 +2831,14 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 					}
 				}
 				resp.TriggerAuthorType = comment.AuthorType
-				// The triggering comment's author is the task initiator — the
-				// real requester behind this run. Surface it (type + id + name,
-				// plus email for members) so a workspace-visible agent can
-				// attribute the request to the right person instead of to the
-				// runtime owner. Same lookups as the display name above; we just
-				// also capture the id and email. See MUL-2645.
-				resp.InitiatorType = comment.AuthorType
-				if comment.AuthorID.Valid {
-					resp.InitiatorID = uuidToString(comment.AuthorID)
-				}
+				// Preserve the direct trigger actor independently from the human
+				// whose authority this run uses. They can differ on delegated runs
+				// and manual reruns of comment-triggered tasks.
 				switch comment.AuthorType {
 				case "agent":
 					if comment.AuthorID.Valid {
 						if a, err := h.Queries.GetAgent(r.Context(), comment.AuthorID); err == nil {
 							resp.TriggerAuthorName = a.Name
-							resp.InitiatorName = a.Name
 						}
 					}
 				case "member":
@@ -2872,8 +2847,6 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 					if comment.AuthorID.Valid {
 						if u, err := h.Queries.GetUser(r.Context(), comment.AuthorID); err == nil {
 							resp.TriggerAuthorName = u.Name
-							resp.InitiatorName = u.Name
-							resp.InitiatorEmail = u.Email
 						}
 					}
 				}
@@ -3665,6 +3638,33 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 		}
 	}
 
+	// Wakeup rules that waited for this run hand it their inputs now, after
+	// every gate passed, and only for a daemon that renders them; otherwise
+	// they keep their inputs and start their own run.
+	if requestHasClientCapability(r, protocol.DaemonCapabilityJoinedWakeupsV1) {
+		joined, err := (&service.IssueWakeupService{Tasks: h.TaskService}).JoinWaitingWakeups(r.Context(), *task)
+		if err != nil {
+			slog.Warn("daemon claim: waiting wakeups keep their inputs", "task_id", uuidToString(task.ID), "error", err)
+		} else {
+			task.Context = joined
+			resp.WakeupJoined = service.JoinedWakeupNotes(joined)
+		}
+	}
+
+	// Hydrate attribution only after every source/workspace/version gate has
+	// passed so a rejected claim cannot receive another user's profile data.
+	// The existing flat initiator fields carry the run's authorization human to
+	// installed daemons as well as current ones. Direct trigger authors remain
+	// available separately through trigger_author_*.
+	h.hydrateTaskAttributions(r.Context(), []*TaskAttribution{resp.Attribution})
+	if resp.Attribution != nil && resp.Attribution.Originator != nil {
+		originator := resp.Attribution.Originator
+		resp.InitiatorType = "member"
+		resp.InitiatorID = originator.ID
+		resp.InitiatorName = originator.Name
+		resp.InitiatorEmail = originator.Email
+	}
+
 	return resp, deliveredCommentIDs, issueSnapshot, agentSkillCount, builtinSkillCount, nil
 }
 
@@ -4037,7 +4037,6 @@ func (h *Handler) ListPendingTasksByRuntime(w http.ResponseWriter, r *http.Reque
 	for i, t := range tasks {
 		resp[i] = taskToResponse(t, workspaceID)
 	}
-
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -4085,8 +4084,9 @@ func (h *Handler) StartTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		RuntimeID    string `json:"runtime_id"`
-		DispatchedAt string `json:"dispatched_at"`
+		Capabilities []string `json:"capabilities"`
+		RuntimeID    string   `json:"runtime_id"`
+		DispatchedAt string   `json:"dispatched_at"`
 	}
 	if r.ContentLength != 0 {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -4094,13 +4094,14 @@ func (h *Handler) StartTask(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	enableTaskSupplement := slices.Contains(req.Capabilities, protocol.DaemonCapabilityTaskSupplementV1)
 	var task *db.AgentTaskQueue
 	var err error
 	legacy := req.RuntimeID == "" && req.DispatchedAt == ""
 	if legacy {
 		// Older daemons send {}. Keep their single-winner behavior; in
 		// particular, they cannot acknowledge an already-running task.
-		task, err = h.TaskService.StartTask(r.Context(), parseUUID(taskID))
+		task, err = h.TaskService.StartTask(r.Context(), parseUUID(taskID), enableTaskSupplement)
 	} else {
 		runtimeID, ok := parseUUIDOrBadRequest(w, req.RuntimeID, "runtime_id")
 		if !ok {
@@ -4114,7 +4115,7 @@ func (h *Handler) StartTask(w http.ResponseWriter, r *http.Request) {
 		task, err = h.TaskService.StartTaskForClaim(r.Context(), db.LockAgentTaskStartClaimParams{
 			ID: parseUUID(taskID), RuntimeID: runtimeID,
 			DispatchedAt: pgtype.Timestamptz{Time: generation, Valid: true},
-		})
+		}, enableTaskSupplement)
 	}
 	if err != nil {
 		slog.Warn("start task failed", "task_id", taskID, "error", err)
@@ -4131,7 +4132,19 @@ func (h *Handler) StartTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	slog.Info("task started", "task_id", taskID, "agent_id", uuidToString(task.AgentID))
-	writeJSON(w, http.StatusOK, taskToResponse(*task, workspaceID))
+	resp := taskToResponse(*task, workspaceID)
+	// Echo the capability the server actually committed for this exact run.
+	// A daemon must use this response rather than its own offer: an old server
+	// ignores the offer and omits the field, which keeps daemon-first rollouts
+	// fail closed without requiring synchronized deployment.
+	if task.IssueID.Valid {
+		if capability, capabilityErr := h.Queries.GetTaskSupplementCapability(r.Context(), task.ID); capabilityErr == nil {
+			resp.SupplementCapability = capability.Capability
+		} else if !errors.Is(capabilityErr, pgx.ErrNoRows) {
+			slog.Warn("start task: failed to load negotiated supplement capability", "task_id", taskID, "error", capabilityErr)
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // TaskWaitLocalDirectoryRequest is the body the daemon POSTs when it parks
@@ -4457,6 +4470,7 @@ func (h *Handler) reconcileCommentsOnCompletion(ctx context.Context, task *db.Ag
 		IssueID:           task.IssueID,
 		Since:             task.CreatedAt,
 		PlannedCommentIds: plannedCommentIDs,
+		AgentID:           task.AgentID,
 	})
 	if err != nil {
 		slog.Warn("reconcile comments on completion: list comments failed",
@@ -5657,6 +5671,7 @@ func (h *Handler) ListTasksByIssue(w http.ResponseWriter, r *http.Request) {
 	for i, t := range tasks {
 		resp[i] = taskToResponse(t, workspaceID)
 	}
+	h.hydrateTaskSupplementMetadata(r.Context(), r, issue.WorkspaceID, tasks, resp)
 	// Execution-log rows render the "on behalf of <member>" badge, so this
 	// issue-facing surface must resolve initiator/originator names (departed-safe,
 	// one batch) — otherwise the badge falls back to "someone" on issue detail.

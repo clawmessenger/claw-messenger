@@ -216,6 +216,9 @@ export interface AgentActivityBucket {
   // back-end always reports all three.
   completed_count: number;
   cancelled_count: number;
+  // Absent on older servers; do not estimate duration from a task page.
+  duration_ms?: number;
+  duration_count?: number;
 }
 
 // 30-day total run count per agent, drives the Agents-list RUNS column.
@@ -366,6 +369,12 @@ export interface AgentTask {
    * trigger/coalesced union; an explicitly empty array is still authoritative.
    */
   delivered_comment_ids?: string[];
+  /** Exact run-scoped live-input capability negotiated at this task's start. */
+  supplement_capability?: string;
+  /** Ordinary historical comments explicitly bound to this run, in send order. */
+  supplement_comment_ids?: string[];
+  /** Server-side invocation verdict for the current member and this agent. */
+  can_supplement?: boolean;
   /**
    * Canonical short description of what triggered this task — snapshot
    * taken at creation time. For comment-triggered tasks it's the

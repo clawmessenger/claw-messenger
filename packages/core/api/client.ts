@@ -1,9 +1,9 @@
-﻿import type { IssueWakeup, IssueWakeupSummaryRow } from "../types/issue-wakeup";
+import { type ZodType, z } from "zod";
+import type { IssueWakeup, IssueWakeupInput, IssueWakeupSummaryRow, PausedWakeup, SystemWakeup, WakeupRun, WorkspaceSystemWakeup } from "../types/issue-wakeup";
 import type { WorkspaceWakeupPage, WorkspaceWakeupFilters } from "../types/issue-wakeup";
-import { WorkspaceWakeupPageSchema, IssueWakeupSchema, IssueWakeupSummaryRowSchema } from "./schemas";
+import { WorkspaceWakeupPageSchema, IssueWakeupSchema, IssueWakeupSummaryRowSchema, PausedWakeupSchema, SystemWakeupSchema, WakeupRunSchema, WorkspaceSystemWakeupSchema } from "./schemas";
 import type { InboxFilters } from "../inbox/filter-store";
 import type { ArchivedInboxPage, ArchivedInboxFacets } from "../types/inbox";
-import { z } from "zod";
 import { configStore } from "../config";
 import type {
   Issue,
@@ -16,6 +16,9 @@ import type {
   ListIssuesResponse,
   SearchIssuesResponse,
   SearchProjectsResponse,
+  SearchIndexManifest,
+  SearchIndexSnapshotPage,
+  SearchIndexChanges,
   UpdateMeRequest,
   CreateMemberRequest,
   UpdateMemberRequest,
@@ -169,7 +172,7 @@ import type {
   PluginPreviewRequest,
   PluginInstallRequest,
   PluginConfigRequest,
-  GitHubPullRequest,
+  IssuePullRequestsResponse,
   ListGitHubInstallationsResponse,
   ListGitHubRepositoriesResponse,
   GitHubConnectResponse,
@@ -260,6 +263,7 @@ import {
   RuntimeProfileSchema,
   RuntimeProfileListSchema,
   AgentTaskListSchema,
+  AgentTaskPageSchema,
   AgentActivityBucketListSchema,
   AttachmentResponseSchema,
   CancelTaskResponseSchema,
@@ -344,6 +348,9 @@ import {
   RuntimeUsageListSchema,
   SearchIssuesResponseSchema,
   SearchProjectsResponseSchema,
+  SearchIndexManifestSchema,
+  SearchIndexSnapshotPageSchema,
+  SearchIndexChangesSchema,
   SquadSchema,
   SquadListSchema,
   SquadMemberStatusListResponseSchema,
@@ -390,16 +397,16 @@ import {
   EMPTY_REDEEM_TELEGRAM_BINDING_TOKEN_RESPONSE,
   RongCloudConfigSchema,
   EMPTY_RONGCLOUD_CONFIG,
-  RongCloudNodeSchema,
   RongCloudChatroomSchema,
   EMPTY_RONGCLOUD_CHATROOM,
-  RongCloudDeviceSchema,
-  RongCloudNodeModelSchema,
-  RongCloudPairingSessionSchema,
   RongCloudSystemHostSchema,
   EMPTY_RONGCLOUD_SYSTEM_HOST,
   RongCloudDiscussionStateSchema,
   EMPTY_RONGCLOUD_DISCUSSION_STATE,
+  RongCloudNodeSchema,
+  RongCloudNodeModelSchema,
+  RongCloudDeviceSchema,
+  RongCloudPairingSessionSchema,
   RongCloudDiscussionEventSchema,
   RongCloudRegisterNodeResponseSchema,
   RongCloudEnrollDeviceResponseSchema,
@@ -548,6 +555,12 @@ export interface LoginResponse {
   user: User;
 }
 
+function parseSearchIndexResponse<T>(raw: unknown, schema: ZodType, endpoint: string): T {
+  const parsed = parseWithFallback<T | null>(raw, schema, null, { endpoint });
+  if (parsed === null) throw new Error(`Malformed response from ${endpoint}`);
+  return parsed;
+}
+
 export class ApiError extends Error {
   readonly status: number;
   readonly statusText: string;
@@ -597,15 +610,15 @@ function assertIssueCreatePropertiesSnapshot(
     if (!Object.prototype.hasOwnProperty.call(issue.properties, propertyId)) {
       throw new Error(
         `Issue ${issue.identifier || issue.id} was created, but the server did not confirm its custom properties. Review the issue before retrying.`,
-    );
-  }
+      );
+    }
   }
 }
 
 // errorCode extracts the stable `code` a handler attaches to a failure
 // (writeErrorCode), so a caller can render its own localized sentence instead
 // of toasting the server's English one. Returns undefined for a non-ApiError,
-// or a server that did not send one 鈥?the caller then falls back to
+// or a server that did not send one — the caller then falls back to
 // err.message, which is what every endpoint that has not adopted this yet
 // produces.
 export function errorCode(err: unknown): string | undefined {
@@ -631,8 +644,8 @@ export function dispatchReasonCode(err: unknown): string | undefined {
 }
 
 // clientErrorMessage returns the server's message only when it is a CLIENT
-// error (4xx). Handlers write those for the user 鈥?"autopilot is not active",
-// "Idempotency-Key is too long" 鈥?so they are worth rendering. A 5xx message is
+// error (4xx). Handlers write those for the user — "autopilot is not active",
+// "Idempotency-Key is too long" — so they are worth rendering. A 5xx message is
 // internal detail (Go error chains, pgx table/constraint names, internal ids)
 // that must never reach a toast (MUL-6472), and a non-ApiError is a transport
 // failure whose message ("Failed to fetch") says nothing a user can act on.
@@ -656,7 +669,7 @@ export class PreviewTooLargeError extends Error {
 
 // Thrown by getAttachmentTextContent when the server's text whitelist
 // rejects the content type. Normally the client's isPreviewable() guard
-// catches this earlier, but the two whitelists can drift 鈥?surfacing the
+// catches this earlier, but the two whitelists can drift — surfacing the
 // 415 as a typed error makes the drift visible.
 export class PreviewUnsupportedError extends Error {
   constructor() {
@@ -723,8 +736,8 @@ function subscriberTarget(
  * `authHeaders()` normally stamps `X-Workspace-Slug` from the global
  * current-workspace singleton, and the server resolves the workspace from that
  * header BEFORE any `workspace_id` query param. Anything that acts on a
- * workspace the user is not currently "in" 鈥?notably the create-workspace flow,
- * which provisions a workspace it has not navigated to yet 鈥?must say so
+ * workspace the user is not currently "in" — notably the create-workspace flow,
+ * which provisions a workspace it has not navigated to yet — must say so
  * explicitly, or a concurrent writer of that singleton silently redirects the
  * write to the wrong workspace.
  */
@@ -750,7 +763,7 @@ function dingTalkGroupSearch(params: ListDingTalkGroupsParams): string {
 // be retried.
 const CSRF_REJECTED_ERROR = "CSRF validation failed";
 
-// One header, two possible values 鈥?see ApiClient.readCsrfValue.
+// One header, two possible values — see ApiClient.readCsrfValue.
 const CSRF_HEADER = "X-CSRF-Token";
 const CSRF_COOKIE = "multica_csrf";
 const SESSION_CSRF_COOKIE = "multica_csrf_session";
@@ -807,7 +820,7 @@ export class ApiClient {
    * The session-bound value is preferred: it survives a sliding renewal, so a
    * request another tab built before a renewal still validates after it. The
    * token-bound value is the fallback, and it is what a server running the
-   * PREVIOUS release can verify 鈥?after a rollback the session-bound value is
+   * PREVIOUS release can verify — after a rollback the session-bound value is
    * meaningless to it.
    *
    * Both travel in the same header. A second header name would have to be in
@@ -816,7 +829,7 @@ export class ApiClient {
    *
    * `csrfSessionValueRejected` records the exact session-bound value a server
    * refused, so the fallback is used for as long as that value is current and
-   * no longer 鈥?a renewal or a new login replaces the cookie and the preferred
+   * no longer — a renewal or a new login replaces the cookie and the preferred
    * binding is tried again. Keying on the value rather than a boolean is what
    * stops this from oscillating once per renewal against a current server.
    */
@@ -853,7 +866,7 @@ export class ApiClient {
   }
 
   /**
-   * A 401 ends the session 鈥?unless the credential it answered has already
+   * A 401 ends the session — unless the credential it answered has already
    * been replaced.
    *
    * A request that went out just before a renewal (or from another window
@@ -901,9 +914,9 @@ export class ApiClient {
   }
 
   // Sends the request with the standard headers (auth, CSRF, request id,
-  // client identity) and runs the shared error path (401 鈫?handleUnauthorized,
+  // client identity) and runs the shared error path (401 → handleUnauthorized,
   // structured ApiError, status-aware log level). Returns the raw Response so
-  // callers can decide how to decode the body 鈥?JSON for the typed `fetch<T>`
+  // callers can decide how to decode the body — JSON for the typed `fetch<T>`
   // path, plain text for the attachment-preview proxy, etc.
   private async fetchRaw(
     path: string,
@@ -927,7 +940,7 @@ export class ApiClient {
     // credential it actually used, not whatever is current when it lands.
     const credentialUsed = this.getToken();
 
-    this.logger.info(`鈫?${method} ${path}`, { rid });
+    this.logger.info(`→ ${method} ${path}`, { rid });
 
     const send = () =>
       fetch(`${this.baseUrl}${path}`, {
@@ -955,7 +968,7 @@ export class ApiClient {
       const { message } = await this.parseErrorBody(res.clone(), "");
       if (message === CSRF_REJECTED_ERROR) {
         this.csrfSessionValueRejected = this.readCookie(SESSION_CSRF_COOKIE);
-        this.logger.info(`鈫?${method} ${path} (CSRF token rejected, retrying once)`, { rid });
+        this.logger.info(`↻ ${method} ${path} (CSRF token rejected, retrying once)`, { rid });
         res = await send();
       }
     }
@@ -964,11 +977,11 @@ export class ApiClient {
       if (res.status === 401) this.handleUnauthorized(credentialUsed);
       const { message, body } = await this.parseErrorBody(res, `API error: ${res.status} ${res.statusText}`);
       const logLevel = res.status === 404 ? "warn" : "error";
-      this.logger[logLevel](`鈫?${res.status} ${path}`, { rid, duration: `${Date.now() - start}ms`, error: message });
+      this.logger[logLevel](`← ${res.status} ${path}`, { rid, duration: `${Date.now() - start}ms`, error: message });
       throw new ApiError(message, res.status, res.statusText, body);
     }
 
-    this.logger.info(`鈫?${res.status} ${path}`, { rid, duration: `${Date.now() - start}ms` });
+    this.logger.info(`← ${res.status} ${path}`, { rid, duration: `${Date.now() - start}ms` });
     return res;
   }
 
@@ -1016,7 +1029,7 @@ export class ApiClient {
 
   /**
    * Ask the server to extend this session if it has entered its renewal
-   * window. The server owns that decision 鈥?no client reads `exp` or
+   * window. The server owns that decision — no client reads `exp` or
    * compares it against a local clock, which is what keeps clock skew out of
    * the picture entirely.
    *
@@ -1118,7 +1131,7 @@ export class ApiClient {
     if (params?.label_ids?.length) search.set("label_ids", params.label_ids.join(","));
     if (params?.top_level_only) search.set("top_level_only", "true");
     // No `.length` guard on purpose: an empty ids array must still send
-    // `ids=` 鈥?the server treats a PRESENT-but-empty list as an empty window
+    // `ids=` — the server treats a PRESENT-but-empty list as an empty window
     // (nothing running), while an absent param means no restriction.
     if (params?.ids) search.set("ids", params.ids.join(","));
     if (params?.involves_user_id) search.set("involves_user_id", params.involves_user_id);
@@ -1135,7 +1148,7 @@ export class ApiClient {
     if (params?.date_end) search.set("date_end", params.date_end);
     if (params?.sort_by) search.set("sort", params.sort_by);
     if (params?.sort_direction) search.set("direction", params.sort_direction);
-    // An ids facet can carry hundreds of UUIDs (agents-working filter) 鈥?
+    // An ids facet can carry hundreds of UUIDs (agents-working filter) —
     // enough to blow the ~8 KB request-line cap of common reverse proxies.
     // Route those windows through the POST twin, which takes the SAME
     // key/value pairs as a JSON body.
@@ -1264,6 +1277,48 @@ export class ApiClient {
     });
   }
 
+  // Local search index sync (MUL-7754). Each call names its workspace so a
+  // request issued for one workspace cannot be answered for whichever one the
+  // tab has switched to since. A body that fails its schema rejects rather
+  // than degrading: an empty page would be applied to the local copy as truth.
+  async getSearchIndexManifest(params: { workspaceSlug: string; signal?: AbortSignal }): Promise<SearchIndexManifest> {
+    const raw = await this.fetch<unknown>("/api/search-index/manifest", {
+      headers: { "X-Workspace-Slug": params.workspaceSlug },
+      signal: params.signal,
+    });
+    return parseSearchIndexResponse<SearchIndexManifest>(raw, SearchIndexManifestSchema, "GET /api/search-index/manifest");
+  }
+
+  async getSearchIndexSnapshot(params: {
+    workspaceSlug: string;
+    afterNumber: number;
+    limit?: number;
+    signal?: AbortSignal;
+  }): Promise<SearchIndexSnapshotPage> {
+    const search = new URLSearchParams({ after_number: String(params.afterNumber) });
+    if (params.limit !== undefined) search.set("limit", String(params.limit));
+    const raw = await this.fetch<unknown>(`/api/search-index/snapshot?${search}`, {
+      headers: { "X-Workspace-Slug": params.workspaceSlug },
+      signal: params.signal,
+    });
+    return parseSearchIndexResponse<SearchIndexSnapshotPage>(raw, SearchIndexSnapshotPageSchema, "GET /api/search-index/snapshot");
+  }
+
+  async getSearchIndexChanges(params: {
+    workspaceSlug: string;
+    cursor: string;
+    limit?: number;
+    signal?: AbortSignal;
+  }): Promise<SearchIndexChanges> {
+    const raw = await this.fetch<unknown>("/api/search-index/changes", {
+      method: "POST",
+      headers: { "X-Workspace-Slug": params.workspaceSlug },
+      body: JSON.stringify({ cursor: params.cursor, limit: params.limit }),
+      signal: params.signal,
+    });
+    return parseSearchIndexResponse<SearchIndexChanges>(raw, SearchIndexChangesSchema, "POST /api/search-index/changes");
+  }
+
   /**
    * Fetch one issue by UUID **or** by bare identifier ("MUL-123"): the server
    * resolves `PREFIX-NUMBER` against the workspace's own prefix through the
@@ -1277,7 +1332,7 @@ export class ApiClient {
    * is no safe-empty shape to degrade to, and the identifier-autolink caller
    * caches this result for 5 minutes, so a field-missing or type-drifted 200
    * must not become a truthy issue with an `undefined` id. Like createIssue,
-   * an unusable body fails the call 鈥?and it fails with a plain Error, never
+   * an unusable body fails the call — and it fails with a plain Error, never
    * an ApiError 404, so `issueIdentifierOptions` propagates it instead of
    * caching it as "no such issue".
    */
@@ -1309,6 +1364,52 @@ export class ApiClient {
 
   async editIssueWakeupInstruction(issueId: string, wakeupId: string, input: { instruction: string; expected_instruction: string; revision: number }): Promise<void> {
     await this.fetch(`/api/issues/${encodeURIComponent(issueId)}/wakeups/${encodeURIComponent(wakeupId)}/instruction`, { method: "PATCH", body: JSON.stringify(input) });
+  }
+
+  async createIssueWakeup(issueId: string, input: IssueWakeupInput): Promise<void> {
+    await this.fetch(`/api/issues/${encodeURIComponent(issueId)}/wakeups`, { method: "POST", body: JSON.stringify(input) });
+  }
+
+  async listIssueSystemWakeups(issueId: string): Promise<SystemWakeup[]> {
+    const raw = await this.fetch<unknown>(`/api/issues/${encodeURIComponent(issueId)}/system-wakeups`);
+    const parsed = parseWithFallback<SystemWakeup[] | null>(raw, SystemWakeupSchema.array(), null, { endpoint: "GET /api/issues/:id/system-wakeups" });
+    if (!parsed) throw new Error("Could not load system wakeups");
+    return parsed;
+  }
+
+  async listIssueWakeupRuns(issueId: string, wakeupId: string): Promise<WakeupRun[]> {
+    const raw = await this.fetch<unknown>(`/api/issues/${encodeURIComponent(issueId)}/wakeups/${encodeURIComponent(wakeupId)}/runs`);
+    const parsed = parseWithFallback<WakeupRun[] | null>(raw, WakeupRunSchema.array(), null, { endpoint: "GET /api/issues/:id/wakeups/:wakeupId/runs" });
+    if (!parsed) throw new Error("Could not load wakeup runs");
+    return parsed;
+  }
+
+  async listPausedWakeups(): Promise<PausedWakeup[]> {
+    const raw = await this.fetch<unknown>("/api/issue-wakeup-paused");
+    return parseWithFallback<PausedWakeup[]>(raw, PausedWakeupSchema.array(), [], { endpoint: "GET /api/issue-wakeup-paused" });
+  }
+
+  async triggerIssueWakeup(issueId: string, wakeupId: string): Promise<void> {
+    await this.fetch(`/api/issues/${encodeURIComponent(issueId)}/wakeups/${encodeURIComponent(wakeupId)}/trigger`, { method: "POST" });
+  }
+
+  async deleteIssueWakeup(issueId: string, wakeupId: string): Promise<void> {
+    await this.fetch(`/api/issues/${encodeURIComponent(issueId)}/wakeups/${encodeURIComponent(wakeupId)}`, { method: "DELETE" });
+  }
+
+  async updateIssueSystemWakeup(issueId: string, rule: SystemWakeup["rule"], input: { enabled?: boolean; instruction?: string }): Promise<void> {
+    await this.fetch(`/api/issues/${encodeURIComponent(issueId)}/system-wakeups/${encodeURIComponent(rule)}`, { method: "PUT", body: JSON.stringify(input) });
+  }
+
+  async listWorkspaceSystemWakeups(): Promise<WorkspaceSystemWakeup[]> {
+    const raw = await this.fetch<unknown>("/api/system-wakeups");
+    const parsed = parseWithFallback<WorkspaceSystemWakeup[] | null>(raw, WorkspaceSystemWakeupSchema.array(), null, { endpoint: "GET /api/system-wakeups" });
+    if (!parsed) throw new Error("Could not load system wakeups");
+    return parsed;
+  }
+
+  async updateWorkspaceSystemWakeup(rule: WorkspaceSystemWakeup["rule"], input: { enabled?: boolean; instruction?: string }): Promise<void> {
+    await this.fetch(`/api/system-wakeups/${encodeURIComponent(rule)}`, { method: "PUT", body: JSON.stringify(input) });
   }
 
   async disableIssueWakeup(issueId: string, wakeupId: string): Promise<void> {
@@ -1501,7 +1602,7 @@ export class ApiClient {
     });
   }
 
-  /** Batched variant 鈥?returns children for multiple parents in one request.
+  /** Batched variant — returns children for multiple parents in one request.
    *  Avoids an N-request fan-out in Swimlane (one per visible parent lane).
    *  parentIds must be non-empty; pass a sorted, deduplicated list so the
    *  React Query cache key is stable across renders. */
@@ -1570,6 +1671,7 @@ export class ApiClient {
     parentId?: string,
     attachmentIds?: string[],
     suppressAgentIds?: string[],
+    steerTaskIds?: string[],
   ): Promise<Comment> {
     return this.fetch(`/api/issues/${issueId}/comments`, {
       method: "POST",
@@ -1579,6 +1681,7 @@ export class ApiClient {
         ...(parentId ? { parent_id: parentId } : {}),
         ...(attachmentIds?.length ? { attachment_ids: attachmentIds } : {}),
         ...(suppressAgentIds?.length ? { suppress_agent_ids: suppressAgentIds } : {}),
+        ...(steerTaskIds?.length ? { steer_task_ids: steerTaskIds } : {}),
       }),
     });
   }
@@ -1723,7 +1826,7 @@ export class ApiClient {
 
   /**
    * Leaves this issue and every descendant, and keeps future children of the
-   * tree from re-subscribing the user 鈥?the escape hatch for an agent-built
+   * tree from re-subscribing the user — the escape hatch for an agent-built
    * tree that keeps growing (MUL-5483).
    *
    * Deliberately its own endpoint rather than a `subtree` flag on
@@ -1771,7 +1874,7 @@ export class ApiClient {
    * Only a runtime and a language are sent: name, description, avatar,
    * permissions, and the system instruction layer are server constants, so a
    * client cannot mint an agent that would claim them. The server is also the
-   * idempotency boundary 鈥?calling twice yields the same agent.
+   * idempotency boundary — calling twice yields the same agent.
    */
   async createMikaAgent(
     data: {
@@ -1781,7 +1884,7 @@ export class ApiClient {
       model?: string;
       /** Label for the onboarding conversation, used only if this call is the
        *  one that creates it. The session's identity is the member and Mika,
-       *  never this string 鈥?it is localized. */
+       *  never this string — it is localized. */
       session_title?: string;
     },
     workspaceSlug?: string,
@@ -1850,12 +1953,12 @@ export class ApiClient {
   }
 
   /** Rebinds a live builder conversation to another runtime. Callers must not
-   *  show the new runtime as selected until this resolves 鈥?the whole point is
+   *  show the new runtime as selected until this resolves — the whole point is
    *  that the UI's runtime and the executing runtime agree.
    *
    *  A non-2xx throws before we get here and nothing was committed. Reaching the
    *  parse means the server bound `data.runtime_id`, so that is the fallback for
-   *  an unparseable body 鈥?see agentBuilderRuntimeSwitchFallback. */
+   *  an unparseable body — see agentBuilderRuntimeSwitchFallback. */
   async switchAgentBuilderRuntime(
     sessionId: string,
     data: { runtime_id: string },
@@ -1980,7 +2083,7 @@ export class ApiClient {
   }
 
   // ---------------------------------------------------------------------
-  // Cloud Billing 鈥?proxies to multica-cloud /api/v1/billing/*. The
+  // Cloud Billing — proxies to multica-cloud /api/v1/billing/*. The
   // multica-api server stamps X-User-ID and forwards bytes; everything
   // here is upstream-shaped. See packages/core/types/billing.ts for the
   // response field documentation.
@@ -2095,7 +2198,7 @@ export class ApiClient {
   async createCloudBillingPortalSession(): Promise<CreateBillingPortalSessionResponse> {
     const res = await this.fetchRaw("/api/cloud-billing/portal-sessions", {
       method: "POST",
-      // Body is intentionally absent 鈥?the upstream endpoint requires no
+      // Body is intentionally absent — the upstream endpoint requires no
       // payload today. fetchRaw with no body skips the Content-Type
       // default; that's fine because there's nothing to declare.
     });
@@ -2109,7 +2212,7 @@ export class ApiClient {
   }
 
   // ---------------------------------------------------------------------
-  // Workspace subscriptions 鈥?the server resolves the workspace from the
+  // Workspace subscriptions — the server resolves the workspace from the
   // authenticated request context, so no caller names one.
   //
   // Two distinct failure paths, both of which a caller must render as
@@ -2257,7 +2360,7 @@ export class ApiClient {
   // the confirmation dialog and submits the user-confirmed active agent set
   // here. Server compares the snapshot to the live set inside the transaction
   // and refuses with `code: "runtime_delete_plan_changed"` (same shape, fresh
-  // `active_agents`) if they don't match 鈥?caller should re-render the agent
+  // `active_agents`) if they don't match — caller should re-render the agent
   // list and force the user to re-confirm.
   //
   // The agents are UNBOUND, not archived or deleted (MUL-5559): they keep their
@@ -2286,7 +2389,7 @@ export class ApiClient {
       visibility?: "private" | "public";
       /**
        * Custom display name. Pass an empty string to clear it (the server
-       * reverts to the default name). Omit to leave it unchanged 鈥?a JSON
+       * reverts to the default name). Omit to leave it unchanged — a JSON
        * `null` is treated as "unchanged", not "clear". See MUL-4217.
        */
       custom_name?: string;
@@ -2446,7 +2549,7 @@ export class ApiClient {
   }
 
   // ---------------------------------------------------------------------------
-  // Workspace dashboard 鈥?three independent rollups for `/{slug}/dashboard`.
+  // Workspace dashboard — three independent rollups for `/{slug}/dashboard`.
   // Each accepts an optional `project_id` to narrow the scope to one project.
   // Cost is computed client-side from the model pricing table (same contract
   // as the per-runtime endpoints above).
@@ -2646,11 +2749,22 @@ export class ApiClient {
     return this.fetch(`/api/runtimes/${runtimeId}/local-skills/import/${requestId}`);
   }
 
-  async listAgentTasks(agentId: string): Promise<AgentTask[]> {
-    const raw = await this.fetch<unknown>(`/api/agents/${agentId}/tasks`);
-    return parseWithFallback<AgentTask[]>(raw, AgentTaskListSchema, [], {
-      endpoint: "GET /api/agents/:id/tasks",
+  async listAgentTasksPage(
+    agentId: string,
+    options: { limit?: number; before?: string; signal?: AbortSignal } = {},
+  ): Promise<{ tasks: AgentTask[]; nextCursor: string | null }> {
+    const search = new URLSearchParams({ limit: String(options.limit ?? 200) });
+    if (options.before) search.set("before", options.before);
+    const response = await this.fetchRaw(`/api/agents/${agentId}/tasks?${search}`, {
+      signal: options.signal,
     });
+    const tasks: unknown = await response.json();
+    return parseWithFallback(
+      { tasks, nextCursor: response.headers.get("X-Agent-Tasks-Next-Cursor") },
+      AgentTaskPageSchema,
+      { tasks: [], nextCursor: null },
+      { endpoint: "GET /api/agents/:id/tasks" },
+    );
   }
 
   // Workspace-scoped agent task snapshot: every active task
@@ -2718,6 +2832,12 @@ export class ApiClient {
     const raw = await this.fetch<unknown>(`/api/issues/${issueId}/task-runs`);
     return parseWithFallback<AgentTask[]>(raw, AgentTaskListSchema, [], {
       endpoint: "GET /api/issues/:id/task-runs",
+    });
+  }
+
+  async retryTaskSupplement(issueId: string, taskId: string, commentId: string): Promise<void> {
+    await this.fetch(`/api/issues/${issueId}/tasks/${taskId}/supplements/${commentId}/retry`, {
+      method: "POST",
     });
   }
 
@@ -2821,7 +2941,7 @@ export class ApiClient {
     return this.fetch(`/api/inbox/${id}/unarchive`, { method: "POST" });
   }
 
-  // Raw unread ROW count 鈥?not the number any badge shows. The inbox renders
+  // Raw unread ROW count — not the number any badge shows. The inbox renders
   // one row per issue, so a single issue with three unread notifications
   // counts once there and three times here. `getInboxUnreadSummary` is the
   // deduplicated, per-workspace count the UI is built on (see
@@ -2862,7 +2982,7 @@ export class ApiClient {
   //
   // `workspaceSlug` overrides the default `X-Workspace-Slug` header (which
   // follows the active workspace) so a caller can read a SPECIFIC workspace's
-  // preferences 鈥?e.g. honoring the mute setting of the workspace an inbox
+  // preferences — e.g. honoring the mute setting of the workspace an inbox
   // notification came from while the user is viewing a different one (#3766).
   async getNotificationPreferences(workspaceSlug?: string): Promise<NotificationPreferenceResponse> {
     const raw = await this.fetch<unknown>(
@@ -2940,7 +3060,7 @@ export class ApiClient {
 
   /**
    * The workspace's MCP server library. The response carries identity and
-   * transport only 鈥?the stored entries are write-only server-side, so there
+   * transport only — the stored entries are write-only server-side, so there
    * is nothing here to redact.
    */
   async listWorkspaceMcpServers(workspaceId: string): Promise<WorkspaceMcpServer[]> {
@@ -2951,7 +3071,7 @@ export class ApiClient {
   }
 
   /**
-   * Adds a server to the library. It is assigned to NO agent 鈥?an agent gets
+   * Adds a server to the library. It is assigned to NO agent — an agent gets
    * it only through addAgentMcpServer.
    */
   async createWorkspaceMcpServer(
@@ -3050,7 +3170,7 @@ export class ApiClient {
 
   /**
    * Publishes an artifact bundle: a zip holding the manifest and every file it
-   * names. This is the whole publishing path 鈥?a plugin author needs no server
+   * names. This is the whole publishing path — a plugin author needs no server
    * of their own, and nothing about a published version changes afterwards.
    *
    * Not routed through `this.fetch`, for the same reason uploadFile is not: the
@@ -3078,7 +3198,7 @@ export class ApiClient {
   }
 
   /**
-   * Publishes from a directory the operator hosts (MULTICA_PLUGIN_DIR) 鈥?the
+   * Publishes from a directory the operator hosts (MULTICA_PLUGIN_DIR) — the
    * development channel, so iterating on a surface does not mean zipping and
    * uploading after every edit. It still produces an immutable version.
    */
@@ -3153,7 +3273,7 @@ export class ApiClient {
   /**
    * Performs one Action API call on behalf of a plugin surface.
    *
-   * The surface has no credential 鈥?it asked the host over postMessage, and
+   * The surface has no credential — it asked the host over postMessage, and
    * this re-issues the call on the signed-in user's session. The installation
    * travels in a header the iframe cannot set for itself; the server derives
    * the workspace from it rather than trusting anything the client sends.
@@ -3178,7 +3298,7 @@ export class ApiClient {
    * `ui` comes from a button inside a surface, `manual` from the issue actions
    * menu or the command palette. Both block this request and only this request:
    * somebody is waiting for the answer. The `event` trigger never comes through
-   * here 鈥?the host dispatches it, so no client can ask for one and inherit an
+   * here — the host dispatches it, so no client can ask for one and inherit an
    * identity that is supposed to be the plugin's.
    */
   async invokePluginHook(
@@ -3224,7 +3344,7 @@ export class ApiClient {
    * Lists what an `mcp`-transport hook's server currently offers.
    *
    * Read-only: discovering a tool adopts nothing. approvePluginMCPTools is the
-   * grant, which is the difference from an `http` hook 鈥?that one declares a
+   * grant, which is the difference from an `http` hook — that one declares a
    * single endpoint in a manifest an administrator already read, while an MCP
    * server decides its own tool list at runtime and can change it later.
    */
@@ -3240,7 +3360,7 @@ export class ApiClient {
   /**
    * Pins the approved tool set for one hook.
    *
-   * `tools` is the COMPLETE set, not a delta 鈥?removing one is the same request
+   * `tools` is the COMPLETE set, not a delta — removing one is the same request
    * shape as adding one, so there is no way to think you revoked something and
    * have it stay. An empty array withdraws the hook entirely.
    */
@@ -3530,7 +3650,7 @@ export class ApiClient {
 
     const rid = createRequestId();
     const start = Date.now();
-    this.logger.info("鈫?POST /api/upload-file", { rid });
+    this.logger.info("→ POST /api/upload-file", { rid });
 
     const credentialUsed = this.getToken();
     const res = await fetch(`${this.baseUrl}/api/upload-file`, {
@@ -3544,11 +3664,11 @@ export class ApiClient {
     if (!res.ok) {
       if (res.status === 401) this.handleUnauthorized(credentialUsed);
       const message = await this.parseErrorMessage(res, `Upload failed: ${res.status}`);
-      this.logger.error(`鈫?${res.status} /api/upload-file`, { rid, duration: `${Date.now() - start}ms`, error: message });
+      this.logger.error(`← ${res.status} /api/upload-file`, { rid, duration: `${Date.now() - start}ms`, error: message });
       throw new Error(message);
     }
 
-    this.logger.info(`鈫?${res.status} /api/upload-file`, { rid, duration: `${Date.now() - start}ms` });
+    this.logger.info(`← ${res.status} /api/upload-file`, { rid, duration: `${Date.now() - start}ms` });
     const raw = (await res.json()) as unknown;
     return parseWithFallback(raw, AttachmentResponseSchema, EMPTY_ATTACHMENT, {
       endpoint: "POST /api/upload-file",
@@ -3602,7 +3722,7 @@ export class ApiClient {
   // than on this response.
   // Refresh the quick actions for the given assistant turn. Sends the message
   // id the caller is refreshing so the server can atomically confirm it is still
-  // the session's latest turn (409 otherwise) 鈥?that keeps the client's pending
+  // the session's latest turn (409 otherwise) — that keeps the client's pending
   // marker aligned with the turn chat:quick_actions will resolve, with no
   // response reconciliation needed even under a WS-before-HTTP race (MUL-5149).
   async regenerateChatQuickActions(
@@ -3689,7 +3809,7 @@ export class ApiClient {
       // existed returns 404 for the unknown route. Fall back to the legacy
       // full-list endpoint so chat never white-screens regardless of whether
       // the server or the client deploys first. Only the initial (cursorless)
-      // page falls back 鈥?the legacy endpoint returns every message at once, so
+      // page falls back — the legacy endpoint returns every message at once, so
       // the fallback page reports has_more: false and there is no follow-up
       // request to translate. A 404 on a cursor request is an unexpected state
       // and propagates instead of duplicating the whole list.
@@ -3778,7 +3898,7 @@ export class ApiClient {
 
   /**
    * Pending deferred-cancellation draft restores for a session (#5219).
-   * A 404 means the backend predates the endpoint 鈥?treat as "nothing
+   * A 404 means the backend predates the endpoint — treat as "nothing
    * pending" so older servers never error the composer.
    */
   async listChatDraftRestores(sessionId: string): Promise<ChatDraftRestoresResponse> {
@@ -3796,7 +3916,7 @@ export class ApiClient {
     });
   }
 
-  /** Idempotent consume 鈥?deleting an already-consumed restore is a 204 no-op. */
+  /** Idempotent consume — deleting an already-consumed restore is a 204 no-op. */
   async consumeChatDraftRestore(sessionId: string, restoreId: string): Promise<void> {
     await this.fetch(`/api/chat/sessions/${sessionId}/draft-restores/${restoreId}`, {
       method: "DELETE",
@@ -3816,8 +3936,8 @@ export class ApiClient {
   }
 
   // Advertises the durable draft-restore capability (#5219). The server only
-  // defers the empty-transcript judgment 鈥?and therefore only withholds the
-  // synchronous restore from the response 鈥?for clients that send this; without
+  // defers the empty-transcript judgment — and therefore only withholds the
+  // synchronous restore from the response — for clients that send this; without
   // it we would be treated as a pre-#5219 client and get the legacy behaviour.
   async cancelTaskById(
     taskId: string,
@@ -3869,7 +3989,7 @@ export class ApiClient {
   // the preview dispatcher can choose between markdown / html / plain code.
   //
   // Routes through `fetchRaw` so it inherits the standard auth headers,
-  // 401 鈫?handleUnauthorized recovery, request-id logging, and ApiError
+  // 401 → handleUnauthorized recovery, request-id logging, and ApiError
   // shape. 413 / 415 are translated to typed `Preview*Error` instances so
   // the modal can render specific fallbacks instead of generic failure.
   async getAttachmentTextContent(
@@ -3900,12 +4020,12 @@ export class ApiClient {
   // signing or presign mode; in **proxy** mode (self-hosted MinIO or any
   // storage endpoint on an internal host, which the default `auto` mode
   // classifies as proxy) it returns the auth-gated API path again. Clients
-  // that cannot ride the session cookie on a native `<img>` resource fetch 鈥?
-  // Desktop's file:// renderer, the mobile webview, split-origin web 鈥?get
+  // that cannot ride the session cookie on a native `<img>` resource fetch —
+  // Desktop's file:// renderer, the mobile webview, split-origin web — get
   // the bytes here and render them from an object URL instead.
   //
   // Routes through `fetchRaw` so it inherits the standard auth headers,
-  // 401 鈫?handleUnauthorized recovery, request-id logging and ApiError shape.
+  // 401 → handleUnauthorized recovery, request-id logging and ApiError shape.
   // Callers must only reach for this once the metadata refresh has shown
   // there is no signed URL: in the other modes the endpoint 302s to storage,
   // where CORS is not configured for a JS fetch.
@@ -4104,7 +4224,7 @@ export class ApiClient {
   }
 
   /**
-   * Quick actions catalog 鈥?one projection for every caller.
+   * Quick actions catalog — one projection for every caller.
    *
    * The server hides nothing beyond `private` ownership; whether the caller
    * may RUN an action is answered by runQuickAction, not here. There is
@@ -4157,7 +4277,7 @@ export class ApiClient {
 
   /**
    * Run a quick action against one issue. The response is a Comment carrying
-   * `trigger_outcomes` 鈥?the same shape POST /comments returns 鈥?so callers
+   * `trigger_outcomes` — the same shape POST /comments returns — so callers
    * reuse one result handler and inherit `queued` / `coalesced` / `deferred` /
    * `blocked` instead of a parallel vocabulary that would drift.
    */
@@ -4172,8 +4292,8 @@ export class ApiClient {
 
   /**
    * What a quick action WOULD post, without posting it. Backs the composer
-   * hand-off (鈱?click and the `/` menu) so the user can edit before sending.
-   * Returns "" when the response cannot be read 鈥?callers must treat an empty
+   * hand-off (⌥-click and the `/` menu) so the user can edit before sending.
+   * Returns "" when the response cannot be read — callers must treat an empty
    * string as "insert nothing" rather than clearing the composer.
    */
   async renderQuickAction(issueId: string, quickActionId: string): Promise<string> {
@@ -4309,7 +4429,7 @@ export class ApiClient {
       body: JSON.stringify(data),
     });
     // null fallback: the create itself succeeded server-side; a response we
-    // cannot parse must not crash the dialog 鈥?callers refetch the list.
+    // cannot parse must not crash the dialog — callers refetch the list.
     return parseWithFallback(raw, IssueViewSchema.nullable(), null, {
       endpoint: "POST /api/issue-views",
     });
@@ -4552,7 +4672,7 @@ export class ApiClient {
 
   // Returns a single run including its full trigger_payload. List responses
   // omit trigger_payload to keep them small (a webhook envelope can be
-  // up to 256 KiB 脳 limit rows), so the detail view fetches via this route.
+  // up to 256 KiB × limit rows), so the detail view fetches via this route.
   async getAutopilotRun(autopilotId: string, runId: string): Promise<AutopilotRun> {
     return this.fetch(`/api/autopilots/${autopilotId}/runs/${runId}`);
   }
@@ -4598,7 +4718,7 @@ export class ApiClient {
     );
   }
 
-  // Webhook deliveries 鈥?list is slim (no raw_body / selected_headers /
+  // Webhook deliveries — list is slim (no raw_body / selected_headers /
   // response_body); detail returns the full row. Both responses are parsed
   // through a lenient schema so an unknown server-side `status` /
   // `signature_status` value degrades to a generic row instead of dropping
@@ -4638,7 +4758,7 @@ export class ApiClient {
 
   // Replay creates a NEW delivery row referencing the original via
   // `replayed_from_delivery_id`. Server rejects replays of
-  // signature-invalid / rejected deliveries with 400 鈥?the UI keeps the
+  // signature-invalid / rejected deliveries with 400 — the UI keeps the
   // button disabled for those rows, but the server is the source of truth.
   async replayAutopilotDelivery(
     autopilotId: string,
@@ -4713,13 +4833,58 @@ export class ApiClient {
     });
   }
 
-  async listIssuePullRequests(issueId: string): Promise<{ pull_requests: GitHubPullRequest[] }> {
+  async listIssuePullRequests(issueId: string): Promise<IssuePullRequestsResponse> {
     const raw = await this.fetch<unknown>(`/api/issues/${issueId}/pull-requests`);
     return parseWithFallback(
       raw,
       IssuePullRequestsResponseSchema,
       EMPTY_ISSUE_PULL_REQUESTS_RESPONSE,
       { endpoint: "GET /api/issues/:id/pull-requests" },
+    );
+  }
+
+  /** Link a PR the workspace already mirrors, by pasted URL or by id (undo). */
+  async linkIssuePullRequest(
+    issueId: string,
+    body: { url: string } | { pull_request_id: string },
+  ): Promise<IssuePullRequestsResponse> {
+    const raw = await this.fetch<unknown>(`/api/issues/${issueId}/pull-requests`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    return parseWithFallback(
+      raw,
+      IssuePullRequestsResponseSchema,
+      EMPTY_ISSUE_PULL_REQUESTS_RESPONSE,
+      { endpoint: "POST /api/issues/:id/pull-requests" },
+    );
+  }
+
+  /** Remove a PR from an issue; later webhooks will not link it again. */
+  async unlinkIssuePullRequest(issueId: string, pullRequestId: string): Promise<IssuePullRequestsResponse> {
+    const raw = await this.fetch<unknown>(
+      `/api/issues/${issueId}/pull-requests/${pullRequestId}`,
+      { method: "DELETE" },
+    );
+    return parseWithFallback(
+      raw,
+      IssuePullRequestsResponseSchema,
+      EMPTY_ISSUE_PULL_REQUESTS_RESPONSE,
+      { endpoint: "DELETE /api/issues/:id/pull-requests/:prId" },
+    );
+  }
+
+  /** Turn PR auto-complete off (or back on) for one issue. */
+  async setIssuePRAutoComplete(issueId: string, disabled: boolean): Promise<IssuePullRequestsResponse> {
+    const raw = await this.fetch<unknown>(`/api/issues/${issueId}/pr-auto-complete`, {
+      method: "PUT",
+      body: JSON.stringify({ disabled }),
+    });
+    return parseWithFallback(
+      raw,
+      IssuePullRequestsResponseSchema,
+      EMPTY_ISSUE_PULL_REQUESTS_RESPONSE,
+      { endpoint: "PUT /api/issues/:id/pr-auto-complete" },
     );
   }
 
@@ -4769,7 +4934,7 @@ export class ApiClient {
     // against the corresponding accounts host (accounts.feishu.cn vs
     // accounts.larksuite.com) so the QR renders against the right
     // cloud up front. Empty / omitted region still resolves to Feishu
-    // server-side (RegionOrDefault) 鈥?we surface region as a required
+    // server-side (RegionOrDefault) — we surface region as a required
     // arg here so every call site is forced to make a deliberate
     // choice rather than silently defaulting to mainland.
     const search = new URLSearchParams({ agent_id: agentId, region });
@@ -4979,11 +5144,11 @@ export class ApiClient {
       { endpoint: "POST /api/dingtalk/binding/redeem" },
     );
   }
-  // WeCom smart-bot ("鏅鸿兘鏈哄櫒浜? / aibot) integration. The bot dials a
+  // WeCom smart-bot ("智能机器人" / aibot) integration. The bot dials a
   // WebSocket long connection to wss://openws.work.weixin.qq.com and stays
   // authenticated with (bot_id, secret); no public callback URL is required.
   // These three methods drive the Settings-page BYO Connect dialog + list +
-  // disconnect only 鈥?the inbound WebSocket loop runs entirely server-side.
+  // disconnect only — the inbound WebSocket loop runs entirely server-side.
   async listWecomInstallations(workspaceId: string): Promise<ListWecomInstallationsResponse> {
     const raw = await this.fetch<unknown>(`/api/workspaces/${workspaceId}/wecom/installations`);
     return parseWithFallback(
@@ -5026,9 +5191,9 @@ export class ApiClient {
   // token to the logged-in Multica user. Called by the /wecom/bind redeem
   // page after the user clicks through the "link your Multica account"
   // prompt the bot sent in WeCom. Status codes:
-  //   410 Gone      鈫?invalid / expired / already consumed
-  //   409 Conflict  鈫?the WeCom user is already bound to a different user
-  //   403 Forbidden 鈫?the logged-in user is not a workspace member
+  //   410 Gone      → invalid / expired / already consumed
+  //   409 Conflict  → the WeCom user is already bound to a different user
+  //   403 Forbidden → the logged-in user is not a workspace member
   async redeemWecomBindingToken(token: string): Promise<RedeemWecomBindingTokenResponse> {
     const raw = await this.fetch<unknown>(`/api/wecom/binding/redeem`, {
       method: "POST",
@@ -5090,7 +5255,6 @@ export class ApiClient {
       { endpoint: "POST /api/telegram/binding/redeem" },
     );
   }
-  // 鈹€鈹€ RongCloud: Public endpoints 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
   async getRongCloudConfig(): Promise<RongCloudConfig> {
     const raw = await this.fetch<unknown>("/api/config/rongcloud");

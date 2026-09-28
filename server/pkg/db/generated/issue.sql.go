@@ -487,8 +487,23 @@ cleared_wakeup_receipts AS (
 cleared_wakeups AS (
  DELETE FROM issue_wakeup WHERE issue_id IN (SELECT target.id FROM target)
 ),
+cleared_child_events AS (
+ DELETE FROM issue_child_event WHERE parent_id IN (SELECT target.id FROM target) OR child_id IN (SELECT target.id FROM target)
+),
+cleared_task_supplements AS (
+ DELETE FROM task_supplement WHERE issue_id IN (SELECT target.id FROM target)
+),
+cleared_task_supplement_capabilities AS (
+ DELETE FROM task_supplement_capability WHERE issue_id IN (SELECT target.id FROM target)
+),
 cleared_vcs_pr_links AS (
     DELETE FROM issue_vcs_pull_request WHERE issue_id IN (SELECT target.id FROM target)
+),
+cleared_pr_automation AS (
+    DELETE FROM issue_pr_automation WHERE issue_id IN (SELECT target.id FROM target)
+),
+cleared_pr_exclusions AS (
+    DELETE FROM issue_pull_request_exclusion WHERE issue_id IN (SELECT target.id FROM target)
 )
 DELETE FROM issue WHERE issue.id IN (SELECT target.id FROM target)
 `
@@ -1013,6 +1028,36 @@ func (q *Queries) GetIssueMetadataInWorkspace(ctx context.Context, arg GetIssueM
 	return i, err
 }
 
+const getIssueRefInWorkspace = `-- name: GetIssueRefInWorkspace :one
+SELECT id, number, title, status FROM issue
+WHERE id = $1 AND workspace_id = $2
+`
+
+type GetIssueRefInWorkspaceParams struct {
+	ID          pgtype.UUID `json:"id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+}
+
+type GetIssueRefInWorkspaceRow struct {
+	ID     pgtype.UUID `json:"id"`
+	Number int32       `json:"number"`
+	Title  string      `json:"title"`
+	Status string      `json:"status"`
+}
+
+// The summary a duplicate's response carries for its original (MUL-7349).
+func (q *Queries) GetIssueRefInWorkspace(ctx context.Context, arg GetIssueRefInWorkspaceParams) (GetIssueRefInWorkspaceRow, error) {
+	row := q.db.QueryRow(ctx, getIssueRefInWorkspace, arg.ID, arg.WorkspaceID)
+	var i GetIssueRefInWorkspaceRow
+	err := row.Scan(
+		&i.ID,
+		&i.Number,
+		&i.Title,
+		&i.Status,
+	)
+	return i, err
+}
+
 const getIssueTriageState = `-- name: GetIssueTriageState :one
 SELECT triage_state FROM issue WHERE id = $1
 `
@@ -1288,11 +1333,56 @@ func (q *Queries) ListIssueGCStatuses(ctx context.Context, arg ListIssueGCStatus
 	return items, nil
 }
 
+const listIssueRefsInWorkspace = `-- name: ListIssueRefsInWorkspace :many
+SELECT id, number, title, status FROM issue
+WHERE workspace_id = $1
+  AND id = ANY($2::uuid[])
+`
+
+type ListIssueRefsInWorkspaceParams struct {
+	WorkspaceID pgtype.UUID   `json:"workspace_id"`
+	Ids         []pgtype.UUID `json:"ids"`
+}
+
+type ListIssueRefsInWorkspaceRow struct {
+	ID     pgtype.UUID `json:"id"`
+	Number int32       `json:"number"`
+	Title  string      `json:"title"`
+	Status string      `json:"status"`
+}
+
+// GetIssueRefInWorkspace for a page: every original the page's duplicates
+// point at, in one read.
+func (q *Queries) ListIssueRefsInWorkspace(ctx context.Context, arg ListIssueRefsInWorkspaceParams) ([]ListIssueRefsInWorkspaceRow, error) {
+	rows, err := q.db.Query(ctx, listIssueRefsInWorkspace, arg.WorkspaceID, arg.Ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListIssueRefsInWorkspaceRow{}
+	for rows.Next() {
+		var i ListIssueRefsInWorkspaceRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Number,
+			&i.Title,
+			&i.Status,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listIssues = `-- name: ListIssues :many
 SELECT i.id, i.workspace_id, i.title, i.description, i.status, i.priority,
        i.assignee_type, i.assignee_id, i.creator_type, i.creator_id,
        i.parent_issue_id, i.position, i.start_date, i.due_date, i.created_at, i.updated_at, i.last_activity_at, i.number, i.project_id, i.metadata, i.stage, i.properties,
-       i.revision
+       i.revision, i.duplicate_of_issue_id
 FROM issue i
 WHERE i.workspace_id = $1
   AND ($4::text IS NULL OR i.status = $4)
@@ -1363,29 +1453,30 @@ type ListIssuesParams struct {
 }
 
 type ListIssuesRow struct {
-	ID             pgtype.UUID        `json:"id"`
-	WorkspaceID    pgtype.UUID        `json:"workspace_id"`
-	Title          string             `json:"title"`
-	Description    pgtype.Text        `json:"description"`
-	Status         string             `json:"status"`
-	Priority       string             `json:"priority"`
-	AssigneeType   pgtype.Text        `json:"assignee_type"`
-	AssigneeID     pgtype.UUID        `json:"assignee_id"`
-	CreatorType    string             `json:"creator_type"`
-	CreatorID      pgtype.UUID        `json:"creator_id"`
-	ParentIssueID  pgtype.UUID        `json:"parent_issue_id"`
-	Position       float64            `json:"position"`
-	StartDate      pgtype.Date        `json:"start_date"`
-	DueDate        pgtype.Date        `json:"due_date"`
-	CreatedAt      pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
-	LastActivityAt pgtype.Timestamptz `json:"last_activity_at"`
-	Number         int32              `json:"number"`
-	ProjectID      pgtype.UUID        `json:"project_id"`
-	Metadata       []byte             `json:"metadata"`
-	Stage          pgtype.Int4        `json:"stage"`
-	Properties     []byte             `json:"properties"`
-	Revision       int64              `json:"revision"`
+	ID                 pgtype.UUID        `json:"id"`
+	WorkspaceID        pgtype.UUID        `json:"workspace_id"`
+	Title              string             `json:"title"`
+	Description        pgtype.Text        `json:"description"`
+	Status             string             `json:"status"`
+	Priority           string             `json:"priority"`
+	AssigneeType       pgtype.Text        `json:"assignee_type"`
+	AssigneeID         pgtype.UUID        `json:"assignee_id"`
+	CreatorType        string             `json:"creator_type"`
+	CreatorID          pgtype.UUID        `json:"creator_id"`
+	ParentIssueID      pgtype.UUID        `json:"parent_issue_id"`
+	Position           float64            `json:"position"`
+	StartDate          pgtype.Date        `json:"start_date"`
+	DueDate            pgtype.Date        `json:"due_date"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
+	LastActivityAt     pgtype.Timestamptz `json:"last_activity_at"`
+	Number             int32              `json:"number"`
+	ProjectID          pgtype.UUID        `json:"project_id"`
+	Metadata           []byte             `json:"metadata"`
+	Stage              pgtype.Int4        `json:"stage"`
+	Properties         []byte             `json:"properties"`
+	Revision           int64              `json:"revision"`
+	DuplicateOfIssueID pgtype.UUID        `json:"duplicate_of_issue_id"`
 }
 
 // involves_user_id widens the assignee filter to surface issues where the user
@@ -1440,6 +1531,7 @@ func (q *Queries) ListIssues(ctx context.Context, arg ListIssuesParams) ([]ListI
 			&i.Stage,
 			&i.Properties,
 			&i.Revision,
+			&i.DuplicateOfIssueID,
 		); err != nil {
 			return nil, err
 		}
@@ -1455,7 +1547,7 @@ const listOpenIssues = `-- name: ListOpenIssues :many
 SELECT i.id, i.workspace_id, i.title, i.description, i.status, i.priority,
        i.assignee_type, i.assignee_id, i.creator_type, i.creator_id,
        i.parent_issue_id, i.position, i.start_date, i.due_date, i.created_at, i.updated_at, i.last_activity_at, i.number, i.project_id, i.metadata, i.stage, i.properties,
-       i.revision
+       i.revision, i.duplicate_of_issue_id
 FROM issue i
 WHERE i.workspace_id = $1
   -- Negate only known terminal keys so an unknown legacy key remains visible.
@@ -1572,29 +1664,30 @@ type ListOpenIssuesParams struct {
 }
 
 type ListOpenIssuesRow struct {
-	ID             pgtype.UUID        `json:"id"`
-	WorkspaceID    pgtype.UUID        `json:"workspace_id"`
-	Title          string             `json:"title"`
-	Description    pgtype.Text        `json:"description"`
-	Status         string             `json:"status"`
-	Priority       string             `json:"priority"`
-	AssigneeType   pgtype.Text        `json:"assignee_type"`
-	AssigneeID     pgtype.UUID        `json:"assignee_id"`
-	CreatorType    string             `json:"creator_type"`
-	CreatorID      pgtype.UUID        `json:"creator_id"`
-	ParentIssueID  pgtype.UUID        `json:"parent_issue_id"`
-	Position       float64            `json:"position"`
-	StartDate      pgtype.Date        `json:"start_date"`
-	DueDate        pgtype.Date        `json:"due_date"`
-	CreatedAt      pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
-	LastActivityAt pgtype.Timestamptz `json:"last_activity_at"`
-	Number         int32              `json:"number"`
-	ProjectID      pgtype.UUID        `json:"project_id"`
-	Metadata       []byte             `json:"metadata"`
-	Stage          pgtype.Int4        `json:"stage"`
-	Properties     []byte             `json:"properties"`
-	Revision       int64              `json:"revision"`
+	ID                 pgtype.UUID        `json:"id"`
+	WorkspaceID        pgtype.UUID        `json:"workspace_id"`
+	Title              string             `json:"title"`
+	Description        pgtype.Text        `json:"description"`
+	Status             string             `json:"status"`
+	Priority           string             `json:"priority"`
+	AssigneeType       pgtype.Text        `json:"assignee_type"`
+	AssigneeID         pgtype.UUID        `json:"assignee_id"`
+	CreatorType        string             `json:"creator_type"`
+	CreatorID          pgtype.UUID        `json:"creator_id"`
+	ParentIssueID      pgtype.UUID        `json:"parent_issue_id"`
+	Position           float64            `json:"position"`
+	StartDate          pgtype.Date        `json:"start_date"`
+	DueDate            pgtype.Date        `json:"due_date"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
+	LastActivityAt     pgtype.Timestamptz `json:"last_activity_at"`
+	Number             int32              `json:"number"`
+	ProjectID          pgtype.UUID        `json:"project_id"`
+	Metadata           []byte             `json:"metadata"`
+	Stage              pgtype.Int4        `json:"stage"`
+	Properties         []byte             `json:"properties"`
+	Revision           int64              `json:"revision"`
+	DuplicateOfIssueID pgtype.UUID        `json:"duplicate_of_issue_id"`
 }
 
 // See ListIssues for the semantics of involves_user_id (mirrors the 4-branch
@@ -1643,6 +1736,7 @@ func (q *Queries) ListOpenIssues(ctx context.Context, arg ListOpenIssuesParams) 
 			&i.Stage,
 			&i.Properties,
 			&i.Revision,
+			&i.DuplicateOfIssueID,
 		); err != nil {
 			return nil, err
 		}

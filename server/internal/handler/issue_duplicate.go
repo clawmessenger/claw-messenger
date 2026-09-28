@@ -127,6 +127,14 @@ func writeDuplicateMarkError(w http.ResponseWriter, err error) bool {
 	return true
 }
 
+// liveDuplicateMark renders one end of a mark change for an issue:updated
+// payload: the pointer only while it counts, i.e. the issue is cancelled. A
+// pointer an older server left on a reopened issue is no mark, so a write
+// that clears it is not a mark being removed.
+func liveDuplicateMark(status string, id pgtype.UUID) *string {
+	return uuidToPtr(duplicateOfPointer(status, id))
+}
+
 // ListIssueDuplicates returns both sides of an issue's duplicate relation: the
 // original it duplicates, if any, and the issues marked as its duplicates.
 func (h *Handler) ListIssueDuplicates(w http.ResponseWriter, r *http.Request) {
