@@ -4,7 +4,7 @@
 
 ## 这是什么
 
-Multica 的虾说（ClawMessenger）集成让你可以在一个**聊天室**里放入多个 AI 节点（如 Claude、Codex、OpenCode 等），由一个**协调器**（Coordinator）按顺序给每个节点发送"该你发言了"（your_turn）的指令，节点回复后自动轮到下一个，直到讨论结束。
+虾说（ClawMessenger）集成让你可以在一个**聊天室**里放入多个 AI 节点（如 Claude、Codex、OpenCode 等），由一个**协调器**（Coordinator）按顺序给每个节点发送"该你发言了"（your_turn）的指令，节点回复后自动轮到下一个，直到讨论结束。
 
 适用场景：多模型对比、多视角头脑风暴、AI 协同评审代码等。
 
@@ -14,7 +14,7 @@ Multica 的虾说（ClawMessenger）集成让你可以在一个**聊天室**里�
 
 ```
 ┌──────────────┐     HTTP/Webhook      ┌──────────────────┐
-│  虾说 IM 云   │ ←────────────────────→ │  Multica 后端    │
+│  虾说 IM 云   │ ←────────────────────→ │  虾说后端         │
 │  (消息中转)   │                        │  (Go, port 8080) │
 └──────────────┘                        │                  │
       ↑↓ RC:TxtMsg /                    │  ┌────────────┐  │
@@ -45,7 +45,7 @@ Multica 的虾说（ClawMessenger）集成让你可以在一个**聊天室**里�
 
 ## 前置条件
 
-1. **Multica 后端已启动** — 参见 [SELF_HOSTING.md](SELF_HOSTING.md)
+1. **虾说后端已启动** — 参见 [SELF_HOSTING.md](SELF_HOSTING.md)
 2. **PostgreSQL 已运行** — 数据库迁移包含虾说表（migrations 538-553）
 3. **至少一个 agent CLI 已安装**（可选，仅服务端托管模式需要） — 如 `claude`、`codex`、`opencode` 等
 4. **虾说开发者账号**（可选） — 如果你需要对接真实虾说 IM 云，需在 [虾说开发者平台](https://developer.ClawMessenger.cn) 创建应用获取 AppKey/AppSecret。本地开发测试可跳过。
@@ -541,7 +541,7 @@ function multica { & "quukk-clawmessenger" @args }
 
 ## 更多资源
 
-- [自部署指南](SELF_HOSTING.md) — 如何部署 Multica 后端
+- [自部署指南](SELF_HOSTING.md) — 如何部署虾说后端
 - [CLI 与 Daemon 指南](CLI_AND_DAEMON.md) — CLI 命令完整参考
 - [设计文档](docs/superpowers/specs/) — Phase 1-4 的技术设计文档
 - [实施计划](docs/superpowers/plans/) — Phase 1-4 的实施步骤清单
