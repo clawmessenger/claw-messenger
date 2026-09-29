@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -25,31 +26,42 @@ func (h *Handler) GetRongCloudConfig(w http.ResponseWriter, r *http.Request) {
 
 // RegisterRongCloudAINode registers a new AI node in RongCloud and stores its
 // credentials. Public endpoint (no workspace scope) — the node's workspace
-// and owner are assigned in Phase 2b when the workspace association flow lands.
+// attribution comes from an optional pairing ticket in the request body; the
+// owner defaults to a workspace manager resolved by the service.
 func (h *Handler) RegisterRongCloudAINode(w http.ResponseWriter, r *http.Request) {
 	if h.RongCloudNode == nil {
 		writeFeatureDisabled(w, "rongcloud_not_configured", "RongCloud integration is not configured")
 		return
 	}
 	var req struct {
-		Name         string   `json:"name"`
-		MacAddress   string   `json:"mac_address"`
-		NodeType     string   `json:"node_type"`
-		AIType       string   `json:"ai_type"`
-		Capabilities []string `json:"capabilities"`
+		Name          string   `json:"name"`
+		MacAddress    string   `json:"mac_address"`
+		NodeType      string   `json:"node_type"`
+		AIType        string   `json:"ai_type"`
+		Capabilities  []string `json:"capabilities"`
+		PairingTicket string   `json:"pairing_ticket"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	result, err := h.RongCloudNode.Register(r.Context(), rongcloud.NodeRegisterParams{
-		Name:         req.Name,
-		MacAddress:   req.MacAddress,
-		NodeType:     req.NodeType,
-		AIType:       req.AIType,
-		Capabilities: req.Capabilities,
+		Name:          req.Name,
+		MacAddress:    req.MacAddress,
+		NodeType:      req.NodeType,
+		AIType:        req.AIType,
+		Capabilities:  req.Capabilities,
+		PairingTicket: req.PairingTicket,
 	})
 	if err != nil {
+		if errors.Is(err, rongcloud.ErrWorkspaceAttributionRequired) {
+			writeError(w, http.StatusBadRequest, "workspace attribution required: provide a pairing_ticket")
+			return
+		}
+		if errors.Is(err, rongcloud.ErrInvalidPairingTicket) {
+			writeError(w, http.StatusBadRequest, "invalid or expired pairing_ticket")
+			return
+		}
 		if strings.Contains(err.Error(), "duplicate") {
 			writeError(w, http.StatusConflict, "node already registered")
 			return
@@ -360,10 +372,10 @@ func (h *Handler) UpdateRongCloudChatroom(w http.ResponseWriter, r *http.Request
 		return
 	}
 	var req struct {
-		HostNodeID      string          `json:"host_node_id"`
-		MaxRounds       int32           `json:"max_rounds"`
-		ConversationKind string         `json:"conversation_kind"`
-		Config          json.RawMessage `json:"config"`
+		HostNodeID       string          `json:"host_node_id"`
+		MaxRounds        int32           `json:"max_rounds"`
+		ConversationKind string          `json:"conversation_kind"`
+		Config           json.RawMessage `json:"config"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -422,7 +434,7 @@ func (h *Handler) SetRongCloudChatroomMembers(w http.ResponseWriter, r *http.Req
 			RoleInstructions: m.RoleInstructions,
 			Capabilities:     m.Capabilities,
 			Model:            m.Model,
-			SpeakingOrder:     m.SpeakingOrder,
+			SpeakingOrder:    m.SpeakingOrder,
 			DiscussionModel:  m.DiscussionModel,
 		})
 	}
@@ -517,10 +529,10 @@ func (h *Handler) CreateRongCloudDevice(w http.ResponseWriter, r *http.Request) 
 	}
 	device, err := h.RongCloudNode.CreateDevice(r.Context(), rongcloud.DeviceCreateParams{
 		WorkspaceID: wsID,
-		OwnerUserID:  ownerUUID,
-		NodeID:       nodeUUID,
-		DeviceName:   req.DeviceName,
-		DeviceType:   req.DeviceType,
+		OwnerUserID: ownerUUID,
+		NodeID:      nodeUUID,
+		DeviceName:  req.DeviceName,
+		DeviceType:  req.DeviceType,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create device")

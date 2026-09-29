@@ -19,13 +19,14 @@ import (
 )
 
 type NodeRegisterParams struct {
-	Name         string   `json:"name"`
-	MacAddress   string   `json:"mac_address"`
-	NodeType     string   `json:"node_type"`
-	AIType       string   `json:"ai_type"`
-	Capabilities []string `json:"capabilities"`
-	WorkspaceID  pgtype.UUID
-	OwnerUserID  pgtype.UUID
+	Name          string   `json:"name"`
+	MacAddress    string   `json:"mac_address"`
+	NodeType      string   `json:"node_type"`
+	AIType        string   `json:"ai_type"`
+	Capabilities  []string `json:"capabilities"`
+	PairingTicket string   `json:"pairing_ticket"` // optional: attribute node to the ticket's workspace
+	WorkspaceID   pgtype.UUID
+	OwnerUserID   pgtype.UUID
 }
 
 type NodeRegisterResult struct {
@@ -73,6 +74,20 @@ func (s *NodeService) Register(ctx context.Context, params NodeRegisterParams) (
 	if s.client == nil {
 		return NodeRegisterResult{}, errors.New("rongcloud: API client not configured")
 	}
+	// Resolve workspace attribution: explicit params take precedence, then a
+	// pending pairing ticket. The rongcloud tables require a workspace and an
+	// owner, so without either source Register fails fast instead of pushing
+	// a NOT NULL violation down into the database.
+	if !params.WorkspaceID.Valid {
+		resolved, err := s.resolveWorkspaceAttribution(ctx, params.PairingTicket)
+		if err != nil {
+			return NodeRegisterResult{}, err
+		}
+		params.WorkspaceID = resolved.workspaceID
+		if !params.OwnerUserID.Valid {
+			params.OwnerUserID = resolved.ownerUserID
+		}
+	}
 	rcUserID := fmt.Sprintf("rc_node_%s", params.MacAddress)
 	token, err := s.client.getUserToken(ctx, rcUserID, params.Name, "")
 	if err != nil {
@@ -105,7 +120,7 @@ func (s *NodeService) Register(ctx context.Context, params NodeRegisterParams) (
 		RongcloudUserID: rcUserID,
 		NodeID:          nodeID,
 		AiType:          pgText(params.AIType),
-		Capabilities:     capabilitiesJSON,
+		Capabilities:    capabilitiesJSON,
 		DeployStatus:    "offline",
 		BindingVersion:  1,
 	})
@@ -140,6 +155,45 @@ func (s *NodeService) Register(ctx context.Context, params NodeRegisterParams) (
 		DeviceCredentialTicket: credID,
 		BindingVersion:         int(node.BindingVersion),
 	}, nil
+}
+
+// ErrWorkspaceAttributionRequired is returned by Register when neither an
+// explicit workspace nor a usable pairing ticket was supplied. The rongcloud
+// tables have no nullable workspace, so an unattributed node cannot be stored.
+var ErrWorkspaceAttributionRequired = errors.New("rongcloud: workspace attribution required")
+
+// ErrInvalidPairingTicket is returned by Register when the pairing ticket does
+// not exist, is no longer pending, or has expired. Registering with a bad
+// ticket must fail loudly, not silently drop the attribution.
+var ErrInvalidPairingTicket = errors.New("rongcloud: invalid or expired pairing ticket")
+
+type workspaceAttribution struct {
+	workspaceID pgtype.UUID
+	ownerUserID pgtype.UUID
+}
+
+// resolveWorkspaceAttribution fills the workspace (and a default owner) from a
+// pending, unexpired pairing ticket. An empty ticket yields
+// ErrWorkspaceAttributionRequired; a known-but-unusable one yields
+// ErrInvalidPairingTicket. The owner defaults to the workspace's first
+// manager (owner role first) because the pairing session carries no owner of
+// its own; an explicit params.OwnerUserID still wins.
+func (s *NodeService) resolveWorkspaceAttribution(ctx context.Context, ticket string) (workspaceAttribution, error) {
+	if ticket == "" {
+		return workspaceAttribution{}, ErrWorkspaceAttributionRequired
+	}
+	session, err := s.queries.GetRongCloudPairingSessionByTicket(ctx, ticket)
+	if err != nil {
+		return workspaceAttribution{}, fmt.Errorf("%w: %v", ErrInvalidPairingTicket, err)
+	}
+	if session.Status != "pending" || !session.ExpiresAt.Time.After(time.Now()) {
+		return workspaceAttribution{}, ErrInvalidPairingTicket
+	}
+	owner := pgtype.UUID{}
+	if managers, err := s.queries.ListWorkspaceManagerUserIDs(ctx, session.WorkspaceID); err == nil && len(managers) > 0 {
+		owner = managers[0]
+	}
+	return workspaceAttribution{workspaceID: session.WorkspaceID, ownerUserID: owner}, nil
 }
 
 func (s *NodeService) RefreshToken(ctx context.Context, nodeID string) (string, error) {
@@ -328,10 +382,10 @@ func (s *NodeService) OpenConnectionSession(ctx context.Context, nodeID string) 
 		"opened_at": ts,
 	})
 	_, err = s.queries.UpsertRongCloudSystemConfig(ctx, db.UpsertRongCloudSystemConfigParams{
-		WorkspaceID:  node.WorkspaceID,
-		ConfigKey:    "connection_session:" + sessionID,
-		NodeID:       node.ID,
-		Config:       configJSON,
+		WorkspaceID:   node.WorkspaceID,
+		ConfigKey:     "connection_session:" + sessionID,
+		NodeID:        node.ID,
+		Config:        configJSON,
 		ConfigVersion: 1,
 	})
 	if err != nil {
