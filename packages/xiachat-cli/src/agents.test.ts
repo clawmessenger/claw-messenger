@@ -3,8 +3,6 @@ import { describe, expect, it } from "vitest";
 import { discoverAgents, KNOWN_AGENT_CLIS, runAgentTurn } from "./agents.js";
 import { createEchoAgentScript, type EchoAgentFixture } from "./test-fixtures.js";
 
-const windowsFlaky = process.platform === "win32";
-
 describe("KNOWN_AGENT_CLIS", () => {
   it("matches the server-side knownAgentCLIs list", () => {
     expect(KNOWN_AGENT_CLIS).toEqual([
