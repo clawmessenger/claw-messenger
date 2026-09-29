@@ -1,6 +1,8 @@
 // @vitest-environment node
 import { describe, expect, it, vi } from "vitest";
-import { SessionQueue } from "./run.js";
+import { SessionQueue, connectTransport } from "./run.js";
+import type { IMTransport } from "./im.js";
+import { XiachatApi } from "./api.js";
 
 describe("SessionQueue", () => {
   it("serializes messages within one conversation", async () => {
@@ -72,5 +74,102 @@ describe("SessionQueue", () => {
     q.enqueue("conv-1", async () => { ranAfter = true; });
     await q.idle();
     expect(ranAfter).toBe(true);
+  });
+});
+
+describe("connectTransport (token-expiry auto-reconnect, spec 9.1)", () => {
+  function makeHarness(opts: {
+    storedToken: string;
+    connectAttempts: Array<(token: string) => Promise<void>>;
+    refreshToken?: (nodeId: string) => Promise<{ token: string }>;
+  }) {
+    const connectCalls: string[] = [];
+    const transport: IMTransport = {
+      connect: (appKey: string, token: string) => {
+        connectCalls.push(token);
+        const impl = opts.connectAttempts[connectCalls.length - 1];
+        return impl(token);
+      },
+      sendMessage: async () => {},
+      onMessage: () => {},
+      disconnect: async () => {},
+    };
+    const api = new XiachatApi("http://unused.local");
+    const refreshToken = opts.refreshToken
+      ?? vi.fn(async () => ({ token: "fresh-token" }));
+    vi.spyOn(api, "refreshToken").mockImplementation(refreshToken);
+    vi.spyOn(api, "getConfig").mockImplementation(async () => ({ appKey: "appkey-1" }));
+    return {
+      transport,
+      api,
+      connectCalls,
+      run: () =>
+        connectTransport({
+          creds: { nodeId: "node_1", token: opts.storedToken, serverUrl: "http://unused.local", appKey: "appkey-1" },
+          api,
+          transport,
+        }),
+    };
+  }
+
+  it("connects with the stored token when it is still valid", async () => {
+    const h = makeHarness({
+      storedToken: "valid-token",
+      connectAttempts: [async () => {}],
+    });
+    await h.run();
+    expect(h.connectCalls).toEqual(["valid-token"]);
+  });
+
+  it("refreshes the token once on connect failure and retries with the fresh token", async () => {
+    const h = makeHarness({
+      storedToken: "expired-token",
+      connectAttempts: [
+        async () => { throw new Error("imlib connect failed: 31004 token expired"); },
+        async () => {},
+      ],
+    });
+    await h.run();
+    // First connect used the stale stored token; the single retry used the
+    // refreshed token (and nothing else).
+    expect(h.connectCalls).toEqual(["expired-token", "fresh-token"]);
+  });
+
+  it("propagates the failure when the retried connect also fails", async () => {
+    const h = makeHarness({
+      storedToken: "expired-token",
+      connectAttempts: [
+        async () => { throw new Error("imlib connect failed: 31004"); },
+        async () => { throw new Error("imlib connect failed: 31004"); },
+      ],
+    });
+    await expect(h.run()).rejects.toThrow("31004");
+    expect(h.connectCalls).toEqual(["expired-token", "fresh-token"]);
+  });
+
+  it("does not retry more than once", async () => {
+    const calls: string[] = [];
+    const transport: IMTransport = {
+      connect: (_appKey: string, token: string) => {
+        calls.push(token);
+        return Promise.reject(new Error("imlib connect failed: 31004"));
+      },
+      sendMessage: async () => {},
+      onMessage: () => {},
+      disconnect: async () => {},
+    };
+    const api = new XiachatApi("http://unused.local");
+    const refresh = vi.fn(async () => ({ token: "fresh-token" }));
+    vi.spyOn(api, "refreshToken").mockImplementation(refresh);
+    vi.spyOn(api, "getConfig").mockImplementation(async () => ({ appKey: "appkey-1" }));
+    await expect(
+      connectTransport({
+        creds: { nodeId: "node_1", token: "stale", serverUrl: "http://unused.local", appKey: "appkey-1" },
+        api,
+        transport,
+      }),
+    ).rejects.toThrow("31004");
+    expect(calls).toEqual(["stale", "fresh-token"]);
+    expect(refresh).toHaveBeenCalledTimes(1);
   });
 });

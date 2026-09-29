@@ -102,10 +102,13 @@ export function conversationKeyOf(msg: InboundIMMessage): string {
   return `${msg.conversationType}:${msg.targetId}`;
 }
 
-export interface StartRunLoopOpts {
+export interface ConnectTransportOpts {
   creds: StoredCredentials;
   api: XiachatApi;
   transport: IMTransport;
+}
+
+export interface StartRunLoopOpts extends ConnectTransportOpts {
   agentExecPath: string;
   model?: string;
   stdout: NodeJS.WriteStream;
@@ -113,8 +116,7 @@ export interface StartRunLoopOpts {
 }
 
 export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
-  const { appKey, token } = await ensureConnection(opts);
-  await opts.transport.connect(appKey, token);
+  await connectTransport(opts);
 
   const dispatcher = new MessageDispatcher({
     send: (toUserId, objectName, content) => opts.transport.sendMessage(toUserId, objectName, content),
@@ -168,16 +170,28 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
   await new Promise<void>(() => {}); // run until process exit
 }
 
-async function ensureConnection(opts: StartRunLoopOpts): Promise<{ appKey: string; token: string }> {
+// Resolve appKey + token and connect. Token-expiry auto-reconnect (spec
+// 9.1): when the first connect fails, refresh the token once and retry
+// with the fresh token — a single retry, no loops. The refreshed token is
+// used for this session only; startRunLoop has no keystore access to
+// persist it (run `xiachat login` to store one).
+export async function connectTransport(opts: ConnectTransportOpts): Promise<void> {
   const appKey = opts.creds.appKey ?? (await opts.api.getConfig()).appKey;
   let token = opts.creds.token;
   if (!token) {
-    // The refreshed token is used for this session only; startRunLoop has no
-    // keystore access to persist it (run `xiachat login` to store one).
     const refreshed = await opts.api.refreshToken(opts.creds.nodeId);
     token = refreshed.token;
   }
-  return { appKey, token };
+  try {
+    await opts.transport.connect(appKey, token);
+  } catch (err) {
+    console.error(
+      "connect failed, refreshing token once and retrying:",
+      err instanceof Error ? err.message : err,
+    );
+    const refreshed = await opts.api.refreshToken(opts.creds.nodeId);
+    await opts.transport.connect(appKey, refreshed.token);
+  }
 }
 
 // Production transport over @rongcloud/imlib-next 5.46.1. The imlib API
