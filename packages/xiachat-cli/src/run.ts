@@ -133,12 +133,15 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
       // Single chat busy hint; discussion turns never overflow (coordinator
       // serializes turns itself).
       void opts.transport
-        .sendMessage(peer, "RC:TxtMsg", JSON.stringify({ content: "正在思考中，请稍候…" }))
+        .sendMessage(peer, "RC:TxtMsg", JSON.stringify({ content: "正在思考中…" }))
         .catch(() => {});
     },
   });
 
   opts.transport.onMessage((msg) => {
+    // IM observability: every inbound message is logged so smoke runs can
+    // tell "message never arrived" from "dispatch failed".
+    console.log(`im in: type=${msg.objectName} from=${msg.fromUserId} conv=${msg.conversationType}`);
     const key = conversationKeyOf(msg);
     busyPeer.set(key, msg.fromUserId);
     queue.enqueue(key, async () => {
@@ -188,6 +191,10 @@ async function ensureConnection(opts: StartRunLoopOpts): Promise<{ appKey: strin
 type CommandMessageCtor = new (content: Record<string, unknown>) => BaseMessage<Record<string, unknown>>;
 
 export async function createImlibTransport(): Promise<IMTransport> {
+  // imlib-next is browser-built; give it the minimal Node globals it
+  // touches (window/localStorage/XHR) before importing.
+  const { installBrowserShim } = await import("./browser-shim.js");
+  installBrowserShim();
   const imlib = await import("@rongcloud/imlib-next");
   const listeners: Array<(msg: InboundIMMessage) => void> = [];
   let commandMessage: CommandMessageCtor | undefined;
