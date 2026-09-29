@@ -99,6 +99,30 @@ export function buildProgram(opts: BuildProgramOpts): Command {
     });
 
   program
+    .command("run")
+    .description("Connect to RongCloud IM and dispatch agent turns")
+    .requiredOption("--agent <name>", "agent CLI name; must be discoverable on PATH (see xiachat agents)")
+    .option("--model <model>", "model override passed to the agent CLI")
+    .action(async (cmdOpts: { agent: string; model?: string }) => {
+      const creds = opts.keystore.load();
+      if (!creds) throw new Error("no credentials; run xiachat register or pair first");
+      const api = opts.apiFactory(creds.serverUrl);
+      const found = await discoverAgents({});
+      const agent = found.find((a) => a.name === cmdOpts.agent);
+      if (!agent) throw new Error(`agent CLI ${cmdOpts.agent} not found on PATH; run xiachat agents`);
+      const { startRunLoop, createImlibTransport } = await import("./run.js");
+      const transport = await createImlibTransport();
+      await startRunLoop({
+        creds,
+        api,
+        transport,
+        agentExecPath: agent.path,
+        model: cmdOpts.model,
+        stdout: opts.stdout,
+      });
+    });
+
+  program
     .command("status")
     .description("Show stored identity")
     .action(async () => {
