@@ -11,9 +11,29 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/util/secretbox"
 	"github.com/multica-ai/multica/server/pkg/db/generated"
+)
+
+// Claim-verdict sentinels. They let the handler separate client-fixable
+// rejections (unknown ticket, session not claimable, bad claim key) from
+// database faults, which stay wrapped errors mapped to 500.
+var (
+	// ErrUnknownPairingTicket is returned by ClaimSession when no session
+	// exists for the ticket.
+	ErrUnknownPairingTicket = errors.New("rongcloud: unknown pairing ticket")
+	// ErrPairingSessionNotPending is returned when the session was already
+	// claimed, expired or cancelled and the request is not an idempotent
+	// replay of the original claim.
+	ErrPairingSessionNotPending = errors.New("rongcloud: pairing session is not pending")
+	// ErrPairingSessionExpired is returned when the session's expiry passed;
+	// the session is marked expired before the error is returned.
+	ErrPairingSessionExpired = errors.New("rongcloud: pairing session expired")
+	// ErrInvalidClaimKey is returned when the request's claim key does not
+	// match the key the workspace bound to the session at creation.
+	ErrInvalidClaimKey = errors.New("rongcloud: invalid client claim key")
 )
 
 type PairingCreateParams struct {
@@ -85,23 +105,26 @@ func (s *PairingService) ClaimSession(ctx context.Context, ticket, clientClaimKe
 	}
 	session, err := s.queries.GetRongCloudPairingSessionByTicket(ctx, ticket)
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ClaimResult{}, ErrUnknownPairingTicket
+		}
 		return ClaimResult{}, fmt.Errorf("rongcloud: get pairing session: %w", err)
 	}
 	if session.Status != "pending" {
 		if session.IdempotencyKey.Valid && session.IdempotencyKey.String == idempotencyKey && session.Status == "claimed" {
 			return ClaimResult{Session: session}, nil
 		}
-		return ClaimResult{}, errors.New("rongcloud: pairing session is not pending")
+		return ClaimResult{}, ErrPairingSessionNotPending
 	}
 	if session.ExpiresAt.Time.Before(time.Now()) {
 		_, _ = s.queries.UpdateRongCloudPairingSessionStatus(ctx, db.UpdateRongCloudPairingSessionStatusParams{
 			ID:     session.ID,
 			Status: "expired",
 		})
-		return ClaimResult{}, errors.New("rongcloud: pairing session expired")
+		return ClaimResult{}, ErrPairingSessionExpired
 	}
 	if session.ClientClaimKey.Valid && session.ClientClaimKey.String != clientClaimKey {
-		return ClaimResult{}, errors.New("rongcloud: invalid client claim key")
+		return ClaimResult{}, ErrInvalidClaimKey
 	}
 	session, err = s.queries.UpdateRongCloudPairingSessionStatus(ctx, db.UpdateRongCloudPairingSessionStatusParams{
 		ID:     session.ID,

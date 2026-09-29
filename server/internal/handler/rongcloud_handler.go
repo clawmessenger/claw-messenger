@@ -248,6 +248,51 @@ func (h *Handler) CloseConnectionSession(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+// ClaimRongCloudPairing lets a device claim a pairing session with a ticket.
+// Public endpoint (no workspace scope): the ticket itself is the credential;
+// an optional client claim key, bound at session creation, hardens it.
+func (h *Handler) ClaimRongCloudPairing(w http.ResponseWriter, r *http.Request) {
+	if h.RongCloudPairing == nil {
+		writeFeatureDisabled(w, "rongcloud_not_configured", "RongCloud integration is not configured")
+		return
+	}
+	ticket := chi.URLParam(r, "ticket")
+	if ticket == "" {
+		writeError(w, http.StatusBadRequest, "missing ticket")
+		return
+	}
+	var req struct {
+		ClientClaimKey string `json:"client_claim_key"`
+		IdempotencyKey string `json:"idempotency_key"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	result, err := h.RongCloudPairing.ClaimSession(r.Context(), ticket, req.ClientClaimKey, req.IdempotencyKey)
+	if err != nil {
+		switch {
+		case errors.Is(err, rongcloud.ErrUnknownPairingTicket):
+			writeError(w, http.StatusNotFound, "pairing session not found")
+		case errors.Is(err, rongcloud.ErrPairingSessionNotPending):
+			writeError(w, http.StatusConflict, "pairing session is not pending")
+		case errors.Is(err, rongcloud.ErrPairingSessionExpired):
+			writeError(w, http.StatusGone, "pairing session expired")
+		case errors.Is(err, rongcloud.ErrInvalidClaimKey):
+			writeError(w, http.StatusBadRequest, "invalid client claim key")
+		default:
+			writeError(w, http.StatusInternalServerError, "failed to claim pairing session")
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"device_credential_id": result.DeviceCredentialID,
+		"device_secret":        result.DeviceSecret,
+		"node_id":              result.NodeID,
+		"session":              result.Session,
+	})
+}
+
 // --- Task 7: Workspace member GET endpoints ---
 
 // GetRongCloudChatroom retrieves a single chatroom by ID.
