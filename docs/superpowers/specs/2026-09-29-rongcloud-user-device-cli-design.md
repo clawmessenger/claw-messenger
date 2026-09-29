@@ -138,8 +138,15 @@ src/
 
 ### 3.2 路径 A：直接注册（个人快速上手）
 
+> **实现决定（2026-09-29，final review I2）**：路径 A 现要求管理员预先签发
+> pending 配对票——注册请求必须携带 `pairing_ticket`。原因：migration 564 的
+> rongcloud 各表 `workspace_id` 为 `NOT NULL`，无归属的节点无法落库（分支前
+> 的代码写零 UUID 并以 500 失败）。空 ticket 现返回 400
+> "workspace attribution required: provide a pairing_ticket"。下文的
+> "无 ticket 直接注册" 流程不再可用。
+
 ```
-CLI → POST /api/ai/register {name, ai_type, node_type:"ai", capabilities:[…]}
+CLI → POST /api/ai/register {name, ai_type, node_type:"ai", capabilities:[…], pairing_ticket:"pt_…"}
     ← {node_id, token, device_credential_ticket, binding_version}
 CLI 本地保存 → 连 IM → 上线
 ```

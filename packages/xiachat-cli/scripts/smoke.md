@@ -20,15 +20,15 @@ INSERT INTO rongcloud_pairing_session (workspace_id, ticket, status, expires_at)
 VALUES ('48a1d54a-5a96-4fbd-9586-6ef2a1d6bc99', 'pt_<64hex>', 'pending', now() + interval '30 minutes');
 ```
 
-节点注册（二选一）：
+节点注册（二选一；均需 pairing ticket——rongcloud 表 workspace NOT NULL，无 ticket 返回 400）：
 
 ```powershell
-# CLI（注意：当前 CLI 不发送 mac_address，同一机器重复注册空 mac 会 500 重复键）
-node packages/xiachat-cli/dist/xiachat.bundle.js register --server http://localhost:8081 --ticket pt_<64hex> --agent opencode
+# CLI（自动携带稳定机器 ID 作为 mac_address，同机重注册复用 rc_user_id）
+node packages/xiachat-cli/dist/xiachat.bundle.js register --server http://localhost:8081 --name xiachat-node --ai-type xiachat --pairing-ticket pt_<64hex>
 
-# curl（带 mac_address，ai_type=xiachat 走 IM 路径）
+# curl（显式 mac_address，ai_type=xiachat 走 IM 路径）
 curl -X POST http://localhost:8081/api/ai/register -H "Content-Type: application/json" `
-  -d '{"ticket":"pt_<64hex>","ai_type":"xiachat","mac_address":"aa:bb:cc:dd:ee:77","agent":"opencode"}'
+  -d '{"name":"xiachat-node","ai_type":"xiachat","node_type":"ai","mac_address":"aa:bb:cc:dd:ee:77","pairing_ticket":"pt_<64hex>"}'
 ```
 
 验证：响应 201 含 `token`；`node ... status` 显示 token；DB 行 `rongcloud_node`（`node_id`、`rongcloud_user_id = 'rc_node_' + mac_address`）。
@@ -67,7 +67,6 @@ curl -X POST http://localhost:8081/api/workspaces/<ws>/rongcloud/discussions -H 
 
 1. **agent 执行 STDIN 缺口**：`runAgentTurn`（CLI）与 Go DiscussionBridge 均以 STDIN 喂 prompt；真实 codex 拒绝、opencode 交互挂起。argv 方式（`opencode run '<prompt>'`）可用。回合完成（单聊回复、讨论 turn_completed）因此标记 PENDING MANUAL。
 2. **回包链路 webhook**：节点→服务端回包需融云控制台 webhook 指向本服务；localhost 不可达，需公网 URL（控制台配置）。CLI→云端→CLI 已验证。
-3. **CLI 重复注册空 mac**：CLI register 不发送 mac_address，同机二次注册空 mac 触发 500（唯一键冲突）。workaround：curl 带独立 mac_address。
 
 ## 服务端缺陷（冒烟中发现并修复，见 fix(rongcloud) commit）
 
