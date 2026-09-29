@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -25,9 +26,16 @@ type rongcloudAPIClient struct {
 	base      string
 	client    *http.Client
 	logger    *slog.Logger
-	// loadCreds, when set, lazily resolves credentials from the active
-	// channel installation on first use (and re-resolves after a reset).
+	// loadCreds, when set, resolves credentials from the active channel
+	// installation. Resolution happens at most once per process: on success
+	// the values cache for the client's lifetime; rotation requires a
+	// process restart. Guarded by credsMu.
 	loadCreds func(ctx context.Context) (appKey, appSecret string, err error)
+	credsMu   sync.Mutex
+	// credsResolved is set once credentials are known (either supplied at
+	// construction or successfully loaded), so failed loads can retry
+	// without re-running after a success.
+	credsResolved bool
 }
 
 func newRongCloudAPIClient(appKey, appSecret, base string, client *http.Client, logger *slog.Logger) *rongcloudAPIClient {
@@ -90,10 +98,17 @@ func (c *rongcloudAPIClient) signRequest(req *http.Request, contentType string) 
 }
 
 // ensureCreds populates appKey/appSecret for service-layer clients that were
-// constructed without credentials, resolving them lazily from the active
-// channel installation so a later (re)configuration is picked up too.
+// constructed without credentials, resolving them from the active channel
+// installation exactly once: concurrent callers wait on the mutex while the
+// first resolves; a failed resolution leaves the client unresolved so the
+// next request retries, while a success caches for the process lifetime.
 func (c *rongcloudAPIClient) ensureCreds(ctx context.Context) error {
-	if c.appKey != "" && c.appSecret != "" || c.loadCreds == nil {
+	if c.loadCreds == nil {
+		return nil
+	}
+	c.credsMu.Lock()
+	defer c.credsMu.Unlock()
+	if c.credsResolved {
 		return nil
 	}
 	appKey, appSecret, err := c.loadCreds(ctx)
@@ -104,6 +119,7 @@ func (c *rongcloudAPIClient) ensureCreds(ctx context.Context) error {
 		return fmt.Errorf("rongcloud: no active installation with app credentials")
 	}
 	c.appKey, c.appSecret = appKey, appSecret
+	c.credsResolved = true
 	return nil
 }
 

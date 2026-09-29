@@ -30,6 +30,9 @@ func (s *InstallService) GetAppKey(ctx context.Context) string {
 	if s.queries == nil {
 		return ""
 	}
+	// Single-install assumption: when several active installations exist,
+	// the oldest one (ListActiveChannelInstallations orders by created_at)
+	// wins across all workspaces. Workspace scoping needs product input.
 	insts, err := s.queries.ListActiveChannelInstallations(ctx, string(TypeRongCloud))
 	if err != nil || len(insts) == 0 {
 		return ""
