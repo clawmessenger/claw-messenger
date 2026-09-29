@@ -1,9 +1,11 @@
 // Minimal browser globals for @rongcloud/imlib-next (browser-built) under
-// Node. Covers exactly what the engine touches at init/connect/send time:
+// Node. Covers what the engine touches at init/connect/send time:
 // `window` (Electron context-bridge probe, online/offline listeners),
 // localStorage (KV cache), location.protocol, and an XMLHttpRequest backed
-// by fetch. Not a general-purpose polyfill; anything beyond these code
-// paths will throw loudly instead of silently misbehaving.
+// by fetch. Not a general-purpose polyfill: XHR surface beyond the
+// engine's usage (e.g. responseType, timeout, intermediate readyState) is
+// absent and may fail silently rather than throw; unshimmed globals are
+// simply undefined.
 
 export function installBrowserShim(): void {
   const g = globalThis as typeof globalThis & {

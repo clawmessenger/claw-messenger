@@ -2,12 +2,15 @@ import { Command } from "commander";
 import { Keystore, type StoredCredentials } from "./keystore.js";
 import { XiachatApi } from "./api.js";
 import { discoverAgents } from "./agents.js";
-import { DEFAULT_SERVER_URL } from "./config.js";
+import { DEFAULT_SERVER_URL, machineId } from "./config.js";
 
 export interface BuildProgramOpts {
   keystore: Keystore;
   apiFactory: (serverUrl: string) => XiachatApi;
   stdout: NodeJS.WriteStream;
+  // Injectable for tests; defaults to the machine-id minted next to the
+  // keystore (see config.ts machineId).
+  machineId?: () => string;
 }
 
 export function buildProgram(opts: BuildProgramOpts): Command {
@@ -34,6 +37,9 @@ export function buildProgram(opts: BuildProgramOpts): Command {
           name: cmdOpts.name,
           aiType: cmdOpts.aiType,
           nodeType: "ai",
+          // Stable per-machine id: keeps rc_user_id (and thus node_id)
+          // consistent across re-registers on one machine.
+          macAddress: (opts.machineId ?? machineId)(),
           pairingTicket: cmdOpts.pairingTicket,
         });
         const creds: StoredCredentials = {

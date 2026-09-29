@@ -39,6 +39,29 @@ describe("xiachat register", () => {
     expect(stored?.serverUrl).toBe("http://srv");
   });
 
+  it("sends a non-empty stable mac_address on register", async () => {
+    const keystore = tempKeystore();
+    const seenMac: string[] = [];
+    const fakeApi = {
+      getConfig: async () => ({ appKey: "pk" }),
+      register: async (params: { macAddress?: string }) => {
+        seenMac.push(params.macAddress ?? "");
+        return { nodeId: "node_1", token: "tok_1" };
+      },
+      claimPairing: async () => ({ deviceCredentialId: "", deviceSecret: "", nodeId: "" }),
+      refreshToken: async () => ({ token: "" }),
+    };
+    const program = buildProgram({
+      keystore,
+      apiFactory: () => fakeApi as unknown as XiachatApi,
+      stdout: process.stdout,
+    });
+    await program.parseAsync(["node", "xiachat", "register", "--name", "n", "--ai-type", "claude", "--server", "http://srv"]);
+    await program.parseAsync(["node", "xiachat", "register", "--name", "n", "--ai-type", "claude", "--server", "http://srv"]);
+    expect(seenMac[0].length).toBeGreaterThan(0);
+    expect(seenMac[1]).toBe(seenMac[0]);
+  });
+
   it("register --server is required", async () => {
     const program = buildProgram({
       keystore: tempKeystore(),
