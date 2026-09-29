@@ -9,9 +9,15 @@ export interface CommandContent {
   params?: Record<string, unknown>;
 }
 
+// Semantic result kind; rides INSIDE payload (payload.kind). The outer
+// msg_type is always the literal "command_result" — the Go webhook gate
+// (channel.go isCommandResult) routes on that exact string, and the
+// server's own sendCommandResult (client.go) emits nothing else.
+export type CommandResultKind = "text" | "stream" | "error";
+
 export interface CommandResultContent {
   request_id: string;
-  msg_type: "text" | "stream" | "error";
+  msg_type: "command_result";
   payload: Record<string, unknown>;
 }
 
@@ -53,10 +59,14 @@ export function decodeCommandContent(raw: string): CommandContent | null {
 
 export function encodeCommandResult(
   requestId: string,
-  msgType: CommandResultContent["msg_type"],
+  kind: CommandResultKind,
   payload: Record<string, unknown>,
 ): string {
-  return JSON.stringify({ request_id: requestId, msg_type: msgType, payload });
+  return JSON.stringify({
+    request_id: requestId,
+    msg_type: "command_result",
+    payload: { kind, ...payload },
+  });
 }
 
 export function encodeStreamFrame(

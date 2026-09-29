@@ -45,12 +45,24 @@ describe("decodeCommandContent", () => {
 });
 
 describe("encodeCommandResult", () => {
-  it("echoes request_id and tags msg_type", () => {
+  it("emits the literal command_result msg_type the Go webhook gate requires", () => {
+    // server/internal/integrations/rongcloud channel.go routes a "command"
+    // message to handleCommandResult only when msg_type == "command_result"
+    // (isCommandResult); the semantic type rides inside payload.kind.
     const raw = encodeCommandResult("r1", "text", { content: "hi" });
     const parsed = JSON.parse(raw);
     expect(parsed.request_id).toBe("r1");
-    expect(parsed.msg_type).toBe("text");
+    expect(parsed.msg_type).toBe("command_result");
+    expect(parsed.payload.kind).toBe("text");
     expect(parsed.payload.content).toBe("hi");
+  });
+
+  it("keeps error payload backward-compatible (payload.error)", () => {
+    const raw = encodeCommandResult("r2", "error", { error: "boom" });
+    const parsed = JSON.parse(raw);
+    expect(parsed.msg_type).toBe("command_result");
+    expect(parsed.payload.kind).toBe("error");
+    expect(parsed.payload.error).toBe("boom");
   });
 });
 

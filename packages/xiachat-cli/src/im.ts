@@ -60,8 +60,14 @@ export class MessageDispatcher {
         return;
       }
       const params = (cmd.params ?? {}) as {
-        round?: number; speaking_order?: number; role_name?: string; model?: string;
+        round?: number; speaking_order?: number; role_name?: string; model?: string; chatroom_id?: string;
       };
+      // Address the reply to the discussion chatroom: the server's webhook
+      // sets targetId to the private-message receiver, and the coordinator
+      // dispatches on that targetId parsed as the chatroom UUID. Replying
+      // to msg.fromUserId (the host node) would never parse. Without a
+      // chatroom_id in params, fall back to the sender.
+      const replyTo = params.chatroom_id || msg.fromUserId;
       const prompt = [
         `[discussion] round=${params.round ?? "?"} speaking_order=${params.speaking_order ?? "?"}`,
         params.role_name ? `role: ${params.role_name}` : "",
@@ -70,13 +76,13 @@ export class MessageDispatcher {
       try {
         const out = await turns.runTurn(prompt, params.model);
         await this.deps.send(
-          msg.fromUserId,
+          replyTo,
           "command",
           encodeCommandResult(cmd.request_id, "text", { content: out }),
         );
       } catch (err) {
         await this.deps.send(
-          msg.fromUserId,
+          replyTo,
           "command",
           encodeCommandResult(cmd.request_id, "error", {
             error: err instanceof Error ? err.message : "agent turn failed",
