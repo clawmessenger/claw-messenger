@@ -14,10 +14,17 @@ export interface RegisterResult {
   bindingVersion?: number;
 }
 
+export interface ClaimSession {
+  status: string;
+  ticket: string;
+  expiresAt?: string;
+}
+
 export interface ClaimResult {
   deviceCredentialId: string;
   deviceSecret: string;
   nodeId: string;
+  session?: ClaimSession;
 }
 
 export class XiachatApi {
@@ -49,12 +56,24 @@ export class XiachatApi {
   }
 
   async claimPairing(ticket: string, clientClaimKey: string, idempotencyKey: string): Promise<ClaimResult> {
-    const raw = await this.request<{ device_credential_id: string; device_secret: string; node_id: string }>(
+    const raw = await this.request<{
+      device_credential_id: string;
+      device_secret: string;
+      node_id: string;
+      session?: { status: string; ticket: string; expires_at?: string };
+    }>(
       "POST",
       `/api/claw/pairing/${encodeURIComponent(ticket)}/claim`,
       { client_claim_key: clientClaimKey, idempotency_key: idempotencyKey },
     );
-    return { deviceCredentialId: raw.device_credential_id, deviceSecret: raw.device_secret, nodeId: raw.node_id };
+    return {
+      deviceCredentialId: raw.device_credential_id,
+      deviceSecret: raw.device_secret,
+      nodeId: raw.node_id,
+      ...(raw.session
+        ? { session: { status: raw.session.status, ticket: raw.session.ticket, ...(raw.session.expires_at ? { expiresAt: raw.session.expires_at } : {}) } }
+        : {}),
+    };
   }
 
   async refreshToken(nodeId: string): Promise<{ token: string }> {
@@ -70,6 +89,10 @@ export class XiachatApi {
     if (!res.ok) {
       throw new Error(`${method} ${path}: HTTP ${res.status}`);
     }
-    return (await res.json()) as T;
+    try {
+      return (await res.json()) as T;
+    } catch (err) {
+      throw new Error(`${method} ${path}: decode response: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 }
