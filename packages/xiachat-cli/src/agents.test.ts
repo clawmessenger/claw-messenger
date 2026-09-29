@@ -94,6 +94,59 @@ describe("runAgentTurn", () => {
         maxOutputBytes: 1024,
       });
       expect(out.length).toBeLessThanOrEqual(1024);
+      expect(out).toBe("a".repeat(1024));
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("keeps CJK characters intact when a code point splits across stdout chunks", async () => {
+    const fixture = createEchoAgentScript("claude", { cjkSplit: true, cjkRepeat: 100 });
+    try {
+      const chunks: string[] = [];
+      const out = await runAgentTurn({
+        execPath: fixture.agentPath,
+        prompt: "p",
+        timeoutMs: 30_000,
+        onChunk: (c) => { chunks.push(c); },
+      });
+      const expected = "你好".repeat(100);
+      expect(out).toBe(expected);
+      expect(out).not.toContain("\uFFFD");
+      expect(chunks.join("")).toBe(out);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("truncates CJK output on a byte cap without corrupting the cut", async () => {
+    // 100 CJK chars = 300 UTF-8 bytes; cap 100 bytes holds 33 complete chars
+    // (99 bytes: 16 full 你好 pairs + one 你); the 34th char's dangling lead
+    // byte must be dropped, never decoded to U+FFFD.
+    const fixture = createEchoAgentScript("claude", { cjkSplit: true, cjkRepeat: 50 });
+    try {
+      const out = await runAgentTurn({
+        execPath: fixture.agentPath,
+        prompt: "p",
+        timeoutMs: 30_000,
+        maxOutputBytes: 100,
+      });
+      expect(Buffer.byteLength(out, "utf8")).toBeLessThanOrEqual(100);
+      expect(out).toBe("你好".repeat(16) + "你");
+      expect(out).not.toContain("\uFFFD");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("rejects immediately when the signal is already aborted", async () => {
+    const fixture = createEchoAgentScript("claude");
+    try {
+      const controller = new AbortController();
+      controller.abort();
+      await expect(
+        runAgentTurn({ execPath: fixture.agentPath, prompt: "p", timeoutMs: 30_000, signal: controller.signal }),
+      ).rejects.toThrow(/abort/i);
     } finally {
       fixture.cleanup();
     }

@@ -14,6 +14,8 @@ export interface EchoAgentOptions {
   hangMs?: number;
   bigOutputBytes?: number;
   failWith?: { code: number; message: string };
+  cjkSplit?: boolean;
+  cjkRepeat?: number;
 }
 
 // Creates a temporary directory holding a fake agent executable named `name`
@@ -24,6 +26,30 @@ export function createEchoAgentScript(name: string, opts: EchoAgentOptions = {})
   const isWin = process.platform === "win32";
   const scriptPath = join(dir, isWin ? `${name}.cmd` : name);
   const argsFile = join(dir, "args.txt");
+
+  if (opts.cjkSplit) {
+    // Node helper emits "\u4f60\u597d" (3 bytes/char) split mid-codepoint
+    // across two stdout writes so the parent sees two data events with a
+    // dangling UTF-8 lead byte between them.
+    const repeat = opts.cjkRepeat ?? 100;
+    const splitAt = 3 * repeat + 1;
+    const cjsPath = join(dir, "cjk-agent.cjs");
+    writeFileSync(cjsPath, [
+      `const full = Buffer.from("\\u4f60\\u597d".repeat(${repeat}), "utf8");`,
+      `const splitAt = ${splitAt};`,
+      `process.stdout.write(full.subarray(0, splitAt), () => {`,
+      `  setTimeout(() => process.stdout.end(full.subarray(splitAt)), 30);`,
+      `});`,
+      `process.stdin.resume();`,
+    ].join("\n"));
+    if (isWin) {
+      writeFileSync(scriptPath, `@echo off\r\nnode "${cjsPath}"\r\n`, { mode: 0o755 });
+    } else {
+      writeFileSync(scriptPath, `#!/bin/sh\nexec node "${cjsPath}"\n`, { mode: 0o755 });
+      chmodSync(scriptPath, 0o755);
+    }
+    return makeFixture(dir, scriptPath, argsFile);
+  }
 
   if (isWin) {
     const lines = ["@echo off"];
@@ -58,6 +84,10 @@ export function createEchoAgentScript(name: string, opts: EchoAgentOptions = {})
     chmodSync(scriptPath, 0o755);
   }
 
+  return makeFixture(dir, scriptPath, argsFile);
+}
+
+function makeFixture(dir: string, scriptPath: string, argsFile: string): EchoAgentFixture {
   return {
     dir,
     agentPath: scriptPath,

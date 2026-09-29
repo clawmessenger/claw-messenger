@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { access, constants } from "node:fs/promises";
 import { delimiter, join } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 
 // Mirrors knownAgentCLIs in server/internal/integrations/rongcloud/
 // discussion_bridge.go — keep both lists in sync.
@@ -57,6 +58,35 @@ function killProcessTree(child: { pid?: number; kill: () => void }): void {
   child.kill();
 }
 
+// Drops trailing incomplete UTF-8 sequences (lead byte without its
+// continuation bytes) so a byte-cap cut never decodes to U+FFFD.
+function trimIncompleteUtf8Tail(buf: Buffer): Buffer {
+  let end = buf.length;
+  let seqStart = end;
+  // Walk back at most 4 bytes looking for the start of the last sequence.
+  while (end > 0 && seqStart === end && end > buf.length - 4) {
+    const byte = buf[end - 1];
+    if ((byte & 0x80) === 0) break; // ASCII terminator: sequence complete
+    if ((byte & 0xe0) === 0xc0) { seqStart = end - 1; break; } // 2-byte lead
+    if ((byte & 0xf0) === 0xe0) { seqStart = end - 1; break; } // 3-byte lead
+    if ((byte & 0xf8) === 0xf0) { seqStart = end - 1; break; } // 4-byte lead
+    end -= 1; // continuation byte (0b10xxxxxx): keep walking back
+  }
+  if (seqStart < end) {
+    const expected = utf8SequenceLength(buf[seqStart]);
+    const actual = end - seqStart;
+    if (actual < expected) return buf.subarray(0, seqStart);
+  }
+  return buf;
+}
+
+function utf8SequenceLength(lead: number): number {
+  if ((lead & 0xe0) === 0xc0) return 2;
+  if ((lead & 0xf0) === 0xe0) return 3;
+  if ((lead & 0xf8) === 0xf0) return 4;
+  return 1;
+}
+
 export async function discoverAgents(opts: { extraPath?: string }): Promise<AgentInfo[]> {
   // When extraPath is provided (even empty) we scan ONLY there (tests and
   // explicit overrides must not pick up a real claude on the dev machine);
@@ -91,6 +121,11 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
   const maxBytes = opts.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
 
   return new Promise<string>((resolve, reject) => {
+    if (opts.signal?.aborted) {
+      reject(new Error("agent turn aborted"));
+      return;
+    }
+
     const agentArgs = opts.model ? ["--model", opts.model] : [];
     const { file, args } = buildSpawnInvocation(opts.execPath, agentArgs);
     const child = spawn(file, args, {
@@ -98,7 +133,12 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
       windowsHide: true,
     });
 
-    let stdout = "";
+    // stdout accumulates raw bytes; decoding happens through a streaming
+    // StringDecoder so code points split across chunk boundaries survive,
+    // and truncation caps BYTES and backs off to a code-point boundary.
+    const chunks: Buffer[] = [];
+    let totalBytes = 0;
+    let decoder = new StringDecoder("utf8");
     let stderr = "";
     let truncated = false;
     let settled = false;
@@ -128,14 +168,23 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
 
     child.stdout.on("data", (buf: Buffer) => {
       if (truncated) return;
-      if (stdout.length + buf.length > maxBytes) {
-        stdout += buf.subarray(0, Math.max(0, maxBytes - stdout.length)).toString("utf8");
+      if (totalBytes + buf.length > maxBytes) {
+        const remaining = Math.max(0, maxBytes - totalBytes);
+        const tail = trimIncompleteUtf8Tail(buf.subarray(0, remaining));
+        if (tail.length > 0) {
+          chunks.push(tail);
+          totalBytes += tail.length;
+          const delta = decoder.write(tail);
+          if (delta) opts.onChunk?.(delta);
+        }
+        decoder = new StringDecoder("utf8"); // drop any held partial sequence
         truncated = true;
-        opts.onChunk?.(stdout);
         return;
       }
-      stdout += buf.toString("utf8");
-      opts.onChunk?.(buf.toString("utf8"));
+      chunks.push(buf);
+      totalBytes += buf.length;
+      const delta = decoder.write(buf);
+      if (delta) opts.onChunk?.(delta);
     });
     child.stderr.on("data", (buf: Buffer) => {
       stderr = (stderr + buf.toString("utf8")).slice(-2000);
@@ -145,6 +194,7 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
     });
     child.on("close", (code) => {
       settle(() => {
+        const stdout = Buffer.concat(chunks).toString("utf8");
         if (code === 0) {
           resolve(stdout);
         } else {
