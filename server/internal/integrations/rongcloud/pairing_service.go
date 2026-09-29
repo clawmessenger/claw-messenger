@@ -13,6 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/util"
 	"github.com/multica-ai/multica/server/internal/util/secretbox"
 	"github.com/multica-ai/multica/server/pkg/db/generated"
 )
@@ -44,10 +45,31 @@ type PairingCreateParams struct {
 }
 
 type ClaimResult struct {
-	Session            db.RongcloudPairingSession `json:"session"`
-	DeviceCredentialID string                     `json:"device_credential_id"`
-	DeviceSecret       string                     `json:"device_secret,omitempty"`
-	NodeID             string                     `json:"node_id"`
+	Session            PairingSessionView `json:"session"`
+	DeviceCredentialID string             `json:"device_credential_id"`
+	DeviceSecret       string             `json:"device_secret,omitempty"`
+	NodeID             string             `json:"node_id"`
+}
+
+// PairingSessionView is the caller-facing projection of a pairing session.
+// The full row carries the client claim key and the idempotency key — both
+// credentials — so responses echo only what a caller needs after a claim.
+type PairingSessionView struct {
+	ID          string `json:"id"`
+	WorkspaceID string `json:"workspace_id"`
+	Ticket      string `json:"ticket"`
+	Status      string `json:"status"`
+	ExpiresAt   string `json:"expires_at"`
+}
+
+func newPairingSessionView(session db.RongcloudPairingSession) PairingSessionView {
+	return PairingSessionView{
+		ID:          util.UUIDToString(session.ID),
+		WorkspaceID: util.UUIDToString(session.WorkspaceID),
+		Ticket:      session.Ticket,
+		Status:      session.Status,
+		ExpiresAt:   session.ExpiresAt.Time.Format(time.RFC3339),
+	}
 }
 
 type PairingService struct {
@@ -67,6 +89,16 @@ func (s *PairingService) generateTicket() string {
 	b := make([]byte, 32)
 	_, _ = rand.Read(b)
 	return "pt_" + hex.EncodeToString(b)
+}
+
+// safeTicketPrefix returns the first 6 characters of a ticket ("pt_" plus
+// three hex chars). Pairing tickets are bearer credentials, so logs get only
+// this non-identifying prefix — enough to correlate lines, not to claim.
+func safeTicketPrefix(ticket string) string {
+	if len(ticket) > 6 {
+		return ticket[:6]
+	}
+	return ticket
 }
 
 func (s *PairingService) CreateSession(ctx context.Context, params PairingCreateParams) (db.RongcloudPairingSession, error) {
@@ -108,45 +140,59 @@ func (s *PairingService) ClaimSession(ctx context.Context, ticket, clientClaimKe
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ClaimResult{}, ErrUnknownPairingTicket
 		}
+		s.logger.Error("rongcloud: pairing session lookup failed", "ticket_prefix", safeTicketPrefix(ticket), "error", err)
 		return ClaimResult{}, fmt.Errorf("rongcloud: get pairing session: %w", err)
 	}
 	if session.Status != "pending" {
 		if session.IdempotencyKey.Valid && session.IdempotencyKey.String == idempotencyKey && session.Status == "claimed" {
-			return ClaimResult{Session: session}, nil
+			// Idempotent replay of a successful claim: the secret was handed
+			// out once and is not stored in plaintext, so only the session
+			// comes back. Callers detect the replay via the empty secret.
+			return ClaimResult{Session: newPairingSessionView(session)}, nil
 		}
 		return ClaimResult{}, ErrPairingSessionNotPending
 	}
 	if session.ExpiresAt.Time.Before(time.Now()) {
-		_, _ = s.queries.UpdateRongCloudPairingSessionStatus(ctx, db.UpdateRongCloudPairingSessionStatusParams{
+		if _, err := s.queries.UpdateRongCloudPairingSessionStatus(ctx, db.UpdateRongCloudPairingSessionStatusParams{
 			ID:     session.ID,
 			Status: "expired",
-		})
+		}); err != nil {
+			// Marking expiry is best-effort bookkeeping; the session is
+			// already rejected either way, so log instead of failing.
+			s.logger.Error("rongcloud: failed to mark pairing session expired", "error", err)
+		}
 		return ClaimResult{}, ErrPairingSessionExpired
 	}
 	if session.ClientClaimKey.Valid && session.ClientClaimKey.String != clientClaimKey {
 		return ClaimResult{}, ErrInvalidClaimKey
 	}
-	session, err = s.queries.UpdateRongCloudPairingSessionStatus(ctx, db.UpdateRongCloudPairingSessionStatusParams{
-		ID:     session.ID,
-		Status: "claimed",
+	session, err = s.queries.UpdateRongCloudPairingSessionClaim(ctx, db.UpdateRongCloudPairingSessionClaimParams{
+		ID:             session.ID,
+		IdempotencyKey: pgText(idempotencyKey),
 	})
 	if err != nil {
+		s.logger.Error("rongcloud: pairing session claim write failed", "error", err)
 		return ClaimResult{}, fmt.Errorf("rongcloud: claim pairing session: %w", err)
 	}
 
 	var candidateNodeIDs []pgtype.UUID
 	if err := json.Unmarshal(session.CandidateNodeIds, &candidateNodeIDs); err != nil || len(candidateNodeIDs) == 0 {
-		return ClaimResult{Session: session}, fmt.Errorf("rongcloud: no candidate nodes in session")
+		// The status flip already persisted; log so the half-claimed session
+		// is diagnosable from server logs alone.
+		s.logger.Error("rongcloud: claimed pairing session has no usable candidate nodes", "ticket_prefix", safeTicketPrefix(ticket), "error", err)
+		return ClaimResult{Session: newPairingSessionView(session)}, fmt.Errorf("rongcloud: no candidate nodes in session")
 	}
 
 	node, err := s.queries.GetRongCloudNodeByID(ctx, candidateNodeIDs[0])
 	if err != nil {
-		return ClaimResult{Session: session}, fmt.Errorf("rongcloud: get candidate node: %w", err)
+		s.logger.Error("rongcloud: candidate node lookup failed on claim", "error", err)
+		return ClaimResult{Session: newPairingSessionView(session)}, fmt.Errorf("rongcloud: get candidate node: %w", err)
 	}
 
 	credID, credSecret, err := generateDeviceCredential()
 	if err != nil {
-		return ClaimResult{Session: session}, fmt.Errorf("rongcloud: generate device credential: %w", err)
+		s.logger.Error("rongcloud: device credential generation failed", "error", err)
+		return ClaimResult{Session: newPairingSessionView(session)}, fmt.Errorf("rongcloud: generate device credential: %w", err)
 	}
 
 	encSecret := ""
@@ -168,11 +214,12 @@ func (s *PairingService) ClaimSession(ctx context.Context, ticket, clientClaimKe
 		Status:                    "active",
 	})
 	if err != nil {
-		return ClaimResult{Session: session}, fmt.Errorf("rongcloud: create device on claim: %w", err)
+		s.logger.Error("rongcloud: create device on claim failed", "error", err)
+		return ClaimResult{Session: newPairingSessionView(session)}, fmt.Errorf("rongcloud: create device on claim: %w", err)
 	}
 
 	return ClaimResult{
-		Session:            session,
+		Session:            newPairingSessionView(session),
 		DeviceCredentialID: credID,
 		DeviceSecret:       credSecret,
 		NodeID:             node.NodeID,

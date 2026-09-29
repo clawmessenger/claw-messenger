@@ -1283,6 +1283,33 @@ func (q *Queries) UpdateRongCloudNodeDeployStatus(ctx context.Context, arg Updat
 	return i, err
 }
 
+const updateRongCloudPairingSessionClaim = `-- name: UpdateRongCloudPairingSessionClaim :one
+UPDATE rongcloud_pairing_session SET status = 'claimed', idempotency_key = $2, updated_at = now() WHERE id = $1 RETURNING id, workspace_id, ticket, status, client_claim_key, idempotency_key, candidate_node_ids, expires_at, created_at, updated_at
+`
+
+type UpdateRongCloudPairingSessionClaimParams struct {
+	ID             pgtype.UUID `json:"id"`
+	IdempotencyKey pgtype.Text `json:"idempotency_key"`
+}
+
+func (q *Queries) UpdateRongCloudPairingSessionClaim(ctx context.Context, arg UpdateRongCloudPairingSessionClaimParams) (RongcloudPairingSession, error) {
+	row := q.db.QueryRow(ctx, updateRongCloudPairingSessionClaim, arg.ID, arg.IdempotencyKey)
+	var i RongcloudPairingSession
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.Ticket,
+		&i.Status,
+		&i.ClientClaimKey,
+		&i.IdempotencyKey,
+		&i.CandidateNodeIds,
+		&i.ExpiresAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const updateRongCloudPairingSessionStatus = `-- name: UpdateRongCloudPairingSessionStatus :one
 UPDATE rongcloud_pairing_session SET status = $2, updated_at = now() WHERE id = $1 RETURNING id, workspace_id, ticket, status, client_claim_key, idempotency_key, candidate_node_ids, expires_at, created_at, updated_at
 `

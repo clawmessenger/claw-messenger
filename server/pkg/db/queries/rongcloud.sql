@@ -147,6 +147,9 @@ SELECT * FROM rongcloud_pairing_session WHERE ticket = $1;
 -- name: UpdateRongCloudPairingSessionStatus :one
 UPDATE rongcloud_pairing_session SET status = $2, updated_at = now() WHERE id = $1 RETURNING *;
 
+-- name: UpdateRongCloudPairingSessionClaim :one
+UPDATE rongcloud_pairing_session SET status = 'claimed', idempotency_key = $2, updated_at = now() WHERE id = $1 RETURNING *;
+
 -- name: DeleteRongCloudPairingSession :exec
 DELETE FROM rongcloud_pairing_session WHERE id = $1;
 
