@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/util/secretbox"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
@@ -174,26 +175,39 @@ type workspaceAttribution struct {
 
 // resolveWorkspaceAttribution fills the workspace (and a default owner) from a
 // pending, unexpired pairing ticket. An empty ticket yields
-// ErrWorkspaceAttributionRequired; a known-but-unusable one yields
-// ErrInvalidPairingTicket. The owner defaults to the workspace's first
-// manager (owner role first) because the pairing session carries no owner of
-// its own; an explicit params.OwnerUserID still wins.
+// ErrWorkspaceAttributionRequired; an unknown, non-pending, or expired one
+// yields ErrInvalidPairingTicket. Any other lookup failure is a database
+// fault, not a verdict on the ticket: it is logged and returned as a distinct
+// error so the handler maps it to 500 instead of a wrong 400. The owner
+// defaults to the workspace's first manager (owner role first) because the
+// pairing session carries no owner of its own; an explicit params.OwnerUserID
+// still wins.
 func (s *NodeService) resolveWorkspaceAttribution(ctx context.Context, ticket string) (workspaceAttribution, error) {
 	if ticket == "" {
 		return workspaceAttribution{}, ErrWorkspaceAttributionRequired
 	}
 	session, err := s.queries.GetRongCloudPairingSessionByTicket(ctx, ticket)
 	if err != nil {
-		return workspaceAttribution{}, fmt.Errorf("%w: %v", ErrInvalidPairingTicket, err)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return workspaceAttribution{}, ErrInvalidPairingTicket
+		}
+		s.logger.Error("rongcloud: pairing ticket lookup failed", "error", err)
+		return workspaceAttribution{}, fmt.Errorf("rongcloud: get pairing session: %w", err)
 	}
 	if session.Status != "pending" || !session.ExpiresAt.Time.After(time.Now()) {
 		return workspaceAttribution{}, ErrInvalidPairingTicket
 	}
-	owner := pgtype.UUID{}
-	if managers, err := s.queries.ListWorkspaceManagerUserIDs(ctx, session.WorkspaceID); err == nil && len(managers) > 0 {
-		owner = managers[0]
+	managers, err := s.queries.ListWorkspaceManagerUserIDs(ctx, session.WorkspaceID)
+	if err != nil {
+		s.logger.Error("rongcloud: workspace manager lookup failed", "workspace_id", session.WorkspaceID, "error", err)
+		return workspaceAttribution{}, fmt.Errorf("rongcloud: resolve workspace owner: %w", err)
 	}
-	return workspaceAttribution{workspaceID: session.WorkspaceID, ownerUserID: owner}, nil
+	if len(managers) == 0 {
+		// rongcloud_node.owner_user_id is NOT NULL; a zero UUID would only
+		// resurface as an opaque insert failure further down.
+		return workspaceAttribution{}, fmt.Errorf("rongcloud: workspace %s has no manager to own the node", session.WorkspaceID)
+	}
+	return workspaceAttribution{workspaceID: session.WorkspaceID, ownerUserID: managers[0]}, nil
 }
 
 func (s *NodeService) RefreshToken(ctx context.Context, nodeID string) (string, error) {

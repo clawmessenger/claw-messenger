@@ -2,6 +2,7 @@ package rongcloud
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -19,7 +20,6 @@ import (
 type registerTestEnv struct {
 	pool    *pgxpool.Pool
 	queries *db.Queries
-	dbfx    *testutil.Fixture
 	nodes   *NodeService
 	pairing *PairingService
 	wsID    string
@@ -65,7 +65,6 @@ func newRegisterTestEnv(t *testing.T) *registerTestEnv {
 	return &registerTestEnv{
 		pool:    pool,
 		queries: queries,
-		dbfx:    testutil.New(pool, wsID, userID),
 		nodes:   NewNodeService(queries, newRongCloudAPIClient("key", "secret", srv.URL, srv.Client(), testLogger()), nil, testLogger()),
 		pairing: NewPairingService(queries, nil, testLogger()),
 		wsID:    wsID,
@@ -125,7 +124,7 @@ func TestRegisterWithoutPairingTicketRequiresAttribution(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for registration without workspace attribution, got nil")
 	}
-	if want := ErrWorkspaceAttributionRequired; !containsError(err, want) {
+	if !errors.Is(err, ErrWorkspaceAttributionRequired) {
 		t.Fatalf("expected ErrWorkspaceAttributionRequired, got %v", err)
 	}
 }
@@ -136,7 +135,7 @@ func TestRegisterWithUnknownTicketFails(t *testing.T) {
 	env := newRegisterTestEnv(t)
 
 	_, err := env.nodes.Register(context.Background(), registerParams("aa:bb:cc:dd:ee:02", "pt_does_not_exist"))
-	if !containsError(err, ErrInvalidPairingTicket) {
+	if !errors.Is(err, ErrInvalidPairingTicket) {
 		t.Fatalf("expected ErrInvalidPairingTicket, got %v", err)
 	}
 }
@@ -147,8 +146,33 @@ func TestRegisterWithExpiredTicketFails(t *testing.T) {
 	ticket := env.createPendingPairingTicket(t, -time.Minute)
 
 	_, err := env.nodes.Register(context.Background(), registerParams("aa:bb:cc:dd:ee:03", ticket))
-	if !containsError(err, ErrInvalidPairingTicket) {
+	if !errors.Is(err, ErrInvalidPairingTicket) {
 		t.Fatalf("expected ErrInvalidPairingTicket for expired ticket, got %v", err)
+	}
+}
+
+// A ticket whose session was already claimed is no longer pending and must be
+// rejected like an expired one — only the expiry branch was covered before.
+func TestRegisterWithClaimedTicketFails(t *testing.T) {
+	env := newRegisterTestEnv(t)
+	ticket := env.createPendingPairingTicket(t, 5*time.Minute)
+
+	// Mark the session claimed the way ClaimSession does, without its
+	// candidate-node requirements.
+	session, err := env.queries.GetRongCloudPairingSessionByTicket(context.Background(), ticket)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if _, err := env.queries.UpdateRongCloudPairingSessionStatus(context.Background(), db.UpdateRongCloudPairingSessionStatusParams{
+		ID:     session.ID,
+		Status: "claimed",
+	}); err != nil {
+		t.Fatalf("claim session: %v", err)
+	}
+
+	_, err = env.nodes.Register(context.Background(), registerParams("aa:bb:cc:dd:ee:05", ticket))
+	if !errors.Is(err, ErrInvalidPairingTicket) {
+		t.Fatalf("expected ErrInvalidPairingTicket for claimed ticket, got %v", err)
 	}
 }
 
@@ -194,19 +218,4 @@ func TestRegisterWithValidTicketAttributesWorkspace(t *testing.T) {
 	if user.WorkspaceID != wsUUID {
 		t.Fatalf("rongcloud user workspace = %v, want %s", user.WorkspaceID, env.wsID)
 	}
-}
-
-func containsError(err, target error) bool {
-	for err != nil {
-		if err == target {
-			return true
-		}
-		type unwrapper interface{ Unwrap() error }
-		if u, ok := err.(unwrapper); ok {
-			err = u.Unwrap()
-			continue
-		}
-		return false
-	}
-	return false
 }
