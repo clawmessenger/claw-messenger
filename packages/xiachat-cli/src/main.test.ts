@@ -31,6 +31,7 @@ describe("xiachat register", () => {
       keystore,
       apiFactory: () => fakeApi as unknown as XiachatApi,
       stdout: process.stdout,
+      machineId: () => "test-machine-1",
     });
     await program.parseAsync(["node", "xiachat", "register", "--name", "我的Claude", "--ai-type", "claude", "--server", "http://srv"]);
     const stored = keystore.load();
@@ -55,10 +56,11 @@ describe("xiachat register", () => {
       keystore,
       apiFactory: () => fakeApi as unknown as XiachatApi,
       stdout: process.stdout,
+      machineId: () => "test-machine-2",
     });
     await program.parseAsync(["node", "xiachat", "register", "--name", "n", "--ai-type", "claude", "--server", "http://srv"]);
     await program.parseAsync(["node", "xiachat", "register", "--name", "n", "--ai-type", "claude", "--server", "http://srv"]);
-    expect(seenMac[0].length).toBeGreaterThan(0);
+    expect(seenMac[0]).toBe("test-machine-2");
     expect(seenMac[1]).toBe(seenMac[0]);
   });
 
@@ -87,6 +89,7 @@ describe("xiachat register", () => {
       keystore,
       apiFactory: () => fakeApi as unknown as XiachatApi,
       stdout: process.stdout,
+      machineId: () => "test-machine-1",
     });
     await expect(
       program.parseAsync(["node", "xiachat", "register", "--name", "n", "--ai-type", "claude", "--server", "http://srv"]),
