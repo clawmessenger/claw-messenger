@@ -545,3 +545,49 @@ function multica { & "quukk-clawmessenger" @args }
 - [CLI 与 Daemon 指南](CLI_AND_DAEMON.md) — CLI 命令完整参考
 - [设计文档](docs/superpowers/specs/) — Phase 1-4 的技术设计文档
 - [实施计划](docs/superpowers/plans/) — Phase 1-4 的实施步骤清单
+
+
+---
+
+## 附录 A：用户设备 CLI（xiachat）
+
+xiachat 是运行在用户设备上的轻量节点 CLI：注册到工作区后，经融云 IM 接收单聊消息与讨论指令，在本机调用真实 agent CLI（codex / opencode 等）完成回合。完整冒烟手册见 `packages/xiachat-cli/scripts/smoke.md`。
+
+### 安装
+
+```bash
+pnpm --filter @multica/xiachat-cli build:bin   # 产出 dist/xiachat.bundle.js
+node packages/xiachat-cli/dist/xiachat.bundle.js agents   # 列出本机可用 agent
+```
+
+### 注册（pairing）
+
+管理员先在数据库创建配对票（30 分钟有效）：
+
+```sql
+INSERT INTO rongcloud_pairing_session (workspace_id, ticket, status, expires_at)
+VALUES ('<workspace_id>', 'pt_<64位hex>', 'pending', now() + interval '30 minutes');
+```
+
+节点设备上执行：
+
+```bash
+node dist/xiachat.bundle.js register --server http://<server> --ticket pt_<64位hex> --agent opencode
+```
+
+> **Note:** 当前 CLI 注册不携带 mac_address；同一机器用不同 ticket 二次注册会因空 mac 唯一键冲突返回 500。规避：用 curl 调 `POST /api/ai/register` 并传入独立 `mac_address`。
+
+### 运行
+
+```bash
+node dist/xiachat.bundle.js run --agent opencode
+# 输出 xiachat run: connected and dispatching 即已连上融云并分发消息
+```
+
+单聊消息按会话串行处理（并发 1、队列深 1）；忙碌时向对端回 `正在思考中…`。讨论模式下收到 `your_turn` 指令后执行本机 agent，超时 120s 自动跳过。
+
+### 验证与排障
+
+- `node dist/xiachat.bundle.js status` 查看凭据与 token。
+- 运行日志的 `im in: type=... from=...` 行标记每条入站消息，用于区分"消息未达"与"分发失败"。
+- 已知缺口（agent 执行 STDIN、回包 webhook 公网地址）见 smoke.md「已知缺口」一节。
