@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
-import { discoverAgents, KNOWN_AGENT_CLIS, runAgentTurn } from "./agents.js";
+import { discoverAgents, KNOWN_AGENT_CLIS, runAgentTurn, trimIncompleteUtf8Tail } from "./agents.js";
 import { createEchoAgentScript, type EchoAgentFixture } from "./test-fixtures.js";
 
 describe("KNOWN_AGENT_CLIS", () => {
@@ -37,6 +37,61 @@ describe("discoverAgents", () => {
 
   it("returns [] for an empty extraPath", async () => {
     expect(await discoverAgents({ extraPath: "" })).toEqual([]);
+  });
+});
+
+describe("trimIncompleteUtf8Tail", () => {
+  // "你" = E4 BD A0 (3-byte); "😀" = F0 9F 98 80 (4-byte).
+  const cjk = Buffer.from("你", "utf8"); // e4 bd a0
+  const emoji = Buffer.from("😀", "utf8"); // f0 9f 98 80
+  const ascii = Buffer.from("a", "utf8");
+
+  it("returns the buffer unchanged when it ends on a complete ASCII char", () => {
+    const buf = Buffer.concat([ascii, cjk, ascii]);
+    expect(trimIncompleteUtf8Tail(buf)).toEqual(buf);
+  });
+
+  it("returns an empty buffer for input that is only a partial sequence", () => {
+    expect(trimIncompleteUtf8Tail(cjk.subarray(0, 1))).toEqual(Buffer.alloc(0));
+    expect(trimIncompleteUtf8Tail(emoji.subarray(0, 1))).toEqual(Buffer.alloc(0));
+  });
+
+  it("trims a cut after the lead byte of a 3-byte char (E4)", () => {
+    const buf = Buffer.concat([ascii, cjk.subarray(0, 1)]); // ...e4
+    expect(trimIncompleteUtf8Tail(buf)).toEqual(ascii);
+  });
+
+  it("trims a cut after the 1st continuation byte of a 3-byte char (E4 BD)", () => {
+    const buf = Buffer.concat([ascii, cjk.subarray(0, 2)]); // ...e4 bd
+    expect(trimIncompleteUtf8Tail(buf)).toEqual(ascii);
+  });
+
+  it("trims a cut after the lead byte of a 4-byte char (F0)", () => {
+    const buf = Buffer.concat([ascii, emoji.subarray(0, 1)]); // ...f0
+    expect(trimIncompleteUtf8Tail(buf)).toEqual(ascii);
+  });
+
+  it("trims a cut after the 1st continuation byte of a 4-byte char (F0 9F)", () => {
+    const buf = Buffer.concat([ascii, emoji.subarray(0, 2)]); // ...f0 9f
+    expect(trimIncompleteUtf8Tail(buf)).toEqual(ascii);
+  });
+
+  it("trims a cut after the 2nd continuation byte of a 4-byte char (F0 9F 98)", () => {
+    const buf = Buffer.concat([ascii, emoji.subarray(0, 3)]); // ...f0 9f 98
+    expect(trimIncompleteUtf8Tail(buf)).toEqual(ascii);
+  });
+
+  it("keeps a complete multi-byte char at the end", () => {
+    const buf = Buffer.concat([ascii, cjk]);
+    expect(trimIncompleteUtf8Tail(buf)).toEqual(buf);
+    const withEmoji = Buffer.concat([ascii, emoji]);
+    expect(trimIncompleteUtf8Tail(withEmoji)).toEqual(withEmoji);
+  });
+
+  it("cuts the trailing continuation run when no lead byte exists within 4 bytes (invalid UTF-8)", () => {
+    const garbage = Buffer.from([0x80, 0x80, 0x80, 0x80]); // bare continuations
+    const buf = Buffer.concat([ascii, garbage]);
+    expect(trimIncompleteUtf8Tail(buf)).toEqual(ascii);
   });
 });
 

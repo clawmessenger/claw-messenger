@@ -59,25 +59,29 @@ function killProcessTree(child: { pid?: number; kill: () => void }): void {
 }
 
 // Drops trailing incomplete UTF-8 sequences (lead byte without its
-// continuation bytes) so a byte-cap cut never decodes to U+FFFD.
-function trimIncompleteUtf8Tail(buf: Buffer): Buffer {
-  let end = buf.length;
-  let seqStart = end;
-  // Walk back at most 4 bytes looking for the start of the last sequence.
-  while (end > 0 && seqStart === end && end > buf.length - 4) {
-    const byte = buf[end - 1];
-    if ((byte & 0x80) === 0) break; // ASCII terminator: sequence complete
-    if ((byte & 0xe0) === 0xc0) { seqStart = end - 1; break; } // 2-byte lead
-    if ((byte & 0xf0) === 0xe0) { seqStart = end - 1; break; } // 3-byte lead
-    if ((byte & 0xf8) === 0xf0) { seqStart = end - 1; break; } // 4-byte lead
-    end -= 1; // continuation byte (0b10xxxxxx): keep walking back
+// continuation bytes) so a byte-cap cut never decodes to U+FFFD. Exported
+// for direct unit testing (pure function).
+export function trimIncompleteUtf8Tail(buf: Buffer): Buffer {
+  // Scan back over trailing continuation bytes (max 3) to find the last
+  // sequence's lead byte; cut before that lead if the sequence is
+  // incomplete within the buffer.
+  const end = buf.length;
+  for (let i = 1; i <= Math.min(4, end); i++) {
+    const byte = buf[end - i];
+    if ((byte & 0x80) === 0) {
+      // ASCII: the sequence before it is complete; nothing to trim.
+      return buf;
+    }
+    if ((byte & 0xe0) === 0xc0 || (byte & 0xf0) === 0xe0 || (byte & 0xf8) === 0xf0) {
+      // Lead byte i-1 bytes from the end; incomplete → cut before the lead.
+      const need = utf8SequenceLength(byte);
+      return i < need ? buf.subarray(0, end - i) : buf;
+    }
+    // Continuation byte (0b10xxxxxx): keep walking back.
   }
-  if (seqStart < end) {
-    const expected = utf8SequenceLength(buf[seqStart]);
-    const actual = end - seqStart;
-    if (actual < expected) return buf.subarray(0, seqStart);
-  }
-  return buf;
+  // Walked past 4 bytes with no lead byte: not valid UTF-8; drop the
+  // trailing continuation run.
+  return buf.subarray(0, Math.max(0, end - 4));
 }
 
 function utf8SequenceLength(lead: number): number {
