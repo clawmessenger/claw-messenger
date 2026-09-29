@@ -25,6 +25,9 @@ type rongcloudAPIClient struct {
 	base      string
 	client    *http.Client
 	logger    *slog.Logger
+	// loadCreds, when set, lazily resolves credentials from the active
+	// channel installation on first use (and re-resolves after a reset).
+	loadCreds func(ctx context.Context) (appKey, appSecret string, err error)
 }
 
 func newRongCloudAPIClient(appKey, appSecret, base string, client *http.Client, logger *slog.Logger) *rongcloudAPIClient {
@@ -86,8 +89,29 @@ func (c *rongcloudAPIClient) signRequest(req *http.Request, contentType string) 
 	req.Header.Set("Signature", signature)
 }
 
+// ensureCreds populates appKey/appSecret for service-layer clients that were
+// constructed without credentials, resolving them lazily from the active
+// channel installation so a later (re)configuration is picked up too.
+func (c *rongcloudAPIClient) ensureCreds(ctx context.Context) error {
+	if c.appKey != "" && c.appSecret != "" || c.loadCreds == nil {
+		return nil
+	}
+	appKey, appSecret, err := c.loadCreds(ctx)
+	if err != nil {
+		return fmt.Errorf("rongcloud: load installation credentials: %w", err)
+	}
+	if appKey == "" || appSecret == "" {
+		return fmt.Errorf("rongcloud: no active installation with app credentials")
+	}
+	c.appKey, c.appSecret = appKey, appSecret
+	return nil
+}
+
 // postForm sends a POST request with form-urlencoded body and returns the parsed JSON response.
 func (c *rongcloudAPIClient) postForm(ctx context.Context, path string, form url.Values) (map[string]interface{}, error) {
+	if err := c.ensureCreds(ctx); err != nil {
+		return nil, err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+path, strings.NewReader(form.Encode()))
 	if err != nil {
 		return nil, fmt.Errorf("rongcloud: create request: %w", err)
