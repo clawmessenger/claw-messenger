@@ -5,11 +5,11 @@
 ## 0. 打包
 
 ```powershell
-pnpm --filter @multica/xiachat-cli build:bin   # tsc + esbuild → dist/xiachat.bundle.js
+pnpm --filter @multica/xiachat-cli build:bin   # tsc + pack.mjs shim → dist/xiachat.bundle.js
 node packages/xiachat-cli/dist/xiachat.bundle.js agents   # 列出本机 agent
 ```
 
-Node 直跑 bundle 需要 Node 全局垫片（`src/browser-shim.ts` 已内置，无需手工操作）。
+打包为无依赖 shim（esbuild 未声明为 devDep 且离线不可加，已移除）：`xiachat.bundle.js` 直接转发到 tsc 产物 `dist/bin.js`。Node 直跑需要 Node 全局垫片（`src/browser-shim.ts` 已内置，无需手工操作）。
 
 ## 1. 注册（pairing ticket）
 
