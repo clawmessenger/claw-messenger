@@ -171,13 +171,13 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
     },
   });
 
-    opts.transport.onMessage((msg) => {
-      // IM observability: every inbound message is logged so smoke runs can
-      // tell "message never arrived" from "dispatch failed".
-      console.log(`im in: type=${msg.objectName} from=${msg.fromUserId} conv=${msg.conversationType}`);
-      const key = conversationKeyOf(msg);
-      busyPeer.set(key, msg.fromUserId);
-      queue.enqueue(key, async () => {
+  opts.transport.onMessage((msg) => {
+    // IM observability: every inbound message is logged so smoke runs can
+    // tell "message never arrived" from "dispatch failed".
+    console.log(`im in: type=${msg.objectName} from=${msg.fromUserId} conv=${msg.conversationType}`);
+    const key = conversationKeyOf(msg);
+    busyPeer.set(key, msg.fromUserId);
+    queue.enqueue(key, async () => {
       try {
         await dispatcher.handle(msg, {
           runTurn: (prompt, model) =>
