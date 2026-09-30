@@ -2,6 +2,7 @@ package rongcloud
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/multica-ai/multica/server/internal/testutil"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
@@ -217,5 +219,45 @@ func TestRegisterWithValidTicketAttributesWorkspace(t *testing.T) {
 	}
 	if user.WorkspaceID != wsUUID {
 		t.Fatalf("rongcloud user workspace = %v, want %s", user.WorkspaceID, env.wsID)
+	}
+}
+
+// Registering with a valid ticket must record the newly created node as the
+// pairing session's candidate, so a subsequent claim can mint the device
+// credential (the web UI creates sessions with empty candidates).
+func TestRegisterWithTicketBackfillsSessionCandidates(t *testing.T) {
+	env := newRegisterTestEnv(t)
+	ticket := env.createPendingPairingTicket(t, 5*time.Minute)
+	env.cleanupRegisteredNode(t, "aa:bb:cc:dd:ee:06")
+
+	result, err := env.nodes.Register(context.Background(), registerParams("aa:bb:cc:dd:ee:06", ticket))
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	node, err := env.queries.GetRongCloudNodeByNodeID(context.Background(), result.NodeID)
+	if err != nil {
+		t.Fatalf("GetRongCloudNodeByNodeID: %v", err)
+	}
+	session, err := env.queries.GetRongCloudPairingSessionByTicket(context.Background(), ticket)
+	if err != nil {
+		t.Fatalf("GetRongCloudPairingSessionByTicket: %v", err)
+	}
+	var candidates []pgtype.UUID
+	if err := json.Unmarshal(session.CandidateNodeIds, &candidates); err != nil {
+		t.Fatalf("unmarshal candidate_node_ids (%s): %v", string(session.CandidateNodeIds), err)
+	}
+	if len(candidates) != 1 || candidates[0] != node.ID {
+		t.Fatalf("candidate_node_ids = %v, want [%s]", candidates, node.ID)
+	}
+
+	// The full web-driven chain must now claim successfully end-to-end:
+	// create (empty candidates) -> register with ticket (backfill) -> claim.
+	claim, err := env.pairing.ClaimSession(context.Background(), ticket, "", "idem-backfill-test")
+	if err != nil {
+		t.Fatalf("ClaimSession after backfill: %v", err)
+	}
+	if claim.NodeID != result.NodeID {
+		t.Fatalf("claim node = %q, want %q", claim.NodeID, result.NodeID)
 	}
 }

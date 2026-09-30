@@ -1594,6 +1594,61 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// a single-use high-entropy secret, and an optional client claim key in
 	// the body must match the one bound at session creation.
 	r.Post("/api/claw/pairing/{ticket}/claim", h.ClaimRongCloudPairing)
+	// xiachat pairing creation/polling for the legacy ClawMessenger web app.
+	// Authenticated by the legacy Bearer token (claw_im_users.rongcloud_token),
+	// not the Multica session.
+	r.Post("/api/claw/pairing", h.ClawCreatePairing)
+	r.Get("/api/claw/pairing/{ticket}", h.ClawGetPairing)
+
+	// ClawMessenger (虾说) compatibility API — 移植自旧 Python 后端的公开契约，
+	// 供 clawmessenger-web / clawmessenger-uniapp 前端直连。
+	r.Post("/api/register", h.ClawRegister)
+	r.Post("/api/login", h.ClawLogin)
+	r.Get("/api/user/list", h.ClawUserList)
+	r.Get("/api/user/info", h.ClawUserInfo)
+	r.Post("/api/user/info", h.ClawUserInfo)
+	r.Post("/api/user/update", h.ClawUserUpdate)
+	r.Get("/api/config/user-guide", h.ClawUserGuide)
+	r.Post("/api/im/refresh-token", h.ClawImRefreshToken)
+
+	// ClawMessenger admin (虾说后台) compatibility API — /api/admin/*
+	r.Post("/api/admin/auth/login", h.ClawAdminLogin)
+	r.Post("/api/admin/auth/refresh", h.ClawAdminRefresh)
+	r.Post("/api/admin/auth/logout", h.ClawAdminLogout)
+	r.Get("/api/admin/auth/me", h.ClawAdminMe)
+	r.Get("/api/admin/users", h.ClawAdminListUsers)
+	r.Get("/api/admin/users/{id}", h.ClawAdminGetUser)
+	r.Put("/api/admin/users/{id}", h.ClawAdminUpdateUser)
+	r.Put("/api/admin/users/{id}/status", h.ClawAdminUpdateUserStatus)
+	r.Get("/api/admin/users/{id}/nodes", h.ClawAdminUserNodes)
+	r.Get("/api/admin/users/{id}/groups", h.ClawAdminUserGroups)
+	r.Get("/api/admin/stats", h.ClawAdminStats)
+	r.Get("/api/admin/audit-logs", h.ClawAdminAuditLogs)
+	r.Get("/api/admin/system/config", h.ClawAdminSystemConfigList)
+	r.Get("/api/admin/system/config/{key}", h.ClawAdminSystemConfigGet)
+	r.Put("/api/admin/system/config/{key}", h.ClawAdminSystemConfigPut)
+	r.Get("/api/admin/admins", h.ClawAdminListAdmins)
+	r.Post("/api/admin/admins", h.ClawAdminCreateAdmin)
+	r.Get("/api/admin/admins/{id}", h.ClawAdminGetAdmin)
+	r.Put("/api/admin/admins/{id}", h.ClawAdminUpdateAdmin)
+	r.Put("/api/admin/admins/{id}/status", h.ClawAdminUpdateAdminStatus)
+	r.Delete("/api/admin/admins/{id}", h.ClawAdminDeleteAdmin)
+	r.Get("/api/admin/roles", h.ClawAdminListRoles)
+	r.Post("/api/admin/roles", h.ClawAdminCreateRole)
+	r.Get("/api/admin/roles/{id}", h.ClawAdminGetRole)
+	r.Put("/api/admin/roles/{id}", h.ClawAdminUpdateRole)
+	r.Delete("/api/admin/roles/{id}", h.ClawAdminDeleteRole)
+	r.Get("/api/admin/nodes", h.ClawAdminEmptyPage)
+	r.Get("/api/admin/nodes/status/all", h.ClawAdminEmptyList)
+	r.Get("/api/admin/nodes/{id}", h.ClawAdminNotFound)
+	r.Get("/api/admin/nodes/{id}/status", h.ClawAdminNotFound)
+	r.Get("/api/admin/groups", h.ClawAdminEmptyPage)
+	r.Get("/api/admin/groups/{id}", h.ClawAdminNotFound)
+	r.Get("/api/admin/groups/{id}/members", h.ClawAdminEmptyList)
+	r.Get("/api/admin/chatrooms", h.ClawAdminEmptyPage)
+	r.Get("/api/admin/chatrooms/{id}", h.ClawAdminNotFound)
+	r.Get("/api/admin/chatrooms/{id}/messages", h.ClawAdminEmptyList)
+	r.Get("/api/admin/messages", h.ClawAdminEmptyPage)
 
 	// Composio OAuth callback (MUL-3843). NOT under the Auth group on purpose:
 	// Composio 302-redirects the user's browser here at the end of the OAuth

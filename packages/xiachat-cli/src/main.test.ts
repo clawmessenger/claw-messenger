@@ -103,7 +103,7 @@ describe("xiachat pair", () => {
     const keystore = tempKeystore();
     const fakeApi = {
       getConfig: async () => ({ appKey: "pk" }),
-      register: async () => { throw new Error("not used"); },
+      register: async () => ({ nodeId: "node_1", token: "tok_1" }),
       claimPairing: async () => ({
         deviceCredentialId: "dc_9",
         deviceSecret: "",
@@ -120,7 +120,9 @@ describe("xiachat pair", () => {
     await expect(
       program.parseAsync(["node", "xiachat", "pair", "--ticket", "pt_1"]),
     ).rejects.toThrow(/already claimed/);
-    expect(keystore.load()).toBeNull();
+    // The register step still persisted its own node identity, but the
+    // claimed-by-another-device result must not overwrite it.
+    expect(keystore.load()?.nodeId).toBe("node_1");
   });
 
   it("derives the same idempotency key across retries on one machine", async () => {
@@ -128,7 +130,7 @@ describe("xiachat pair", () => {
     const seenIdemKeys: string[] = [];
     const fakeApi = {
       getConfig: async () => ({ appKey: "pk" }),
-      register: async () => { throw new Error("not used"); },
+      register: async () => ({ nodeId: "node_5", token: "tok_5" }),
       claimPairing: async (_ticket: string, _cck: string, idemKey: string) => {
         seenIdemKeys.push(idemKey);
         return {
@@ -162,7 +164,7 @@ describe("xiachat pair", () => {
     const seenIdemKeys: string[] = [];
     const fakeApi = {
       getConfig: async () => ({ appKey: "pk" }),
-      register: async () => { throw new Error("not used"); },
+      register: async () => ({ nodeId: "node_6", token: "tok_6" }),
       claimPairing: async (_ticket: string, _cck: string, idemKey: string) => {
         seenIdemKeys.push(idemKey);
         return { deviceCredentialId: "dc_1", deviceSecret: "s", nodeId: "node_6" };

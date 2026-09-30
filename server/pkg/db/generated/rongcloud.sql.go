@@ -11,6 +11,35 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const backfillRongCloudPairingSessionCandidates = `-- name: BackfillRongCloudPairingSessionCandidates :one
+UPDATE rongcloud_pairing_session SET candidate_node_ids = $2, updated_at = now()
+WHERE ticket = $1 AND status = 'pending'
+RETURNING id, workspace_id, ticket, status, client_claim_key, idempotency_key, candidate_node_ids, expires_at, created_at, updated_at
+`
+
+type BackfillRongCloudPairingSessionCandidatesParams struct {
+	Ticket           string `json:"ticket"`
+	CandidateNodeIds []byte `json:"candidate_node_ids"`
+}
+
+func (q *Queries) BackfillRongCloudPairingSessionCandidates(ctx context.Context, arg BackfillRongCloudPairingSessionCandidatesParams) (RongcloudPairingSession, error) {
+	row := q.db.QueryRow(ctx, backfillRongCloudPairingSessionCandidates, arg.Ticket, arg.CandidateNodeIds)
+	var i RongcloudPairingSession
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.Ticket,
+		&i.Status,
+		&i.ClientClaimKey,
+		&i.IdempotencyKey,
+		&i.CandidateNodeIds,
+		&i.ExpiresAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const createRongCloudChatroom = `-- name: CreateRongCloudChatroom :one
 
 INSERT INTO rongcloud_chatroom (workspace_id, rongcloud_chatroom_id, owner_user_id, host_node_id, max_rounds, conversation_kind, config, status)

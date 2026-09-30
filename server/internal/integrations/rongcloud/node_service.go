@@ -149,6 +149,18 @@ func (s *NodeService) Register(ctx context.Context, params NodeRegisterParams) (
 		CredentialSecretEncrypted: pgText(encSecret),
 		Status:                    "active",
 	})
+	// When registration is attributed to a pairing ticket, record the newly
+	// created node as the session's candidate so a later claim can mint the
+	// device credential. Best-effort: a missing or already-claimed session
+	// must not fail the registration itself.
+	if params.PairingTicket != "" {
+		if candidates, err := json.Marshal([]pgtype.UUID{node.ID}); err == nil {
+			_, _ = s.queries.BackfillRongCloudPairingSessionCandidates(ctx, db.BackfillRongCloudPairingSessionCandidatesParams{
+				Ticket:           params.PairingTicket,
+				CandidateNodeIds: candidates,
+			})
+		}
+	}
 	return NodeRegisterResult{
 		NodeID:                 nodeID,
 		Token:                  token,

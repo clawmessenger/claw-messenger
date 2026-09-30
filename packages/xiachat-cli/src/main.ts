@@ -1,5 +1,6 @@
 import { Command } from "commander";
 import { createHash } from "node:crypto";
+import * as os from "node:os";
 import { Keystore, type StoredCredentials } from "./keystore.js";
 import { XiachatApi } from "./api.js";
 import { discoverAgents } from "./agents.js";
@@ -70,11 +71,38 @@ export function buildProgram(opts: BuildProgramOpts): Command {
 
   program
     .command("pair")
-    .description("Claim a pairing session with a ticket")
+    .description("Register this device and claim a pairing session with a ticket")
     .requiredOption("--ticket <ticket>", "pairing ticket (pt_...)")
     .option("--server <url>", "Quukk server base URL", DEFAULT_SERVER_URL)
-    .action(async (cmdOpts: { ticket: string; server: string }) => {
+    .option("--name <name>", "node display name")
+    .option("--ai-type <type>", "agent platform (claude, codex, opencode, ...)", "opencode")
+    .action(async (cmdOpts: { ticket: string; server: string; name?: string; aiType: string }) => {
       const api = opts.apiFactory(cmdOpts.server);
+      // Register with the ticket first: the server attributes the node to
+      // the ticket's workspace and backfills the session's candidate node
+      // list so the subsequent claim can issue device credentials.
+      try {
+        const reg = await api.register({
+          name: cmdOpts.name ?? `${os.hostname()} ${cmdOpts.aiType}`,
+          aiType: cmdOpts.aiType,
+          nodeType: "ai",
+          macAddress: (opts.machineId ?? machineId)(),
+          pairingTicket: cmdOpts.ticket,
+        });
+        opts.keystore.save({
+          nodeId: reg.nodeId,
+          token: reg.token,
+          credentialId: reg.deviceCredentialTicket,
+          serverUrl: cmdOpts.server,
+        });
+        opts.stdout.write(`registered ${reg.nodeId}\n`);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (message.includes("attribution")) {
+          throw new Error(`${message}\nhint: provide --pairing-ticket (get one from your workspace admin)`);
+        }
+        throw err;
+      }
       const idemKey = pairIdempotencyKey(cmdOpts.ticket, (opts.machineId ?? machineId)());
       const result = await api.claimPairing(cmdOpts.ticket, "", idemKey);
       if (result.session?.status === "claimed" && !result.deviceSecret) {

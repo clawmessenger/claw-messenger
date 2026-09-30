@@ -45,6 +45,31 @@ func (s *InstallService) GetAppKey(ctx context.Context) string {
 	return appKey
 }
 
+// GetAppSecret returns the decrypted AppSecret of the oldest active
+// installation (same single-install assumption as GetAppKey). Unlike
+// GetAppKey it returns an error because decryption can fail and callers
+// such as the claw compat layer treat a missing secret as fatal.
+func (s *InstallService) GetAppSecret(ctx context.Context) (string, error) {
+	if s.queries == nil {
+		return "", fmt.Errorf("rongcloud: install service has no queries")
+	}
+	insts, err := s.queries.ListActiveChannelInstallations(ctx, string(TypeRongCloud))
+	if err != nil {
+		return "", err
+	}
+	if len(insts) == 0 {
+		return "", fmt.Errorf("no active rongcloud channel installation found")
+	}
+	if s.box == nil {
+		return "", fmt.Errorf("rongcloud: install service has no secretbox")
+	}
+	cfg, err := decodeCredentials(insts[0].Config, s.box.Open)
+	if err != nil {
+		return "", err
+	}
+	return cfg.AppSecret, nil
+}
+
 func (s *InstallService) GetInstallation(ctx context.Context, instID pgtype.UUID) (channel.Config, error) {
 	inst, err := s.queries.GetChannelInstallation(ctx, db.GetChannelInstallationParams{
 		ID:          instID,
