@@ -102,31 +102,52 @@ func (s *NodeService) Register(ctx context.Context, params NodeRegisterParams) (
 		}
 		encToken = base64.StdEncoding.EncodeToString(sealed)
 	}
-	rcUser, err := s.queries.CreateRongCloudUser(ctx, db.CreateRongCloudUserParams{
-		WorkspaceID:     params.WorkspaceID,
-		RongcloudUserID: rcUserID,
-		Name:            pgText(params.Name),
-		TokenEncrypted:  pgText(encToken),
-		IsAiNode:        true,
-		NodeType:        "ai",
-	})
-	if err != nil {
-		return NodeRegisterResult{}, fmt.Errorf("rongcloud: create user: %w", err)
+	// Register must be idempotent per machine: a repeat `xiachat pair` on a
+	// device that already registered would otherwise collide with the unique
+	// rongcloud_user_id / node rows and fail with a 500. Reuse the existing
+	// identity and just refresh its stored IM token.
+	rcUser, err := s.queries.GetRongCloudUserByRongCloudID(ctx, rcUserID)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return NodeRegisterResult{}, fmt.Errorf("rongcloud: lookup user: %w", err)
+	}
+	if err == nil {
+		_, _ = s.queries.UpdateRongCloudUserToken(ctx, db.UpdateRongCloudUserTokenParams{
+			ID:             rcUser.ID,
+			TokenEncrypted: pgText(encToken),
+		})
+	} else {
+		rcUser, err = s.queries.CreateRongCloudUser(ctx, db.CreateRongCloudUserParams{
+			WorkspaceID:     params.WorkspaceID,
+			RongcloudUserID: rcUserID,
+			Name:            pgText(params.Name),
+			TokenEncrypted:  pgText(encToken),
+			IsAiNode:        true,
+			NodeType:        "ai",
+		})
+		if err != nil {
+			return NodeRegisterResult{}, fmt.Errorf("rongcloud: create user: %w", err)
+		}
 	}
 	nodeID := fmt.Sprintf("node_%s", hex.EncodeToString(rcUser.ID.Bytes[:8]))
 	capabilitiesJSON, _ := json.Marshal(params.Capabilities)
-	node, err := s.queries.CreateRongCloudNode(ctx, db.CreateRongCloudNodeParams{
-		WorkspaceID:     params.WorkspaceID,
-		OwnerUserID:     params.OwnerUserID,
-		RongcloudUserID: rcUserID,
-		NodeID:          nodeID,
-		AiType:          pgText(params.AIType),
-		Capabilities:    capabilitiesJSON,
-		DeployStatus:    "offline",
-		BindingVersion:  1,
-	})
+	node, err := s.queries.GetRongCloudNodeByRongCloudUserID(ctx, rcUserID)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return NodeRegisterResult{}, fmt.Errorf("rongcloud: lookup node: %w", err)
+	}
 	if err != nil {
-		return NodeRegisterResult{}, fmt.Errorf("rongcloud: create node: %w", err)
+		node, err = s.queries.CreateRongCloudNode(ctx, db.CreateRongCloudNodeParams{
+			WorkspaceID:     params.WorkspaceID,
+			OwnerUserID:     params.OwnerUserID,
+			RongcloudUserID: rcUserID,
+			NodeID:          nodeID,
+			AiType:          pgText(params.AIType),
+			Capabilities:    capabilitiesJSON,
+			DeployStatus:    "offline",
+			BindingVersion:  1,
+		})
+		if err != nil {
+			return NodeRegisterResult{}, fmt.Errorf("rongcloud: create node: %w", err)
+		}
 	}
 	credID, credSecret, err := generateDeviceCredential()
 	if err != nil {

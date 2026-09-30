@@ -261,3 +261,38 @@ func TestRegisterWithTicketBackfillsSessionCandidates(t *testing.T) {
 		t.Fatalf("claim node = %q, want %q", claim.NodeID, result.NodeID)
 	}
 }
+
+// Registering a machine that already registered must be idempotent: a repeat
+// `xiachat pair` reuses the existing user/node rows instead of colliding with
+// their unique constraints.
+func TestRegisterIsIdempotentForExistingMachine(t *testing.T) {
+	env := newRegisterTestEnv(t)
+	ticket1 := env.createPendingPairingTicket(t, 5*time.Minute)
+	ticket2 := env.createPendingPairingTicket(t, 5*time.Minute)
+	env.cleanupRegisteredNode(t, "aa:bb:cc:dd:ee:07")
+
+	first, err := env.nodes.Register(context.Background(), registerParams("aa:bb:cc:dd:ee:07", ticket1))
+	if err != nil {
+		t.Fatalf("first Register: %v", err)
+	}
+	second, err := env.nodes.Register(context.Background(), registerParams("aa:bb:cc:dd:ee:07", ticket2))
+	if err != nil {
+		t.Fatalf("second Register: %v", err)
+	}
+	if second.NodeID != first.NodeID {
+		t.Fatalf("second node = %q, want same node %q", second.NodeID, first.NodeID)
+	}
+	if _, err := env.queries.GetRongCloudNodeByRongCloudUserID(context.Background(), "rc_node_aa:bb:cc:dd:ee:07"); err != nil {
+		t.Fatalf("node row must exist after re-register: %v", err)
+	}
+
+	// The re-registration must also backfill its own ticket so its claim can
+	// mint the credential.
+	claim, err := env.pairing.ClaimSession(context.Background(), ticket2, "", "idem-idempotent-test")
+	if err != nil {
+		t.Fatalf("ClaimSession after re-register: %v", err)
+	}
+	if claim.NodeID != second.NodeID {
+		t.Fatalf("claim node = %q, want %q", claim.NodeID, second.NodeID)
+	}
+}
