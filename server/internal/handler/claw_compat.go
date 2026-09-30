@@ -688,6 +688,24 @@ func (h *Handler) ClawGetPairing(w http.ResponseWriter, r *http.Request) {
 	clawJSON(w, 200, 200, "", view)
 }
 
+// ClawListNodes GET /api/claw/nodes —— 旧站远程设备列表（HTTP 通道，不依赖浏览器 IM 连接）。
+func (h *Handler) ClawListNodes(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.clawRequireClawUser(w, r); !ok {
+		return
+	}
+	if h.RongCloudNode == nil {
+		clawJSON(w, 503, 503, "RongCloud 未配置", nil)
+		return
+	}
+	records, err := h.RongCloudNode.LegacyNodeRecords(r.Context())
+	if err != nil {
+		slog.Warn("claw nodes list failed", "error", err)
+		clawJSON(w, 500, 500, "获取设备列表失败", nil)
+		return
+	}
+	clawJSON(w, 200, 200, "ok", map[string]interface{}{"nodes": records})
+}
+
 // ClawBindPairing POST /api/claw/pairing/{ticket}/bind —— 旧站弹窗勾选绑定 agent。
 // 票据必须已 claimed（设备已 pair）；每个被选 agent 独立建 rc user + node + 凭据。
 func (h *Handler) ClawBindPairing(w http.ResponseWriter, r *http.Request) {

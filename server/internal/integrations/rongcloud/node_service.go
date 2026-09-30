@@ -337,6 +337,48 @@ func (s *NodeService) EnrollDeviceCredential(ctx context.Context, nodeID string)
 	return credID, secret, nil
 }
 
+// LegacyNodeRecords returns all nodes in the installation workspace mapped to
+// the legacy NodeRecord shape consumed by the old web client's device list.
+func (s *NodeService) LegacyNodeRecords(ctx context.Context) ([]map[string]interface{}, error) {
+	if s.queries == nil {
+		return nil, errors.New("rongcloud: no queries")
+	}
+	insts, err := s.queries.ListActiveChannelInstallations(ctx, string(TypeRongCloud))
+	if err != nil {
+		return nil, err
+	}
+	if len(insts) == 0 {
+		return nil, errors.New("no active rongcloud channel installation found")
+	}
+	nodes, err := s.queries.ListRongCloudNodesByWorkspace(ctx, insts[0].WorkspaceID)
+	if err != nil {
+		return nil, err
+	}
+	records := make([]map[string]interface{}, 0, len(nodes))
+	for _, n := range nodes {
+		aiType := n.AiType.String
+		record := map[string]interface{}{
+			"node_id":       n.NodeID,
+			"node_type":     aiType,
+			"name":          aiType,
+			"rongcloud_id":  n.RongcloudUserID,
+			"deploy_status": n.DeployStatus,
+			"status":        "active",
+			"created_at":    n.CreatedAt.Time,
+			"updated_at":    n.UpdatedAt.Time,
+		}
+		if len(n.Capabilities) > 0 {
+			record["capabilities"] = json.RawMessage(n.Capabilities)
+		}
+		if u, err := s.queries.GetRongCloudUserByRongCloudID(ctx, n.RongcloudUserID); err == nil && u.Name.Valid && u.Name.String != "" {
+			record["name"] = u.Name.String
+			record["nickname"] = u.Name.String
+		}
+		records = append(records, record)
+	}
+	return records, nil
+}
+
 func (s *NodeService) ListNodeModels(ctx context.Context, nodeID pgtype.UUID) ([]db.RongcloudNodeModelCatalog, error) {
 	if s.queries == nil {
 		return nil, errors.New("rongcloud: database not configured")

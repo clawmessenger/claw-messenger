@@ -52,6 +52,8 @@ func (h *systemHandler) handleCommand(ctx context.Context, msg NormalizedMessage
 		return h.handleDeviceCommand(ctx, msg, cmd)
 	case "discussion":
 		return h.handleDiscussionCommand(ctx, msg, cmd)
+	case "ai":
+		return h.handleAICommand(ctx, msg, cmd)
 	default:
 		h.logger.Warn("rongcloud: unknown service", "service", cmd.Service, "msgUID", msg.MsgUID)
 		return h.sendError(ctx, msg, cmd.RequestID, fmt.Sprintf("unknown service: %s", cmd.Service))
@@ -109,6 +111,57 @@ func (h *systemHandler) handleChatroomCommand(ctx context.Context, msg Normalize
 
 	default:
 		return h.sendError(ctx, msg, cmd.RequestID, fmt.Sprintf("unsupported chatroom action: %s", cmd.Action))
+	}
+}
+
+func (h *systemHandler) handleAICommand(ctx context.Context, msg NormalizedMessage, cmd CommandContent) error {
+	if h.queries == nil {
+		return h.sendError(ctx, msg, cmd.RequestID, "database not available")
+	}
+
+	switch cmd.Action {
+	case "getNodes":
+		// Resolve the installation workspace through the system user this
+		// handler is connected as (local single-install semantics).
+		sysUser, err := h.queries.GetRongCloudUserByRongCloudID(ctx, h.nodeID)
+		if err != nil {
+			h.logger.Error("rongcloud: ai getNodes resolve system user", "error", err)
+			return h.sendError(ctx, msg, cmd.RequestID, "failed to resolve workspace")
+		}
+		nodes, err := h.queries.ListRongCloudNodesByWorkspace(ctx, sysUser.WorkspaceID)
+		if err != nil {
+			h.logger.Error("rongcloud: ai getNodes list nodes", "error", err)
+			return h.sendError(ctx, msg, cmd.RequestID, "failed to list nodes")
+		}
+		records := make([]map[string]interface{}, 0, len(nodes))
+		for _, n := range nodes {
+			aiType := n.AiType.String
+			record := map[string]interface{}{
+				"node_id":       n.NodeID,
+				"node_type":     aiType,
+				"name":          aiType,
+				"rongcloud_id":  n.RongcloudUserID,
+				"deploy_status": n.DeployStatus,
+				"status":        "active",
+				"created_at":    n.CreatedAt.Time,
+				"updated_at":    n.UpdatedAt.Time,
+			}
+			if len(n.Capabilities) > 0 {
+				record["capabilities"] = json.RawMessage(n.Capabilities)
+			}
+			if u, err := h.queries.GetRongCloudUserByRongCloudID(ctx, n.RongcloudUserID); err == nil && u.Name.Valid && u.Name.String != "" {
+				record["name"] = u.Name.String
+				record["nickname"] = u.Name.String
+			}
+			records = append(records, record)
+		}
+		return h.client.sendCommandResult(ctx, h.nodeID, msg.FromUserID, cmd.RequestID, map[string]interface{}{
+			"ok":    true,
+			"nodes": records,
+		})
+
+	default:
+		return h.sendError(ctx, msg, cmd.RequestID, fmt.Sprintf("unsupported ai action: %s", cmd.Action))
 	}
 }
 

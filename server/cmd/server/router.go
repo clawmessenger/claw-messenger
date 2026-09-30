@@ -1601,6 +1601,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	r.Get("/api/claw/pairing/{ticket}", h.ClawGetPairing)
 	r.Post("/api/claw/pairing/{ticket}/bind", h.ClawBindPairing)
 	r.Post("/api/claw/device/nodes", h.ClawDeviceNodes)
+	r.Get("/api/claw/nodes", h.ClawListNodes)
 
 	// ClawMessenger (虾说) compatibility API — 移植自旧 Python 后端的公开契约，
 	// 供 clawmessenger-web / clawmessenger-uniapp 前端直连。
