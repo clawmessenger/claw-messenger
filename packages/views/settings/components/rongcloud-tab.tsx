@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { Play, Square, Trash2 } from "lucide-react";
+import { Link2, Play, Square, Trash2 } from "lucide-react";
 import { RongCloudMark } from "./rongcloud-mark";
 import { Button } from "@multica/ui/components/ui/button";
 import { Card, CardContent } from "@multica/ui/components/ui/card";
@@ -17,12 +17,20 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@multica/ui/components/ui/alert-dialog";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@multica/ui/components/ui/dialog";
 import { useWorkspaceId } from "@multica/core/hooks";
 import { useCurrentMember } from "@multica/core/permissions";
 import {
   rongcloudConfigOptions,
   rongcloudChatroomsOptions,
   rongcloudNodesOptions,
+  rongcloudPairingOptions,
   rongcloudKeys,
 } from "@multica/core/rongcloud";
 import { api } from "@multica/core/api";
@@ -56,6 +64,41 @@ export function RongCloudTab() {
     { chatroomId: string; action: "start" | "stop" } | null
   >(null);
   const [discussionLoading, setDiscussionLoading] = useState(false);
+  const [pairTicket, setPairTicket] = useState<string | null>(null);
+  const [pairing, setPairing] = useState(false);
+
+  // Poll the pairing session while the dialog is open so the UI flips to
+  // "bound" when the CLI claims the ticket.
+  const { data: pairSession } = useQuery({
+    ...rongcloudPairingOptions(wsId, pairTicket ?? ""),
+    enabled: !!wsId && !!pairTicket,
+    refetchInterval: (query) =>
+      query.state.status === "success" && query.state.data?.status === "pending"
+        ? 2_000
+        : false,
+  });
+
+  async function handleCreatePairing() {
+    if (pairing || !wsId) return;
+    setPairing(true);
+    try {
+      const session = await api.createRongCloudPairing(wsId, {
+        candidate_node_ids: [],
+        client_claim_key: "",
+        expires_in_seconds: 600,
+      });
+      setPairTicket(session.ticket);
+      toast.success(t(($) => $.rongcloud.toast_pairing_created));
+    } catch (e) {
+      toast.error(
+        e instanceof Error
+          ? e.message
+          : t(($) => $.rongcloud.toast_pairing_failed),
+      );
+    } finally {
+      setPairing(false);
+    }
+  }
 
   async function handleDelete() {
     if (!deleteTarget || deleting) return;
@@ -147,6 +190,14 @@ export function RongCloudTab() {
             nodes: nodes.length,
           })}
         </p>
+        {canManage && (
+          <Button variant="outline" size="sm" onClick={handleCreatePairing} disabled={pairing}>
+            <Link2 className="size-3.5" />
+            {pairing
+              ? t(($) => $.rongcloud.pairing_creating)
+              : t(($) => $.rongcloud.bind_device)}
+          </Button>
+        )}
       </section>
 
       <section className="space-y-3">
@@ -290,6 +341,51 @@ export function RongCloudTab() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      <Dialog
+        open={pairTicket !== null}
+        onOpenChange={(open) => !open && setPairTicket(null)}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>
+              {t(($) => $.rongcloud.pairing_dialog_title)}
+            </DialogTitle>
+            <DialogDescription>
+              {t(($) => $.rongcloud.pairing_dialog_description)}
+            </DialogDescription>
+          </DialogHeader>
+          {pairSession?.status === "claimed" ? (
+            <div className="space-y-2 py-2">
+              <p className="text-body font-medium text-success">
+                {t(($) => $.rongcloud.pairing_claimed)}
+              </p>
+              <p className="text-caption text-muted-foreground">
+                {t(($) => $.rongcloud.pairing_claimed_hint)}
+              </p>
+            </div>
+          ) : pairSession?.status === "expired" ? (
+            <div className="space-y-2 py-2">
+              <p className="text-body font-medium text-destructive">
+                {t(($) => $.rongcloud.pairing_expired)}
+              </p>
+            </div>
+          ) : (
+            <div className="space-y-3 py-2">
+              <p className="text-caption text-muted-foreground">
+                {t(($) => $.rongcloud.pairing_step_label)}
+              </p>
+              <code className="block overflow-x-auto rounded-xs bg-muted px-2 py-1.5 text-micro">
+                xiachat pair --ticket {pairTicket ?? ""} --server{" "}
+                {typeof window !== "undefined" ? window.location.origin : ""}
+              </code>
+              <p className="text-caption text-muted-foreground">
+                {t(($) => $.rongcloud.pairing_waiting)}
+              </p>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
