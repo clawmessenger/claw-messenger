@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -538,10 +539,10 @@ func TestChannelConnectRegistersWebhook(t *testing.T) {
 			AppSecret:    "secret",
 			SystemNodeID: "sys",
 		},
-		client:       newRongCloudAPIClient("key", "secret", "", nil, testLogger()),
+		client:        newRongCloudAPIClient("key", "secret", "", nil, testLogger()),
 		systemHandler: newSystemHandler(newRongCloudAPIClient("key", "secret", "", nil, testLogger()), "sys", testLogger(), nil, nil),
 		registrar:     dispatcher,
-		handler:      func(ctx context.Context, msg channel.InboundMessage) error { return nil },
+		handler:       func(ctx context.Context, msg channel.InboundMessage) error { return nil },
 		logger:        testLogger(),
 	}
 
@@ -665,9 +666,9 @@ func newTestWebhookChannel(t *testing.T) (*rongcloudChannel, *httptest.Server) {
 			SystemNodeID: "sys-node",
 		},
 		client:        newRongCloudAPIClient("test-key", "test-secret", srv.URL, srv.Client(), testLogger()),
-		systemHandler:  newSystemHandler(newRongCloudAPIClient("test-key", "test-secret", srv.URL, srv.Client(), testLogger()), "sys-node", testLogger(), nil, nil),
-		registrar:      dispatcher,
-		logger:         testLogger(),
+		systemHandler: newSystemHandler(newRongCloudAPIClient("test-key", "test-secret", srv.URL, srv.Client(), testLogger()), "sys-node", testLogger(), nil, nil),
+		registrar:     dispatcher,
+		logger:        testLogger(),
 	}
 	if err := dispatcher.Register("test-inst", ch.handleWebhook); err != nil {
 		t.Fatalf("register webhook: %v", err)
@@ -1081,10 +1082,10 @@ func TestPairingServiceGenerateTicket(t *testing.T) {
 func TestHandleNodeMessage(t *testing.T) {
 	sh := newSystemHandler(nil, "node-123", testLogger(), nil, nil)
 	msg := NormalizedMessage{
-		MsgUID:      "msg-001",
-		FromUserID:  "user-abc",
-		ObjectName:  "RC:TxtMsg",
-		Content:     `{"text":"hello"}`,
+		MsgUID:     "msg-001",
+		FromUserID: "user-abc",
+		ObjectName: "RC:TxtMsg",
+		Content:    `{"text":"hello"}`,
 	}
 	sh.handleNodeMessage(context.Background(), msg)
 }
@@ -1528,10 +1529,10 @@ func TestHandleDiscussionCommandStatusNoRegistry(t *testing.T) {
 func TestHandleNodeMessageNilRegistry(t *testing.T) {
 	sh := newSystemHandler(nil, "node-123", testLogger(), nil, nil)
 	msg := NormalizedMessage{
-		MsgUID:      "msg-001",
-		FromUserID:  "user-abc",
-		ObjectName:  objectNameStream,
-		Content:     `{"turn_id":"turn1","stream_type":"chunk","content":"hi"}`,
+		MsgUID:     "msg-001",
+		FromUserID: "user-abc",
+		ObjectName: objectNameStream,
+		Content:    `{"turn_id":"turn1","stream_type":"chunk","content":"hi"}`,
 	}
 	sh.handleNodeMessage(context.Background(), msg)
 }
@@ -1624,7 +1625,7 @@ func TestNewDiscussionServiceWithBridge(t *testing.T) {
 
 func TestNewDiscussionCoordinatorWithBridge(t *testing.T) {
 	state := DiscussionState{
-		Status:     StatusInProgress,
+		Status:       StatusInProgress,
 		CurrentRound: 1,
 	}
 	coord := NewDiscussionCoordinator(
@@ -1682,5 +1683,103 @@ func TestEnsureCredsResolvesOnceConcurrently(t *testing.T) {
 	}
 	if c.appKey != "key" || c.appSecret != "secret" {
 		t.Fatalf("creds = %q/%q, want key/secret", c.appKey, c.appSecret)
+	}
+}
+
+func TestBuildInvocation(t *testing.T) {
+	tests := []struct {
+		name      string
+		agent     string
+		prompt    string
+		model     string
+		wantArgv  []string
+		wantStdin bool
+	}{
+		{
+			name:      "claude argv mode with model",
+			agent:     "claude",
+			prompt:    "hi",
+			model:     "sonnet-4",
+			wantArgv:  []string{"-p", "hi", "--model", "sonnet-4"},
+			wantStdin: false,
+		},
+		{
+			name:      "codex argv mode with model",
+			agent:     "codex",
+			prompt:    "hi",
+			model:     "gpt-5",
+			wantArgv:  []string{"exec", "hi", "-m", "gpt-5"},
+			wantStdin: false,
+		},
+		{
+			name:      "opencode argv mode with model",
+			agent:     "opencode",
+			prompt:    "hi",
+			model:     "glm-4.7",
+			wantArgv:  []string{"run", "hi", "--model", "glm-4.7"},
+			wantStdin: false,
+		},
+		{
+			name:      "claude argv mode without model",
+			agent:     "claude",
+			prompt:    "hi",
+			wantArgv:  []string{"-p", "hi"},
+			wantStdin: false,
+		},
+		{
+			name:      "codex argv mode without model",
+			agent:     "codex",
+			prompt:    "hi",
+			wantArgv:  []string{"exec", "hi"},
+			wantStdin: false,
+		},
+		{
+			name:      "opencode argv mode without model",
+			agent:     "opencode",
+			prompt:    "hi",
+			wantArgv:  []string{"run", "hi"},
+			wantStdin: false,
+		},
+		{
+			name:      "unknown agent keeps stdin without model flag",
+			agent:     "kimi",
+			prompt:    "hi",
+			wantArgv:  nil,
+			wantStdin: true,
+		},
+		{
+			name:      "unknown agent with model keeps stdin and model flag",
+			agent:     "kimi",
+			prompt:    "hi",
+			model:     "m1",
+			wantArgv:  []string{"--model", "m1"},
+			wantStdin: true,
+		},
+		{
+			name:      "strategy agent past argv cap falls back to stdin",
+			agent:     "claude",
+			prompt:    strings.Repeat("a", 8001),
+			model:     "sonnet-4",
+			wantArgv:  []string{"--model", "sonnet-4"},
+			wantStdin: true,
+		},
+		{
+			name:      "strategy agent at argv cap stays in argv mode",
+			agent:     "claude",
+			prompt:    strings.Repeat("a", 8000),
+			wantArgv:  []string{"-p", strings.Repeat("a", 8000)},
+			wantStdin: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := buildInvocation(tt.agent, tt.prompt, tt.model)
+			if !reflect.DeepEqual(spec.argv, tt.wantArgv) {
+				t.Errorf("argv = %v, want %v", spec.argv, tt.wantArgv)
+			}
+			if spec.stdinPrompt != tt.wantStdin {
+				t.Errorf("stdinPrompt = %v, want %v", spec.stdinPrompt, tt.wantStdin)
+			}
+		})
 	}
 }
