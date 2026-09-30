@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -41,17 +42,70 @@ type NodeRegisterResult struct {
 }
 
 type NodeService struct {
-	queries *db.Queries
-	client  *rongcloudAPIClient
-	box     *secretbox.Box
-	logger  *slog.Logger
+	queries    *db.Queries
+	client     *rongcloudAPIClient
+	box        *secretbox.Box
+	logger     *slog.Logger
+	mu         sync.Mutex
+	heartbeats map[pgtype.UUID]time.Time
 }
 
 func NewNodeService(queries *db.Queries, client *rongcloudAPIClient, box *secretbox.Box, logger *slog.Logger) *NodeService {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &NodeService{queries: queries, client: client, box: box, logger: logger}
+	return &NodeService{queries: queries, client: client, box: box, logger: logger, heartbeats: make(map[pgtype.UUID]time.Time)}
+}
+
+// heartbeatTTL is how long a device heartbeat stays fresh before the node is
+// considered offline.
+const heartbeatTTL = 90 * time.Second
+
+// Heartbeat authenticates a device credential and records a liveness tick for
+// the node, used to render online/offline status in the legacy device list.
+func (s *NodeService) Heartbeat(ctx context.Context, nodeIDText, credentialID, secret string) error {
+	if s.queries == nil {
+		return errors.New("rongcloud: database not configured")
+	}
+	node, err := s.queries.GetRongCloudNodeByNodeID(ctx, nodeIDText)
+	if err != nil {
+		return ErrInvalidDeviceCredential
+	}
+	device, err := s.queries.GetRongCloudDeviceByNodeAndCredential(ctx, db.GetRongCloudDeviceByNodeAndCredentialParams{
+		NodeID:       node.ID,
+		CredentialID: pgtype.Text{String: credentialID, Valid: credentialID != ""},
+	})
+	if err != nil {
+		return ErrInvalidDeviceCredential
+	}
+	if !device.CredentialSecretEncrypted.Valid || s.box == nil {
+		return ErrInvalidDeviceCredential
+	}
+	sealed, err := base64.StdEncoding.DecodeString(device.CredentialSecretEncrypted.String)
+	if err != nil {
+		return ErrInvalidDeviceCredential
+	}
+	plain, err := s.box.Open(sealed)
+	if err != nil || !hmac.Equal([]byte(plain), []byte(secret)) {
+		return ErrInvalidDeviceCredential
+	}
+	s.mu.Lock()
+	s.heartbeats[node.ID] = time.Now()
+	s.mu.Unlock()
+	return nil
+}
+
+// IsOnline reports whether the node has heartbeated within heartbeatTTL.
+func (s *NodeService) IsOnline(id pgtype.UUID) bool {
+	s.mu.Lock()
+	last, ok := s.heartbeats[id]
+	s.mu.Unlock()
+	return ok && time.Since(last) < heartbeatTTL
+}
+
+// GetNodeByNodeID 按业务节点 ID（node_xxx）查节点行，供状态端点使用。
+func (s *NodeService) GetNodeByNodeID(ctx context.Context, nodeIDText string) (db.RongcloudNode, error) {
+	return s.queries.GetRongCloudNodeByNodeID(ctx, nodeIDText)
 }
 
 func pgText(s string) pgtype.Text {
@@ -357,15 +411,20 @@ func (s *NodeService) LegacyNodeRecords(ctx context.Context) ([]map[string]inter
 	records := make([]map[string]interface{}, 0, len(nodes))
 	for _, n := range nodes {
 		aiType := n.AiType.String
+		online := "offline"
+		if s.IsOnline(n.ID) {
+			online = "online"
+		}
 		record := map[string]interface{}{
-			"node_id":       n.NodeID,
-			"node_type":     aiType,
-			"name":          aiType,
-			"rongcloud_id":  n.RongcloudUserID,
-			"deploy_status": n.DeployStatus,
-			"status":        "active",
-			"created_at":    n.CreatedAt.Time,
-			"updated_at":    n.UpdatedAt.Time,
+			"node_id":         n.NodeID,
+			"node_type":       aiType,
+			"name":            aiType,
+			"rongcloud_id":    n.RongcloudUserID,
+			"deploy_status":   online,
+			"realtime_status": online,
+			"status":          "active",
+			"created_at":      n.CreatedAt.Time,
+			"updated_at":      n.UpdatedAt.Time,
 		}
 		if len(n.Capabilities) > 0 {
 			record["capabilities"] = json.RawMessage(n.Capabilities)

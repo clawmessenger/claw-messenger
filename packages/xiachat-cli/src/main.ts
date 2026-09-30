@@ -172,15 +172,24 @@ export function buildProgram(opts: BuildProgramOpts): Command {
       if (!agent) throw new Error(`agent CLI ${cmdOpts.agent} not found on PATH; run xiachat agents`);
       const { startRunLoop, createImlibTransport } = await import("./run.js");
       const transport = await createImlibTransport();
-      await startRunLoop({
-        creds,
-        api,
-        transport,
-        agentExecPath: agent.path,
-        agentName: agent.name,
-        model: cmdOpts.model,
-        stdout: opts.stdout,
-      });
+      const hb = setInterval(() => {
+        void api
+          .heartbeat(creds.nodeId ?? "", creds.credentialId ?? "", creds.deviceSecret ?? "")
+          .catch(() => {});
+      }, 30_000);
+      try {
+        await startRunLoop({
+          creds,
+          api,
+          transport,
+          agentExecPath: agent.path,
+          agentName: agent.name,
+          model: cmdOpts.model,
+          stdout: opts.stdout,
+        });
+      } finally {
+        clearInterval(hb);
+      }
     });
 
   program

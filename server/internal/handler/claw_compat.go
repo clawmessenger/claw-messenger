@@ -781,3 +781,58 @@ func (h *Handler) ClawDeviceNodes(w http.ResponseWriter, r *http.Request) {
 	}
 	clawJSON(w, 200, 200, "", map[string]interface{}{"nodes": creds})
 }
+
+// ClawDeviceHeartbeat POST /api/claw/device/heartbeat ���� xiachat ���豸�Ĭ��
+// �豸ÿ 30s ��һ��֤������ƾ�ݣ�����ڴ�¼�������豸��ʱ״̬�� 90s ����ȡ
+func (h *Handler) ClawDeviceHeartbeat(w http.ResponseWriter, r *http.Request) {
+	if h.RongCloudNode == nil {
+		clawJSON(w, 503, 503, "RongCloud ����δ����", nil)
+		return
+	}
+	var req struct {
+		NodeID       string `json:"nodeId"`
+		CredentialID string `json:"credentialId"`
+		Secret       string `json:"secret"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil || req.NodeID == "" || req.CredentialID == "" || req.Secret == "" {
+		clawJSON(w, 400, 400, "ȱ���豸ƾ��", nil)
+		return
+	}
+	if err := h.RongCloudNode.Heartbeat(r.Context(), req.NodeID, req.CredentialID, req.Secret); err != nil {
+		if errors.Is(err, rongcloud.ErrInvalidDeviceCredential) {
+			clawJSON(w, 401, 401, "�豸ƾ����Ч", nil)
+			return
+		}
+		slog.Warn("claw: device heartbeat failed", "nodeId", req.NodeID, "error", err)
+		clawJSON(w, 500, 500, "�Ĵ����ʧ��", nil)
+		return
+	}
+	clawJSON(w, 200, 200, "", map[string]interface{}{"ok": true})
+}
+
+// ClawNodeStatus GET /api/claw/nodes/{nodeId} �Ѱ�վ�����豸ʱ״̬�����ģ����ʱ״̬����
+func (h *Handler) ClawNodeStatus(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.clawRequireClawUser(w, r); !ok {
+		return
+	}
+	if h.RongCloudNode == nil {
+		clawJSON(w, 503, 503, "RongCloud ����δ����", nil)
+		return
+	}
+	nodeID := chi.URLParam(r, "nodeId")
+	if nodeID == "" {
+		clawJSON(w, 400, 400, "ȱ���ڵ�ID", nil)
+		return
+	}
+	node, err := h.RongCloudNode.GetNodeByNodeID(r.Context(), nodeID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			clawJSON(w, 404, 404, "�ڵ㲻����", nil)
+			return
+		}
+		slog.Warn("claw: node status lookup failed", "nodeId", nodeID, "error", err)
+		clawJSON(w, 500, 500, "��ѯ�ڵ�ʧ��", nil)
+		return
+	}
+	clawJSON(w, 200, 200, "", map[string]interface{}{"online": h.RongCloudNode.IsOnline(node.ID)})
+}
