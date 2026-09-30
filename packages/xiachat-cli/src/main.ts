@@ -123,6 +123,7 @@ export function buildProgram(opts: BuildProgramOpts): Command {
         api,
         transport,
         agentExecPath: agent.path,
+        agentName: agent.name,
         model: cmdOpts.model,
         stdout: opts.stdout,
       });

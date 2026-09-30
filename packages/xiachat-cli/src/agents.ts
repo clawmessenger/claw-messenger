@@ -19,12 +19,43 @@ export interface AgentInfo {
 
 export interface RunAgentTurnOpts {
   execPath: string;
+  // Agent CLI name (as in KNOWN_AGENT_CLIS); selects the invocation
+  // strategy. When omitted, the prompt always goes via stdin.
+  agentName?: string;
   prompt: string;
   model?: string;
   timeoutMs?: number;
   maxOutputBytes?: number;
   onChunk?: (chunk: string) => void;
   signal?: AbortSignal;
+}
+
+// Agents known to reject or hang on stdin-mode invocation get an argv
+// strategy: the prompt rides as a CLI argument instead of stdin.
+//   claude:   print mode (-p), non-interactive
+//   codex:    `exec` subcommand (stdin-mode invocation is rejected)
+//   opencode: `run` subcommand (stdin-mode invocation hangs)
+// Keep in sync with agentArgvArgs in server discussion_bridge.go.
+type AgentArgvStrategy = (prompt: string, model?: string) => string[];
+
+const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
+  claude: (prompt, model) => ["-p", prompt, ...(model ? ["--model", model] : [])],
+  codex: (prompt, model) => ["exec", prompt, ...(model ? ["-m", model] : [])],
+  opencode: (prompt, model) => ["run", prompt, ...(model ? ["--model", model] : [])],
+};
+
+// Windows CreateProcess caps the whole command line near 32k chars (and
+// .cmd wrappers shrink that further), so very long prompts cannot ride as
+// argv — past this cap every agent falls back to stdin mode regardless of
+// strategy.
+const ARGV_PROMPT_MAX_CHARS = 8000;
+
+// Returns the argv for an agent turn; an empty array means stdin mode
+// (unknown agent, or a prompt too long for argv).
+export function buildAgentArgs(name: string, prompt: string, model?: string): string[] {
+  const strategy = agentArgvStrategies[name];
+  if (!strategy || prompt.length > ARGV_PROMPT_MAX_CHARS) return [];
+  return strategy(prompt, model);
 }
 
 const DEFAULT_TIMEOUT_MS = 120_000;
@@ -130,7 +161,14 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
       return;
     }
 
-    const agentArgs = opts.model ? ["--model", opts.model] : [];
+    // Strategy agents take the prompt as argv; everything else (unknown
+    // agent, or a prompt past the argv length cap) keeps the legacy stdin
+    // invocation with the model flag as the only argument.
+    const strategyArgs = opts.agentName
+      ? buildAgentArgs(opts.agentName, opts.prompt, opts.model)
+      : [];
+    const argvMode = strategyArgs.length > 0;
+    const agentArgs = argvMode ? strategyArgs : (opts.model ? ["--model", opts.model] : []);
     const { file, args } = buildSpawnInvocation(opts.execPath, agentArgs);
     const child = spawn(file, args, {
       stdio: ["pipe", "pipe", "pipe"],
@@ -211,7 +249,11 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
       // The agent may exit before reading all stdin (EPIPE); the close
       // handler reports the real outcome.
     });
-    child.stdin.write(opts.prompt);
-    child.stdin.end();
+    if (argvMode) {
+      child.stdin.end();
+    } else {
+      child.stdin.write(opts.prompt);
+      child.stdin.end();
+    }
   });
 }

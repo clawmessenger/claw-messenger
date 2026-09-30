@@ -11,6 +11,10 @@ export interface EchoAgentFixture {
 
 export interface EchoAgentOptions {
   recordArgs?: boolean;
+  // 1-based CLI argument position to echo (argv-mode prompt receipt —
+  // every strategy puts the prompt at position 2) instead of echoing
+  // stdin.
+  echoArg?: number;
   hangMs?: number;
   bigOutputBytes?: number;
   failWith?: { code: number; message: string };
@@ -61,6 +65,8 @@ export function createEchoAgentScript(name: string, opts: EchoAgentOptions = {})
     if (opts.hangMs) lines.push(`ping -n ${Math.ceil(opts.hangMs / 1000) + 1} 127.0.0.1 >nul`);
     if (opts.bigOutputBytes) {
       lines.push(`powershell -NoProfile -Command "[Console]::Out.Write(([string]::new([char]97, ${opts.bigOutputBytes})))"`);
+    } else if (opts.echoArg) {
+      lines.push(`echo %${opts.echoArg}`);
     } else if (!opts.failWith) {
       lines.push(`powershell -NoProfile -Command "$input | Select-Object -First 1"`);
     }
@@ -76,6 +82,8 @@ export function createEchoAgentScript(name: string, opts: EchoAgentOptions = {})
     if (opts.hangMs) lines.push(`sleep $((${opts.hangMs} / 1000 + 1))`);
     if (opts.bigOutputBytes) {
       lines.push(`python3 -c "import sys; sys.stdout.write('a' * ${opts.bigOutputBytes})"`);
+    } else if (opts.echoArg) {
+      lines.push(`echo "$${opts.echoArg}"`);
     } else if (!opts.failWith) {
       lines.push("cat");
     }

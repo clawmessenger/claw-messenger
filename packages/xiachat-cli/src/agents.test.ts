@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
-import { discoverAgents, KNOWN_AGENT_CLIS, runAgentTurn, trimIncompleteUtf8Tail } from "./agents.js";
+import { buildAgentArgs, discoverAgents, KNOWN_AGENT_CLIS, runAgentTurn, trimIncompleteUtf8Tail } from "./agents.js";
 import { createEchoAgentScript, type EchoAgentFixture } from "./test-fixtures.js";
 
 describe("KNOWN_AGENT_CLIS", () => {
@@ -11,6 +11,37 @@ describe("KNOWN_AGENT_CLIS", () => {
       "reasonix", "dsh", "kiro-cli", "agy", "qodercli", "qoderclicn",
       "traecli", "grok", "qwen", "qwenpaw", "mcode", "dim", "zeroclaw",
     ]);
+  });
+});
+
+describe("buildAgentArgs", () => {
+  it("claude uses print mode with --model", () => {
+    expect(buildAgentArgs("claude", "hi", "sonnet-4")).toEqual(["-p", "hi", "--model", "sonnet-4"]);
+  });
+
+  it("codex uses exec subcommand with -m", () => {
+    expect(buildAgentArgs("codex", "hi", "gpt-5")).toEqual(["exec", "hi", "-m", "gpt-5"]);
+  });
+
+  it("opencode uses run subcommand with --model", () => {
+    expect(buildAgentArgs("opencode", "hi", "glm-4.7")).toEqual(["run", "hi", "--model", "glm-4.7"]);
+  });
+
+  it("omits model flags when no model is given", () => {
+    expect(buildAgentArgs("claude", "hi")).toEqual(["-p", "hi"]);
+    expect(buildAgentArgs("codex", "hi")).toEqual(["exec", "hi"]);
+    expect(buildAgentArgs("opencode", "hi")).toEqual(["run", "hi"]);
+  });
+
+  it("returns [] for agents without a strategy", () => {
+    expect(buildAgentArgs("kimi", "hi", "m1")).toEqual([]);
+    expect(buildAgentArgs("codebuddy", "hi")).toEqual([]);
+  });
+
+  it("returns [] past the argv length cap (falls back to stdin)", () => {
+    expect(buildAgentArgs("claude", "a".repeat(8001))).toEqual([]);
+    expect(buildAgentArgs("codex", "a".repeat(8001), "gpt-5")).toEqual([]);
+    expect(buildAgentArgs("claude", "a".repeat(8000))).toEqual(["-p", "a".repeat(8000)]);
   });
 });
 
@@ -101,6 +132,65 @@ describe("runAgentTurn", () => {
     try {
       const out = await runAgentTurn({ execPath: fixture.agentPath, prompt: "hello agent", timeoutMs: 30_000 });
       expect(out).toContain("hello agent");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("strategy agents receive the prompt as argv", async () => {
+    // Echo agent prints its first argument (the argv prompt for strategy
+    // agents) instead of stdin.
+    const fixture = createEchoAgentScript("codex", { recordArgs: true, echoArg: 2 });
+    try {
+      const out = await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "codex",
+        prompt: "argv-prompt-here",
+        timeoutMs: 30_000,
+      });
+      expect(out).toContain("argv-prompt-here");
+      const args = fixture.recordedArgs();
+      expect(args).toContain("exec");
+      expect(args).toContain("argv-prompt-here");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("strategy agents fall back to stdin past the argv length cap", async () => {
+    // Long prompt -> buildAgentArgs returns [] -> stdin mode. The fixture
+    // echoes stdin when no prompt arg is given.
+    const fixture = createEchoAgentScript("codex", { recordArgs: true });
+    try {
+      const longPrompt = "x".repeat(8001);
+      const out = await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "codex",
+        prompt: longPrompt,
+        timeoutMs: 30_000,
+      });
+      expect(out).toContain("x".repeat(80));
+      const args = fixture.recordedArgs();
+      expect(args).not.toContain("exec");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("unknown agents keep stdin mode", async () => {
+    const fixture = createEchoAgentScript("kimi", { recordArgs: true });
+    try {
+      const out = await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "kimi",
+        prompt: "stdin-still-works",
+        timeoutMs: 30_000,
+      });
+      expect(out).toContain("stdin-still-works");
+      const args = fixture.recordedArgs();
+      expect(args).not.toContain("-p");
+      expect(args).not.toContain("run");
+      expect(args).not.toContain("exec");
     } finally {
       fixture.cleanup();
     }

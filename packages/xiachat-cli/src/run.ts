@@ -110,6 +110,9 @@ export interface ConnectTransportOpts {
 
 export interface StartRunLoopOpts extends ConnectTransportOpts {
   agentExecPath: string;
+  // Selects the per-agent invocation strategy (argv vs stdin); see
+  // agents.ts buildAgentArgs.
+  agentName?: string;
   model?: string;
   stdout: NodeJS.WriteStream;
   turnTimeoutMs?: number;
@@ -152,6 +155,7 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
           runTurn: (prompt, model) =>
             runAgentTurn({
               execPath: opts.agentExecPath,
+              agentName: opts.agentName,
               prompt,
               model: opts.model ?? model,
               timeoutMs: opts.turnTimeoutMs ?? 120_000,
