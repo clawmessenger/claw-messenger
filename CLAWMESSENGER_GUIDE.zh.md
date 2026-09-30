@@ -92,6 +92,8 @@ AI 节点代表一个参与讨论的智能体。每个节点有类型（`ai_type
 
 > **Note:** 注册必须携带 `pairing_ticket`（管理员预建的 pending 配对票）：rongcloud 表的 workspace 为 NOT NULL，无 ticket 返回 400，见设计文档 §3.2 的实现决定。
 
+**获取配对票（推荐）**：管理员在 **Settings → Integrations → RongMessenger → 「绑定设备」** 一键生成（见附录 A.1），用户设备上用 `xiachat pair` 认领即可完成注册 + 绑定，无需手工 curl。下方 API 方式适用于脚本化场景。
+
 ### 通过 API 注册
 
 ```bash
@@ -553,45 +555,82 @@ function multica { & "quukk-clawmessenger" @args }
 
 ---
 
-## 附录 A：用户设备 CLI（xiachat）
+## 附录 A：用户设备 CLI（xiachat）— 绑定与使用
 
-xiachat 是运行在用户设备上的轻量节点 CLI：注册到工作区后，经融云 IM 接收单聊消息与讨论指令，在本机调用真实 agent CLI（codex / opencode 等）完成回合。完整冒烟手册见 `packages/xiachat-cli/scripts/smoke.md`。
+xiachat 是运行在用户设备上的轻量节点 CLI：绑定到工作区后，经融云 IM 接收单聊消息与讨论指令，在本机调用真实 agent CLI（codex / opencode 等）完成回合。完整冒烟手册见 `packages/xiachat-cli/scripts/smoke.md`。
 
-### 安装
+### A.1 绑定流程（Web 端发起）
 
-```bash
-pnpm --filter @multica/xiachat-cli build:bin   # 产出 dist/xiachat.bundle.js
-node packages/xiachat-cli/dist/xiachat.bundle.js agents   # 列出本机可用 agent
-```
+绑定 = 管理员在 Web 生成一张**配对票**（10 分钟有效），用户在设备上用 CLI 认领。
 
-### 注册（pairing）
+**第 1 步：管理员生成配对票（Web 端）**
 
-注册必须携带 pairing ticket（rongcloud 表的 workspace 为 NOT NULL，无 ticket 返回 400）。管理员先在数据库创建配对票（30 分钟有效）：
-
-```sql
-INSERT INTO rongcloud_pairing_session (workspace_id, ticket, status, expires_at)
-VALUES ('<workspace_id>', 'pt_<64位hex>', 'pending', now() + interval '30 minutes');
-```
-
-节点设备上执行：
+1. 打开 **Settings → Integrations → RongCloud**
+2. 点击 **「绑定设备」** 按钮（仅 owner/admin 可见）
+3. 弹窗显示一条完整命令，形如：
 
 ```bash
-node dist/xiachat.bundle.js register --server http://<server> --name <节点名> --ai-type opencode --pairing-ticket pt_<64位hex>
+xiachat pair --ticket pt_<64位hex> --server https://<你的服务地址>
 ```
 
-> **Note:** CLI 注册自动携带稳定机器 ID 作为 `mac_address`（存储于 `~/.xiachat/machine_id`），同一机器重复注册复用同一 `rc_user_id`（`rc_node_<machine_id>`）。
+弹窗会每 2 秒自动检查票据状态，无需手动刷新。
 
-### 运行
+**第 2 步：用户在设备上安装并认领**
+
+```bash
+# 安装（在 claw-messenger 仓库内）
+pnpm --filter @multica/xiachat-cli build:bin
+
+# 确认本机有可用的 agent CLI（claude / codex / opencode 等）
+node packages/xiachat-cli/dist/xiachat.bundle.js agents
+
+# 认领配对票（复制 Web 弹窗里的命令，在设备上执行）
+node packages/xiachat-cli/dist/xiachat.bundle.js pair --ticket pt_<64位hex> --server https://<你的服务地址>
+```
+
+**第 3 步：确认绑定成功**
+
+- Web 弹窗自动变为 **「设备已绑定」**
+- 设备上 `node dist/xiachat.bundle.js status` 可看到节点凭据
+
+> **Note:** 认领失败提示 "ticket already claimed" 表示票据已被其他设备使用；「票据已过期」则需管理员重新生成。
+> 绑定只需做一次；凭据保存在 `~/.xiachat/credentials.json`（权限 0600）。
+
+### A.2 日常使用
+
+**上线（每次使用前启动）**
 
 ```bash
 node dist/xiachat.bundle.js run --agent opencode   # --agent 必填；可用值见 xiachat agents
-# 输出 xiachat run: connected and dispatching 即已连上融云并分发消息
+# 输出 xiachat run: connected and dispatching 即已连上融云并开始分发消息
 ```
 
-单聊消息按会话串行处理（并发 1、队列深 1）；忙碌时向对端回 `正在思考中…`。讨论模式下收到 `your_turn` 指令后执行本机 agent，超时 120s 自动跳过。
+上线后即可：
 
-### 验证与排障
+| 场景 | 做法 |
+|------|------|
+| **单聊** | 用虾说 App（或任意融云客户端）向该节点发消息 → CLI 调本机 agent → 回复直达 App |
+| **多节点讨论** | 管理员建聊天室并把该节点加为成员（见第三、四步）→ 启动讨论 → 节点按发言顺序自动参与 |
 
-- `node dist/xiachat.bundle.js status` 查看凭据与 token。
+**行为说明**
+
+- 单聊按会话串行（并发 1、队列深 1）；agent 忙碌时对端收到 `正在思考中…`
+- agent 调用：claude 用 `-p`、codex 用 `exec`、opencode 用 `run` 子命令（argv 模式）；超长 prompt（>8000 字符）自动回退 STDIN
+- 讨论回合超时 120s 自动跳过（事件日志记 `turn_skipped`），不影响其他节点
+- token 过期自动刷新重连，无需人工干预
+
+**常用命令**
+
+```bash
+node dist/xiachat.bundle.js agents   # 列出本机可发现的 agent CLI
+node dist/xiachat.bundle.js status   # 查看当前身份/token/服务器
+node dist/xiachat.bundle.js login    # 手动刷新 IM token（一般不需要）
+```
+
+### A.3 验证与排障
+
 - 运行日志的 `im in: type=... from=...` 行标记每条入站消息，用于区分"消息未达"与"分发失败"。
-- 已知缺口（agent 执行 STDIN、回包 webhook 公网地址）见 smoke.md「已知缺口」一节。
+- 单聊不通：先查 `xiachat agents` 是否列出了目标 agent；再看日志有无 `im in:`（无 = IM 未连上，检查 token/网络）。
+- 讨论只有 `turn_skipped` 没有 `turn_completed`：回包需经融云 webhook 回服务器，确认融云控制台 webhook 已配置为公网可达地址（见 smoke.md「C1 修复后复验」）。
+- 注册/绑定报 `workspace attribution required`：必须带 `--pairing-ticket`，从 Web 端「绑定设备」获取。
+- 其余已知事项见 smoke.md「已知缺口」一节。
