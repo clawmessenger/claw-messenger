@@ -46,7 +46,7 @@ await imlib.sendMessage(
 ```
 
 验证：CLI 日志出现 `im in: type=RC:TxtMsg from=rc_node_...`；连发 3 条（queueDepth=1）第 3 条触发 busy hint，对端收到 `正在思考中…` 回包。
-注意：回复完成依赖 agent 执行 —— 当前 `runAgentTurn` 仅经 STDIN 喂 prompt，真实 codex 拒绝（"stdin is not a terminal"）、opencode 交互挂起（120s 超时）。`opencode run '<prompt>'`（argv）可用。见「已知缺口」。
+agent 执行：claude/codex/opencode 走 argv 模式（`-p`/`exec`/`run` 子命令，见 agents.ts buildAgentArgs），>8000 字符 prompt 自动回退 STDIN。
 
 ## 3. 讨论
 
@@ -63,10 +63,18 @@ curl -X POST http://localhost:8081/api/workspaces/<ws>/rongcloud/discussions -H 
 
 杀掉 CLI（`Stop-Process <pid>`），讨论内轮到该节点 → 120s 后 `turn_skipped`（事件端点可查），讨论继续。
 
-## 已知缺口（冒烟时发现，未在本任务修复）
+## 已知缺口
 
-1. **agent 执行 STDIN 缺口**：`runAgentTurn`（CLI）与 Go DiscussionBridge 均以 STDIN 喂 prompt；真实 codex 拒绝、opencode 交互挂起。argv 方式（`opencode run '<prompt>'`）可用。回合完成（单聊回复、讨论 turn_completed）因此标记 PENDING MANUAL。
-2. **回包链路 webhook**：节点→服务端回包需融云控制台 webhook 指向本服务；localhost 不可达，需公网 URL（控制台配置）。CLI→云端→CLI 已验证。
+1. ~~agent 执行 STDIN 缺口~~ **已修复（B1）**：CLI 与 Go bridge 均改为按 agent 策略 argv 调用（claude `-p` / codex `exec` / opencode `run`），>8000 字符回退 STDIN。codex 0.144.6、opencode 1.18.33 已真机验证；claude 未在本机安装，待验证。
+2. **回包链路 webhook**：节点→服务端回包需融云控制台 webhook 指向本服务；localhost 不可达，需公网 URL（控制台配置）。CLI→云端→CLI 已验证。C1 修复后（回包信封 `command_result` + 寻址 chatroom UUID），需在公网环境重跑下方「复验」。
+
+## C1 修复后复验（需公网 webhook 环境）
+
+前置：融云控制台 webhook 配置为 `https://<公网域名>/api/webhooks/rongcloud?inst=<installation_id>`，后端经该域名可达。
+
+1. 单聊回复闭环：对端发 `RC:TxtMsg` → CLI argv 调 agent → 回包 → 对端收到文本（不再 PENDING）。
+2. 讨论回合闭环：启动讨论 → `your_turn` 到达 CLI → argv 调 agent → 回包（`msg_type:"command_result"`，寻址 chatroom UUID）→ 事件端点出现 `turn_completed`（此前只有 `turn_skipped`）。
+3. 记录：把结果追加到下方「结果」区，注明日期与环境。
 
 ## 服务端缺陷（冒烟中发现并修复，见 fix(rongcloud) commit）
 
@@ -79,3 +87,4 @@ curl -X POST http://localhost:8081/api/workspaces/<ws>/rongcloud/discussions -H 
 ## 结果
 
 - 2026-09-29：注册 PASS；单聊投递 PASS（busy hint 收到）；讨论事件链 PASS（your_turn 下发）；kill 超时 PASS（turn_skipped）。回复完成 PENDING MANUAL（缺口 1、2）。
+- 2026-09-30：缺口 1 修复（B1 argv 模式，两侧同步）；C1 修复（回包信封/寻址）。待公网环境按「C1 修复后复验」补验 turn_completed。
