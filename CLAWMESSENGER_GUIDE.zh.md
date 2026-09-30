@@ -92,7 +92,7 @@ AI 节点代表一个参与讨论的智能体。每个节点有类型（`ai_type
 
 > **Note:** 注册必须携带 `pairing_ticket`（管理员预建的 pending 配对票）：rongcloud 表的 workspace 为 NOT NULL，无 ticket 返回 400，见设计文档 §3.2 的实现决定。
 
-**获取配对票（推荐）**：管理员在 **Settings → Integrations → RongMessenger → 「绑定设备」** 一键生成（见附录 A.1），用户设备上用 `xiachat pair` 认领即可完成注册 + 绑定，无需手工 curl。下方 API 方式适用于脚本化场景。
+**获取配对票（推荐）**：在虾说 Web「远程设备」页点 **「绑定远程设备」** 一键生成（见附录 A.1），用户设备上用 `xiachat pair` 认领即可完成注册 + 绑定，无需手工 curl。下方 API 方式适用于脚本化场景。
 
 ### 通过 API 注册
 
@@ -563,17 +563,17 @@ xiachat 是运行在用户设备上的轻量节点 CLI：绑定到工作区后�
 
 绑定 = 管理员在 Web 生成一张**配对票**（10 分钟有效），用户在设备上用 CLI 认领。
 
-**第 1 步：管理员生成配对票（Web 端）**
+**第 1 步：在虾说 Web 生成配对票**
 
-1. 打开 **Settings → Integrations → RongCloud**
-2. 点击 **「绑定设备」** 按钮（仅 owner/admin 可见）
-3. 弹窗显示一条完整命令，形如：
+1. 打开虾说 Web（旧站），进入 **「远程设备」** 标签页
+2. 点击 **「绑定远程设备」** 按钮（需登录；任何账号均可绑定自己的设备）
+3. 弹窗自动生成一张 10 分钟有效的票据，并显示一条完整命令（`--server` 已自动填好），形如：
 
 ```bash
 xiachat pair --ticket pt_<64位hex> --server https://<你的服务地址>
 ```
 
-弹窗会每 2 秒自动检查票据状态，无需手动刷新。
+弹窗会每 2 秒自动检查票据状态，无需手动刷新；倒计时结束未认领会自动提示并可一键重新生成。
 
 **第 2 步：用户在设备上安装并认领**
 
@@ -596,8 +596,8 @@ xiachat pair --ticket pt_<64位hex> --server https://<你的服务地址>
 - Web 弹窗自动变为 **「设备已绑定」**
 - 设备上 `xiachat.exe status` 可看到节点凭据
 
-> **Note:** 认领失败提示 "ticket already claimed" 表示票据已被其他设备使用；「票据已过期」则需管理员重新生成。
-> 绑定只需做一次；凭据保存在 `~/.xiachat/credentials.json`（权限 0600）。
+> **Note:** 认领失败提示 "ticket already claimed" 表示票据已被其他设备使用；「票据已过期」则重新点「绑定远程设备」生成。
+> 绑定只需做一次；凭据保存在 `~/.xiachat/credentials.json`（权限 0600）。同一设备重复 pair 是安全的（幂等：复用已有节点，不会重复创建）。
 
 ### A.2 日常使用
 
@@ -635,5 +635,5 @@ xiachat login    # 手动刷新 IM token（一般不需要）
 - 运行日志的 `im in: type=... from=...` 行标记每条入站消息，用于区分"消息未达"与"分发失败"。
 - 单聊不通：先查 `xiachat agents` 是否列出了目标 agent；再看日志有无 `im in:`（无 = IM 未连上，检查 token/网络）。
 - 讨论只有 `turn_skipped` 没有 `turn_completed`：回包需经融云 webhook 回服务器，确认融云控制台 webhook 已配置为公网可达地址（见 smoke.md「C1 修复后复验」）。
-- 注册/绑定报 `workspace attribution required`：必须带 `--pairing-ticket`，从 Web 端「绑定设备」获取。
+- 注册/绑定报 `workspace attribution required`：票据无效或已过期，在「远程设备」页重新点「绑定远程设备」获取新票据。
 - 其余已知事项见 smoke.md「已知缺口」一节。
