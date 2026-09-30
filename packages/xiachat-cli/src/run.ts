@@ -102,6 +102,33 @@ export function conversationKeyOf(msg: InboundIMMessage): string {
   return `${msg.conversationType}:${msg.targetId}`;
 }
 
+// Bounded LRU-ish map (the run loop's busyPeer tracker): Map preserves
+// insertion order, so on insert past the cap the oldest entry is evicted;
+// a re-set refreshes recency via delete+set.
+export interface BoundedMap {
+  get(key: string): string | undefined;
+  set(key: string, value: string): void;
+  readonly size: number;
+}
+
+export function createBoundedMap(maxEntries: number): BoundedMap {
+  const entries = new Map<string, string>();
+  return {
+    get: (key) => entries.get(key),
+    set(key, value) {
+      entries.delete(key);
+      entries.set(key, value);
+      if (entries.size > maxEntries) {
+        const oldest = entries.keys().next().value;
+        if (oldest !== undefined) entries.delete(oldest);
+      }
+    },
+    get size() {
+      return entries.size;
+    },
+  };
+}
+
 export interface ConnectTransportOpts {
   creds: StoredCredentials;
   api: XiachatApi;
@@ -110,6 +137,9 @@ export interface ConnectTransportOpts {
 
 export interface StartRunLoopOpts extends ConnectTransportOpts {
   agentExecPath: string;
+  // Selects the per-agent invocation strategy (argv vs stdin); see
+  // agents.ts buildAgentArgs.
+  agentName?: string;
   model?: string;
   stdout: NodeJS.WriteStream;
   turnTimeoutMs?: number;
@@ -123,7 +153,8 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
   });
   // onBusy only receives the conversation key; remember the latest peer per
   // conversation so the busy hint can be addressed (private chat only).
-  const busyPeer = new Map<string, string>();
+  // Bounded so a hostile/long-lived peer stream cannot grow it forever.
+  const busyPeer = createBoundedMap(128);
   const queue = new SessionQueue({
     concurrencyPerConversation: 1,
     queueDepth: 1,
@@ -152,6 +183,7 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
           runTurn: (prompt, model) =>
             runAgentTurn({
               execPath: opts.agentExecPath,
+              agentName: opts.agentName,
               prompt,
               model: opts.model ?? model,
               timeoutMs: opts.turnTimeoutMs ?? 120_000,

@@ -67,6 +67,64 @@ func (b *DiscussionBridge) IsServerManagedByType(aiType string) bool {
 	return ok
 }
 
+// Agents known to reject or hang on stdin-mode invocation get an argv
+// strategy: the prompt rides as a CLI argument instead of stdin.
+//   claude:   print mode (-p), non-interactive
+//   codex:    `exec` subcommand (stdin-mode invocation is rejected)
+//   opencode: `run` subcommand (stdin-mode invocation hangs)
+// Keep in sync with buildAgentArgs in packages/xiachat-cli/src/agents.ts.
+func agentArgvArgs(name, prompt, model string) []string {
+	var args []string
+	switch name {
+	case "claude":
+		args = append(args, "-p", prompt)
+		if model != "" {
+			args = append(args, "--model", model)
+		}
+	case "codex":
+		args = append(args, "exec", prompt)
+		if model != "" {
+			args = append(args, "-m", model)
+		}
+	case "opencode":
+		args = append(args, "run", prompt)
+		if model != "" {
+			args = append(args, "--model", model)
+		}
+	default:
+		return nil
+	}
+	return args
+}
+
+// Windows CreateProcess caps the whole command line near 32k chars, so
+// very long prompts cannot ride as argv — past this cap every agent falls
+// back to stdin mode regardless of strategy.
+const argvPromptMaxChars = 8000
+
+type invocationSpec struct {
+	// argv holds the full agent argument list.
+	argv []string
+	// stdinPrompt reports whether the prompt must ride via Stdin (unknown
+	// agent, or a prompt past the argv length cap).
+	stdinPrompt bool
+}
+
+// buildInvocation mirrors buildAgentArgs in packages/xiachat-cli: agents
+// with a known strategy take the prompt as argv; unknown agents (or a
+// prompt past the argv length cap) keep the stdin invocation with the
+// model flag as the only argument.
+func buildInvocation(name, prompt, model string) invocationSpec {
+	argv := agentArgvArgs(name, prompt, model)
+	if argv != nil && len(prompt) <= argvPromptMaxChars {
+		return invocationSpec{argv: argv}
+	}
+	if model != "" {
+		return invocationSpec{argv: []string{"--model", model}, stdinPrompt: true}
+	}
+	return invocationSpec{stdinPrompt: true}
+}
+
 func (b *DiscussionBridge) ExecuteTurn(ctx context.Context, chatroomID, nodeID pgtype.UUID, prompt, model string) (string, error) {
 	node, err := b.queries.GetRongCloudNodeByID(ctx, nodeID)
 	if err != nil {
@@ -80,11 +138,11 @@ func (b *DiscussionBridge) ExecuteTurn(ctx context.Context, chatroomID, nodeID p
 	execCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(execCtx, execPath)
-	if model != "" {
-		cmd.Args = append(cmd.Args, "--model", model)
+	spec := buildInvocation(node.AiType.String, prompt, model)
+	cmd := exec.CommandContext(execCtx, execPath, spec.argv...)
+	if spec.stdinPrompt {
+		cmd.Stdin = strings.NewReader(prompt)
 	}
-	cmd.Stdin = strings.NewReader(prompt)
 
 	var stdout, stderr strings.Builder
 	cmd.Stdout = &stdout

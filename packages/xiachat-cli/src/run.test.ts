@@ -1,8 +1,42 @@
 // @vitest-environment node
 import { describe, expect, it, vi } from "vitest";
-import { SessionQueue, connectTransport } from "./run.js";
+import { SessionQueue, connectTransport, createBoundedMap } from "./run.js";
 import type { IMTransport } from "./im.js";
 import { XiachatApi } from "./api.js";
+
+describe("createBoundedMap (busyPeer cap)", () => {
+  it("evicts the oldest entry past the cap", () => {
+    const m = createBoundedMap(3);
+    m.set("a", "1");
+    m.set("b", "2");
+    m.set("c", "3");
+    m.set("d", "4");
+    expect(m.size).toBe(3);
+    expect(m.get("a")).toBeUndefined();
+    expect(m.get("d")).toBe("4");
+  });
+
+  it("re-setting an existing key refreshes recency", () => {
+    const m = createBoundedMap(3);
+    m.set("a", "1");
+    m.set("b", "2");
+    m.set("a", "1b"); // refresh a to most-recent
+    m.set("c", "3");
+    m.set("d", "4"); // evicts b, not a
+    expect(m.size).toBe(3);
+    expect(m.get("a")).toBe("1b");
+    expect(m.get("b")).toBeUndefined();
+    expect(m.get("d")).toBe("4");
+  });
+
+  it("updates the value of an existing key", () => {
+    const m = createBoundedMap(2);
+    m.set("a", "1");
+    m.set("a", "2");
+    expect(m.size).toBe(1);
+    expect(m.get("a")).toBe("2");
+  });
+});
 
 describe("SessionQueue", () => {
   it("serializes messages within one conversation", async () => {
