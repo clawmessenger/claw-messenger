@@ -578,20 +578,23 @@ xiachat pair --ticket pt_<64位hex> --server https://<你的服务地址>
 **第 2 步：用户在设备上安装并认领**
 
 ```bash
-# 安装（在 claw-messenger 仓库内）
-pnpm --filter @quukk/xiachat-cli build:bin
+ # 构建（在 claw-messenger 仓库内；产物为无依赖单文件，无需安装 Node）
+ pnpm --filter @quukk/xiachat-cli build:exe
+ # → packages/xiachat-cli/dist/xiachat.exe（Linux/macOS 为 dist/xiachat）
 
-# 确认本机有可用的 agent CLI（claude / codex / opencode 等）
-node packages/xiachat-cli/dist/xiachat.bundle.js agents
+ # 确认本机有可用的 agent CLI（claude / codex / opencode 等）
+ packages/xiachat-cli/dist/xiachat.exe agents
 
-# 认领配对票（复制 Web 弹窗里的命令，在设备上执行）
-node packages/xiachat-cli/dist/xiachat.bundle.js pair --ticket pt_<64位hex> --server https://<你的服务地址>
-```
+ # 认领配对票（复制 Web 弹窗里的命令，在设备上执行）
+ packages/xiachat-cli/dist/xiachat.exe pair --ticket pt_<64位hex> --server https://<你的服务地址>
+ ```
+
+> 也可用 `build:bin` 产出 `dist/xiachat.bundle.js`（需本机装有 Node ≥ 20，用 `node xiachat.bundle.js <cmd>` 运行）。
 
 **第 3 步：确认绑定成功**
 
 - Web 弹窗自动变为 **「设备已绑定」**
-- 设备上 `node dist/xiachat.bundle.js status` 可看到节点凭据
+- 设备上 `xiachat.exe status` 可看到节点凭据
 
 > **Note:** 认领失败提示 "ticket already claimed" 表示票据已被其他设备使用；「票据已过期」则需管理员重新生成。
 > 绑定只需做一次；凭据保存在 `~/.xiachat/credentials.json`（权限 0600）。
@@ -601,7 +604,7 @@ node packages/xiachat-cli/dist/xiachat.bundle.js pair --ticket pt_<64位hex> --s
 **上线（每次使用前启动）**
 
 ```bash
-node dist/xiachat.bundle.js run --agent opencode   # --agent 必填；可用值见 xiachat agents
+xiachat.exe run --agent opencode   # --agent 必填；可用值见 xiachat agents（exe 与 node 运行方式通用）
 # 输出 xiachat run: connected and dispatching 即已连上融云并开始分发消息
 ```
 
@@ -622,9 +625,9 @@ node dist/xiachat.bundle.js run --agent opencode   # --agent 必填；可用值�
 **常用命令**
 
 ```bash
-node dist/xiachat.bundle.js agents   # 列出本机可发现的 agent CLI
-node dist/xiachat.bundle.js status   # 查看当前身份/token/服务器
-node dist/xiachat.bundle.js login    # 手动刷新 IM token（一般不需要）
+xiachat agents   # 列出本机可发现的 agent CLI（下文以 xiachat 指代 exe 或 node 运行方式）
+xiachat status   # 查看当前身份/token/服务器
+xiachat login    # 手动刷新 IM token（一般不需要）
 ```
 
 ### A.3 验证与排障
