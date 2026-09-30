@@ -102,6 +102,33 @@ export function conversationKeyOf(msg: InboundIMMessage): string {
   return `${msg.conversationType}:${msg.targetId}`;
 }
 
+// Bounded LRU-ish map (the run loop's busyPeer tracker): Map preserves
+// insertion order, so on insert past the cap the oldest entry is evicted;
+// a re-set refreshes recency via delete+set.
+export interface BoundedMap {
+  get(key: string): string | undefined;
+  set(key: string, value: string): void;
+  readonly size: number;
+}
+
+export function createBoundedMap(maxEntries: number): BoundedMap {
+  const entries = new Map<string, string>();
+  return {
+    get: (key) => entries.get(key),
+    set(key, value) {
+      entries.delete(key);
+      entries.set(key, value);
+      if (entries.size > maxEntries) {
+        const oldest = entries.keys().next().value;
+        if (oldest !== undefined) entries.delete(oldest);
+      }
+    },
+    get size() {
+      return entries.size;
+    },
+  };
+}
+
 export interface ConnectTransportOpts {
   creds: StoredCredentials;
   api: XiachatApi;
@@ -126,7 +153,8 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
   });
   // onBusy only receives the conversation key; remember the latest peer per
   // conversation so the busy hint can be addressed (private chat only).
-  const busyPeer = new Map<string, string>();
+  // Bounded so a hostile/long-lived peer stream cannot grow it forever.
+  const busyPeer = createBoundedMap(128);
   const queue = new SessionQueue({
     concurrencyPerConversation: 1,
     queueDepth: 1,
@@ -143,13 +171,13 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
     },
   });
 
-  opts.transport.onMessage((msg) => {
-    // IM observability: every inbound message is logged so smoke runs can
-    // tell "message never arrived" from "dispatch failed".
-    console.log(`im in: type=${msg.objectName} from=${msg.fromUserId} conv=${msg.conversationType}`);
-    const key = conversationKeyOf(msg);
-    busyPeer.set(key, msg.fromUserId);
-    queue.enqueue(key, async () => {
+    opts.transport.onMessage((msg) => {
+      // IM observability: every inbound message is logged so smoke runs can
+      // tell "message never arrived" from "dispatch failed".
+      console.log(`im in: type=${msg.objectName} from=${msg.fromUserId} conv=${msg.conversationType}`);
+      const key = conversationKeyOf(msg);
+      busyPeer.set(key, msg.fromUserId);
+      queue.enqueue(key, async () => {
       try {
         await dispatcher.handle(msg, {
           runTurn: (prompt, model) =>
