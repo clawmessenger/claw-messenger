@@ -1,0 +1,24 @@
+{
+  "name": "@multica/xiachat-cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": { "xiachat": "./dist/bin.js" },
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "build:bin": "tsc -p tsconfig.json && node scripts/pack.mjs",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint src --ext .ts"
+  },
+  "dependencies": {
+    "@rongcloud/imlib-next": "^5.9.0",
+    "commander": "^14.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}

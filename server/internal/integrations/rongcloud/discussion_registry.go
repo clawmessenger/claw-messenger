@@ -49,7 +49,9 @@ func chatroomKey(id pgtype.UUID) string {
 	if !id.Valid {
 		return ""
 	}
-	var buf [36]byte
+	// hex of 16 UUID bytes is 32 chars; a larger buffer would trail with NUL
+	// bytes that PostgreSQL JSONB rejects (SQLSTATE 22P05).
+	var buf [32]byte
 	hex.Encode(buf[:], id.Bytes[:])
 	return string(buf[:])
 }

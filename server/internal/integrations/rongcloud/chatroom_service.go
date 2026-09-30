@@ -67,6 +67,11 @@ func (s *ChatroomService) CreateChatroom(ctx context.Context, params ChatroomCre
 			return db.RongcloudChatroom{}, err
 		}
 	}
+	// config is NOT NULL in the schema; a caller that omits it gets the same
+	// '{}' default the column declares instead of an insert failure.
+	if len(params.Config) == 0 {
+		params.Config = json.RawMessage("{}")
+	}
 	return s.queries.CreateRongCloudChatroom(ctx, db.CreateRongCloudChatroomParams{
 		WorkspaceID:         params.WorkspaceID,
 		RongcloudChatroomID:  params.RongcloudChatroomID,
@@ -182,6 +187,10 @@ func (s *ChatroomService) SetMembers(ctx context.Context, chatroomID pgtype.UUID
 		return err
 	}
 	for _, m := range members {
+		// capabilities is NOT NULL; default to '{}' like the column does.
+		if len(m.Capabilities) == 0 {
+			m.Capabilities = json.RawMessage("{}")
+		}
 		_, err := s.queries.CreateRongCloudChatroomMember(ctx, db.CreateRongCloudChatroomMemberParams{
 			ChatroomID:       chatroomID,
 			NodeID:           m.NodeID,

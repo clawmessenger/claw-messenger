@@ -258,6 +258,10 @@ func (c *DiscussionCoordinator) emitEvent(ctx context.Context, eventType string,
 	if c.eventStore == nil {
 		return
 	}
+	// content is NOT NULL JSONB; events without a payload get '{}'.
+	if len(content) == 0 {
+		content = []byte("{}")
+	}
 	event := DiscussionEvent{
 		ChatroomID:    c.chatroomID,
 		WorkspaceID:   c.workspaceID,

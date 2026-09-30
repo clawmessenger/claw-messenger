@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -29,10 +30,10 @@ func (s *InstallService) GetAppKey(ctx context.Context) string {
 	if s.queries == nil {
 		return ""
 	}
-	insts, err := s.queries.ListChannelInstallationsByWorkspace(ctx, db.ListChannelInstallationsByWorkspaceParams{
-		WorkspaceID: pgtype.UUID{},
-		ChannelType: string(TypeRongCloud),
-	})
+	// Single-install assumption: when several active installations exist,
+	// the oldest one (ListActiveChannelInstallations orders by created_at)
+	// wins across all workspaces. Workspace scoping needs product input.
+	insts, err := s.queries.ListActiveChannelInstallations(ctx, string(TypeRongCloud))
 	if err != nil || len(insts) == 0 {
 		return ""
 	}
@@ -129,9 +130,26 @@ func (s *InstallService) DeleteSystemConfig(ctx context.Context, workspaceID pgt
 }
 
 // NewRongCloudAPIClientForServices creates an API client for service-layer
-// use. The client starts with empty credentials; InstallService fills them
-// per-request from the encrypted installation config. Returns nil if the
-// logger is nil (caller should guard).
+// use. The client starts with empty credentials; the loader below fills them
+// lazily from the encrypted installation config on first request. Returns a
+// client with no loader if the logger is nil (caller should guard).
 func NewRongCloudAPIClientForServices(box *secretbox.Box, queries *db.Queries, logger *slog.Logger) *rongcloudAPIClient {
-	return newRongCloudAPIClient("", "", "", nil, logger)
+	c := newRongCloudAPIClient("", "", "", nil, logger)
+	if queries != nil && box != nil {
+		c.loadCreds = func(ctx context.Context) (string, string, error) {
+			insts, err := queries.ListActiveChannelInstallations(ctx, string(TypeRongCloud))
+			if err != nil {
+				return "", "", err
+			}
+			if len(insts) == 0 {
+				return "", "", fmt.Errorf("no active rongcloud channel installation found")
+			}
+			cfg, err := decodeCredentials(insts[0].Config, box.Open)
+			if err != nil {
+				return "", "", err
+			}
+			return cfg.AppKey, cfg.AppSecret, nil
+		}
+	}
+	return c
 }

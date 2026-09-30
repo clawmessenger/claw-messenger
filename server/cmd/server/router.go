@@ -1590,6 +1590,10 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	r.Post("/api/claw/device-credentials/enroll", h.EnrollDeviceCredential)
 	r.Post("/api/claw/connection-sessions", h.CreateConnectionSession)
 	r.Post("/api/claw/connection-sessions/{sessionId}/close", h.CloseConnectionSession)
+	// User-device pairing claim. Public like the routes above: the ticket is
+	// a single-use high-entropy secret, and an optional client claim key in
+	// the body must match the one bound at session creation.
+	r.Post("/api/claw/pairing/{ticket}/claim", h.ClaimRongCloudPairing)
 
 	// Composio OAuth callback (MUL-3843). NOT under the Auth group on purpose:
 	// Composio 302-redirects the user's browser here at the end of the OAuth

@@ -14,6 +14,8 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1633,5 +1635,52 @@ func TestNewDiscussionCoordinatorWithBridge(t *testing.T) {
 	)
 	if coord == nil {
 		t.Fatal("expected non-nil DiscussionCoordinator")
+	}
+}
+
+func TestChatroomKeyLengthAndNoNUL(t *testing.T) {
+	id := pgtype.UUID{Bytes: [16]byte{0xde, 0xad, 0xbe, 0xef, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, Valid: true}
+	key := chatroomKey(id)
+	if len(key) != 32 {
+		t.Fatalf("chatroomKey length = %d, want 32 (hex of 16 UUID bytes)", len(key))
+	}
+	for i := 0; i < len(key); i++ {
+		if key[i] == 0 {
+			t.Fatalf("chatroomKey contains NUL byte at %d; JSONB would reject (22P05)", i)
+		}
+	}
+	if chatroomKey(pgtype.UUID{}) != "" {
+		t.Fatal("chatroomKey of invalid UUID should be empty")
+	}
+}
+
+func TestEnsureCredsResolvesOnceConcurrently(t *testing.T) {
+	var calls atomic.Int32
+	c := newRongCloudAPIClient("", "", "", nil, testLogger())
+	c.loadCreds = func(ctx context.Context) (string, string, error) {
+		calls.Add(1)
+		time.Sleep(20 * time.Millisecond) // widen the race window
+		return "key", "secret", nil
+	}
+	var wg sync.WaitGroup
+	errs := make([]error, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = c.ensureCreds(context.Background())
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("ensureCreds[%d] error: %v", i, err)
+		}
+	}
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("loadCreds called %d times, want exactly 1", n)
+	}
+	if c.appKey != "key" || c.appSecret != "secret" {
+		t.Fatalf("creds = %q/%q, want key/secret", c.appKey, c.appSecret)
 	}
 }

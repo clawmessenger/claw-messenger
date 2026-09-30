@@ -90,18 +90,22 @@ cd server; go run ./cmd/server
 
 AI 节点代表一个参与讨论的智能体。每个节点有类型（`ai_type`）、能力列表和唯一标识。
 
+> **Note:** 注册必须携带 `pairing_ticket`（管理员预建的 pending 配对票）：rongcloud 表的 workspace 为 NOT NULL，无 ticket 返回 400，见设计文档 §3.2 的实现决定。
+
 ### 通过 API 注册
 
 ```bash
-# 注册一个 Claude 节点
+# 注册一个 Claude 节点（必须携带 pairing_ticket：rongcloud 表的 workspace 为 NOT NULL，
+# 无 ticket 注册返回 400 "workspace attribution required"）
 curl -X POST http://localhost:8080/api/ai/register \
   -H "Content-Type: application/json" \
   -d '{
     "name": "Claude 节点",
-    "mac_address": "",
+    "mac_address": "aa:bb:cc:dd:ee:01",
     "node_type": "ai",
     "ai_type": "claude",
-    "capabilities": ["code-review", "reasoning"]
+    "capabilities": ["code-review", "reasoning"],
+    "pairing_ticket": "pt_<64位hex>"
   }'
 ```
 
@@ -390,15 +394,15 @@ WS="00000000-0000-0000-0000-000000000001"
 BASE="http://localhost:8080/api/workspaces/$WS/ClawMessenger"
 AUTH="Cookie: session_cookie=你的session_cookie"
 
-# 1. 注册两个 AI 节点
+# 1. 注册两个 AI 节点（注册必须携带 pairing_ticket，否则 400；ticket 需管理员预先创建且为 pending）
 NODE1=$(curl -s -X POST http://localhost:8080/api/ai/register \
   -H "Content-Type: application/json" \
-  -d '{"name":"Reviewer","node_type":"ai","ai_type":"claude","capabilities":["review"]}' \
+  -d '{"name":"Reviewer","node_type":"ai","ai_type":"claude","capabilities":["review"],"mac_address":"aa:bb:cc:dd:ee:01","pairing_ticket":"pt_<64位hex>"}' \
   | grep -o '"node_id":"[^"]*"' | head -1)
 
 NODE2=$(curl -s -X POST http://localhost:8080/api/ai/register \
   -H "Content-Type: application/json" \
-  -d '{"name":"Architect","node_type":"ai","ai_type":"codex","capabilities":["design"]}' \
+  -d '{"name":"Architect","node_type":"ai","ai_type":"codex","capabilities":["design"],"mac_address":"aa:bb:cc:dd:ee:02","pairing_ticket":"pt_<64位hex>"}' \
   | grep -o '"node_id":"[^"]*"' | head -1)
 
 echo "Node 1: $NODE1"
@@ -545,3 +549,49 @@ function multica { & "quukk-clawmessenger" @args }
 - [CLI 与 Daemon 指南](CLI_AND_DAEMON.md) — CLI 命令完整参考
 - [设计文档](docs/superpowers/specs/) — Phase 1-4 的技术设计文档
 - [实施计划](docs/superpowers/plans/) — Phase 1-4 的实施步骤清单
+
+
+---
+
+## 附录 A：用户设备 CLI（xiachat）
+
+xiachat 是运行在用户设备上的轻量节点 CLI：注册到工作区后，经融云 IM 接收单聊消息与讨论指令，在本机调用真实 agent CLI（codex / opencode 等）完成回合。完整冒烟手册见 `packages/xiachat-cli/scripts/smoke.md`。
+
+### 安装
+
+```bash
+pnpm --filter @multica/xiachat-cli build:bin   # 产出 dist/xiachat.bundle.js
+node packages/xiachat-cli/dist/xiachat.bundle.js agents   # 列出本机可用 agent
+```
+
+### 注册（pairing）
+
+注册必须携带 pairing ticket（rongcloud 表的 workspace 为 NOT NULL，无 ticket 返回 400）。管理员先在数据库创建配对票（30 分钟有效）：
+
+```sql
+INSERT INTO rongcloud_pairing_session (workspace_id, ticket, status, expires_at)
+VALUES ('<workspace_id>', 'pt_<64位hex>', 'pending', now() + interval '30 minutes');
+```
+
+节点设备上执行：
+
+```bash
+node dist/xiachat.bundle.js register --server http://<server> --name <节点名> --ai-type opencode --pairing-ticket pt_<64位hex>
+```
+
+> **Note:** CLI 注册自动携带稳定机器 ID 作为 `mac_address`（存储于 `~/.xiachat/machine_id`），同一机器重复注册复用同一 `rc_user_id`（`rc_node_<machine_id>`）。
+
+### 运行
+
+```bash
+node dist/xiachat.bundle.js run --agent opencode   # --agent 必填；可用值见 xiachat agents
+# 输出 xiachat run: connected and dispatching 即已连上融云并分发消息
+```
+
+单聊消息按会话串行处理（并发 1、队列深 1）；忙碌时向对端回 `正在思考中…`。讨论模式下收到 `your_turn` 指令后执行本机 agent，超时 120s 自动跳过。
+
+### 验证与排障
+
+- `node dist/xiachat.bundle.js status` 查看凭据与 token。
+- 运行日志的 `im in: type=... from=...` 行标记每条入站消息，用于区分"消息未达"与"分发失败"。
+- 已知缺口（agent 执行 STDIN、回包 webhook 公网地址）见 smoke.md「已知缺口」一节。
