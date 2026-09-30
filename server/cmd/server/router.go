@@ -1599,6 +1599,8 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// not the Multica session.
 	r.Post("/api/claw/pairing", h.ClawCreatePairing)
 	r.Get("/api/claw/pairing/{ticket}", h.ClawGetPairing)
+	r.Post("/api/claw/pairing/{ticket}/bind", h.ClawBindPairing)
+	r.Post("/api/claw/device/nodes", h.ClawDeviceNodes)
 
 	// ClawMessenger (虾说) compatibility API — 移植自旧 Python 后端的公开契约，
 	// 供 clawmessenger-web / clawmessenger-uniapp 前端直连。

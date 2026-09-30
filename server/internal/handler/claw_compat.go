@@ -559,6 +559,10 @@ type clawPairingView struct {
 	// AIType 是 claimed 后回填节点的 ai_type（register 时注册的智能体类型），
 	// 供旧站弹窗提示「xiachat run --agent <name>」；pending 时为空串。
 	AIType string `json:"aiType,omitempty"`
+	// ReportedAgents 是 pair 时设备自动上报的本机 agent 列表（pending 时可能为空）。
+	ReportedAgents []string `json:"reportedAgents,omitempty"`
+	// BoundAgents 是用户在弹窗勾选绑定后生成的 [{agent,nodeId}] 结果。
+	BoundAgents []rongcloud.BoundAgentResult `json:"boundAgents,omitempty"`
 }
 
 // clawRequireClawUser 按旧站契约认证：Bearer 即 claw_im_users.rongcloud_token。
@@ -667,10 +671,95 @@ func (h *Handler) ClawGetPairing(w http.ResponseWriter, r *http.Request) {
 		clawJSON(w, 500, 500, "查询票据失败", nil)
 		return
 	}
-	clawJSON(w, 200, 200, "", clawPairingView{
+	view := clawPairingView{
 		Ticket:    session.Ticket,
 		Status:    session.Status,
 		ExpiresAt: session.ExpiresAt.Time.Format(time.RFC3339),
 		AIType:    h.RongCloudPairing.SessionClaimedNodeAIType(r.Context(), session),
-	})
+	}
+	var reported []string
+	if len(session.ReportedAgents) > 0 && json.Unmarshal(session.ReportedAgents, &reported) == nil && len(reported) > 0 {
+		view.ReportedAgents = reported
+	}
+	var bound []rongcloud.BoundAgentResult
+	if len(session.BoundAgents) > 0 && json.Unmarshal(session.BoundAgents, &bound) == nil && len(bound) > 0 {
+		view.BoundAgents = bound
+	}
+	clawJSON(w, 200, 200, "", view)
+}
+
+// ClawBindPairing POST /api/claw/pairing/{ticket}/bind —— 旧站弹窗勾选绑定 agent。
+// 票据必须已 claimed（设备已 pair）；每个被选 agent 独立建 rc user + node + 凭据。
+func (h *Handler) ClawBindPairing(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.clawRequireClawUser(w, r); !ok {
+		return
+	}
+	if h.RongCloudPairing == nil {
+		clawJSON(w, 503, 503, "RongCloud 集成未配置", nil)
+		return
+	}
+	ticket := chi.URLParam(r, "ticket")
+	if ticket == "" {
+		clawJSON(w, 400, 400, "缺少票据", nil)
+		return
+	}
+	var req struct {
+		Agents []string `json:"agents"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil || len(req.Agents) == 0 {
+		clawJSON(w, 400, 400, "缺少要绑定的智能体", nil)
+		return
+	}
+	session, err := h.RongCloudPairing.GetSession(r.Context(), ticket)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			clawJSON(w, 404, 404, "票据不存在", nil)
+			return
+		}
+		clawJSON(w, 500, 500, "查询票据失败", nil)
+		return
+	}
+	results, err := h.RongCloudNode.BindAgents(r.Context(), session, req.Agents)
+	if err != nil {
+		switch {
+		case errors.Is(err, rongcloud.ErrPairingSessionNotClaimed):
+			clawJSON(w, 409, 409, "设备尚未完成配对", nil)
+		case errors.Is(err, rongcloud.ErrPairingSessionExpired):
+			clawJSON(w, 410, 410, "票据已过期", nil)
+		default:
+			slog.Warn("claw: bind pairing agents failed", "error", err, "ticket_prefix", ticket[:min(6, len(ticket))])
+			clawJSON(w, 500, 500, "绑定智能体失败", nil)
+		}
+		return
+	}
+	clawJSON(w, 200, 200, "绑定成功", map[string]interface{}{"bound": results})
+}
+
+// ClawDeviceNodes POST /api/claw/device/nodes —— xiachat supervisor 取回本机全部
+// 已绑定 agent 的连接凭据。认证 = 机器节点 device credential（nodeId + credentialId + secret）。
+func (h *Handler) ClawDeviceNodes(w http.ResponseWriter, r *http.Request) {
+	if h.RongCloudNode == nil {
+		clawJSON(w, 503, 503, "RongCloud 集成未配置", nil)
+		return
+	}
+	var req struct {
+		NodeID       string `json:"nodeId"`
+		CredentialID string `json:"credentialId"`
+		Secret       string `json:"secret"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil || req.NodeID == "" || req.CredentialID == "" || req.Secret == "" {
+		clawJSON(w, 400, 400, "缺少设备凭据", nil)
+		return
+	}
+	creds, err := h.RongCloudNode.MachineAgentCredentials(r.Context(), req.NodeID, req.CredentialID, req.Secret)
+	if err != nil {
+		if errors.Is(err, rongcloud.ErrInvalidDeviceCredential) {
+			clawJSON(w, 401, 401, "设备凭据无效", nil)
+			return
+		}
+		slog.Warn("claw: device nodes lookup failed", "nodeId", req.NodeID, "error", err)
+		clawJSON(w, 500, 500, "查询智能体节点失败", nil)
+		return
+	}
+	clawJSON(w, 200, 200, "", map[string]interface{}{"nodes": creds})
 }

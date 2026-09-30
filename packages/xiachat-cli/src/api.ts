@@ -5,6 +5,9 @@ export interface RegisterParams {
   capabilities?: string[];
   macAddress?: string;
   pairingTicket?: string;
+  // Agent CLIs discoverable on this machine; reported with the register so
+  // the web binding dialog can list them for the user to bind.
+  agents?: string[];
 }
 
 export interface RegisterResult {
@@ -27,6 +30,17 @@ export interface ClaimResult {
   session?: ClaimSession;
 }
 
+// One bound agent's full IM identity, as returned by
+// POST /api/claw/device/nodes (field names match the Go struct tags).
+export interface MachineAgentCredential {
+  agent: string;
+  nodeId: string;
+  rongCloudUser: string;
+  token: string;
+  credentialId: string;
+  deviceSecret: string;
+}
+
 export class XiachatApi {
   constructor(private readonly baseUrl: string) {}
 
@@ -45,6 +59,7 @@ export class XiachatApi {
         capabilities: params.capabilities ?? [],
         mac_address: params.macAddress ?? "",
         ...(params.pairingTicket ? { pairing_ticket: params.pairingTicket } : {}),
+        ...(params.agents && params.agents.length > 0 ? { agents: params.agents } : {}),
       },
     );
     return {
@@ -78,6 +93,26 @@ export class XiachatApi {
 
   async refreshToken(nodeId: string): Promise<{ token: string }> {
     return this.request("POST", `/api/claw/refresh-token/${encodeURIComponent(nodeId)}`);
+  }
+
+  // Supervisor mode: exchange the machine node's device credential for the
+  // credentials of every agent bound to this device. The legacy endpoint
+  // answers with the claw envelope {code,message,data:{nodes:[...]}}.
+  async fetchDeviceNodes(
+    nodeId: string,
+    credentialId: string,
+    secret: string,
+  ): Promise<MachineAgentCredential[]> {
+    const raw = await this.request<{ data?: { nodes?: MachineAgentCredential[] } }>(
+      "POST",
+      "/api/claw/device/nodes",
+      { nodeId, credentialId, secret },
+    );
+    const nodes = raw.data?.nodes;
+    if (!Array.isArray(nodes)) {
+      throw new Error("POST /api/claw/device/nodes: unexpected response shape");
+    }
+    return nodes;
   }
 
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {

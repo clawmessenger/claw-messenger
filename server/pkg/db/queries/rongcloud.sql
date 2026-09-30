@@ -35,8 +35,8 @@ DELETE FROM rongcloud_user WHERE id = $1;
 -- =====================
 
 -- name: CreateRongCloudNode :one
-INSERT INTO rongcloud_node (workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version)
-VALUES (@workspace_id, @owner_user_id, @rongcloud_user_id, @node_id, @ai_type, @capabilities, @deploy_status, @binding_version)
+INSERT INTO rongcloud_node (workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, machine_id)
+VALUES (@workspace_id, @owner_user_id, @rongcloud_user_id, @node_id, @ai_type, @capabilities, @deploy_status, @binding_version, @machine_id)
 RETURNING *;
 
 -- name: GetRongCloudNodeByID :one
@@ -53,6 +53,9 @@ SELECT * FROM rongcloud_node WHERE workspace_id = $1 ORDER BY created_at ASC;
 
 -- name: ListRongCloudNodesByOwner :many
 SELECT * FROM rongcloud_node WHERE owner_user_id = $1 ORDER BY created_at ASC;
+
+-- name: ListRongCloudNodesByMachineID :many
+SELECT * FROM rongcloud_node WHERE machine_id = $1 ORDER BY created_at ASC;
 
 -- name: UpdateRongCloudNodeDeployStatus :one
 UPDATE rongcloud_node SET deploy_status = $2, updated_at = now() WHERE id = $1 RETURNING *;
@@ -154,6 +157,22 @@ UPDATE rongcloud_pairing_session SET status = 'claimed', idempotency_key = $2, u
 UPDATE rongcloud_pairing_session SET candidate_node_ids = $2, updated_at = now()
 WHERE ticket = $1 AND status = 'pending'
 RETURNING *;
+
+-- name: UpdateRongCloudPairingSessionReportedAgents :one
+UPDATE rongcloud_pairing_session SET reported_agents = $2, updated_at = now()
+WHERE ticket = $1 AND status IN ('pending', 'claimed')
+RETURNING *;
+
+-- name: UpdateRongCloudPairingSessionBoundAgents :one
+UPDATE rongcloud_pairing_session SET bound_agents = $2, updated_at = now()
+WHERE ticket = $1 AND status = 'claimed'
+RETURNING *;
+
+-- name: GetRongCloudDeviceByNodeID :one
+SELECT * FROM rongcloud_device WHERE node_id = $1 AND status != 'deleted' ORDER BY created_at ASC LIMIT 1;
+
+-- name: GetRongCloudDeviceByNodeAndCredential :one
+SELECT * FROM rongcloud_device WHERE node_id = $1 AND credential_id = $2 AND status != 'deleted' LIMIT 1;
 
 -- name: DeleteRongCloudPairingSession :exec
 DELETE FROM rongcloud_pairing_session WHERE id = $1;

@@ -1,4 +1,5 @@
 import { Command } from "commander";
+import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import * as os from "node:os";
 import { Keystore, type StoredCredentials } from "./keystore.js";
@@ -80,7 +81,10 @@ export function buildProgram(opts: BuildProgramOpts): Command {
       const api = opts.apiFactory(cmdOpts.server);
       // Register with the ticket first: the server attributes the node to
       // the ticket's workspace and backfills the session's candidate node
-      // list so the subsequent claim can issue device credentials.
+      // list so the subsequent claim can issue device credentials. The
+      // machine's discoverable agent CLIs are reported alongside so the web
+      // dialog can offer them for checkbox binding.
+      const foundAgents = await discoverAgents({});
       try {
         const reg = await api.register({
           name: cmdOpts.name ?? `${os.hostname()} ${cmdOpts.aiType}`,
@@ -88,6 +92,7 @@ export function buildProgram(opts: BuildProgramOpts): Command {
           nodeType: "ai",
           macAddress: (opts.machineId ?? machineId)(),
           pairingTicket: cmdOpts.ticket,
+          agents: foundAgents.map((a) => a.name),
         });
         opts.keystore.save({
           nodeId: reg.nodeId,
@@ -144,13 +149,24 @@ export function buildProgram(opts: BuildProgramOpts): Command {
 
   program
     .command("run")
-    .description("Connect to RongCloud IM and dispatch agent turns")
-    .requiredOption("--agent <name>", "agent CLI name; must be discoverable on PATH (see xiachat agents)")
+    .description(
+      "Connect to RongCloud IM and dispatch agent turns. Without --agent, run every agent bound to this device (supervisor mode).",
+    )
+    .option("--agent <name>", "agent CLI name; must be discoverable on PATH (see xiachat agents)")
     .option("--model <model>", "model override passed to the agent CLI")
-    .action(async (cmdOpts: { agent: string; model?: string }) => {
-      const creds = opts.keystore.load();
+    .action(async (cmdOpts: { agent?: string; model?: string }) => {
+      // Supervisor-spawned children carry their agent-specific credentials
+      // in the environment; a plain `xiachat run` never sees them otherwise
+      // because each child overwrites nothing in the shared keystore.
+      const envCreds = process.env.XIACHAT_AGENT_CREDS;
+      const parsedEnvCreds = envCreds ? (JSON.parse(envCreds) as StoredCredentials) : undefined;
+      const creds = parsedEnvCreds ?? opts.keystore.load();
       if (!creds) throw new Error("no credentials; run xiachat register or pair first");
       const api = opts.apiFactory(creds.serverUrl);
+      if (!cmdOpts.agent) {
+        await runSupervisor({ opts, creds, api, model: cmdOpts.model });
+        return;
+      }
       const found = await discoverAgents({});
       const agent = found.find((a) => a.name === cmdOpts.agent);
       if (!agent) throw new Error(`agent CLI ${cmdOpts.agent} not found on PATH; run xiachat agents`);
@@ -180,4 +196,68 @@ export function buildProgram(opts: BuildProgramOpts): Command {
     });
 
   return program;
+}
+
+// Supervisor mode: `xiachat run` with no --agent. Exchanges the machine
+// node's device credential for every bound agent's IM credentials, then
+// spawns one child `xiachat run --agent <name>` per agent. Each child gets
+// its agent-specific credentials via XIACHAT_AGENT_CREDS (imlib-next is a
+// module-level singleton, so one OS process per IM user is required).
+interface RunSupervisorOpts {
+  opts: BuildProgramOpts;
+  creds: StoredCredentials;
+  api: XiachatApi;
+  model?: string;
+}
+
+async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void> {
+  const { opts, creds, api } = supervisor;
+  if (!creds.credentialId || !creds.deviceSecret) {
+    throw new Error("no machine device credential; run xiachat pair on this device first");
+  }
+  const bound = await api.fetchDeviceNodes(creds.nodeId, creds.credentialId, creds.deviceSecret);
+  if (bound.length === 0) {
+    throw new Error("no agents bound to this device; select and bind agents in the web binding dialog first");
+  }
+  const found = await discoverAgents({});
+  // SEA single-file exe: re-invoke the exe itself. Node script mode: re-run
+  // the bundle entry so argv keeps the [execPath, script, ...] shape.
+  const script = process.argv[1];
+  const isSea = !script || !script.endsWith(".js");
+  const children: ChildProcess[] = [];
+  for (const agent of bound) {
+    const local = found.find((f) => f.name === agent.agent);
+    if (!local) {
+      console.error(`agent CLI ${agent.agent} not found on PATH; skipping`);
+      continue;
+    }
+    const childCreds: StoredCredentials = {
+      nodeId: agent.nodeId,
+      token: agent.token,
+      credentialId: agent.credentialId,
+      deviceSecret: agent.deviceSecret,
+      serverUrl: creds.serverUrl,
+    };
+    const runArgs = ["run", "--agent", agent.agent];
+    if (supervisor.model) runArgs.push("--model", supervisor.model);
+    const child = spawn(process.execPath, isSea ? runArgs : [script as string, ...runArgs], {
+      env: { ...process.env, XIACHAT_AGENT_CREDS: JSON.stringify(childCreds) },
+    });
+    child.stdout?.on("data", (chunk: Buffer) => opts.stdout.write(`[${agent.agent}] ${chunk}`));
+    child.stderr?.on("data", (chunk: Buffer) => process.stderr.write(`[${agent.agent}] ${chunk}`));
+    child.on("exit", (code) => {
+      console.error(`agent ${agent.agent} exited with code ${code}`);
+    });
+    children.push(child);
+  }
+  if (children.length === 0) {
+    throw new Error("none of the bound agent CLIs is available on this machine's PATH");
+  }
+  opts.stdout.write(`xiachat supervisor: ${children.length} agent(s) online\n`);
+  const shutdown = (): void => {
+    for (const child of children) child.kill("SIGTERM");
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+  await new Promise<void>(() => {}); // supervise until process exit
 }

@@ -544,6 +544,57 @@ type ChatSession struct {
 	ExplicitlyCreatedAt pgtype.Timestamptz `json:"explicitly_created_at"`
 }
 
+type ClawAdminAuditLog struct {
+	ID           int64              `json:"id"`
+	AdminID      string             `json:"admin_id"`
+	Action       string             `json:"action"`
+	ResourceType pgtype.Text        `json:"resource_type"`
+	ResourceID   pgtype.Text        `json:"resource_id"`
+	Detail       []byte             `json:"detail"`
+	IpAddress    pgtype.Text        `json:"ip_address"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+}
+
+type ClawAdminRole struct {
+	RoleID      string             `json:"role_id"`
+	Name        string             `json:"name"`
+	RoleName    string             `json:"role_name"`
+	Description pgtype.Text        `json:"description"`
+	Status      string             `json:"status"`
+	Permissions []string           `json:"permissions"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
+}
+
+type ClawAdminUser struct {
+	AdminID      string             `json:"admin_id"`
+	Username     string             `json:"username"`
+	Nickname     pgtype.Text        `json:"nickname"`
+	PasswordHash string             `json:"password_hash"`
+	RoleID       string             `json:"role_id"`
+	Status       string             `json:"status"`
+	LastLoginAt  pgtype.Timestamptz `json:"last_login_at"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+}
+
+type ClawImUser struct {
+	UserID         string             `json:"user_id"`
+	Username       string             `json:"username"`
+	Nickname       pgtype.Text        `json:"nickname"`
+	PortraitUri    pgtype.Text        `json:"portrait_uri"`
+	Email          pgtype.Text        `json:"email"`
+	Phone          pgtype.Text        `json:"phone"`
+	Signature      pgtype.Text        `json:"signature"`
+	Gender         pgtype.Text        `json:"gender"`
+	Birthday       pgtype.Text        `json:"birthday"`
+	PasswordHash   string             `json:"password_hash"`
+	RongcloudToken pgtype.Text        `json:"rongcloud_token"`
+	Status         string             `json:"status"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
+}
+
 type ClientUsageDaily struct {
 	UserID          pgtype.UUID        `json:"user_id"`
 	ClientType      string             `json:"client_type"`
@@ -1414,6 +1465,7 @@ type RongcloudNode struct {
 	BindingVersion  int32              `json:"binding_version"`
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+	MachineID       string             `json:"machine_id"`
 }
 
 type RongcloudNodeModelCatalog struct {
@@ -1439,6 +1491,8 @@ type RongcloudPairingSession struct {
 	ExpiresAt        pgtype.Timestamptz `json:"expires_at"`
 	CreatedAt        pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
+	ReportedAgents   []byte             `json:"reported_agents"`
+	BoundAgents      []byte             `json:"bound_agents"`
 }
 
 type RongcloudSystemConfig struct {

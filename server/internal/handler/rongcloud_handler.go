@@ -40,6 +40,7 @@ func (h *Handler) RegisterRongCloudAINode(w http.ResponseWriter, r *http.Request
 		AIType        string   `json:"ai_type"`
 		Capabilities  []string `json:"capabilities"`
 		PairingTicket string   `json:"pairing_ticket"`
+		Agents        []string `json:"agents"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -52,6 +53,7 @@ func (h *Handler) RegisterRongCloudAINode(w http.ResponseWriter, r *http.Request
 		AIType:        req.AIType,
 		Capabilities:  req.Capabilities,
 		PairingTicket: req.PairingTicket,
+		Agents:        req.Agents,
 	})
 	if err != nil {
 		if errors.Is(err, rongcloud.ErrWorkspaceAttributionRequired) {
