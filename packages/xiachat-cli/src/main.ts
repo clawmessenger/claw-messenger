@@ -1,8 +1,17 @@
 import { Command } from "commander";
+import { createHash } from "node:crypto";
 import { Keystore, type StoredCredentials } from "./keystore.js";
 import { XiachatApi } from "./api.js";
 import { discoverAgents } from "./agents.js";
 import { DEFAULT_SERVER_URL, machineId } from "./config.js";
+
+// Deterministic per (ticket, machine): a retried claim after a lost
+// response reuses the same key, so the server deduplicates instead of
+// answering a misleading 409 "another device". Different machines derive
+// different keys.
+export function pairIdempotencyKey(ticket: string, mid: string): string {
+  return `idem-${createHash("sha256").update(`${ticket}:${mid}`).digest("hex").slice(0, 24)}`;
+}
 
 export interface BuildProgramOpts {
   keystore: Keystore;
@@ -66,7 +75,8 @@ export function buildProgram(opts: BuildProgramOpts): Command {
     .option("--server <url>", "Multica server base URL", DEFAULT_SERVER_URL)
     .action(async (cmdOpts: { ticket: string; server: string }) => {
       const api = opts.apiFactory(cmdOpts.server);
-      const result = await api.claimPairing(cmdOpts.ticket, "", `idem-${Date.now()}`);
+      const idemKey = pairIdempotencyKey(cmdOpts.ticket, (opts.machineId ?? machineId)());
+      const result = await api.claimPairing(cmdOpts.ticket, "", idemKey);
       if (result.session?.status === "claimed" && !result.deviceSecret) {
         throw new Error("ticket already claimed by another device");
       }

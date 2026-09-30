@@ -122,6 +122,70 @@ describe("xiachat pair", () => {
     ).rejects.toThrow(/already claimed/);
     expect(keystore.load()).toBeNull();
   });
+
+  it("derives the same idempotency key across retries on one machine", async () => {
+    const keystore = tempKeystore();
+    const seenIdemKeys: string[] = [];
+    const fakeApi = {
+      getConfig: async () => ({ appKey: "pk" }),
+      register: async () => { throw new Error("not used"); },
+      claimPairing: async (_ticket: string, _cck: string, idemKey: string) => {
+        seenIdemKeys.push(idemKey);
+        return {
+          deviceCredentialId: "dc_1",
+          deviceSecret: "sec_1",
+          nodeId: "node_5",
+        };
+      },
+      refreshToken: async () => ({ token: "" }),
+    };
+    const program = buildProgram({
+      keystore,
+      apiFactory: () => fakeApi as unknown as XiachatApi,
+      stdout: process.stdout,
+      machineId: () => "machine-A",
+    });
+    // A retried claim after a lost response: same ticket, same machine.
+    await program.parseAsync(["node", "xiachat", "pair", "--ticket", "pt_same"]);
+    await program.parseAsync(["node", "xiachat", "pair", "--ticket", "pt_same"]);
+    expect(seenIdemKeys).toHaveLength(2);
+    expect(seenIdemKeys[0]).toBe(seenIdemKeys[1]);
+    expect(seenIdemKeys[0]).toMatch(/^idem-[0-9a-f]{24}$/);
+
+    // A different ticket on the same machine derives a different key.
+    await program.parseAsync(["node", "xiachat", "pair", "--ticket", "pt_other"]);
+    expect(seenIdemKeys[2]).not.toBe(seenIdemKeys[0]);
+  });
+
+  it("derives a different idempotency key per machine", async () => {
+    const keystore = tempKeystore();
+    const seenIdemKeys: string[] = [];
+    const fakeApi = {
+      getConfig: async () => ({ appKey: "pk" }),
+      register: async () => { throw new Error("not used"); },
+      claimPairing: async (_ticket: string, _cck: string, idemKey: string) => {
+        seenIdemKeys.push(idemKey);
+        return { deviceCredentialId: "dc_1", deviceSecret: "s", nodeId: "node_6" };
+      },
+      refreshToken: async () => ({ token: "" }),
+    };
+    const program = buildProgram({
+      keystore,
+      apiFactory: () => fakeApi as unknown as XiachatApi,
+      stdout: process.stdout,
+      machineId: () => "machine-B",
+    });
+    await program.parseAsync(["node", "xiachat", "pair", "--ticket", "pt_same"]);
+    const machineBKey = seenIdemKeys[0];
+    const program2 = buildProgram({
+      keystore,
+      apiFactory: () => fakeApi as unknown as XiachatApi,
+      stdout: process.stdout,
+      machineId: () => "machine-C",
+    });
+    await program2.parseAsync(["node", "xiachat", "pair", "--ticket", "pt_same"]);
+    expect(seenIdemKeys[1]).not.toBe(machineBKey);
+  });
 });
 
 describe("xiachat status", () => {
