@@ -131,6 +131,26 @@ func (s *PairingService) GetSession(ctx context.Context, ticket string) (db.Rong
 	return s.queries.GetRongCloudPairingSessionByTicket(ctx, ticket)
 }
 
+// SessionClaimedNodeAIType returns the ai_type of the node that claimed the
+// session (candidates[0], backfilled by register). Empty string when the
+// session is not claimed or the node lookup fails — callers treat it as
+// optional display metadata.
+func (s *PairingService) SessionClaimedNodeAIType(ctx context.Context, session db.RongcloudPairingSession) string {
+	if s.queries == nil || session.Status != "claimed" {
+		return ""
+	}
+	var candidateNodeIDs []pgtype.UUID
+	if err := json.Unmarshal(session.CandidateNodeIds, &candidateNodeIDs); err != nil || len(candidateNodeIDs) == 0 {
+		return ""
+	}
+	node, err := s.queries.GetRongCloudNodeByID(ctx, candidateNodeIDs[0])
+	if err != nil {
+		s.logger.Warn("rongcloud: claimed node lookup failed for ai_type", "ticket_prefix", safeTicketPrefix(session.Ticket), "error", err)
+		return ""
+	}
+	return node.AiType.String
+}
+
 func (s *PairingService) ClaimSession(ctx context.Context, ticket, clientClaimKey, idempotencyKey string) (ClaimResult, error) {
 	if s.queries == nil {
 		return ClaimResult{}, errors.New("rongcloud: database not configured")

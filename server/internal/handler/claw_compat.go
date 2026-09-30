@@ -556,6 +556,9 @@ type clawPairingView struct {
 	Ticket    string `json:"ticket"`
 	Status    string `json:"status"`
 	ExpiresAt string `json:"expiresAt"`
+	// AIType 是 claimed 后回填节点的 ai_type（register 时注册的智能体类型），
+	// 供旧站弹窗提示「xiachat run --agent <name>」；pending 时为空串。
+	AIType string `json:"aiType,omitempty"`
 }
 
 // clawRequireClawUser 按旧站契约认证：Bearer 即 claw_im_users.rongcloud_token。
@@ -668,5 +671,6 @@ func (h *Handler) ClawGetPairing(w http.ResponseWriter, r *http.Request) {
 		Ticket:    session.Ticket,
 		Status:    session.Status,
 		ExpiresAt: session.ExpiresAt.Time.Format(time.RFC3339),
+		AIType:    h.RongCloudPairing.SessionClaimedNodeAIType(r.Context(), session),
 	})
 }
