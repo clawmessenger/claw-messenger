@@ -579,7 +579,7 @@ xiachat pair --ticket pt_<64位hex> --server https://<你的服务地址>
 
 ```bash
 # 安装（在 claw-messenger 仓库内）
-pnpm --filter @multica/xiachat-cli build:bin
+pnpm --filter @quukk/xiachat-cli build:bin
 
 # 确认本机有可用的 agent CLI（claude / codex / opencode 等）
 node packages/xiachat-cli/dist/xiachat.bundle.js agents

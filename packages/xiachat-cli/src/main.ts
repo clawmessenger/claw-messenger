@@ -37,7 +37,7 @@ export function buildProgram(opts: BuildProgramOpts): Command {
     .description("Register this device as a RongCloud AI node")
     .requiredOption("--name <name>", "node display name")
     .requiredOption("--ai-type <type>", "agent platform (claude, codex, opencode, ...)")
-    .requiredOption("--server <url>", "Multica server base URL")
+    .requiredOption("--server <url>", "Quukk server base URL")
     .option("--pairing-ticket <ticket>", "attribute the node to a workspace via pairing ticket")
     .action(async (cmdOpts: { name: string; aiType: string; server: string; pairingTicket?: string }) => {
       const api = opts.apiFactory(cmdOpts.server);
@@ -72,7 +72,7 @@ export function buildProgram(opts: BuildProgramOpts): Command {
     .command("pair")
     .description("Claim a pairing session with a ticket")
     .requiredOption("--ticket <ticket>", "pairing ticket (pt_...)")
-    .option("--server <url>", "Multica server base URL", DEFAULT_SERVER_URL)
+    .option("--server <url>", "Quukk server base URL", DEFAULT_SERVER_URL)
     .action(async (cmdOpts: { ticket: string; server: string }) => {
       const api = opts.apiFactory(cmdOpts.server);
       const idemKey = pairIdempotencyKey(cmdOpts.ticket, (opts.machineId ?? machineId)());

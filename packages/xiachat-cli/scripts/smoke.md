@@ -5,7 +5,7 @@
 ## 0. 打包
 
 ```powershell
-pnpm --filter @multica/xiachat-cli build:bin   # tsc + pack.mjs shim → dist/xiachat.bundle.js
+pnpm --filter @quukk/xiachat-cli build:bin   # tsc + pack.mjs shim → dist/xiachat.bundle.js
 node packages/xiachat-cli/dist/xiachat.bundle.js agents   # 列出本机 agent
 ```
 
