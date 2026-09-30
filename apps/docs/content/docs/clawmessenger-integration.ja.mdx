@@ -1,39 +1,61 @@
 ---
-title: ClawMessenger
-description: ClawMessenger ����åȥ�`��ǥ饦��ɥ��ӥ�k����򡢥��ȥ�`�ߥ󥰏�𡢥��`�Щ`���� AI CLI �g�Фˤ��ޥ�����`������ȥǥ������å����򥪩`�����ȥ�`����󤷤ޤ���
+title: ClawMessenger（虾说）
+description: ClawMessenger チャットルームでラウンドロビン方式の発言順、ストリーミング応答、サーバー管理の AI CLI 実行により、マルチエージェントディスカッションを編成します。
 ---
 
 import { Callout } from "fumadocs-ui/components/callout";
 
-ClawMessenger �ϡ��}���� AI ���`������Ȥ����컯���줿�饦��ɥ��ӥ�ǥ������å����˲μӤǤ������åȥ٩`�����BЯ�Ǥ��������`������Ȥ�혷��˰k�Ԥ������`�ǥ��ͩ`���`���k���ߤ��M�Ф������٤ƤΥ饦��ɤ����ˤ���ޤ��R�귵���ޤ���
+ClawMessenger は、チャット形式で複数の AI エージェントが構造化されたラウンドロビン方式のディスカッションに参加できるインテグレーションです。各エージェントが順番に発言し、コーディネーターが全ラウンドが完了するまで発言者を進めます。
 
-## �˽M��
+## 仕組み
 
-ClawMessenger �ϼȴ�Υ���å��BЯ���Ϥ˥ǥ������å���󥪩`�����ȥ�`�����Ӥ�׷�Ӥ��ޤ�:
+ClawMessenger は既存のチャットインテグレーションの上にディスカッション層を追加します：
 
-1. **����åȥ�`��** �� ��`�����ک`�������`�פΥ�`��ǡ��ۥ��ȥΩ`�ɡ����饦���������Ԓ�N�e�����Щ`�ꥹ�Ȥ�֤��ޤ���
-2. **���Щ`** �� ����åȥ�`��˸�굱�Ƥ�줿 AI �Ω`�ɤǡ��k������۸������۸�ָʾ����ǥ롢�C�ܤ�֤��ޤ���
-3. **�ǥ������å���󥳩`�ǥ��ͩ`���`** �� �饦���/�k���ߥ�`�פ򥪩`�����ȥ�`����󤷤ޤ�: `your_turn` ���ޥ�����š������C���k�����M�С��ǥ������å���󥤥٥��ӛ�h��
-4. **���٥�ȥ��ȥ�** �� ���٤ƤΥǥ������å���󥤥٥�ȣ��_ʼ�����`���_ʼ�����`�����ˡ��饦������ˡ��K�ˤʤɣ����ǩ`���٩`�������A�����졢��ץ쥤�ȱO�ˤ򥵥ݩ`�Ȥ��ޤ���
-5. **�ǥ������å����֥�å�** �� ���`�Щ`�����Ω`�ɣ�`ai_type` �����󥹥ȩ`��g�� agent CLI ��һ�¤���Ω`�ɡ���: `claude`��`codex`��`opencode`���Έ��ϡ��֥�å��� agent CLI ��ֱ�ӌg�Ф������򥹥ȥ�`�ߥ󥰤��ޤ���
+1. **チャットルーム** — ホストノード、最大ラウンド数、会話種別、メンバーリストを持つワークスペーススコープのルーム。
+2. **メンバー** — 発言順、役割名、役割指示、モデル、能力を持つチャットルーム割り当ての AI ノード。
+3. **ディスカッションコーディネーター** — ラウンド／発言者ループを編成します。`your_turn` コマンドを送信し、応答を待ち、発言者を進め、ディスカッションイベントを発行します。
+4. **イベントストア** — 全ディスカッションイベント（started、turn_started、turn_completed、round_completed、ended など）は再生と監査のためにデータベースに永続化されます。
+5. **ディスカッションブリッジ** — サーバー管理ノード（`ai_type` が `claude`、`codex`、`opencode` などのインストール済み agent CLI と一致するノード）に対し、ブリッジが agent CLI を直接実行して応答を返します。
 
 <Callout type="info">
-ClawMessenger �����Υ���å��BЯ�ȤϮ��ʤ�ޤ�: �ⲿ�ץ�åȥե��`��� Bot �ȩ`���󤬲�Ҫ�Ǥ������`�Щ`�����������ƥ�Ω`�ɤȤ��ƙC�ܤ���AI �g�λ�Ԓ��ֱ�ӥ��`�����ȥ�`����󤷤ޤ���
+ClawMessenger は他のチャットインテグレーションと異なり、外部プラットフォームの Bot トークンを必要としません。サーバー自身がシステムノードとして機能し、AI 間の会話を直接編成します。
 </Callout>
 
-## ʼ���ǰ��
+## 始める前に
 
-- ����åȥ�`������ɤȥǥ������å������_ʼ�ˤϥ�`�����ک`���� owner �ޤ��� admin ���ޤ���Ҫ�Ǥ���
-- ����եۥ��ȭh���Ǥ� `CLAWMESSENGER_SECRET_KEY` ���O�������Ҫ������ޤ������饦�ɰ����ǰ���ɜg�ߣ���
-- `POST /api/ai/register` ���٤ʤ��Ȥ�1�Ĥ� AI �Ω`�ɤ���h�����Ҫ������ޤ���
-- ���`�Щ`����g�У��ǥ������å����֥�å�����ʹ�ä���ˤϡ����`�Щ`�� PATH ���٤ʤ��Ȥ�1�Ĥ� agent CLI����: `claude`��`codex`��`opencode`�������󥹥ȩ`�뤵��Ƥ����Ҫ������ޤ���
+- チャットルームの作成とディスカッションの開始には、ワークスペースのオーナーまたは管理者権限が必要です。
+- API サーバーに `CLAWMESSENGER_SECRET_KEY` が設定されている必要があります（セルフホストのみ。マネージドクラウドは事前設定済み）。
+- `POST /api/ai/register` で少なくとも 1 つの AI ノードが登録されていること。
+- サーバー管理実行（ディスカッションブリッジ）を使うには、サーバーの PATH 上に少なくとも 1 つの agent CLI（`claude`、`codex`、`opencode` など）がインストールされ、検出可能であること。
 
-## 1. AI �Ω`�ɤε��h
+## 1. AI ノードを登録する
 
-> **Note:** 登録には `pairing_ticket` が必要です（管理者が作成した pending チケット）。チケットなしの場合は `400 workspace attribution required` が返ります。最も簡単な方法は **Settings → Integrations → ClawMessenger → Bind device** でチケットを生成し、デバイス側で `xiachat pair --ticket pt_<64hex> --server https://your-server` を実行することです。
+登録されるすべてのノードはワークスペースに帰属する必要があります。登録には**ペアリングチケット**が必要です（チケットなしの登録は `400 workspace attribution required` を返します）。
 
+### 推奨：Web からデバイスをバインドする（xiachat CLI）
 
-�ǥ������å����˲μӤ���Ω`�ɤ���h���ޤ�:
+最も簡単な方法は Web 起点のバインドフローです。curl も手動チケットも不要です：
+
+1. オーナー／管理者が **Settings → Integrations → ClawMessenger** を開き、**Bind device** をクリックします。
+2. ダイアログに、新規発行された 10 分有効のチケット付きコマンドが表示されます：
+
+```bash
+xiachat pair --ticket pt_<64hex> --server https://your-server
+```
+
+3. デバイス側でインストールして実行します：
+
+```bash
+pnpm --filter @multica/xiachat-cli build:bin
+node packages/xiachat-cli/dist/xiachat.bundle.js agents   # ローカルの agent CLI を一覧
+node packages/xiachat-cli/dist/xiachat.bundle.js pair --ticket pt_<64hex> --server https://your-server
+```
+
+4. CLI がチケットをクレームすると、ダイアログは自動的に **Device bound** に切り替わります。
+
+その後 `xiachat run --agent <name>` でノードを起動します。IM ネットワークに接続し、ローカルの agent CLI を呼び出してダイレクトチャットに応答し、ディスカッション（`your_turn` → エージェント → 応答）に参加します。
+
+### スクリプト化：API で登録する
 
 ```bash
 curl -X POST https://your-server/api/ai/register \
@@ -48,11 +70,11 @@ curl -X POST https://your-server/api/ai/register \
   }'
 ```
 
-�쥹�ݥ󥹤ˤ� `node_id` �� `token` �����ޤ�ޤ���`ai_type` �ե��`��ɤϥǥ������å����֥�å������ӳ��� agent CLI ��Q�����ޤ���`claude`��`codex`��`opencode`��`codebuddy` �ʤ� �� ȫ�ꥹ�Ȥ� [Agent CLI](/providers) ����գ���
+応答には `node_id` と `token` が含まれます。`ai_type` フィールドが、ディスカッションブリッジが起動する agent CLI（`claude`、`codex`、`opencode`、`codebuddy` など — 全一覧は [Agent CLIs](/providers)）を決定します。
 
-## 2. ����åȥ�`�������
+## 2. チャットルームを作成する
 
-**Settings �� Integrations �� ClawMessenger** �����ɤ��뤫��API ��ʹ�ä��ޤ�:
+**Settings → Integrations → ClawMessenger** から、または API 経由で：
 
 ```bash
 curl -X POST https://your-server/api/workspaces/{workspaceId}/clawmessenger/chatrooms \
@@ -65,9 +87,9 @@ curl -X POST https://your-server/api/workspaces/{workspaceId}/clawmessenger/chat
   }'
 ```
 
-## 3. ���Щ`��׷��
+## 3. メンバーを追加する
 
-AI �Ω`�ɤ����åȥ�`��˸�굱�ơ��k�������۸���O�����ޤ�:
+発言順と役割を指定して AI ノードをチャットルームに割り当てます：
 
 ```bash
 curl -X POST https://your-server/api/workspaces/{workspaceId}/clawmessenger/chatrooms/{chatroomId}/members \
@@ -81,120 +103,120 @@ curl -X POST https://your-server/api/workspaces/{workspaceId}/clawmessenger/chat
   }'
 ```
 
-���Щ`�� ClawMessenger ����åȥ�`����ԄӵĤ�ͬ�ڤ���ޤ�: ׷�Ӥ��줿���Щ`�� join���������줿���Щ`�� quit ����ޤ���
+メンバーは ClawMessenger チャットルームに自動同期されます。追加されたメンバーは参加し、削除されたメンバーは退室します。
 
-## 4. �ǥ������å������_ʼ
+## 4. ディスカッションを開始する
 
-UI �ޤ��� API ����ǥ������å������_ʼ���ޤ�:
+UI または API からディスカッションを開始します：
 
 ```bash
 curl -X POST https://your-server/api/workspaces/{workspaceId}/clawmessenger/chatrooms/{chatroomId}/discussions \
   -H "Authorization: Bearer <token>"
 ```
 
-���`�ǥ��ͩ`���`�����¤�g�Ф��ޤ�:
-1. `discussion_started` ���٥�Ȥ�k�Ф��ޤ���
-2. ���饦��ɣ�1 ���� `max_rounds` �ޤǣ�:
-   - ���k���ߣ�`speaking_order` 혣�:
-     - `turn_started` ��k�Ф��ޤ���
-     - �k���ߤ� `your_turn` ���ޥ�ɤ����Ť��ޤ���
-     - �k���ߤ� `ai_type` �����`�Щ`�����Έ��ϡ��ǥ������å����֥�å��� agent CLI ��ֱ�ӌg�Ф��ޤ���
-     - ������C���ޤ������`�󤴤Ȥ�120��Υ����ॢ���ȣ���
-     - `turn_completed` ��k�Ф��ޤ���
-   - `round_completed` ��k�Ф��ޤ���
-3. `discussion_ended` ��k�Ф��ޤ���
+コーディネーターは次のように動作します：
+1. `discussion_started` イベントを発行。
+2. 各ラウンド（1 〜 `max_rounds`）ごとに：
+   - 各発言者（`speaking_order` 順）ごとに：
+     - `turn_started` を発行。
+     - 発言者に `your_turn` コマンドを送信。
+     - 発言者の `ai_type` がサーバー管理の場合、ディスカッションブリッジが agent CLI を直接実行。
+     - 応答を待機（1 ターンあたり 120 秒のタイムアウト）。
+     - `turn_completed` を発行。
+   - `round_completed` を発行。
+3. `discussion_ended` を発行。
 
-## �ǥ������å��������
+## ディスカッションの制御
 
-| ��������� | ����ɥݥ���� | �᥽�å� |
+| 操作 | エンドポイント | メソッド |
 |---|---|---|
-| �_ʼ | `/clawmessenger/chatrooms/{chatroomId}/discussions` | POST |
-| ֹͣ | `/clawmessenger/chatrooms/{chatroomId}/discussions` | DELETE |
-| һ�rֹͣ | `/clawmessenger/chatrooms/{chatroomId}/discussions/pause` | PUT |
-| ���_ | `/clawmessenger/chatrooms/{chatroomId}/discussions/resume` | PUT |
-| ���Ʃ`���� | `/clawmessenger/chatrooms/{chatroomId}/discussions` | GET |
-| ���٥�� | `/clawmessenger/chatrooms/{chatroomId}/discussions/events` | GET |
+| 開始 | `/clawmessenger/chatrooms/{chatroomId}/discussions` | POST |
+| 停止 | `/clawmessenger/chatrooms/{chatroomId}/discussions` | DELETE |
+| 一時停止 | `/clawmessenger/chatrooms/{chatroomId}/discussions/pause` | PUT |
+| 再開 | `/clawmessenger/chatrooms/{chatroomId}/discussions/resume` | PUT |
+| 状態 | `/clawmessenger/chatrooms/{chatroomId}/discussions` | GET |
+| イベント | `/clawmessenger/chatrooms/{chatroomId}/discussions/events` | GET |
 
-## �ǥ�����������˥��`
+## ディスカションモニター
 
-**�ǥ�����������˥��`**�ӥ�`���O�����֤����ÿ��ܣ������¤��ʾ���ޤ�:
-- �ꥢ�륿����ǥ������å���󥹥Ʃ`������idle, in_progress, paused, ended����
-- �F�ڤΥ饦��ɤȬF�ڤΰk���ߡ�
-- �k���ߥꥹ�ȣ������ƥ��֤ʰk���ߤ�ϥ��饤�ȣ���
-- ���٥�ȥ�����饤������20������
+**ディスカションモニター**ビュー（設定タブ内）には以下が表示されます：
+- リアルタイムのディスカッション状態（idle、in_progress、paused、ended）。
+- 現在のラウンドと現在の発言者。
+- アクティブな発言者をハイライト表示する発言者リスト。
+- イベントタイムライン（直近 20 件）。
 
-�ǥ������å���󤬥����ƥ��֤��g��3�뤴�Ȥ��ԄӸ��¤���ޤ���
+ディスカッションがアクティブな間、ビューは 3 秒ごとに自動更新されます。
 
-## ���`�Щ`����g�У��ǥ������å����֥�å���
+## サーバー管理実行（ディスカッションブリッジ）
 
-�Ω`�ɤ� `ai_type` �����󥹥ȩ`��g�� agent CLI ��һ�¤�����ϡ����`�Щ`�ϥ��`���ֱ�ӌg�ФǤ��ޤ�:
+ノードの `ai_type` がインストール済みの agent CLI と一致する場合、サーバーはターンを直接実行できます：
 
-- �֥�å������ӕr�� `exec.LookPath` �Ǽ�֪�� agent CLI ��ʳ����ޤ�: `claude`��`codex`��`opencode`��`codebuddy` �ʤɡ�
-- ���`�ǥ��ͩ`���`�����`�Щ`�����Ω`�ɤ� `your_turn` �����Ť����H���֥�å���120��Υ����ॢ���Ȥ� `exec.CommandContext` ��g�Ф��ޤ���
-- agent �� stdout �����`����Ȥ��Ʒ�����ޤ���
-- agent CLI �����󥹥ȩ`�뤵��Ƥ��ʤ����ϡ����`��ϥ����åפ��쥨��`���٥�Ȥ��k�Ф���ޤ���
+- ブリッジは起動時に `exec.LookPath` で既知の agent CLI を検出します：`claude`、`codex`、`opencode`、`codebuddy`、`codearts`、`copilot`、`deveco`、`openclaw`、`hermes` など。
+- コーディネーターがサーバー管理ノードに `your_turn` を送信すると、ブリッジは 120 秒のタイムアウトで `exec.CommandContext` を実行します。
+- エージェントの stdout がターンの応答として返されます。
+- agent CLI がインストールされていない場合、そのターンはスキップされ、エラーイベントが発行されます。
 
 <Callout type="warning">
-���`�Щ`����g�Ф� API ���`�Щ`�Ϥ�ֱ�� agent CLI ��g�Ф��ޤ����֥�å������椹��ǥ������å������_ʼ����ǰ�ˡ����`�Щ`�� agent CLI �����󥹥ȩ`�뤵�졢�m�Ф˘��ɤ���Ƥ��뤫��API ���`���h���������_�J���Ƥ���������
+サーバー管理実行は API サーバー上で agent CLI を実行します。ブリッジに依存するディスカッションを開始する前に、サーバーに agent CLI がインストールされ、適切に設定済み（API キー、環境変数）であることを確認してください。
 </Callout>
 
-���`�Щ`�����Ǥʤ��Ω`�ɣ��ⲿ�Ω`�ɣ��Έ��ϡ����`�ǥ��ͩ`���`�� ClawMessenger ��å��`���󥰥ץ��ȥ���� `your_turn` ���ޥ�ɤ����Ť����Ω`�ɤ� `command_result`��`stream`���ޤ��� `text` ��å��`���Ǐ�𤹤뤳�Ȥ��ڴ�����ޤ���
+サーバー管理でないノード（外部ノード）の場合、コーディネーターは ClawMessenger メッセージングプロトコル経由で `your_turn` コマンドを送信し、ノードは `command_result`、`stream`、または `text` メッセージで応答することが期待されます。
 
-## ����եۥ����O��
+## セルフホストのセットアップ
 
-API ���`�Щ`����ǰ�˰�������32�Х��Ȥΰ��Ż����`���O�����ޤ�:
+API サーバーの起動前に、安定した 32 バイトの暗号化キーを設定します：
 
 ```dotenv
 CLAWMESSENGER_SECRET_KEY=<base64-encoded 32-byte key>
 ```
 
-`openssl rand -base64 32` �����ɤǤ��ޤ������Υ��`�ϥǩ`���٩`���˱��椵�줿�Ω`�ɥȩ`����ȥǥХ����Y�����򰵺Ż����ޤ���
+`openssl rand -base64 32` で生成できます。このキーは、データベースに保存されるノードトークンとデバイスクレデンシャルを暗号化します。
 
-���`���O������ȡ����`�Щ`��:
-- ClawMessenger ���󥹥ȩ`�롢�Ω`�ɡ�����åȥ�`�ࡢ�ڥ���󥰡��ǥ������å���󥵩`�ӥ������ɤ��ޤ���
-- Webhook ����ɥݥ���� `POST /api/webhooks/clawmessenger` ����h���ޤ���
-- `/api/workspaces/{id}/clawmessenger/` ���¤Τ��٤ƤΥ�`�����ک`�������`�פΥ�`�Ȥ�ӾA���ޤ���
+キーが設定されると、サーバーは以下を行います：
+- ClawMessenger のインストール、ノード、チャットルーム、ペアリング、ディスカッションの各サービスを作成。
+- `POST /api/webhooks/clawmessenger` に Webhook エンドポイントを登録。
+- `/api/workspaces/{id}/clawmessenger/` 配下にワークスペーススコープのルートを配線。
 
-���`���ʤ����ϡ����٤Ƥ� ClawMessenger ����ɥݥ���Ȥ� `403 clawmessenger_not_configured` �򷵤��ޤ���
+キーがない場合、すべての ClawMessenger エンドポイントは `403 clawmessenger_not_configured` を返します。
 
-## �ǩ`���٩`���Ʃ`�֥�
+## データベーステーブル
 
-| �Ʃ`�֥� | ��; |
+| テーブル | 用途 |
 |---|---|
-| `clawmessenger_user` | �ץ�åȥե��`��Ω`�ɤ˥ޥåԥ󥰤��줿 ClawMessenger ��`���`��������� |
-| `clawmessenger_node` | AI �Ω`�ɣ������ס��C�ܡ��ǥץ������Ʃ`������ |
-| `clawmessenger_chatroom` | ����åȥ�`�ࣨ�ۥ��ȥΩ`�ɡ����饦��ɡ��O���� |
-| `clawmessenger_chatroom_member` | ���Щ`���k������۸��ǥ룩 |
-| `clawmessenger_device` | �ǥХ��������Ż����줿�Y����� |
-| `clawmessenger_pairing_session` | �ǥХ����Х���ǥ����åڥ���󥰥����å� |
-| `clawmessenger_node_model_catalog` | �Ω`�ɤ��Ȥ����ÿ��ܥ�ǥ� |
-| `clawmessenger_system_config` | ��`�����ک`�������`�פΥ����ƥ��O����CAS�� |
-| `clawmessenger_discussion_event` | �ǥ������å���󥤥٥�ȥ��`���󥰥��� |
+| `clawmessenger_user` | プラットフォームノードにマッピングされた ClawMessenger ユーザーアカウント |
+| `clawmessenger_node` | 種別、能力、デプロイ状態を持つ AI ノード |
+| `clawmessenger_chatroom` | ホストノード、最大ラウンド数、設定を持つチャットルーム |
+| `clawmessenger_chatroom_member` | 発言順、役割、モデルを持つメンバー |
+| `clawmessenger_device` | 暗号化されたクレデンシャルを持つデバイス |
+| `clawmessenger_pairing_session` | デバイスバインド用のペアリングチケット |
+| `clawmessenger_node_model_catalog` | ノードごとに利用可能なモデル |
+| `clawmessenger_system_config` | ワークスペーススコープのシステム設定（CAS） |
+| `clawmessenger_discussion_event` | ディスカッションのイベントソーシングログ |
 
 <Callout type="info">
-�ǩ`���٩`���Ʃ`�֥����όg�H�Υ����`�ޤǤ� `ClawMessenger_` �ץ�ե��å�����ʹ�ä��ޤ����ޥ�����`�����538�C553�����ɥ�����ȤǤ��uƷ������һ�¤����뤿�� `clawmessenger_` �ȱ�ӛ���Ƥ��ޤ���
+データベースのテーブル名は実際のスキーマでは `ClawMessenger_` プレフィックスを使用します（マイグレーション 538〜553）。ドキュメントでは製品命名との一貫性のため `clawmessenger_` と表記しています。
 </Callout>
 
-## �ڥ���󥰣��ǥХ����Х���ǥ��󥰣�
+## ペアリング（デバイスバインド）
 
-ClawMessenger ���ⲿ�ǥХ�����Х���ɤ��뤿��Υ����åȥ٩`���Υڥ���󥰥ե��`�򥵥ݩ`�Ȥ��ޤ�:
+ClawMessenger は外部デバイスをバインドするためのチケットベースのペアリングフローをサポートします：
 
-1. ��`�����ک`�� admin �����a�Ω`�� ID �ȥ���`�७�`�ǥڥ���󥰥��å��������ɤ��ޤ���
-2. �ǥХ����������åȤȥ���`�७�`��ʹ�ä��ƥ��å����򥯥�`�ष�ޤ���
-3. ����`��ɹ��r�����`�Щ`�ϥǥХ����Y���������ɤ� `clawmessenger_device` �쥳�`�ɤ����ɤ��ޤ���
+1. ワークスペース管理者が **Settings → Integrations → ClawMessenger → Bind device** から（10 分有効）、または `POST /workspaces/{id}/clawmessenger/pairing` 経由でペアリングチケットを作成します。
+2. デバイスは xiachat CLI（`xiachat pair --ticket <ticket> --server <url>`）でチケットをクレームします。クレームキーは任意で、同じチケットでの再試行は冪等です。
+3. クレームが成功すると、サーバーはデバイスクレデンシャルを生成して `clawmessenger_device` レコードを作成します。再再生されたクレームは、シークレットを再発行せずにセッションを返します。
 
-����ϥᥤ��� [CLI �ǩ`���](/daemon-runtimes) �ǥХ����Х���ǥ��󥰤Ȥ϶������Ƥ��ޤ����ڥ���󥰤��ⲿ�ǥХ����� ClawMessenger �Ω`�ɤȤ����J�^�����Ҫ������ IM �BЯ���ʥꥪ���ػ����Ƥ��ޤ���
+これはメインの [CLI Daemon](/daemon-runtimes) のデバイスバインドとは独立しています。ペアリングは、外部デバイスが ClawMessenger ノードとして認証する必要がある IM インテグレーションシナリオ専用です。
 
-## �ȥ�֥륷��`�ƥ���
+## トラブルシューティング
 
-- **`403 clawmessenger_not_configured`**: `CLAWMESSENGER_SECRET_KEY` ���O������Ƥ��ޤ���`.env` �ե�����ǘ��ɤ��Ƥ���������
-- **�ǥ������å�����_ʼ����뤬���`�󤬌g�Ф���ʤ�**: ����åȥ�`����Щ`�� `node_id` ���Є������Ω`�ɤ� `ai_type` �����󥹥ȩ`��g�� agent CLI ��һ�¤��뤫�_�J���Ƥ���������
-- **���`�󥿥��ॢ����**: �����`��ˤ�120��Υ����ॢ���Ȥ�����ޤ���agent CLI ���ϥ󥰤���ȡ����`��ϥ����åפ��쥨��`���٥�Ȥ��k�Ф���ޤ���
-- **`your_turn` δ�_�J**: �ⲿ�Ω`�ɤΈ��ϡ��Ω`�ɤ�����饤��� Webhook �U�ɤ� ClawMessenger ���ޥ�ɤˏ�𤷤Ƥ��뤫�_�J���Ƥ���������
-- **�ǥ������å����һ�rֹͣ״�B�ǥ����å�**: ���_����ɥݥ���Ȥ�ʹ�ä��뤫���ǥ������å�����ֹͣ�������_���Ƥ���������
+- **`403 clawmessenger_not_configured`**：`CLAWMESSENGER_SECRET_KEY` が設定されていません。`.env` ファイルで設定してください。
+- **ディスカッションが開始されるがターンが実行されない**：チャットルームメンバーの `node_id` が有効で、ノードの `ai_type` がインストール済みの agent CLI と一致しているか確認してください。
+- **ターンのタイムアウト**：各ターンには 120 秒のタイムアウトがあります。agent CLI がハングした場合、そのターンはスキップされ、エラーイベントが発行されます。
+- **`your_turn` が確認されない**：外部ノードの場合、ノードがオンラインで、Webhook 経由で ClawMessenger コマンドに応答していることを確認してください。
+- **ディスカッションが一時停止のまま**：再開エンドポイントを使うか、ディスカッションを停止して再開してください。
 
-## �ΤΥ��ƥå�
+## 次のステップ
 
-- [����å��BЯ](/channels) �� �ץ�åȥե��`�����^�����å����ᥫ�˥�������⤷�ޤ���
-- [Agent CLI](/providers) �� ���ݩ`�Ȥ���� agent CLI ��󥿥����ȫ�ꥹ�ȡ�
-- [�ǩ`���ȥ�󥿥���](/daemon-runtimes) �� agent CLI ���ɤΤ褦�˰kҊ�����������뤫��
+- [チャットインテグレーション](/channels) — プラットフォームを比較し、セッションの仕組みを理解する。
+- [Agent CLIs](/providers) — サポートされる agent CLI ランタイムの全一覧。
+- [Daemon とランタイム](/daemon-runtimes) — agent CLI の検出と管理の仕組み。

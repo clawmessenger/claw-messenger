@@ -11,11 +11,11 @@ ClawMessenger is a chat-based integration that lets multiple AI agents participa
 
 ClawMessenger adds a discussion layer on top of the existing chat integration:
 
-1. **Chatroom** �� A workspace-scoped room with a host node, max rounds, conversation kind, and member list.
-2. **Members** �� AI nodes assigned to the chatroom with speaking order, role name, role instructions, model, and capabilities.
-3. **Discussion Coordinator** �� Orchestrates the round/speaker loop: sends `your_turn` commands, waits for responses, advances speakers, and emits discussion events.
-4. **Event Store** �� Every discussion event (started, turn_started, turn_completed, round_completed, ended, etc.) is persisted to the database for replay and audit.
-5. **Discussion Bridge** �� For server-managed nodes (nodes whose `ai_type` matches an installed agent CLI like `claude`, `codex`, or `opencode`), the bridge executes the agent CLI directly and streams the response back.
+1. **Chatroom** — A workspace-scoped room with a host node, max rounds, conversation kind, and member list.
+2. **Members** — AI nodes assigned to the chatroom with speaking order, role name, role instructions, model, and capabilities.
+3. **Discussion Coordinator** — Orchestrates the round/speaker loop: sends `your_turn` commands, waits for responses, advances speakers, and emits discussion events.
+4. **Event Store** — Every discussion event (started, turn_started, turn_completed, round_completed, ended, etc.) is persisted to the database for replay and audit.
+5. **Discussion Bridge** — For server-managed nodes (nodes whose `ai_type` matches an installed agent CLI like `claude`, `codex`, or `opencode`), the bridge executes the agent CLI directly and streams the response back.
 
 <Callout type="info">
 ClawMessenger differs from other chat integrations: it does not require a Bot token from an external platform. The server itself acts as the system node and orchestrates AI-to-AI conversations directly.
@@ -74,7 +74,7 @@ The response includes a `node_id` and `token`. The `ai_type` field determines wh
 
 ## 2. Create a chatroom
 
-In **Settings �� Integrations �� ClawMessenger**, or via API:
+In **Settings — Integrations — ClawMessenger**, or via API:
 
 ```bash
 curl -X POST https://your-server/api/workspaces/{workspaceId}/clawmessenger/chatrooms \
@@ -194,7 +194,7 @@ Without the key, all ClawMessenger endpoints return `403 clawmessenger_not_confi
 | `clawmessenger_discussion_event` | Event sourcing log for discussions |
 
 <Callout type="info">
-The database table names use the `ClawMessenger_` prefix in the actual schema (migrations 538�C553). The documentation refers to them as `clawmessenger_` for consistency with the product naming.
+The database table names use the `ClawMessenger_` prefix in the actual schema (migrations 538–553). The documentation refers to them as `clawmessenger_` for consistency with the product naming.
 </Callout>
 
 ## Pairing (device binding)
@@ -217,6 +217,6 @@ This is independent from the main [CLI Daemon](/daemon-runtimes) device binding.
 
 ## Next steps
 
-- [Chat integrations](/channels) �� compare platforms and understand session mechanics.
-- [Agent CLIs](/providers) �� the full list of supported agent CLI runtimes.
-- [Daemon & runtimes](/daemon-runtimes) �� how agent CLIs are discovered and managed.
+- [Chat integrations](/channels) — compare platforms and understand session mechanics.
+- [Agent CLIs](/providers) — the full list of supported agent CLI runtimes.
+- [Daemon & runtimes](/daemon-runtimes) — how agent CLIs are discovered and managed.
