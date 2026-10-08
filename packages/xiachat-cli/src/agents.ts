@@ -38,7 +38,9 @@ export interface RunAgentTurnOpts {
 //   claude:   print mode (-p), non-interactive
 //   codex:    `exec` subcommand (stdin-mode invocation is rejected)
 //   opencode: `run` subcommand (stdin-mode invocation hangs)
-//   openclaw: `agent --local -m` one-shot message (stdin-mode unsupported)
+//   openclaw: `agent --local --json -m` one-shot message; --json emits a
+//             clean result envelope (plain stdout interleaves ANSI-colored
+//             log lines with the answer — see parseOpenclawJsonOutput)
 //   hermes:   `-z` one-shot prompt (stdin-mode unsupported)
 // Keep in sync with agentArgvArgs in server discussion_bridge.go.
 type AgentArgvStrategy = (prompt: string, model?: string) => string[];
@@ -47,7 +49,7 @@ const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
   claude: (prompt, model) => ["-p", prompt, ...(model ? ["--model", model] : [])],
   codex: (prompt, model) => ["exec", prompt, ...(model ? ["-m", model] : [])],
   opencode: (prompt, model) => ["run", prompt, ...(model ? ["--model", model] : [])],
-  openclaw: (prompt, model) => ["agent", "--local", "-m", prompt, ...(model ? ["--model", model] : [])],
+  openclaw: (prompt, model) => ["agent", "--local", "--json", "-m", prompt, ...(model ? ["--model", model] : [])],
   hermes: (prompt, model) => ["-z", prompt, ...(model ? ["-m", model] : [])],
 };
 
@@ -127,6 +129,70 @@ function utf8SequenceLength(lead: number): number {
   if ((lead & 0xf0) === 0xe0) return 3;
   if ((lead & 0xf8) === 0xf0) return 4;
   return 1;
+}
+
+// --- openclaw output extraction -------------------------------------------
+// `openclaw agent --local` without --json interleaves ANSI-colored log
+// lines ([model-fetch] start …, [agent] run … ended with stopReason=stop)
+// with the answer on stdout. With --json (preferred) it emits one clean
+// envelope instead. These helpers turn either shape into the plain reply.
+
+// ANSI CSI/SGR escape sequences (colors, cursor moves) — openclaw colors
+// its log lines even when piped.
+const ANSI_ESCAPE_RE = /\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\))/g;
+
+export function stripAnsiCodes(text: string): string {
+  return text.replace(ANSI_ESCAPE_RE, "");
+}
+
+// Log lines look like `[model-fetch] start …` / `[agents/agent-command] …`
+// — a leading bracket tag of word chars, dashes and slashes, NOT followed
+// by `(` (markdown links `[label](url)` must survive).
+const OPENCLAW_LOG_LINE_RE = /^\[[A-Za-z0-9_\-/]+\](?!\()/;
+
+export function normalizeOpenclawOutput(raw: string): string {
+  const lines = stripAnsiCodes(raw).split("\n");
+  const kept = lines.filter((line) => !OPENCLAW_LOG_LINE_RE.test(line.trimStart()));
+  return kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+// Parses the `openclaw agent --json` result envelope. Returns the reply
+// text, or undefined when the output is not a recognizable envelope.
+export function parseOpenclawJsonOutput(raw: string): string | undefined {
+  const text = stripAnsiCodes(raw).trim();
+  if (!text.startsWith("{")) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null) return undefined;
+  const envelope = parsed as {
+    payloads?: unknown;
+    meta?: { finalAssistantVisibleText?: unknown } | null;
+  };
+  if (Array.isArray(envelope.payloads)) {
+    const texts = envelope.payloads
+      .map((p) => (typeof p === "object" && p !== null ? (p as { text?: unknown }).text : undefined))
+      .filter((t): t is string => typeof t === "string" && t.length > 0);
+    if (texts.length > 0) return texts.join("\n");
+  }
+  const visible = envelope.meta?.finalAssistantVisibleText;
+  if (typeof visible === "string" && visible.length > 0) return visible;
+  return undefined;
+}
+
+// Extracts the clean reply from an openclaw agent turn: the --json
+// envelope when present, otherwise the ANSI/log-stripped plain stdout.
+// Falls back to the raw trimmed text when both extractions come up empty
+// so a turn never yields a blank reply.
+export function extractOpenclawReply(raw: string): string {
+  const fromJson = parseOpenclawJsonOutput(raw);
+  if (fromJson !== undefined && fromJson.trim().length > 0) return fromJson.trim();
+  const normalized = normalizeOpenclawOutput(raw);
+  if (normalized.length > 0) return normalized;
+  return raw.trim();
 }
 
 export async function discoverAgents(opts: { extraPath?: string }): Promise<AgentInfo[]> {
@@ -246,7 +312,7 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
       settle(() => {
         const stdout = Buffer.concat(chunks).toString("utf8");
         if (code === 0) {
-          resolve(stdout);
+          resolve(opts.agentName === "openclaw" ? extractOpenclawReply(stdout) : stdout);
         } else {
           reject(new Error(`agent exited with code ${code}: ${stderr}`));
         }

@@ -1,6 +1,16 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
-import { buildAgentArgs, discoverAgents, KNOWN_AGENT_CLIS, runAgentTurn, trimIncompleteUtf8Tail } from "./agents.js";
+import {
+  buildAgentArgs,
+  discoverAgents,
+  extractOpenclawReply,
+  KNOWN_AGENT_CLIS,
+  normalizeOpenclawOutput,
+  parseOpenclawJsonOutput,
+  runAgentTurn,
+  stripAnsiCodes,
+  trimIncompleteUtf8Tail,
+} from "./agents.js";
 import { createEchoAgentScript, type EchoAgentFixture } from "./test-fixtures.js";
 
 describe("KNOWN_AGENT_CLIS", () => {
@@ -27,8 +37,8 @@ describe("buildAgentArgs", () => {
     expect(buildAgentArgs("opencode", "hi", "glm-4.7")).toEqual(["run", "hi", "--model", "glm-4.7"]);
   });
 
-  it("openclaw uses agent --local -m with --model", () => {
-    expect(buildAgentArgs("openclaw", "hi", "m1")).toEqual(["agent", "--local", "-m", "hi", "--model", "m1"]);
+  it("openclaw uses agent --local --json -m with --model", () => {
+    expect(buildAgentArgs("openclaw", "hi", "m1")).toEqual(["agent", "--local", "--json", "-m", "hi", "--model", "m1"]);
   });
 
   it("hermes uses -z with -m", () => {
@@ -39,7 +49,7 @@ describe("buildAgentArgs", () => {
     expect(buildAgentArgs("claude", "hi")).toEqual(["-p", "hi"]);
     expect(buildAgentArgs("codex", "hi")).toEqual(["exec", "hi"]);
     expect(buildAgentArgs("opencode", "hi")).toEqual(["run", "hi"]);
-    expect(buildAgentArgs("openclaw", "hi")).toEqual(["agent", "--local", "-m", "hi"]);
+    expect(buildAgentArgs("openclaw", "hi")).toEqual(["agent", "--local", "--json", "-m", "hi"]);
     expect(buildAgentArgs("hermes", "hi")).toEqual(["-z", "hi"]);
   });
 
@@ -52,6 +62,93 @@ describe("buildAgentArgs", () => {
     expect(buildAgentArgs("claude", "a".repeat(8001))).toEqual([]);
     expect(buildAgentArgs("codex", "a".repeat(8001), "gpt-5")).toEqual([]);
     expect(buildAgentArgs("claude", "a".repeat(8000))).toEqual(["-p", "a".repeat(8000)]);
+  });
+});
+
+// Real shapes observed from OpenClaw 2026.9.2 (`openclaw agent --local …`)
+// on this machine.
+const OPENCLAW_PLAIN_STDOUT = [
+  "\x1b[33m[provider-transport-fetch]\x1b[39m \x1b[36m[model-fetch] start provider=openai api=openai-responses model=gpt-5.6-sol method=POST url=http://127.0.0.1:49830/v1/responses timeoutMs=undefined proxy=none policy=custom\x1b[39m",
+  "\x1b[33m[provider-transport-fetch]\x1b[39m \x1b[36m[model-fetch] response status=200 elapsedMs=28 dispatcher=new contentType=text/event-stream\x1b[39m",
+  "收到",
+  "\x1b[33m[agents/agent-command]\x1b[39m \x1b[36m[agent] run 2b7c1e00-1234 ended with stopReason=stop\x1b[39m",
+  "",
+].join("\n");
+
+const OPENCLAW_JSON_STDOUT = JSON.stringify({
+  payloads: [{ text: "你好！有什么我可以帮你的吗？😊", mediaUrl: null }],
+  meta: {
+    durationMs: 7909,
+    finalPromptText: "你好",
+    finalAssistantVisibleText: "你好！有什么我可以帮你的吗？😊",
+    finalAssistantRawText: "你好！有什么我可以帮你的吗？😊",
+    stopReason: "stop",
+  },
+});
+
+describe("stripAnsiCodes", () => {
+  it("removes CSI color sequences", () => {
+    expect(stripAnsiCodes("\x1b[33m[model-fetch]\x1b[39m text")).toBe("[model-fetch] text");
+    expect(stripAnsiCodes("plain")).toBe("plain");
+  });
+});
+
+describe("normalizeOpenclawOutput", () => {
+  it("drops ANSI log lines and keeps the answer", () => {
+    expect(normalizeOpenclawOutput(OPENCLAW_PLAIN_STDOUT)).toBe("收到");
+  });
+
+  it("preserves markdown links that look like bracket tags", () => {
+    const md = "see [docs](https://example.com) for details";
+    expect(normalizeOpenclawOutput(md)).toBe(md);
+  });
+
+  it("collapses blank runs and trims edges", () => {
+    expect(normalizeOpenclawOutput("\n\nline1\n\n\n\nline2\n\n")).toBe("line1\n\nline2");
+  });
+
+  it("keeps multi-line answers intact", () => {
+    const answer = "第一行\n第二行";
+    expect(normalizeOpenclawOutput(`${answer}\n[agent] run x ended with stopReason=stop`)).toBe(answer);
+  });
+});
+
+describe("parseOpenclawJsonOutput", () => {
+  it("joins payload texts from the --json envelope", () => {
+    expect(parseOpenclawJsonOutput(OPENCLAW_JSON_STDOUT)).toBe("你好！有什么我可以帮你的吗？😊");
+  });
+
+  it("joins multiple payloads with newlines", () => {
+    const raw = JSON.stringify({ payloads: [{ text: "part1" }, { text: "part2" }, { mediaUrl: null }] });
+    expect(parseOpenclawJsonOutput(raw)).toBe("part1\npart2");
+  });
+
+  it("falls back to meta.finalAssistantVisibleText when payloads are empty", () => {
+    const raw = JSON.stringify({ payloads: [], meta: { finalAssistantVisibleText: "visible text" } });
+    expect(parseOpenclawJsonOutput(raw)).toBe("visible text");
+  });
+
+  it("returns undefined for non-JSON output", () => {
+    expect(parseOpenclawJsonOutput("收到")).toBeUndefined();
+    expect(parseOpenclawJsonOutput("")).toBeUndefined();
+  });
+
+  it("returns undefined for JSON without recognizable fields", () => {
+    expect(parseOpenclawJsonOutput(JSON.stringify({ foo: 1 }))).toBeUndefined();
+  });
+});
+
+describe("extractOpenclawReply", () => {
+  it("prefers the --json envelope", () => {
+    expect(extractOpenclawReply(OPENCLAW_JSON_STDOUT)).toBe("你好！有什么我可以帮你的吗？😊");
+  });
+
+  it("normalizes plain stdout when no envelope is present", () => {
+    expect(extractOpenclawReply(OPENCLAW_PLAIN_STDOUT)).toBe("收到");
+  });
+
+  it("falls back to raw trimmed text when extraction comes up empty", () => {
+    expect(extractOpenclawReply("  \n raw fallback \n ")).toBe("raw fallback");
   });
 });
 
