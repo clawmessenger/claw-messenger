@@ -246,15 +246,16 @@ export async function createImlibTransport(): Promise<IMTransport> {
   installBrowserShim();
   const imlib = await import("@rongcloud/imlib-next");
   const listeners: Array<(msg: InboundIMMessage) => void> = [];
-  let commandMessage: CommandMessageCtor | undefined;
+  const customMessages = new Map<string, CommandMessageCtor>();
 
   const toBaseMessage = (objectName: string, content: string): BaseMessage<never> => {
     if (objectName === "RC:TxtMsg") {
       // Dispatcher hands us the full text-message content JSON.
       return new imlib.TextMessage(JSON.parse(content) as { content: string }) as BaseMessage<never>;
     }
-    if (objectName === "command" && commandMessage) {
-      return new commandMessage(JSON.parse(content) as Record<string, unknown>) as BaseMessage<never>;
+    const custom = customMessages.get(objectName);
+    if (custom) {
+      return new custom(JSON.parse(content) as Record<string, unknown>) as BaseMessage<never>;
     }
     throw new Error(`unsupported objectName: ${objectName}`);
   };
@@ -262,9 +263,18 @@ export async function createImlibTransport(): Promise<IMTransport> {
   return {
     async connect(appKey: string, token: string): Promise<void> {
       imlib.init({ appkey: appKey });
-      // Custom message type for the "command" objectName shared with the Go
-      // server (protocol.ts); must be registered before sending.
-      commandMessage = imlib.registerMessageType<Record<string, unknown>>("command", true, true);
+      // Custom message types shared with the web client / Go server
+      // (protocol.ts, web im.ts CUSTOM_MESSAGE_TYPES); registered before
+      // sending. card_message/card_update are persisted; card_action is
+      // transient (fire-and-forget interaction).
+      for (const [name, persisted, counted] of [
+        ["command", true, true],
+        ["card_message", true, true],
+        ["card_update", true, true],
+        ["card_action", false, false],
+      ] as const) {
+        customMessages.set(name, imlib.registerMessageType<Record<string, unknown>>(name, persisted, counted));
+      }
       const res = await imlib.connect(token);
       if (!res.isOk) {
         throw new Error(`imlib connect failed: ${res.code} ${res.msg}`);

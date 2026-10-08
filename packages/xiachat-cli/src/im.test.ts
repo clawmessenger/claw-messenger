@@ -52,6 +52,182 @@ describe("MessageDispatcher single chat", () => {
   });
 });
 
+describe("MessageDispatcher html cards", () => {
+  const REPLY_WITH_HTML = [
+    "这是页面：",
+    "",
+    "```html",
+    "<h1>v1</h1>",
+    "```",
+  ].join("\n");
+
+  function txtMsg(content: string): Parameters<MessageDispatcher["handle"]>[0] {
+    return {
+      objectName: "RC:TxtMsg",
+      fromUserId: "user_1",
+      toUserId: "rc_node_x",
+      targetId: "rc_node_x",
+      conversationType: 1,
+      content,
+    };
+  }
+
+  function cardAction(cardId: string | undefined, payload: Record<string, unknown>): Parameters<MessageDispatcher["handle"]>[0] {
+    return {
+      objectName: "card_action",
+      fromUserId: "user_1",
+      toUserId: "rc_node_x",
+      targetId: "rc_node_x",
+      conversationType: 1,
+      content: JSON.stringify({
+        msg_type: "card_action",
+        cardId,
+        buttonId: "revise",
+        action: { type: "custom", kind: "html_revise", payload },
+      }),
+    };
+  }
+
+  it("sends a card_message when the agent reply contains an ```html fence", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    await dispatcher.handle(txtMsg(JSON.stringify({ content: "做个页面" })), {
+      runTurn: async () => REPLY_WITH_HTML,
+    });
+    expect(deps.sent).toHaveLength(1);
+    const sent = deps.sent[0];
+    expect(sent.objectName).toBe("card_message");
+    expect(sent.to).toBe("user_1");
+    const parsed = JSON.parse(sent.content);
+    expect(parsed.msg_type).toBe("card_message");
+    expect(parsed.card.id).toMatch(/^card-/);
+    expect(parsed.card.sections.some((s: { kind: string }) => s.kind === "html")).toBe(true);
+    const md = parsed.card.sections.find((s: { kind: string }) => s.kind === "markdown");
+    expect(md.content).toContain("这是页面：");
+  });
+
+  it("replies as plain RC:TxtMsg when the reply has no html fence", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    await dispatcher.handle(txtMsg(JSON.stringify({ content: "你好" })), {
+      runTurn: async () => "你好！有什么可以帮你？",
+    });
+    expect(deps.sent).toHaveLength(1);
+    expect(deps.sent[0].objectName).toBe("RC:TxtMsg");
+  });
+
+  it("iterates via card_action: reruns the agent and card_update-replaces the same card", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    await dispatcher.handle(txtMsg(JSON.stringify({ content: "做个页面" })), {
+      runTurn: async () => REPLY_WITH_HTML,
+    });
+    const first = JSON.parse(deps.sent[0].content);
+    const cardId = first.card.id as string;
+
+    const prompts: string[] = [];
+    await dispatcher.handle(cardAction(cardId, { inputValue: "换成蓝色主题" }), {
+      runTurn: async (prompt) => {
+        prompts.push(prompt);
+        return "```html\n<h1>v2 blue</h1>\n```";
+      },
+    });
+
+    // The revise prompt embeds the previous html + the instruction.
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain("<h1>v1</h1>");
+    expect(prompts[0]).toContain("换成蓝色主题");
+
+    expect(deps.sent).toHaveLength(2);
+    const update = deps.sent[1];
+    expect(update.objectName).toBe("card_update");
+    expect(update.to).toBe("user_1");
+    const parsed = JSON.parse(update.content);
+    expect(parsed.msg_type).toBe("card_update");
+    expect(parsed.cardId).toBe(cardId);
+    expect(parsed.mode).toBe("replace");
+    expect(parsed.card.id).toBe(cardId);
+    const html = parsed.card.sections.find((s: { kind: string }) => s.kind === "html");
+    expect(html.content).toContain("<h1>v2 blue</h1>");
+  });
+
+  it("falls back to the user's latest card when cardId is unknown", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    await dispatcher.handle(txtMsg(JSON.stringify({ content: "做个页面" })), {
+      runTurn: async () => REPLY_WITH_HTML,
+    });
+    await dispatcher.handle(cardAction("card-does-not-exist", { inputValue: "加个标题" }), {
+      runTurn: async () => "```html\n<h1>v3</h1>\n```",
+    });
+    const update = deps.sent[1];
+    expect(update.objectName).toBe("card_update");
+    const parsed = JSON.parse(update.content);
+    expect(parsed.cardId).toMatch(/^card-/);
+    expect(parsed.cardId).not.toBe("card-does-not-exist");
+  });
+
+  it("ignores card_action without an instruction and other action kinds", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    await dispatcher.handle(txtMsg(JSON.stringify({ content: "做个页面" })), {
+      runTurn: async () => REPLY_WITH_HTML,
+    });
+    const before = deps.sent.length;
+    // Empty instruction
+    await dispatcher.handle(cardAction(undefined, { inputValue: "  " }), { runTurn: async () => "x" });
+    // Different action kind
+    await dispatcher.handle(
+      {
+        objectName: "card_action",
+        fromUserId: "user_1",
+        toUserId: "rc_node_x",
+        targetId: "rc_node_x",
+        conversationType: 1,
+        content: JSON.stringify({
+          msg_type: "card_action",
+          cardId: "whatever",
+          action: { type: "custom", kind: "other_kind", payload: { inputValue: "hi" } },
+        }),
+      },
+      { runTurn: async () => "x" },
+    );
+    expect(deps.sent.length).toBe(before);
+  });
+
+  it("surfaces revise failures as a plain text error reply", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    await dispatcher.handle(txtMsg(JSON.stringify({ content: "做个页面" })), {
+      runTurn: async () => REPLY_WITH_HTML,
+    });
+    const first = JSON.parse(deps.sent[0].content);
+    await dispatcher.handle(cardAction(first.card.id, { inputValue: "再改" }), {
+      runTurn: async () => { throw new Error("timeout"); },
+    });
+    const error = deps.sent[1];
+    expect(error.objectName).toBe("RC:TxtMsg");
+    const parsed = JSON.parse(error.content);
+    expect(parsed.content).toContain("生成失败");
+    expect(parsed.content).toContain("timeout");
+  });
+
+  it("replies as text when a revise turn returns no html fence", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    await dispatcher.handle(txtMsg(JSON.stringify({ content: "做个页面" })), {
+      runTurn: async () => REPLY_WITH_HTML,
+    });
+    const first = JSON.parse(deps.sent[0].content);
+    await dispatcher.handle(cardAction(first.card.id, { inputValue: "再改" }), {
+      runTurn: async () => "抱歉，我无法生成 HTML。",
+    });
+    const reply = deps.sent[1];
+    expect(reply.objectName).toBe("RC:TxtMsg");
+    expect(JSON.parse(reply.content).content).toContain("抱歉");
+  });
+});
+
 describe("MessageDispatcher discussion your_turn", () => {
   const CHATROOM_ID = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6";
 
