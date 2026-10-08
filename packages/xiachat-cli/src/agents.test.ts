@@ -27,10 +27,20 @@ describe("buildAgentArgs", () => {
     expect(buildAgentArgs("opencode", "hi", "glm-4.7")).toEqual(["run", "hi", "--model", "glm-4.7"]);
   });
 
+  it("openclaw uses agent --local -m with --model", () => {
+    expect(buildAgentArgs("openclaw", "hi", "m1")).toEqual(["agent", "--local", "-m", "hi", "--model", "m1"]);
+  });
+
+  it("hermes uses -z with -m", () => {
+    expect(buildAgentArgs("hermes", "hi", "m1")).toEqual(["-z", "hi", "-m", "m1"]);
+  });
+
   it("omits model flags when no model is given", () => {
     expect(buildAgentArgs("claude", "hi")).toEqual(["-p", "hi"]);
     expect(buildAgentArgs("codex", "hi")).toEqual(["exec", "hi"]);
     expect(buildAgentArgs("opencode", "hi")).toEqual(["run", "hi"]);
+    expect(buildAgentArgs("openclaw", "hi")).toEqual(["agent", "--local", "-m", "hi"]);
+    expect(buildAgentArgs("hermes", "hi")).toEqual(["-z", "hi"]);
   });
 
   it("returns [] for agents without a strategy", () => {

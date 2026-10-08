@@ -72,6 +72,8 @@ func (b *DiscussionBridge) IsServerManagedByType(aiType string) bool {
 //   claude:   print mode (-p), non-interactive
 //   codex:    `exec` subcommand (stdin-mode invocation is rejected)
 //   opencode: `run` subcommand (stdin-mode invocation hangs)
+//   openclaw: `agent --local -m` one-shot message (stdin-mode unsupported)
+//   hermes:   `-z` one-shot prompt (stdin-mode unsupported)
 // Keep in sync with buildAgentArgs in packages/xiachat-cli/src/agents.ts.
 func agentArgvArgs(name, prompt, model string) []string {
 	var args []string
@@ -90,6 +92,16 @@ func agentArgvArgs(name, prompt, model string) []string {
 		args = append(args, "run", prompt)
 		if model != "" {
 			args = append(args, "--model", model)
+		}
+	case "openclaw":
+		args = append(args, "agent", "--local", "-m", prompt)
+		if model != "" {
+			args = append(args, "--model", model)
+		}
+	case "hermes":
+		args = append(args, "-z", prompt)
+		if model != "" {
+			args = append(args, "-m", model)
 		}
 	default:
 		return nil

@@ -35,6 +35,8 @@ export interface RunAgentTurnOpts {
 //   claude:   print mode (-p), non-interactive
 //   codex:    `exec` subcommand (stdin-mode invocation is rejected)
 //   opencode: `run` subcommand (stdin-mode invocation hangs)
+//   openclaw: `agent --local -m` one-shot message (stdin-mode unsupported)
+//   hermes:   `-z` one-shot prompt (stdin-mode unsupported)
 // Keep in sync with agentArgvArgs in server discussion_bridge.go.
 type AgentArgvStrategy = (prompt: string, model?: string) => string[];
 
@@ -42,6 +44,8 @@ const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
   claude: (prompt, model) => ["-p", prompt, ...(model ? ["--model", model] : [])],
   codex: (prompt, model) => ["exec", prompt, ...(model ? ["-m", model] : [])],
   opencode: (prompt, model) => ["run", prompt, ...(model ? ["--model", model] : [])],
+  openclaw: (prompt, model) => ["agent", "--local", "-m", prompt, ...(model ? ["--model", model] : [])],
+  hermes: (prompt, model) => ["-z", prompt, ...(model ? ["-m", model] : [])],
 };
 
 // Windows CreateProcess caps the whole command line near 32k chars (and
