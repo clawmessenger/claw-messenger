@@ -125,6 +125,38 @@ describe("XiachatApi", () => {
     }
   });
 
+  it("bindDeviceAgents posts machine credentials and agents to /api/claw/device/bind-agents", async () => {
+    const { server, url, captured } = await startJsonServer({
+      "POST /api/claw/device/bind-agents": { status: 200, body: { code: 200, data: { bound: [{ agent: "ops", node_id: "node_7" }] } } },
+    });
+    try {
+      const api = new XiachatApi(url);
+      await api.bindDeviceAgents("node_1", "dc_1", "s3cret", ["ops"]);
+      expect(captured["POST /api/claw/device/bind-agents"]).toEqual({
+        nodeId: "node_1",
+        credentialId: "dc_1",
+        secret: "s3cret",
+        agents: ["ops"],
+      });
+    } finally {
+      server.close();
+    }
+  });
+
+  it("bindDeviceAgents throws on non-2xx so callers can treat bind failures as best-effort", async () => {
+    const { server, url } = await startJsonServer({
+      "POST /api/claw/device/bind-agents": { status: 401, body: { code: 401, message: "设备凭据无效" } },
+    });
+    try {
+      const api = new XiachatApi(url);
+      await expect(api.bindDeviceAgents("node_1", "dc_1", "bad", ["ops"])).rejects.toThrow(
+        /HTTP 401/,
+      );
+    } finally {
+      server.close();
+    }
+  });
+
   it("rejects with method and path context when a 2xx response has malformed JSON", async () => {
     const { server, url } = await startJsonServer({
       "GET /api/config/rongcloud": { status: 200, raw: "not-json{{" },

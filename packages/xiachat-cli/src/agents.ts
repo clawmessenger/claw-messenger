@@ -26,6 +26,9 @@ export interface RunAgentTurnOpts {
   model?: string;
   timeoutMs?: number;
   maxOutputBytes?: number;
+  // Working directory for the agent CLI process. The ops agent sets this to
+  // its workdir so `opencode run` picks up the ops AGENTS.md system prompt.
+  cwd?: string;
   onChunk?: (chunk: string) => void;
   signal?: AbortSignal;
 }
@@ -177,6 +180,7 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
     const child = spawn(file, args, {
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
+      cwd: opts.cwd,
     });
 
     // stdout accumulates raw bytes; decoding happens through a streaming

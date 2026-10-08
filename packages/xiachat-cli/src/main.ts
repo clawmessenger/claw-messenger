@@ -6,6 +6,7 @@ import { Keystore, type StoredCredentials } from "./keystore.js";
 import { XiachatApi } from "./api.js";
 import { discoverAgents } from "./agents.js";
 import { DEFAULT_SERVER_URL, machineId } from "./config.js";
+import { ensureOpencodeInstalled, OPS_AGENT_NAME, OPS_TURN_TIMEOUT_MS, setupOpsWorkdir } from "./ops.js";
 
 // Deterministic per (ticket, machine): a retried claim after a lost
 // response reuses the same key, so the server deduplicates instead of
@@ -167,9 +168,27 @@ export function buildProgram(opts: BuildProgramOpts): Command {
         await runSupervisor({ opts, creds, api, model: cmdOpts.model });
         return;
       }
-      const found = await discoverAgents({});
-      const agent = found.find((a) => a.name === cmdOpts.agent);
-      if (!agent) throw new Error(`agent CLI ${cmdOpts.agent} not found on PATH; run xiachat agents`);
+      // The built-in ops agent runs on the local opencode CLI (auto-installed
+      // when missing); it is never skipped by PATH discovery and runs with a
+      // longer turn timeout and its own ops workdir (AGENTS.md system prompt).
+      let agentExecPath: string;
+      let agentName: string;
+      let turnTimeoutMs: number | undefined;
+      let cwd: string | undefined;
+      if (cmdOpts.agent === OPS_AGENT_NAME) {
+        const opencode = await ensureOpencodeInstalled();
+        const workdir = await setupOpsWorkdir();
+        agentExecPath = opencode.path;
+        agentName = "opencode";
+        turnTimeoutMs = OPS_TURN_TIMEOUT_MS;
+        cwd = workdir;
+      } else {
+        const found = await discoverAgents({});
+        const agent = found.find((a) => a.name === cmdOpts.agent);
+        if (!agent) throw new Error(`agent CLI ${cmdOpts.agent} not found on PATH; run xiachat agents`);
+        agentExecPath = agent.path;
+        agentName = agent.name;
+      }
       const { startRunLoop, createImlibTransport } = await import("./run.js");
       const transport = await createImlibTransport();
       const hb = setInterval(() => {
@@ -182,10 +201,12 @@ export function buildProgram(opts: BuildProgramOpts): Command {
           creds,
           api,
           transport,
-          agentExecPath: agent.path,
-          agentName: agent.name,
+          agentExecPath,
+          agentName,
           model: cmdOpts.model,
           stdout: opts.stdout,
+          turnTimeoutMs,
+          cwd,
         });
       } finally {
         clearInterval(hb);
@@ -224,6 +245,13 @@ async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void> {
   if (!creds.credentialId || !creds.deviceSecret) {
     throw new Error("no machine device credential; run xiachat pair on this device first");
   }
+  // Best-effort auto-bind of the built-in ops agent so every device gets ops
+  // capability; server-side binding is idempotent, so this is safe every start.
+  try {
+    await api.bindDeviceAgents(creds.nodeId, creds.credentialId, creds.deviceSecret, [OPS_AGENT_NAME]);
+  } catch (err) {
+    console.warn("ops auto-bind failed:", err instanceof Error ? err.message : String(err));
+  }
   const bound = await api.fetchDeviceNodes(creds.nodeId, creds.credentialId, creds.deviceSecret);
   if (bound.length === 0) {
     throw new Error("no agents bound to this device; select and bind agents in the web binding dialog first");
@@ -235,10 +263,14 @@ async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void> {
   const isSea = !script || !script.endsWith(".js");
   const children: ChildProcess[] = [];
   for (const agent of bound) {
-    const local = found.find((f) => f.name === agent.agent);
-    if (!local) {
-      console.error(`agent CLI ${agent.agent} not found on PATH; skipping`);
-      continue;
+    // The built-in ops agent has no PATH-installed CLI of its own; the child
+    // (`xiachat run --agent ops`) installs opencode itself before connecting.
+    if (agent.agent !== OPS_AGENT_NAME) {
+      const local = found.find((f) => f.name === agent.agent);
+      if (!local) {
+        console.error(`agent CLI ${agent.agent} not found on PATH; skipping`);
+        continue;
+      }
     }
     const childCreds: StoredCredentials = {
       nodeId: agent.nodeId,

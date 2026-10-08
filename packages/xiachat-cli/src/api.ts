@@ -115,6 +115,19 @@ export class XiachatApi {
     return nodes;
   }
 
+  // Bind additional agent nodes to this machine, authenticated by the
+  // machine node's device credential (the supervisor auto-binds its
+  // built-in ops agent here). Idempotent server-side: re-binding an
+  // existing agent node reuses it and never clobbers its credentials.
+  async bindDeviceAgents(
+    nodeId: string,
+    credentialId: string,
+    secret: string,
+    agents: string[],
+  ): Promise<void> {
+    await this.request("POST", "/api/claw/device/bind-agents", { nodeId, credentialId, secret, agents });
+  }
+
   // Runtime heartbeat: tells the server this device/agent is alive so the
   // legacy device list can show online/offline without an IM probe.
   async heartbeat(nodeId: string, credentialId: string, secret: string): Promise<void> {

@@ -143,6 +143,8 @@ export interface StartRunLoopOpts extends ConnectTransportOpts {
   model?: string;
   stdout: NodeJS.WriteStream;
   turnTimeoutMs?: number;
+  // Working directory for agent turns; see RunAgentTurnOpts.cwd.
+  cwd?: string;
 }
 
 export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
@@ -187,6 +189,7 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
               prompt,
               model: opts.model ?? model,
               timeoutMs: opts.turnTimeoutMs ?? 120_000,
+              cwd: opts.cwd,
             }),
         });
       } catch (err) {
