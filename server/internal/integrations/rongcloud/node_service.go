@@ -638,12 +638,6 @@ type MachineAgentCredential struct {
 // agent becomes its own rongcloud user + node + device credential on the
 // device's machine, idempotent on (machine_id, ai_type).
 func (s *NodeService) BindAgents(ctx context.Context, session db.RongcloudPairingSession, agents []string) ([]BoundAgentResult, error) {
-	if s.queries == nil {
-		return nil, errors.New("rongcloud: database not configured")
-	}
-	if s.client == nil {
-		return nil, errors.New("rongcloud: API client not configured")
-	}
 	if session.Status == "expired" || session.ExpiresAt.Time.Before(time.Now()) {
 		return nil, ErrPairingSessionExpired
 	}
@@ -657,6 +651,64 @@ func (s *NodeService) BindAgents(ctx context.Context, session db.RongcloudPairin
 	machineNode, err := s.queries.GetRongCloudNodeByID(ctx, candidateNodeIDs[0])
 	if err != nil {
 		return nil, fmt.Errorf("rongcloud: get machine node: %w", err)
+	}
+	results, err := s.bindAgentsToMachine(ctx, machineNode, agents)
+	if err != nil {
+		return nil, err
+	}
+	if boundJSON, err := json.Marshal(results); err == nil {
+		_, _ = s.queries.UpdateRongCloudPairingSessionBoundAgents(ctx, db.UpdateRongCloudPairingSessionBoundAgentsParams{
+			Ticket:      session.Ticket,
+			BoundAgents: boundJSON,
+		})
+	}
+	return results, nil
+}
+
+// BindAgentsByDeviceCredential lets a paired device bind additional agents on
+// its own machine without going through the pairing dialog. Possession of a
+// valid machine device credential proves the device already claimed its
+// session, so the pairing session is neither looked up nor re-validated (it
+// may legitimately be expired by the time the supervisor runs). The
+// bound_agents column is a pairing-UI artifact and is intentionally not
+// updated here.
+func (s *NodeService) BindAgentsByDeviceCredential(ctx context.Context, machineNodeIDText, credentialID, secret string, agents []string) ([]BoundAgentResult, error) {
+	if s.queries == nil {
+		return nil, errors.New("rongcloud: database not configured")
+	}
+	machineNode, err := s.queries.GetRongCloudNodeByNodeID(ctx, machineNodeIDText)
+	if err != nil {
+		return nil, fmt.Errorf("rongcloud: get machine node: %w", err)
+	}
+	machineDevice, err := s.queries.GetRongCloudDeviceByNodeAndCredential(ctx, db.GetRongCloudDeviceByNodeAndCredentialParams{
+		NodeID:       machineNode.ID,
+		CredentialID: pgtype.Text{String: credentialID, Valid: credentialID != ""},
+	})
+	if err != nil {
+		return nil, ErrInvalidDeviceCredential
+	}
+	if !machineDevice.CredentialSecretEncrypted.Valid || s.box == nil {
+		return nil, ErrInvalidDeviceCredential
+	}
+	sealed, err := base64.StdEncoding.DecodeString(machineDevice.CredentialSecretEncrypted.String)
+	if err != nil {
+		return nil, ErrInvalidDeviceCredential
+	}
+	plain, err := s.box.Open(sealed)
+	if err != nil || !hmac.Equal([]byte(plain), []byte(secret)) {
+		return nil, ErrInvalidDeviceCredential
+	}
+	return s.bindAgentsToMachine(ctx, machineNode, agents)
+}
+
+// bindAgentsToMachine resolves the machine identity and materialises one
+// node per agent, idempotent on (machine_id, ai_type).
+func (s *NodeService) bindAgentsToMachine(ctx context.Context, machineNode db.RongcloudNode, agents []string) ([]BoundAgentResult, error) {
+	if s.queries == nil {
+		return nil, errors.New("rongcloud: database not configured")
+	}
+	if s.client == nil {
+		return nil, errors.New("rongcloud: API client not configured")
 	}
 	machineID := machineNode.MachineID
 	if machineID == "" {
@@ -681,12 +733,6 @@ func (s *NodeService) BindAgents(ctx context.Context, session db.RongcloudPairin
 			return nil, fmt.Errorf("rongcloud: bind agent %q: %w", agent, err)
 		}
 		results = append(results, BoundAgentResult{Agent: agent, NodeID: nodeIDText})
-	}
-	if boundJSON, err := json.Marshal(results); err == nil {
-		_, _ = s.queries.UpdateRongCloudPairingSessionBoundAgents(ctx, db.UpdateRongCloudPairingSessionBoundAgentsParams{
-			Ticket:      session.Ticket,
-			BoundAgents: boundJSON,
-		})
 	}
 	return results, nil
 }

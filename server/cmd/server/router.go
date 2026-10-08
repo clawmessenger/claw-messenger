@@ -1601,6 +1601,9 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	r.Get("/api/claw/pairing/{ticket}", h.ClawGetPairing)
 	r.Post("/api/claw/pairing/{ticket}/bind", h.ClawBindPairing)
 	r.Post("/api/claw/device/nodes", h.ClawDeviceNodes)
+	// xiachat supervisor auto-binds its built-in ops agent on the paired
+	// machine via this device-credential-authenticated endpoint.
+	r.Post("/api/claw/device/bind-agents", h.ClawDeviceBindAgents)
 						r.Post("/api/claw/device/heartbeat", h.ClawDeviceHeartbeat)
 						r.Get("/api/claw/nodes/{nodeId}/status", h.ClawNodeStatus)
 						r.Post("/api/claw/nodes/{nodeId}", h.ClawUpdateNode)

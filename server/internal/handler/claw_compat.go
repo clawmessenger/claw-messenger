@@ -782,6 +782,41 @@ func (h *Handler) ClawDeviceNodes(w http.ResponseWriter, r *http.Request) {
 	clawJSON(w, 200, 200, "", map[string]interface{}{"nodes": creds})
 }
 
+// ClawDeviceBindAgents POST /api/claw/device/bind-agents —— 已配对设备用机器
+// device credential 主动绑定本机 agent（xiachat supervisor 为内置 ops 智能体
+// 自动调用）。每个 agent 独立建 rc user + node + 凭据，幂等可重复调用。
+func (h *Handler) ClawDeviceBindAgents(w http.ResponseWriter, r *http.Request) {
+	if h.RongCloudNode == nil {
+		clawJSON(w, 503, 503, "RongCloud 集成未配置", nil)
+		return
+	}
+	var req struct {
+		NodeID       string   `json:"nodeId"`
+		CredentialID string   `json:"credentialId"`
+		Secret       string   `json:"secret"`
+		Agents       []string `json:"agents"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil || req.NodeID == "" || req.CredentialID == "" || req.Secret == "" {
+		clawJSON(w, 400, 400, "缺少设备凭据", nil)
+		return
+	}
+	if len(req.Agents) == 0 {
+		clawJSON(w, 400, 400, "缺少要绑定的智能体", nil)
+		return
+	}
+	results, err := h.RongCloudNode.BindAgentsByDeviceCredential(r.Context(), req.NodeID, req.CredentialID, req.Secret, req.Agents)
+	if err != nil {
+		if errors.Is(err, rongcloud.ErrInvalidDeviceCredential) {
+			clawJSON(w, 401, 401, "设备凭据无效", nil)
+			return
+		}
+		slog.Warn("claw: device bind agents failed", "nodeId", req.NodeID, "error", err)
+		clawJSON(w, 500, 500, "绑定智能体失败", nil)
+		return
+	}
+	clawJSON(w, 200, 200, "绑定成功", map[string]interface{}{"bound": results})
+}
+
 // ClawDeviceHeartbeat POST /api/claw/device/heartbeat ���� xiachat ���豸�Ĭ��
 // �豸ÿ 30s ��һ��֤������ƾ�ݣ�����ڴ�¼�������豸��ʱ״̬�� 90s ����ȡ
 func (h *Handler) ClawDeviceHeartbeat(w http.ResponseWriter, r *http.Request) {
