@@ -1,0 +1,120 @@
+# Publishes the clawmessenger CLI (packages/xiachat-cli) as standalone Node SEA
+# executables via GitHub Releases.
+#
+# Trigger: pushing a tag named clawmessenger-v*.*.* (for example
+# clawmessenger-v0.1.0). This deliberately avoids the main release.yml trigger
+# (v*.*.*) so the CLI can ship independently from the server/web/desktop
+# release train.
+#
+# The SEA build copies the build machine's node binary into the executable,
+# so cross-compilation is impossible — each target needs its own runner.
+name: clawmessenger release
+
+on:
+  push:
+    tags:
+      - "clawmessenger-v*.*.*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: clawmessenger-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    # Guard against forks of this repository running the release pipeline.
+    if: github.repository == 'clawmessenger/claw-messenger'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows-x64
+            artifact: clawmessenger-windows-x64.exe
+            source: dist/clawmessenger.exe
+          - os: ubuntu-latest
+            name: linux-x64
+            artifact: clawmessenger-linux-x64
+            source: dist/clawmessenger
+          - os: ubuntu-24.04-arm
+            name: linux-arm64
+            artifact: clawmessenger-linux-arm64
+            source: dist/clawmessenger
+          - os: macos-13
+            name: darwin-x64
+            artifact: clawmessenger-darwin-x64
+            source: dist/clawmessenger
+          - os: macos-latest
+            name: darwin-arm64
+            artifact: clawmessenger-darwin-arm64
+            source: dist/clawmessenger
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build SEA executable
+        run: pnpm --filter @quukk/xiachat-cli build:exe
+
+      - name: Stage artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -l packages/xiachat-cli/dist
+          mv "packages/xiachat-cli/${{ matrix.source }}" "${{ matrix.artifact }}"
+          if [[ "${{ runner.os }}" != "Windows" ]]; then
+            chmod +x "${{ matrix.artifact }}"
+          fi
+          ls -l "${{ matrix.artifact }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Create GitHub release
+    needs: build
+    if: github.repository == 'clawmessenger/claw-messenger'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum clawmessenger-* | tee SHA256SUMS
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          NOTES="$(printf 'Standalone clawmessenger CLI builds (Node SEA executables).\n\nDownload the binary for your platform from the assets below; see SHA256SUMS for checksums. Windows: clawmessenger-windows-x64.exe (rename to clawmessenger.exe if you like). macOS/Linux: chmod +x before first run.\n\n'; cat artifacts/SHA256SUMS)"
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "clawmessenger ${TAG#clawmessenger-v}" \
+            --notes "$NOTES" \
+            artifacts/*

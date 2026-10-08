@@ -89,7 +89,7 @@ describe("ensureOpencodeInstalled", () => {
 
 describe("setupOpsWorkdir", () => {
   it("creates the workdir with an AGENTS.md ops system prompt", async () => {
-    const dir = path.join(os.tmpdir(), `xiachat-ops-test-${Date.now()}`);
+    const dir = path.join(os.tmpdir(), `clawmessenger-ops-test-${Date.now()}`);
     try {
       const returned = await setupOpsWorkdir(dir);
       expect(returned).toBe(dir);
@@ -102,7 +102,7 @@ describe("setupOpsWorkdir", () => {
   });
 
   it("rewrites AGENTS.md idempotently", async () => {
-    const dir = path.join(os.tmpdir(), `xiachat-ops-test-${Date.now()}`);
+    const dir = path.join(os.tmpdir(), `clawmessenger-ops-test-${Date.now()}`);
     try {
       await setupOpsWorkdir(dir);
       await setupOpsWorkdir(dir);

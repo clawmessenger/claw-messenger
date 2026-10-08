@@ -32,7 +32,7 @@ ClawMessenger differs from other chat integrations: it does not require a Bot to
 
 Every registered node must be attributed to a workspace: registration requires a **pairing ticket** (a ticketless register returns `400 workspace attribution required`).
 
-### Recommended: bind a device from the web (xiachat CLI)
+### Recommended: bind a device from the web (clawmessenger CLI)
 
 The simplest path is the web-initiated binding flow — no curl, no manual tickets:
 
@@ -40,20 +40,20 @@ The simplest path is the web-initiated binding flow — no curl, no manual ticke
 2. The dialog shows a ready-to-run command with a fresh 10-minute ticket:
 
 ```bash
-xiachat pair --ticket pt_<64hex> --server https://your-server
+clawmessenger pair --ticket pt_<64hex> --server https://your-server
 ```
 
 3. On the device, install and run it:
 
 ```bash
 pnpm --filter @quukk/xiachat-cli build:bin
-node packages/xiachat-cli/dist/xiachat.bundle.js agents   # list local agent CLIs
-node packages/xiachat-cli/dist/xiachat.bundle.js pair --ticket pt_<64hex> --server https://your-server
+node packages/xiachat-cli/dist/clawmessenger.bundle.js agents   # list local agent CLIs
+node packages/xiachat-cli/dist/clawmessenger.bundle.js pair --ticket pt_<64hex> --server https://your-server
 ```
 
 4. The dialog flips to **Device bound** automatically once the CLI claims the ticket.
 
-Then start the node with `xiachat run --agent <name>` — it connects to the IM network, answers direct chats by invoking the local agent CLI, and participates in discussions (`your_turn` → agent → reply).
+Then start the node with `clawmessenger run --agent <name>` — it connects to the IM network, answers direct chats by invoking the local agent CLI, and participates in discussions (`your_turn` → agent → reply).
 
 ### Scripted: register via API
 
@@ -202,7 +202,7 @@ The database table names use the `ClawMessenger_` prefix in the actual schema (m
 ClawMessenger supports a ticket-based pairing flow for binding external devices:
 
 1. A workspace admin creates a pairing ticket from **Settings → Integrations → ClawMessenger → Bind device** (10-minute validity) or via `POST /workspaces/{id}/clawmessenger/pairing`.
-2. The device claims the ticket with the xiachat CLI (`xiachat pair --ticket <ticket> --server <url>`); a claim key is optional, retries with the same ticket are idempotent.
+2. The device claims the ticket with the clawmessenger CLI (`clawmessenger pair --ticket <ticket> --server <url>`); a claim key is optional, retries with the same ticket are idempotent.
 3. On a successful claim, the server generates a device credential and creates a `clawmessenger_device` record; a replayed claim returns the session without re-issuing secrets.
 
 This is independent from the main [CLI Daemon](/daemon-runtimes) device binding. Pairing is specifically for IM integration scenarios where an external device needs to authenticate as a ClawMessenger node.

@@ -1504,7 +1504,7 @@
                       "bind_device":  "Bind device",
                       "pairing_dialog_title":  "Bind a device",
                       "pairing_waiting":  "Waiting for the device to claim the ticket… This dialog closes automatically once bound.",
-                      "pairing_claimed_hint":  "The device claimed the ticket. Start xiachat run on it to go online.",
+                      "pairing_claimed_hint":  "The device claimed the ticket. Start clawmessenger run on it to go online.",
                       "pairing_claimed":  "Device bound",
                       "pairing_step_label":  "On the device, run:",
                       "toast_pairing_created":  "Pairing ticket created",

@@ -9,7 +9,7 @@ import type { XiachatApi } from "./api.js";
 
 const dirs: string[] = [];
 function tempKeystore(): Keystore {
-  const d = mkdtempSync(join(tmpdir(), "xiachat-main-"));
+  const d = mkdtempSync(join(tmpdir(), "clawmessenger-main-"));
   dirs.push(d);
   return new Keystore(join(d, "creds.json"));
 }
@@ -18,7 +18,7 @@ afterEach(() => {
   dirs.length = 0;
 });
 
-describe("xiachat register", () => {
+describe("clawmessenger register", () => {
   it("stores credentials from the server response", async () => {
     const keystore = tempKeystore();
     const fakeApi = {
@@ -33,7 +33,7 @@ describe("xiachat register", () => {
       stdout: process.stdout,
       machineId: () => "test-machine-1",
     });
-    await program.parseAsync(["node", "xiachat", "register", "--name", "我的Claude", "--ai-type", "claude", "--server", "http://srv"]);
+    await program.parseAsync(["node", "clawmessenger", "register", "--name", "我的Claude", "--ai-type", "claude", "--server", "http://srv"]);
     const stored = keystore.load();
     expect(stored?.nodeId).toBe("node_1");
     expect(stored?.token).toBe("tok_1");
@@ -58,8 +58,8 @@ describe("xiachat register", () => {
       stdout: process.stdout,
       machineId: () => "test-machine-2",
     });
-    await program.parseAsync(["node", "xiachat", "register", "--name", "n", "--ai-type", "claude", "--server", "http://srv"]);
-    await program.parseAsync(["node", "xiachat", "register", "--name", "n", "--ai-type", "claude", "--server", "http://srv"]);
+    await program.parseAsync(["node", "clawmessenger", "register", "--name", "n", "--ai-type", "claude", "--server", "http://srv"]);
+    await program.parseAsync(["node", "clawmessenger", "register", "--name", "n", "--ai-type", "claude", "--server", "http://srv"]);
     expect(seenMac[0]).toBe("test-machine-2");
     expect(seenMac[1]).toBe(seenMac[0]);
   });
@@ -71,7 +71,7 @@ describe("xiachat register", () => {
       stdout: process.stdout,
     });
     await expect(
-      program.parseAsync(["node", "xiachat", "register", "--name", "n", "--ai-type", "claude"]),
+      program.parseAsync(["node", "clawmessenger", "register", "--name", "n", "--ai-type", "claude"]),
     ).rejects.toThrow();
   });
 
@@ -92,13 +92,13 @@ describe("xiachat register", () => {
       machineId: () => "test-machine-1",
     });
     await expect(
-      program.parseAsync(["node", "xiachat", "register", "--name", "n", "--ai-type", "claude", "--server", "http://srv"]),
+      program.parseAsync(["node", "clawmessenger", "register", "--name", "n", "--ai-type", "claude", "--server", "http://srv"]),
     ).rejects.toThrow(/--pairing-ticket/);
     expect(keystore.load()).toBeNull();
   });
 });
 
-describe("xiachat pair", () => {
+describe("clawmessenger pair", () => {
   it("does not overwrite the keystore when the ticket was already claimed", async () => {
     const keystore = tempKeystore();
     const fakeApi = {
@@ -118,7 +118,7 @@ describe("xiachat pair", () => {
       stdout: process.stdout,
     });
     await expect(
-      program.parseAsync(["node", "xiachat", "pair", "--ticket", "pt_1"]),
+      program.parseAsync(["node", "clawmessenger", "pair", "--ticket", "pt_1"]),
     ).rejects.toThrow(/already claimed/);
     // The register step still persisted its own node identity, but the
     // claimed-by-another-device result must not overwrite it.
@@ -148,14 +148,14 @@ describe("xiachat pair", () => {
       machineId: () => "machine-A",
     });
     // A retried claim after a lost response: same ticket, same machine.
-    await program.parseAsync(["node", "xiachat", "pair", "--ticket", "pt_same"]);
-    await program.parseAsync(["node", "xiachat", "pair", "--ticket", "pt_same"]);
+    await program.parseAsync(["node", "clawmessenger", "pair", "--ticket", "pt_same"]);
+    await program.parseAsync(["node", "clawmessenger", "pair", "--ticket", "pt_same"]);
     expect(seenIdemKeys).toHaveLength(2);
     expect(seenIdemKeys[0]).toBe(seenIdemKeys[1]);
     expect(seenIdemKeys[0]).toMatch(/^idem-[0-9a-f]{24}$/);
 
     // A different ticket on the same machine derives a different key.
-    await program.parseAsync(["node", "xiachat", "pair", "--ticket", "pt_other"]);
+    await program.parseAsync(["node", "clawmessenger", "pair", "--ticket", "pt_other"]);
     expect(seenIdemKeys[2]).not.toBe(seenIdemKeys[0]);
   });
 
@@ -177,7 +177,7 @@ describe("xiachat pair", () => {
       stdout: process.stdout,
       machineId: () => "machine-B",
     });
-    await program.parseAsync(["node", "xiachat", "pair", "--ticket", "pt_same"]);
+    await program.parseAsync(["node", "clawmessenger", "pair", "--ticket", "pt_same"]);
     const machineBKey = seenIdemKeys[0];
     const program2 = buildProgram({
       keystore,
@@ -185,12 +185,12 @@ describe("xiachat pair", () => {
       stdout: process.stdout,
       machineId: () => "machine-C",
     });
-    await program2.parseAsync(["node", "xiachat", "pair", "--ticket", "pt_same"]);
+    await program2.parseAsync(["node", "clawmessenger", "pair", "--ticket", "pt_same"]);
     expect(seenIdemKeys[1]).not.toBe(machineBKey);
   });
 });
 
-describe("xiachat status", () => {
+describe("clawmessenger status", () => {
   it("prints stored identity", async () => {
     const keystore = tempKeystore();
     keystore.save({ nodeId: "node_9", token: "t", serverUrl: "http://srv" });
@@ -200,7 +200,7 @@ describe("xiachat status", () => {
       apiFactory: () => { throw new Error("should not be called"); },
       stdout: { write: (s: string) => { lines.push(s); return true; } } as unknown as NodeJS.WriteStream,
     });
-    await program.parseAsync(["node", "xiachat", "status"]);
+    await program.parseAsync(["node", "clawmessenger", "status"]);
     expect(lines.join("")).toContain("node_9");
   });
 });

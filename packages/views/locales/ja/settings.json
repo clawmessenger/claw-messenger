@@ -1494,7 +1494,7 @@
                       "bind_device":  "デバイスを連携",
                       "pairing_dialog_title":  "デバイスを連携",
                       "pairing_waiting":  "デバイスによるチケットの取得を待っています…連携が完了すると自動的に更新されます。",
-                      "pairing_claimed_hint":  "デバイスがチケットを取得しました。そのデバイスで xiachat run を実行するとオンラインになります。",
+                      "pairing_claimed_hint":  "デバイスがチケットを取得しました。そのデバイスで clawmessenger run を実行するとオンラインになります。",
                       "pairing_claimed":  "デバイスが連携されました",
                       "pairing_step_label":  "デバイスで実行：",
                       "toast_pairing_created":  "ペアリングチケットを作成しました",

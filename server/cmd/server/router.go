@@ -1594,14 +1594,14 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// a single-use high-entropy secret, and an optional client claim key in
 	// the body must match the one bound at session creation.
 	r.Post("/api/claw/pairing/{ticket}/claim", h.ClaimRongCloudPairing)
-	// xiachat pairing creation/polling for the legacy ClawMessenger web app.
+	// clawmessenger pairing creation/polling for the legacy ClawMessenger web app.
 	// Authenticated by the legacy Bearer token (claw_im_users.rongcloud_token),
 	// not the Multica session.
 	r.Post("/api/claw/pairing", h.ClawCreatePairing)
 	r.Get("/api/claw/pairing/{ticket}", h.ClawGetPairing)
 	r.Post("/api/claw/pairing/{ticket}/bind", h.ClawBindPairing)
 	r.Post("/api/claw/device/nodes", h.ClawDeviceNodes)
-	// xiachat supervisor auto-binds its built-in ops agent on the paired
+	// clawmessenger supervisor auto-binds its built-in ops agent on the paired
 	// machine via this device-credential-authenticated endpoint.
 	r.Post("/api/claw/device/bind-agents", h.ClawDeviceBindAgents)
 						r.Post("/api/claw/device/heartbeat", h.ClawDeviceHeartbeat)

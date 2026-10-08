@@ -1494,7 +1494,7 @@
                       "bind_device":  "绑定设备",
                       "pairing_dialog_title":  "绑定设备",
                       "pairing_waiting":  "等待设备认领票据…绑定成功后此处会自动更新。",
-                      "pairing_claimed_hint":  "设备已认领票据，在该设备上运行 xiachat run 即可上线。",
+                      "pairing_claimed_hint":  "设备已认领票据，在该设备上运行 clawmessenger run 即可上线。",
                       "pairing_claimed":  "设备已绑定",
                       "pairing_step_label":  "在设备上执行：",
                       "toast_pairing_created":  "配对票据已创建",

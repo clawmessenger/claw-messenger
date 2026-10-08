@@ -548,7 +548,7 @@ func (h *Handler) ClawImRefreshToken(w http.ResponseWriter, r *http.Request) {
 	clawJSON(w, 200, 200, "换发成功", map[string]interface{}{"token": fresh, "userId": u.UserID})
 }
 
-// ---- xiachat 设备绑定（旧站兼容端点） ----
+// ---- clawmessenger 设备绑定（旧站兼容端点） ----
 
 // clawPairingView 是旧站可见的票据会话投影（驼峰命名；不含 client_claim_key /
 // idempotency_key 等凭据字段，与 PairingSessionView 同口径）。
@@ -557,7 +557,7 @@ type clawPairingView struct {
 	Status    string `json:"status"`
 	ExpiresAt string `json:"expiresAt"`
 	// AIType 是 claimed 后回填节点的 ai_type（register 时注册的智能体类型），
-	// 供旧站弹窗提示「xiachat run --agent <name>」；pending 时为空串。
+	// 供旧站弹窗提示「clawmessenger run --agent <name>」；pending 时为空串。
 	AIType string `json:"aiType,omitempty"`
 	// ReportedAgents 是 pair 时设备自动上报的本机 agent 列表（pending 时可能为空）。
 	ReportedAgents []string `json:"reportedAgents,omitempty"`
@@ -607,7 +607,7 @@ func (h *Handler) clawSingleInstallWorkspace(ctx context.Context) (pgtype.UUID, 
 	return wsID, true
 }
 
-// ClawCreatePairing POST /api/claw/pairing —— 旧站「绑定设备」生成 xiachat 票据。
+// ClawCreatePairing POST /api/claw/pairing —— 旧站「绑定设备」生成 clawmessenger 票据。
 // Bearer=claw_im_users.rongcloud_token 认证；workspace 取单安装归属；
 // candidates 留空（设备 register 带 ticket 时回填）；有效期 10 分钟。
 func (h *Handler) ClawCreatePairing(w http.ResponseWriter, r *http.Request) {
@@ -753,7 +753,7 @@ func (h *Handler) ClawBindPairing(w http.ResponseWriter, r *http.Request) {
 	clawJSON(w, 200, 200, "绑定成功", map[string]interface{}{"bound": results})
 }
 
-// ClawDeviceNodes POST /api/claw/device/nodes —— xiachat supervisor 取回本机全部
+// ClawDeviceNodes POST /api/claw/device/nodes —— clawmessenger supervisor 取回本机全部
 // 已绑定 agent 的连接凭据。认证 = 机器节点 device credential（nodeId + credentialId + secret）。
 func (h *Handler) ClawDeviceNodes(w http.ResponseWriter, r *http.Request) {
 	if h.RongCloudNode == nil {
@@ -783,7 +783,7 @@ func (h *Handler) ClawDeviceNodes(w http.ResponseWriter, r *http.Request) {
 }
 
 // ClawDeviceBindAgents POST /api/claw/device/bind-agents —— 已配对设备用机器
-// device credential 主动绑定本机 agent（xiachat supervisor 为内置 ops 智能体
+// device credential 主动绑定本机 agent（clawmessenger supervisor 为内置 ops 智能体
 // 自动调用）。每个 agent 独立建 rc user + node + 凭据，幂等可重复调用。
 func (h *Handler) ClawDeviceBindAgents(w http.ResponseWriter, r *http.Request) {
 	if h.RongCloudNode == nil {
@@ -817,7 +817,7 @@ func (h *Handler) ClawDeviceBindAgents(w http.ResponseWriter, r *http.Request) {
 	clawJSON(w, 200, 200, "绑定成功", map[string]interface{}{"bound": results})
 }
 
-// ClawDeviceHeartbeat POST /api/claw/device/heartbeat ���� xiachat ���豸�Ĭ��
+// ClawDeviceHeartbeat POST /api/claw/device/heartbeat ���� clawmessenger ���豸�Ĭ��
 // �豸ÿ 30s ��һ��֤������ƾ�ݣ�����ڴ�¼�������豸��ʱ״̬�� 90s ����ȡ
 func (h *Handler) ClawDeviceHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if h.RongCloudNode == nil {

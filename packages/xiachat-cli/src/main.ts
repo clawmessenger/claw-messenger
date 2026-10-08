@@ -28,7 +28,7 @@ export interface BuildProgramOpts {
 export function buildProgram(opts: BuildProgramOpts): Command {
   const program = new Command();
   program
-    .name("xiachat")
+    .name("clawmessenger")
     .description("User-device agent CLI over RongCloud IM")
     .version("0.1.0")
     // Tests parse this program in-process; commander would otherwise
@@ -129,7 +129,7 @@ export function buildProgram(opts: BuildProgramOpts): Command {
     .description("Refresh the IM token for the stored node")
     .action(async () => {
       const creds = opts.keystore.load();
-      if (!creds) throw new Error("no credentials; run xiachat register or pair first");
+      if (!creds) throw new Error("no credentials; run clawmessenger register or pair first");
       const api = opts.apiFactory(creds.serverUrl);
       const { token } = await api.refreshToken(creds.nodeId);
       opts.keystore.save({ ...creds, token });
@@ -153,16 +153,16 @@ export function buildProgram(opts: BuildProgramOpts): Command {
     .description(
       "Connect to RongCloud IM and dispatch agent turns. Without --agent, run every agent bound to this device (supervisor mode).",
     )
-    .option("--agent <name>", "agent CLI name; must be discoverable on PATH (see xiachat agents)")
+    .option("--agent <name>", "agent CLI name; must be discoverable on PATH (see clawmessenger agents)")
     .option("--model <model>", "model override passed to the agent CLI")
     .action(async (cmdOpts: { agent?: string; model?: string }) => {
       // Supervisor-spawned children carry their agent-specific credentials
-      // in the environment; a plain `xiachat run` never sees them otherwise
+      // in the environment; a plain `clawmessenger run` never sees them otherwise
       // because each child overwrites nothing in the shared keystore.
-      const envCreds = process.env.XIACHAT_AGENT_CREDS;
+      const envCreds = process.env.CLAWMESSENGER_AGENT_CREDS;
       const parsedEnvCreds = envCreds ? (JSON.parse(envCreds) as StoredCredentials) : undefined;
       const creds = parsedEnvCreds ?? opts.keystore.load();
-      if (!creds) throw new Error("no credentials; run xiachat register or pair first");
+      if (!creds) throw new Error("no credentials; run clawmessenger register or pair first");
       const api = opts.apiFactory(creds.serverUrl);
       if (!cmdOpts.agent) {
         await runSupervisor({ opts, creds, api, model: cmdOpts.model });
@@ -185,7 +185,7 @@ export function buildProgram(opts: BuildProgramOpts): Command {
       } else {
         const found = await discoverAgents({});
         const agent = found.find((a) => a.name === cmdOpts.agent);
-        if (!agent) throw new Error(`agent CLI ${cmdOpts.agent} not found on PATH; run xiachat agents`);
+        if (!agent) throw new Error(`agent CLI ${cmdOpts.agent} not found on PATH; run clawmessenger agents`);
         agentExecPath = agent.path;
         agentName = agent.name;
       }
@@ -228,10 +228,10 @@ export function buildProgram(opts: BuildProgramOpts): Command {
   return program;
 }
 
-// Supervisor mode: `xiachat run` with no --agent. Exchanges the machine
+// Supervisor mode: `clawmessenger run` with no --agent. Exchanges the machine
 // node's device credential for every bound agent's IM credentials, then
-// spawns one child `xiachat run --agent <name>` per agent. Each child gets
-// its agent-specific credentials via XIACHAT_AGENT_CREDS (imlib-next is a
+// spawns one child `clawmessenger run --agent <name>` per agent. Each child gets
+// its agent-specific credentials via CLAWMESSENGER_AGENT_CREDS (imlib-next is a
 // module-level singleton, so one OS process per IM user is required).
 interface RunSupervisorOpts {
   opts: BuildProgramOpts;
@@ -243,7 +243,7 @@ interface RunSupervisorOpts {
 async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void> {
   const { opts, creds, api } = supervisor;
   if (!creds.credentialId || !creds.deviceSecret) {
-    throw new Error("no machine device credential; run xiachat pair on this device first");
+    throw new Error("no machine device credential; run clawmessenger pair on this device first");
   }
   // Best-effort auto-bind of the built-in ops agent so every device gets ops
   // capability; server-side binding is idempotent, so this is safe every start.
@@ -264,7 +264,7 @@ async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void> {
   const children: ChildProcess[] = [];
   for (const agent of bound) {
     // The built-in ops agent has no PATH-installed CLI of its own; the child
-    // (`xiachat run --agent ops`) installs opencode itself before connecting.
+    // (`clawmessenger run --agent ops`) installs opencode itself before connecting.
     if (agent.agent !== OPS_AGENT_NAME) {
       const local = found.find((f) => f.name === agent.agent);
       if (!local) {
@@ -282,7 +282,7 @@ async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void> {
     const runArgs = ["run", "--agent", agent.agent];
     if (supervisor.model) runArgs.push("--model", supervisor.model);
     const child = spawn(process.execPath, isSea ? runArgs : [script as string, ...runArgs], {
-      env: { ...process.env, XIACHAT_AGENT_CREDS: JSON.stringify(childCreds) },
+      env: { ...process.env, CLAWMESSENGER_AGENT_CREDS: JSON.stringify(childCreds) },
     });
     child.stdout?.on("data", (chunk: Buffer) => opts.stdout.write(`[${agent.agent}] ${chunk}`));
     child.stderr?.on("data", (chunk: Buffer) => process.stderr.write(`[${agent.agent}] ${chunk}`));
@@ -294,7 +294,7 @@ async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void> {
   if (children.length === 0) {
     throw new Error("none of the bound agent CLIs is available on this machine's PATH");
   }
-  opts.stdout.write(`xiachat supervisor: ${children.length} agent(s) online\n`);
+  opts.stdout.write(`clawmessenger supervisor: ${children.length} agent(s) online\n`);
   const shutdown = (): void => {
     for (const child of children) child.kill("SIGTERM");
   };

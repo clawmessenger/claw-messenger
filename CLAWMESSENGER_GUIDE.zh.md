@@ -92,7 +92,7 @@ AI 节点代表一个参与讨论的智能体。每个节点有类型（`ai_type
 
 > **Note:** 注册必须携带 `pairing_ticket`（管理员预建的 pending 配对票）：rongcloud 表的 workspace 为 NOT NULL，无 ticket 返回 400，见设计文档 §3.2 的实现决定。
 
-**获取配对票（推荐）**：在虾说 Web「远程设备」页点 **「绑定远程设备」** 一键生成（见附录 A.1），用户设备上用 `xiachat pair` 认领即可完成注册 + 绑定，无需手工 curl。下方 API 方式适用于脚本化场景。
+**获取配对票（推荐）**：在虾说 Web「远程设备」页点 **「绑定远程设备」** 一键生成（见附录 A.1），用户设备上用 `clawmessenger pair` 认领即可完成注册 + 绑定，无需手工 curl。下方 API 方式适用于脚本化场景。
 
 ### 通过 API 注册
 
@@ -555,9 +555,9 @@ function multica { & "quukk-clawmessenger" @args }
 
 ---
 
-## 附录 A：用户设备 CLI（xiachat）— 绑定与使用
+## 附录 A：用户设备 CLI（clawmessenger）— 绑定与使用
 
-xiachat 是运行在用户设备上的轻量节点 CLI：绑定到工作区后，经融云 IM 接收单聊消息与讨论指令，在本机调用真实 agent CLI（codex / opencode 等）完成回合。完整冒烟手册见 `packages/xiachat-cli/scripts/smoke.md`。
+clawmessenger 是运行在用户设备上的轻量节点 CLI：绑定到工作区后，经融云 IM 接收单聊消息与讨论指令，在本机调用真实 agent CLI（codex / opencode 等）完成回合。完整冒烟手册见 `packages/xiachat-cli/scripts/smoke.md`。
 
 ### A.1 绑定流程（Web 端发起）
 
@@ -570,7 +570,7 @@ xiachat 是运行在用户设备上的轻量节点 CLI：绑定到工作区后�
 3. 弹窗自动生成一张 10 分钟有效的票据，并显示一条完整命令（`--server` 已自动填好），形如：
 
 ```bash
-xiachat pair --ticket pt_<64位hex> --server https://<你的服务地址>
+clawmessenger pair --ticket pt_<64位hex> --server https://<你的服务地址>
 ```
 
 弹窗会每 2 秒自动检查票据状态，无需手动刷新；倒计时结束未认领会自动提示并可一键重新生成。
@@ -578,34 +578,39 @@ xiachat pair --ticket pt_<64位hex> --server https://<你的服务地址>
 **第 2 步：用户在设备上安装并认领**
 
 ```bash
- # 构建（在 claw-messenger 仓库内；产物为无依赖单文件，无需安装 Node）
- pnpm --filter @quukk/xiachat-cli build:exe
- # → packages/xiachat-cli/dist/xiachat.exe（Linux/macOS 为 dist/xiachat）
+ # 安装：从 GitHub Releases 下载对应平台的单文件可执行版（无需安装 Node）
+ #   https://github.com/clawmessenger/claw-messenger/releases/latest
+ # Windows 直链示例：
+ #   https://github.com/clawmessenger/claw-messenger/releases/latest/download/clawmessenger-windows-x64.exe
+ # Linux/macOS 将文件名替换为 clawmessenger-linux-x64 / clawmessenger-linux-arm64 /
+ # clawmessenger-darwin-x64 / clawmessenger-darwin-arm64，下载后 chmod +x
+ # 开发者也可在仓库内自行构建：pnpm --filter @quukk/xiachat-cli build:exe
+ #   → packages/xiachat-cli/dist/clawmessenger.exe（Linux/macOS 为 dist/clawmessenger）
 
  # 确认本机有可用的 agent CLI（claude / codex / opencode 等）
- packages/xiachat-cli/dist/xiachat.exe agents
+ clawmessenger agents
 
  # 认领配对票（复制 Web 弹窗里的命令，在设备上执行）
- packages/xiachat-cli/dist/xiachat.exe pair --ticket pt_<64位hex> --server https://<你的服务地址>
+ clawmessenger pair --ticket pt_<64位hex> --server https://<你的服务地址>
  ```
 
-> 也可用 `build:bin` 产出 `dist/xiachat.bundle.js`（需本机装有 Node ≥ 20，用 `node xiachat.bundle.js <cmd>` 运行）。
+> 也可用 `build:bin` 产出 `dist/clawmessenger.bundle.js`（需本机装有 Node ≥ 20，用 `node clawmessenger.bundle.js <cmd>` 运行）。
 
 **第 3 步：确认绑定成功**
 
 - Web 弹窗自动变为 **「设备已绑定」**
-- 设备上 `xiachat.exe status` 可看到节点凭据
+- 设备上 `clawmessenger.exe status` 可看到节点凭据
 
 > **Note:** 认领失败提示 "ticket already claimed" 表示票据已被其他设备使用；「票据已过期」则重新点「绑定远程设备」生成。
-> 绑定只需做一次；凭据保存在 `~/.xiachat/credentials.json`（权限 0600）。同一设备重复 pair 是安全的（幂等：复用已有节点，不会重复创建）。
+> 绑定只需做一次；凭据保存在 `~/.clawmessenger/credentials.json`（权限 0600）。同一设备重复 pair 是安全的（幂等：复用已有节点，不会重复创建）。
 
 ### A.2 日常使用
 
 **上线（每次使用前启动）**
 
 ```bash
-xiachat.exe run --agent opencode   # --agent 必填；可用值见 xiachat agents（exe 与 node 运行方式通用）
-# 输出 xiachat run: connected and dispatching 即已连上融云并开始分发消息
+clawmessenger.exe run --agent opencode   # --agent 必填；可用值见 clawmessenger agents（exe 与 node 运行方式通用）
+# 输出 clawmessenger run: connected and dispatching 即已连上融云并开始分发消息
 ```
 
 上线后即可：
@@ -625,15 +630,15 @@ xiachat.exe run --agent opencode   # --agent 必填；可用值见 xiachat agent
 **常用命令**
 
 ```bash
-xiachat agents   # 列出本机可发现的 agent CLI（下文以 xiachat 指代 exe 或 node 运行方式）
-xiachat status   # 查看当前身份/token/服务器
-xiachat login    # 手动刷新 IM token（一般不需要）
+clawmessenger agents   # 列出本机可发现的 agent CLI（下文以 clawmessenger 指代 exe 或 node 运行方式）
+clawmessenger status   # 查看当前身份/token/服务器
+clawmessenger login    # 手动刷新 IM token（一般不需要）
 ```
 
 ### A.3 验证与排障
 
 - 运行日志的 `im in: type=... from=...` 行标记每条入站消息，用于区分"消息未达"与"分发失败"。
-- 单聊不通：先查 `xiachat agents` 是否列出了目标 agent；再看日志有无 `im in:`（无 = IM 未连上，检查 token/网络）。
+- 单聊不通：先查 `clawmessenger agents` 是否列出了目标 agent；再看日志有无 `im in:`（无 = IM 未连上，检查 token/网络）。
 - 讨论只有 `turn_skipped` 没有 `turn_completed`：回包需经融云 webhook 回服务器，确认融云控制台 webhook 已配置为公网可达地址（见 smoke.md「C1 修复后复验」）。
 - 注册/绑定报 `workspace attribution required`：票据无效或已过期，在「远程设备」页重新点「绑定远程设备」获取新票据。
 - 其余已知事项见 smoke.md「已知缺口」一节。

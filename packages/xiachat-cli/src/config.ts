@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 export function defaultKeystorePath(): string {
-  return join(homedir(), ".xiachat", "credentials.json");
+  return join(homedir(), ".clawmessenger", "credentials.json");
 }
 
 // Stable per-machine identifier, minted once and stored next to the
@@ -19,7 +19,7 @@ export function machineId(keystorePath: string = defaultKeystorePath()): string 
   } catch {
     // absent or unreadable: mint below
   }
-  const id = `xiachat-${randomUUID()}`;
+  const id = `clawmessenger-${randomUUID()}`;
   try {
     mkdirSync(dirnameOf(idPath), { recursive: true });
     writeFileSync(idPath, id, { mode: 0o600 });

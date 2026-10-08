@@ -1,16 +1,16 @@
-# XiaChat CLI 全链路冒烟手册（spec §7.2）
+# clawmessenger CLI 全链路冒烟手册（spec §7.2）
 
 按 spec §7.2 的 4 步执行：注册 → 单聊 → 讨论 → kill 超时。前置条件：后端（Postgres 已起、融云测试应用已安装、`MULTICA_RONGCLOUD_SECRET_KEY` 已配置）+ 本机真实 agent CLI。
 
 ## 0. 打包
 
 ```powershell
-pnpm --filter @quukk/xiachat-cli build:exe   # → dist/xiachat.exe（无依赖单文件，Node SEA）
-# 备选：pnpm --filter @quukk/xiachat-cli build:bin → dist/xiachat.bundle.js（需本机 Node ≥ 20）
-packages/xiachat-cli/dist/xiachat.exe agents   # 列出本机 agent
+pnpm --filter @quukk/xiachat-cli build:exe   # → dist/clawmessenger.exe（无依赖单文件，Node SEA）
+# 备选：pnpm --filter @quukk/xiachat-cli build:bin → dist/clawmessenger.bundle.js（需本机 Node ≥ 20）
+packages/xiachat-cli/dist/clawmessenger.exe agents   # 列出本机 agent
 ```
 
-打包为无依赖 shim（esbuild 未声明为 devDep 且离线不可加，已移除）：`xiachat.bundle.js` 直接转发到 tsc 产物 `dist/bin.js`。Node 直跑需要 Node 全局垫片（`src/browser-shim.ts` 已内置，无需手工操作）。
+打包为无依赖 shim（esbuild 未声明为 devDep 且离线不可加，已移除）：`clawmessenger.bundle.js` 直接转发到 tsc 产物 `dist/bin.js`。Node 直跑需要 Node 全局垫片（`src/browser-shim.ts` 已内置，无需手工操作）。
 
 ## 1. 注册（pairing ticket）
 
@@ -25,7 +25,7 @@ VALUES ('48a1d54a-5a96-4fbd-9586-6ef2a1d6bc99', 'pt_<64hex>', 'pending', now() +
 
 ```powershell
 # CLI（自动携带稳定机器 ID 作为 mac_address，同机重注册复用 rc_user_id）
-node packages/xiachat-cli/dist/xiachat.bundle.js register --server http://localhost:8081 --name xiachat-node --ai-type xiachat --pairing-ticket pt_<64hex>
+node packages/xiachat-cli/dist/clawmessenger.bundle.js register --server http://localhost:8081 --name xiachat-node --ai-type xiachat --pairing-ticket pt_<64hex>
 
 # curl（显式 mac_address，ai_type=xiachat 走 IM 路径）
 curl -X POST http://localhost:8081/api/ai/register -H "Content-Type: application/json" `

@@ -201,7 +201,7 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
     });
   });
 
-  opts.stdout.write("xiachat run: connected and dispatching\n");
+  opts.stdout.write("clawmessenger run: connected and dispatching\n");
   await new Promise<void>(() => {}); // run until process exit
 }
 
@@ -209,7 +209,7 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
 // 9.1): when the first connect fails, refresh the token once and retry
 // with the fresh token — a single retry, no loops. The refreshed token is
 // used for this session only; startRunLoop has no keystore access to
-// persist it (run `xiachat login` to store one).
+// persist it (run `clawmessenger login` to store one).
 export async function connectTransport(opts: ConnectTransportOpts): Promise<void> {
   const appKey = opts.creds.appKey ?? (await opts.api.getConfig()).appKey;
   let token = opts.creds.token;

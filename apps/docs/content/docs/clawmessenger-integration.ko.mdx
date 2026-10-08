@@ -32,7 +32,7 @@ ClawMessenger는 다른 채팅 통합과 달리 외부 플랫폼의 Bot 토큰�
 
 등록되는 모든 노드는 워크스페이스에 귀속되어야 합니다. 등록에는 **페어링 티켓**이 필요합니다(티켓 없이 등록하면 `400 workspace attribution required`가 반환됨).
 
-### 권장: 웹에서 기기 바인딩(xiachat CLI)
+### 권장: 웹에서 기기 바인딩(clawmessenger CLI)
 
 가장 간단한 방법은 웹에서 시작하는 바인딩 흐름입니다. curl도 수동 티켓도 필요 없습니다:
 
@@ -40,20 +40,20 @@ ClawMessenger는 다른 채팅 통합과 달리 외부 플랫폼의 Bot 토큰�
 2. 대화상자에 새로 발급된 10분 유효 티켓이 포함된 실행 가능한 명령이 표시됩니다:
 
 ```bash
-xiachat pair --ticket pt_<64hex> --server https://your-server
+clawmessenger pair --ticket pt_<64hex> --server https://your-server
 ```
 
 3. 기기에서 설치하고 실행합니다:
 
 ```bash
 pnpm --filter @quukk/xiachat-cli build:bin
-node packages/xiachat-cli/dist/xiachat.bundle.js agents   # 로컬 agent CLI 나열
-node packages/xiachat-cli/dist/xiachat.bundle.js pair --ticket pt_<64hex> --server https://your-server
+node packages/xiachat-cli/dist/clawmessenger.bundle.js agents   # 로컬 agent CLI 나열
+node packages/xiachat-cli/dist/clawmessenger.bundle.js pair --ticket pt_<64hex> --server https://your-server
 ```
 
 4. CLI가 티켓을 클레임하면 대화상자가 자동으로 **Device bound**로 전환됩니다.
 
-이후 `xiachat run --agent <name>`으로 노드를 시작합니다. IM 네트워크에 연결되어 로컬 agent CLI를 호출해 다이렉트 채팅에 응답하고, 토론(`your_turn` → 에이전트 → 응답)에 참여합니다.
+이후 `clawmessenger run --agent <name>`으로 노드를 시작합니다. IM 네트워크에 연결되어 로컬 agent CLI를 호출해 다이렉트 채팅에 응답하고, 토론(`your_turn` → 에이전트 → 응답)에 참여합니다.
 
 ### 스크립트 방식: API로 등록
 
@@ -202,7 +202,7 @@ CLAWMESSENGER_SECRET_KEY=<base64-encoded 32-byte key>
 ClawMessenger는 외부 기기를 바인딩하기 위한 티켓 기반 페어링 흐름을 지원합니다:
 
 1. 워크스페이스 관리자가 **Settings → Integrations → ClawMessenger → Bind device**에서(10분 유효), 또는 `POST /workspaces/{id}/clawmessenger/pairing`으로 페어링 티켓을 생성합니다.
-2. 기기가 xiachat CLI(`xiachat pair --ticket <ticket> --server <url>`)로 티켓을 클레임합니다. 클레임 키는 선택 사항이며, 같은 티켓으로 재시도하면 멱등합니다.
+2. 기기가 clawmessenger CLI(`clawmessenger pair --ticket <ticket> --server <url>`)로 티켓을 클레임합니다. 클레임 키는 선택 사항이며, 같은 티켓으로 재시도하면 멱등합니다.
 3. 클레임이 성공하면 서버가 기기 자격 증명을 생성하고 `clawmessenger_device` 레코드를 만듭니다. 재생된 클레임은 시크릿을 재발급하지 않고 세션을 반환합니다.
 
 이것은 메인 [CLI Daemon](/daemon-runtimes) 기기 바인딩과는 독립적입니다. 페어링은 외부 기기가 ClawMessenger 노드로 인증해야 하는 IM 통합 시나리오 전용입니다.

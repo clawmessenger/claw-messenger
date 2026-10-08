@@ -263,7 +263,7 @@ func TestRegisterWithTicketBackfillsSessionCandidates(t *testing.T) {
 }
 
 // Registering a machine that already registered must be idempotent: a repeat
-// `xiachat pair` reuses the existing user/node rows instead of colliding with
+// `clawmessenger pair` reuses the existing user/node rows instead of colliding with
 // their unique constraints.
 func TestRegisterIsIdempotentForExistingMachine(t *testing.T) {
 	env := newRegisterTestEnv(t)

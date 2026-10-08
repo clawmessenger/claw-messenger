@@ -376,7 +376,7 @@ export function RongCloudTab() {
                 {t(($) => $.rongcloud.pairing_step_label)}
               </p>
               <code className="block overflow-x-auto rounded-xs bg-muted px-2 py-1.5 text-micro">
-                xiachat pair --ticket {pairTicket ?? ""} --server{" "}
+                clawmessenger pair --ticket {pairTicket ?? ""} --server{" "}
                 {typeof window !== "undefined" ? window.location.origin : ""}
               </code>
               <p className="text-caption text-muted-foreground">

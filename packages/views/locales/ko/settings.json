@@ -1494,7 +1494,7 @@
                       "bind_device":  "기기 연결",
                       "pairing_dialog_title":  "기기 연결",
                       "pairing_waiting":  "기기가 티켓을 가져오기를 기다리는 중… 연결이 완료되면 자동으로 업데이트됩니다.",
-                      "pairing_claimed_hint":  "기기가 티켓을 가져왔습니다. 해당 기기에서 xiachat run을 실행하면 온라인 상태가 됩니다.",
+                      "pairing_claimed_hint":  "기기가 티켓을 가져왔습니다. 해당 기기에서 clawmessenger run을 실행하면 온라인 상태가 됩니다.",
                       "pairing_claimed":  "기기가 연결되었습니다",
                       "pairing_step_label":  "기기에서 실행:",
                       "toast_pairing_created":  "페어링 티켓이 생성되었습니다",

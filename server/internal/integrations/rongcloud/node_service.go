@@ -158,7 +158,7 @@ func (s *NodeService) Register(ctx context.Context, params NodeRegisterParams) (
 		}
 		encToken = base64.StdEncoding.EncodeToString(sealed)
 	}
-	// Register must be idempotent per machine: a repeat `xiachat pair` on a
+	// Register must be idempotent per machine: a repeat `clawmessenger pair` on a
 	// device that already registered would otherwise collide with the unique
 	// rongcloud_user_id / node rows and fail with a 500. Reuse the existing
 	// identity and just refresh its stored IM token.

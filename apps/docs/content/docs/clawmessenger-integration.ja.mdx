@@ -32,7 +32,7 @@ ClawMessenger は他のチャットインテグレーションと異なり、外
 
 登録されるすべてのノードはワークスペースに帰属する必要があります。登録には**ペアリングチケット**が必要です（チケットなしの登録は `400 workspace attribution required` を返します）。
 
-### 推奨：Web からデバイスをバインドする（xiachat CLI）
+### 推奨：Web からデバイスをバインドする（clawmessenger CLI）
 
 最も簡単な方法は Web 起点のバインドフローです。curl も手動チケットも不要です：
 
@@ -40,20 +40,20 @@ ClawMessenger は他のチャットインテグレーションと異なり、外
 2. ダイアログに、新規発行された 10 分有効のチケット付きコマンドが表示されます：
 
 ```bash
-xiachat pair --ticket pt_<64hex> --server https://your-server
+clawmessenger pair --ticket pt_<64hex> --server https://your-server
 ```
 
 3. デバイス側でインストールして実行します：
 
 ```bash
 pnpm --filter @quukk/xiachat-cli build:bin
-node packages/xiachat-cli/dist/xiachat.bundle.js agents   # ローカルの agent CLI を一覧
-node packages/xiachat-cli/dist/xiachat.bundle.js pair --ticket pt_<64hex> --server https://your-server
+node packages/xiachat-cli/dist/clawmessenger.bundle.js agents   # ローカルの agent CLI を一覧
+node packages/xiachat-cli/dist/clawmessenger.bundle.js pair --ticket pt_<64hex> --server https://your-server
 ```
 
 4. CLI がチケットをクレームすると、ダイアログは自動的に **Device bound** に切り替わります。
 
-その後 `xiachat run --agent <name>` でノードを起動します。IM ネットワークに接続し、ローカルの agent CLI を呼び出してダイレクトチャットに応答し、ディスカッション（`your_turn` → エージェント → 応答）に参加します。
+その後 `clawmessenger run --agent <name>` でノードを起動します。IM ネットワークに接続し、ローカルの agent CLI を呼び出してダイレクトチャットに応答し、ディスカッション（`your_turn` → エージェント → 応答）に参加します。
 
 ### スクリプト化：API で登録する
 
@@ -202,7 +202,7 @@ CLAWMESSENGER_SECRET_KEY=<base64-encoded 32-byte key>
 ClawMessenger は外部デバイスをバインドするためのチケットベースのペアリングフローをサポートします：
 
 1. ワークスペース管理者が **Settings → Integrations → ClawMessenger → Bind device** から（10 分有効）、または `POST /workspaces/{id}/clawmessenger/pairing` 経由でペアリングチケットを作成します。
-2. デバイスは xiachat CLI（`xiachat pair --ticket <ticket> --server <url>`）でチケットをクレームします。クレームキーは任意で、同じチケットでの再試行は冪等です。
+2. デバイスは clawmessenger CLI（`clawmessenger pair --ticket <ticket> --server <url>`）でチケットをクレームします。クレームキーは任意で、同じチケットでの再試行は冪等です。
 3. クレームが成功すると、サーバーはデバイスクレデンシャルを生成して `clawmessenger_device` レコードを作成します。再再生されたクレームは、シークレットを再発行せずにセッションを返します。
 
 これはメインの [CLI Daemon](/daemon-runtimes) のデバイスバインドとは独立しています。ペアリングは、外部デバイスが ClawMessenger ノードとして認証する必要がある IM インテグレーションシナリオ専用です。

@@ -7,7 +7,7 @@ import { Keystore } from "./keystore.js";
 
 const dirs: string[] = [];
 function tempDir(): string {
-  const d = mkdtempSync(join(tmpdir(), "xiachat-keystore-"));
+  const d = mkdtempSync(join(tmpdir(), "clawmessenger-keystore-"));
   dirs.push(d);
   return d;
 }

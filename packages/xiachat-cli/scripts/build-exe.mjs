@@ -6,7 +6,7 @@
 // packages), so we locate them by walking up instead of declaring them.
 //
 // Usage:
-//   node scripts/build-exe.mjs                          # dist/xiachat.exe from src/bin.ts
+//   node scripts/build-exe.mjs                          # dist/clawmessenger.exe from src/bin.ts
 //   node scripts/build-exe.mjs --entry <file> --name <name>
 import { spawnSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
@@ -37,7 +37,7 @@ function opt(name, fallback) {
 }
 
 const entry = resolve(opt("--entry", join(pkgRoot, "src", "bin.ts")));
-const exeName = opt("--name", "xiachat");
+const exeName = opt("--name", "clawmessenger");
 const isWindows = process.platform === "win32";
 
 const distDir = join(pkgRoot, "dist");

@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { discoverAgents, type AgentInfo } from "./agents.js";
 
-// Built-in agent name bound on every xiachat device. Distinct from the
+// Built-in agent name bound on every clawmessenger device. Distinct from the
 // "opencode" CLI name: the server sees an agent node named "ops", while
 // turns are executed by the locally installed opencode CLI.
 export const OPS_AGENT_NAME = "ops";
@@ -53,7 +53,7 @@ export async function ensureOpencodeInstalled(deps: EnsureOpencodeDeps = {}): Pr
   // refresh failure the ops branch falls back with a clear error.
   const installed = findOpencode(await discover());
   if (!installed) {
-    throw new Error("opencode was installed but is still not discoverable on PATH; restart xiachat run");
+    throw new Error("opencode was installed but is still not discoverable on PATH; restart clawmessenger run");
   }
   return installed;
 }
@@ -77,7 +77,7 @@ const OPS_AGENTS_MD = `# 虾说运维助手
 // opencode workdir). Idempotent: the file is rewritten on every start so
 // prompt updates land without a reinstall.
 export async function setupOpsWorkdir(dirOverride?: string): Promise<string> {
-  const dir = dirOverride ?? path.join(os.homedir(), ".xiachat", "ops");
+  const dir = dirOverride ?? path.join(os.homedir(), ".clawmessenger", "ops");
   await mkdir(dir, { recursive: true });
   await writeFile(path.join(dir, "AGENTS.md"), OPS_AGENTS_MD, "utf8");
   return dir;

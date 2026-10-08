@@ -1504,7 +1504,7 @@
                       "bind_device":  "Lier un appareil",
                       "pairing_dialog_title":  "Lier un appareil",
                       "pairing_waiting":  "En attente de la réclamation du ticket par l\u0027appareil… Cette fenêtre se met à jour automatiquement une fois liée.",
-                      "pairing_claimed_hint":  "L\u0027appareil a réclamé le ticket. Lancez xiachat run dessus pour le mettre en ligne.",
+                      "pairing_claimed_hint":  "L'appareil a réclamé le ticket. Lancez clawmessenger run dessus pour le mettre en ligne.",
                       "pairing_claimed":  "Appareil lié",
                       "pairing_step_label":  "Sur l\u0027appareil, exécutez :",
                       "toast_pairing_created":  "Ticket d\u0027appairage créé",

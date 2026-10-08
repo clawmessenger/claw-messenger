@@ -108,7 +108,7 @@ function makeFixture(dir: string, scriptPath: string, argsFile: string): EchoAge
 }
 
 function mkdtempXiachat(): string {
-  const dir = join(tmpdir(), `xiachat-agent-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  const dir = join(tmpdir(), `clawmessenger-agent-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   mkdirSync(dir, { recursive: true });
   return dir;
 }
