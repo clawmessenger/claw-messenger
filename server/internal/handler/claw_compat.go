@@ -836,3 +836,59 @@ func (h *Handler) ClawNodeStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	clawJSON(w, 200, 200, "", map[string]interface{}{"online": h.RongCloudNode.IsOnline(node.ID)})
 }
+
+// ClawUpdateNode POST /api/claw/nodes/{nodeId} 旧站编辑设备资料（昵称/头像）走 HTTP，
+// 替代原 IM 通道 ai/updateNode（Go 兼容层从未实现，旧链路恒报错）。
+func (h *Handler) ClawUpdateNode(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.clawRequireClawUser(w, r); !ok {
+		return
+	}
+	if h.RongCloudNode == nil {
+		clawJSON(w, 503, 503, "RongCloud 渠道未安装", nil)
+		return
+	}
+	nodeID := chi.URLParam(r, "nodeId")
+	if nodeID == "" {
+		clawJSON(w, 400, 400, "缺少节点ID", nil)
+		return
+	}
+	var req struct {
+		Name        string `json:"name"`
+		Description string `json:"description"`
+		PortraitUri string `json:"portraitUri"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		clawJSON(w, 400, 400, "请求体格式错误", nil)
+		return
+	}
+	node, err := h.RongCloudNode.GetNodeByNodeID(r.Context(), nodeID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			clawJSON(w, 404, 404, "节点不存在", nil)
+			return
+		}
+		slog.Warn("claw: node update lookup failed", "nodeId", nodeID, "error", err)
+		clawJSON(w, 500, 500, "查询节点失败", nil)
+		return
+	}
+	user, err := h.RongCloudNode.GetUserByRongCloudID(r.Context(), node.RongcloudUserID)
+	if err != nil {
+		slog.Warn("claw: node update user lookup failed", "nodeId", nodeID, "error", err)
+		clawJSON(w, 500, 500, "查询节点用户失败", nil)
+		return
+	}
+	name := req.Name
+	if name == "" {
+		name = user.Name.String
+	}
+	portrait := req.PortraitUri
+	if portrait == "" {
+		portrait = user.PortraitUri.String
+	}
+	if err := h.RongCloudNode.UpdateUserProfile(r.Context(), user.ID, name, portrait); err != nil {
+		slog.Warn("claw: node update profile failed", "nodeId", nodeID, "error", err)
+		clawJSON(w, 500, 500, "更新节点资料失败", nil)
+		return
+	}
+	clawJSON(w, 200, 200, "", map[string]interface{}{"ok": true})
+}

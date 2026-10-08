@@ -773,6 +773,29 @@ func (q *Queries) GetRongCloudSystemConfig(ctx context.Context, arg GetRongCloud
 	return i, err
 }
 
+const getRongCloudUserByID = `-- name: GetRongCloudUserByID :one
+SELECT id, workspace_id, rongcloud_user_id, name, portrait_uri, token_encrypted, is_system_reserved, is_ai_node, node_type, created_at, updated_at FROM rongcloud_user WHERE id = $1
+`
+
+func (q *Queries) GetRongCloudUserByID(ctx context.Context, id pgtype.UUID) (RongcloudUser, error) {
+	row := q.db.QueryRow(ctx, getRongCloudUserByID, id)
+	var i RongcloudUser
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.RongcloudUserID,
+		&i.Name,
+		&i.PortraitUri,
+		&i.TokenEncrypted,
+		&i.IsSystemReserved,
+		&i.IsAiNode,
+		&i.NodeType,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const getRongCloudUserByRongCloudID = `-- name: GetRongCloudUserByRongCloudID :one
 SELECT id, workspace_id, rongcloud_user_id, name, portrait_uri, token_encrypted, is_system_reserved, is_ai_node, node_type, created_at, updated_at FROM rongcloud_user WHERE rongcloud_user_id = $1
 `
@@ -1533,6 +1556,35 @@ func (q *Queries) UpdateRongCloudPairingSessionStatus(ctx context.Context, arg U
 		&i.UpdatedAt,
 		&i.ReportedAgents,
 		&i.BoundAgents,
+	)
+	return i, err
+}
+
+const updateRongCloudUserProfile = `-- name: UpdateRongCloudUserProfile :one
+UPDATE rongcloud_user SET name = $2, portrait_uri = $3, updated_at = now() WHERE id = $1 RETURNING id, workspace_id, rongcloud_user_id, name, portrait_uri, token_encrypted, is_system_reserved, is_ai_node, node_type, created_at, updated_at
+`
+
+type UpdateRongCloudUserProfileParams struct {
+	ID          pgtype.UUID `json:"id"`
+	Name        pgtype.Text `json:"name"`
+	PortraitUri pgtype.Text `json:"portrait_uri"`
+}
+
+func (q *Queries) UpdateRongCloudUserProfile(ctx context.Context, arg UpdateRongCloudUserProfileParams) (RongcloudUser, error) {
+	row := q.db.QueryRow(ctx, updateRongCloudUserProfile, arg.ID, arg.Name, arg.PortraitUri)
+	var i RongcloudUser
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.RongcloudUserID,
+		&i.Name,
+		&i.PortraitUri,
+		&i.TokenEncrypted,
+		&i.IsSystemReserved,
+		&i.IsAiNode,
+		&i.NodeType,
+		&i.CreatedAt,
+		&i.UpdatedAt,
 	)
 	return i, err
 }

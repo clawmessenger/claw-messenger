@@ -12,6 +12,9 @@ RETURNING *;
 -- name: GetRongCloudUserByRongCloudID :one
 SELECT * FROM rongcloud_user WHERE rongcloud_user_id = $1;
 
+-- name: GetRongCloudUserByID :one
+SELECT * FROM rongcloud_user WHERE id = $1;
+
 -- name: GetRongCloudUserByWorkspaceAndID :one
 SELECT * FROM rongcloud_user WHERE workspace_id = $1 AND id = $2;
 
@@ -23,6 +26,9 @@ SELECT * FROM rongcloud_user WHERE workspace_id = $1 AND is_system_reserved = TR
 
 -- name: UpdateRongCloudUserToken :one
 UPDATE rongcloud_user SET token_encrypted = $2, updated_at = now() WHERE id = $1 RETURNING *;
+
+-- name: UpdateRongCloudUserProfile :one
+UPDATE rongcloud_user SET name = $2, portrait_uri = $3, updated_at = now() WHERE id = $1 RETURNING *;
 
 -- name: UpdateRongCloudUserStatus :one
 UPDATE rongcloud_user SET is_system_reserved = $1, is_ai_node = $2, node_type = $3, updated_at = now() WHERE id = $4 RETURNING *;

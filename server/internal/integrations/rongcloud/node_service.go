@@ -438,6 +438,26 @@ func (s *NodeService) LegacyNodeRecords(ctx context.Context) ([]map[string]inter
 	return records, nil
 }
 
+// GetUserByID 按 rongcloud_user.id（UUID）直查用户行。
+func (s *NodeService) GetUserByID(ctx context.Context, id pgtype.UUID) (db.RongcloudUser, error) {
+	return s.queries.GetRongCloudUserByID(ctx, id)
+}
+
+// GetUserByRongCloudID 按融云用户 ID（rc_user_id 字符串）查用户行。
+func (s *NodeService) GetUserByRongCloudID(ctx context.Context, rcUserID string) (db.RongcloudUser, error) {
+	return s.queries.GetRongCloudUserByRongCloudID(ctx, rcUserID)
+}
+
+// UpdateUserProfile 更新节点关联融云用户的昵称与头像（空串保旧由调用方处理）。
+func (s *NodeService) UpdateUserProfile(ctx context.Context, id pgtype.UUID, name, portrait string) error {
+	_, err := s.queries.UpdateRongCloudUserProfile(ctx, db.UpdateRongCloudUserProfileParams{
+		ID:          id,
+		Name:        pgText(name),
+		PortraitUri: pgText(portrait),
+	})
+	return err
+}
+
 func (s *NodeService) ListNodeModels(ctx context.Context, nodeID pgtype.UUID) ([]db.RongcloudNodeModelCatalog, error) {
 	if s.queries == nil {
 		return nil, errors.New("rongcloud: database not configured")
