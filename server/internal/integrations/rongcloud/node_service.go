@@ -124,6 +124,30 @@ func (s *NodeService) VerifyEnrollmentToken(token, bridgeSecret, serverURL, runt
 	return hmac.Equal([]byte(token), []byte(expected))
 }
 
+// rongcloudRCIdentityLimit is the provider's maximum length for a user id.
+const rongcloudRCIdentityLimit = 64
+
+// machineIdentityKey derives the stable key used inside rongcloud user ids
+// from a raw machine identifier. Rongcloud caps user ids at 64 chars, and CLI
+// machine ids look like "clawmessenger-<uuid>" (51 chars); combined ids such
+// as rc_node_<machine>_<agent> would overflow. Long raw ids are shortened to
+// a stable sha256 prefix while short ones (e.g. real mac addresses) are kept
+// verbatim for backwards compatibility with existing rows.
+func machineIdentityKey(machineID string) string {
+	// "rc_node_" (8) + machine + "_" (1) + agent: reserve room for the longest
+	// suffix we ever append. 24 is the longest agent name we reasonably ship.
+	reserve := 8 + 1 + 24
+	budget := rongcloudRCIdentityLimit - reserve
+	if budget < 8 {
+		budget = 8
+	}
+	if len(machineID) <= budget {
+		return machineID
+	}
+	sum := sha256.Sum256([]byte(machineID))
+	return "m_" + hex.EncodeToString(sum[:12])
+}
+
 func (s *NodeService) Register(ctx context.Context, params NodeRegisterParams) (NodeRegisterResult, error) {
 	if s.queries == nil {
 		return NodeRegisterResult{}, errors.New("rongcloud: database not configured")
@@ -145,7 +169,7 @@ func (s *NodeService) Register(ctx context.Context, params NodeRegisterParams) (
 			params.OwnerUserID = resolved.ownerUserID
 		}
 	}
-	rcUserID := fmt.Sprintf("rc_node_%s", params.MacAddress)
+	rcUserID := fmt.Sprintf("rc_node_%s", machineIdentityKey(params.MacAddress))
 	token, err := s.client.getUserToken(ctx, rcUserID, params.Name, "")
 	if err != nil {
 		return NodeRegisterResult{}, fmt.Errorf("rongcloud: getUserToken: %w", err)
@@ -740,7 +764,7 @@ func (s *NodeService) bindAgentsToMachine(ctx context.Context, machineNode db.Ro
 // ensureAgentNode creates (or reuses) the rongcloud user + node + device
 // credential for one agent on the given machine.
 func (s *NodeService) ensureAgentNode(ctx context.Context, machineNode db.RongcloudNode, machineID, agent string) (string, error) {
-	rcUserID := fmt.Sprintf("rc_node_%s_%s", machineID, agent)
+	rcUserID := fmt.Sprintf("rc_node_%s_%s", machineIdentityKey(machineID), agent)
 	name := fmt.Sprintf("%s (%s)", machineNode.NodeID, agent)
 	token, err := s.client.getUserToken(ctx, rcUserID, name, "")
 	if err != nil {
