@@ -43,10 +43,9 @@ jobs:
             name: linux-arm64
             artifact: clawmessenger-linux-arm64
             source: dist/clawmessenger
-          - os: macos-13
-            name: darwin-x64
-            artifact: clawmessenger-darwin-x64
-            source: dist/clawmessenger
+          # darwin-x64 (Intel) dropped: GitHub retired the macos-13 Intel
+          # runners, so that matrix entry queues forever. Intel Macs are not
+          # supported (pre-2020 machines); modern Macs use darwin-arm64.
           - os: macos-latest
             name: darwin-arm64
             artifact: clawmessenger-darwin-arm64
