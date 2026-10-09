@@ -23,6 +23,9 @@ export interface BuildProgramOpts {
   // Injectable for tests; defaults to the machine-id minted next to the
   // keystore (see config.ts machineId).
   machineId?: () => string;
+  // Injectable for tests; defaults to ensureOpencodeInstalled. Called on bind
+  // (pair) and at supervisor start so a device that lacks opencode installs it.
+  ensureOpencode?: () => Promise<unknown>;
 }
 
 export function buildProgram(opts: BuildProgramOpts): Command {
@@ -30,7 +33,7 @@ export function buildProgram(opts: BuildProgramOpts): Command {
   program
     .name("clawmessenger")
     .description("User-device agent CLI over RongCloud IM")
-    .version("0.1.1")
+    .version("0.2.0")
     // Tests parse this program in-process; commander would otherwise
     // process.exit on missing options and kill the vitest runner.
     .exitOverride();
@@ -80,6 +83,16 @@ export function buildProgram(opts: BuildProgramOpts): Command {
     .option("--ai-type <type>", "agent platform (claude, codex, opencode, ...)", "opencode")
     .action(async (cmdOpts: { ticket: string; server: string; name?: string; aiType: string }) => {
       const api = opts.apiFactory(cmdOpts.server);
+      const ensureOpencode = opts.ensureOpencode ?? ensureOpencodeInstalled;
+      // opencode is the default runtime for the built-in ops (运维) agent and a
+      // common default agent. Install it up front on devices that lack it so it
+      // is available to bind and shows up in the reported agent list. Best
+      // effort: an install failure must not block pairing.
+      try {
+        await ensureOpencode();
+      } catch (err) {
+        console.warn("opencode install failed:", err instanceof Error ? err.message : String(err));
+      }
       // Register with the ticket first: the server attributes the node to
       // the ticket's workspace and backfills the session's candidate node
       // list so the subsequent claim can issue device credentials. The
@@ -244,6 +257,16 @@ async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void> {
   const { opts, creds, api } = supervisor;
   if (!creds.credentialId || !creds.deviceSecret) {
     throw new Error("no machine device credential; run clawmessenger pair on this device first");
+  }
+  // Ensure the default opencode runtime is present before spawning children so
+  // both the built-in ops agent and any bound opencode agent can run on a
+  // device that has never installed it. Best effort: a failed install must not
+  // stop the other agents from starting.
+  const ensureOpencode = opts.ensureOpencode ?? ensureOpencodeInstalled;
+  try {
+    await ensureOpencode();
+  } catch (err) {
+    console.warn("opencode install failed:", err instanceof Error ? err.message : String(err));
   }
   // Best-effort auto-bind of the built-in ops agent so every device gets ops
   // capability; server-side binding is idempotent, so this is safe every start.

@@ -135,6 +135,12 @@ func (h *systemHandler) handleAICommand(ctx context.Context, msg NormalizedMessa
 		}
 		records := make([]map[string]interface{}, 0, len(nodes))
 		for _, n := range nodes {
+			// Keep the same visibility contract as the HTTP device list: the
+			// per-machine infrastructure node and the built-in ops maintenance
+			// agent are internal and must not surface to clients.
+			if isHiddenNode(n) {
+				continue
+			}
 			aiType := n.AiType.String
 			record := map[string]interface{}{
 				"node_id":       n.NodeID,

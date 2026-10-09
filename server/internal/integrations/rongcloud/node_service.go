@@ -148,6 +148,31 @@ func machineIdentityKey(machineID string) string {
 	return "m_" + hex.EncodeToString(sum[:12])
 }
 
+// OpsAgentType is the ai_type of the built-in maintenance agent that every
+// clawmessenger device binds (see packages/xiachat-cli src/ops.ts). Its node
+// exists only to power the ops (运维) feature, so it is hidden from the
+// user-facing device list and friend list.
+const OpsAgentType = "ops"
+
+// isMachineNode reports whether n is the per-machine infrastructure node that
+// Register creates for a device, as opposed to a bound agent node that
+// ensureAgentNode creates with an "_<agent>" suffix. The machine node's
+// rongcloud user id is derived from the raw machine identity without an agent
+// suffix, which is what distinguishes it from its agent children.
+func isMachineNode(n db.RongcloudNode) bool {
+	if n.MachineID == "" {
+		return false
+	}
+	return n.RongcloudUserID == "rc_node_"+machineIdentityKey(n.MachineID)
+}
+
+// isHiddenNode reports whether n must be excluded from the user-facing device
+// list and friend list. Two kinds of nodes are internal plumbing: the
+// per-machine infrastructure node and the built-in ops maintenance agent.
+func isHiddenNode(n db.RongcloudNode) bool {
+	return n.AiType.String == OpsAgentType || isMachineNode(n)
+}
+
 func (s *NodeService) Register(ctx context.Context, params NodeRegisterParams) (NodeRegisterResult, error) {
 	if s.queries == nil {
 		return NodeRegisterResult{}, errors.New("rongcloud: database not configured")
@@ -432,8 +457,22 @@ func (s *NodeService) LegacyNodeRecords(ctx context.Context) ([]map[string]inter
 	if err != nil {
 		return nil, err
 	}
+	// The ops (运维) node for each machine powers the maintenance feature but
+	// must not surface as its own device row. Index it by machine so the
+	// visible agent nodes can advertise the capability via om_rongcloud_id.
+	opsByMachine := make(map[string]string)
+	for _, n := range nodes {
+		if n.AiType.String == OpsAgentType && n.MachineID != "" {
+			opsByMachine[n.MachineID] = n.RongcloudUserID
+		}
+	}
 	records := make([]map[string]interface{}, 0, len(nodes))
 	for _, n := range nodes {
+		// Only bound agent nodes are user-facing; the per-machine
+		// infrastructure node and the ops maintenance agent stay internal.
+		if isHiddenNode(n) {
+			continue
+		}
 		aiType := n.AiType.String
 		online := "offline"
 		if s.IsOnline(n.ID) {
@@ -449,6 +488,12 @@ func (s *NodeService) LegacyNodeRecords(ctx context.Context) ([]map[string]inter
 			"status":          "active",
 			"created_at":      n.CreatedAt.Time,
 			"updated_at":      n.UpdatedAt.Time,
+		}
+		// Expose the machine's ops node to the client so the device detail
+		// can still offer the 运维 entry point without listing the ops node.
+		if opsRC, ok := opsByMachine[n.MachineID]; ok && opsRC != "" {
+			record["om_rongcloud_id"] = opsRC
+			record["has_om_capability"] = true
 		}
 		if len(n.Capabilities) > 0 {
 			record["capabilities"] = json.RawMessage(n.Capabilities)
@@ -480,6 +525,119 @@ func (s *NodeService) UpdateUserProfile(ctx context.Context, id pgtype.UUID, nam
 		PortraitUri: pgText(portrait),
 	})
 	return err
+}
+
+// ListUserFriends returns a claw/IM user's RongCloud friend list mapped to the
+// legacy UserInfo shape the web client's contact list expects. This backs the
+// HTTP /api/user/friends fallback the frontend calls alongside the IM SDK.
+func (s *NodeService) ListUserFriends(ctx context.Context, rongCloudUserID string) ([]map[string]interface{}, error) {
+	if s.client == nil {
+		return nil, errors.New("rongcloud: API client not configured")
+	}
+	friends, err := s.client.getFriends(ctx, rongCloudUserID)
+	if err != nil {
+		return nil, err
+	}
+	list := make([]map[string]interface{}, 0, len(friends))
+	for _, f := range friends {
+		nickname := f.Name
+		if nickname == "" {
+			nickname = f.UserID
+		}
+		list = append(list, map[string]interface{}{
+			"userId":      f.UserID,
+			"username":    f.UserID,
+			"nickname":    nickname,
+			"portraitUri": f.PortraitURI,
+		})
+	}
+	return list, nil
+}
+
+// BackfillFriendsOptions tunes BackfillAgentFriends.
+type BackfillFriendsOptions struct {
+	// IncludeOps also friends the internal ops (运维) node. Off by default:
+	// the ops node is hidden from the user-facing friend list by design and
+	// stays reachable through the device-detail maintenance entry instead.
+	IncludeOps bool
+	// Bidirectional also writes the reverse edge (agent -> owner). RongCloud
+	// friend relations are one-way, so this mirrors the legacy device-claim
+	// flow, which added both directions.
+	Bidirectional bool
+	// DryRun reports what would happen without calling RongCloud.
+	DryRun bool
+}
+
+// BackfillFriendOutcome records one owner->agent friend attempt.
+type BackfillFriendOutcome struct {
+	Owner  string `json:"owner"`
+	Agent  string `json:"agent"`
+	NodeRC string `json:"node_rc"`
+	// Status is one of: planned (dry run), added, already, failed.
+	Status string `json:"status"`
+	Error  string `json:"error,omitempty"`
+}
+
+// BackfillAgentFriends ensures every visible agent node of workspaceID is a
+// friend of each owner rongcloud user id. It repairs bindings created before
+// BindAgents wrote the friend edge: the web client's contact list reads the
+// RongCloud friend list, so those devices never appeared there. Writes are
+// idempotent — RongCloud answers 25460 for an existing edge, reported as
+// "already". Machine infrastructure nodes and (unless IncludeOps) the ops node
+// are skipped, matching the device-list visibility rules.
+func (s *NodeService) BackfillAgentFriends(ctx context.Context, workspaceID pgtype.UUID, owners []string, opts BackfillFriendsOptions) ([]BackfillFriendOutcome, error) {
+	if s.queries == nil || s.client == nil {
+		return nil, errors.New("rongcloud: service not configured")
+	}
+	nodes, err := s.queries.ListRongCloudNodesByWorkspace(ctx, workspaceID)
+	if err != nil {
+		return nil, fmt.Errorf("rongcloud: list nodes: %w", err)
+	}
+	agents := make([]db.RongcloudNode, 0, len(nodes))
+	for _, n := range nodes {
+		if isMachineNode(n) {
+			continue
+		}
+		if n.AiType.String == OpsAgentType && !opts.IncludeOps {
+			continue
+		}
+		agents = append(agents, n)
+	}
+	outcomes := make([]BackfillFriendOutcome, 0, len(owners)*len(agents))
+	for _, owner := range owners {
+		owner = strings.TrimSpace(owner)
+		if owner == "" {
+			continue
+		}
+		for _, agent := range agents {
+			outcome := BackfillFriendOutcome{Owner: owner, Agent: agent.AiType.String, NodeRC: agent.RongcloudUserID}
+			if opts.DryRun {
+				outcome.Status = "planned"
+				outcomes = append(outcomes, outcome)
+				continue
+			}
+			already, err := s.client.addFriend(ctx, owner, agent.RongcloudUserID, "")
+			if err != nil {
+				outcome.Status = "failed"
+				outcome.Error = err.Error()
+				outcomes = append(outcomes, outcome)
+				continue
+			}
+			if already {
+				outcome.Status = "already"
+			} else {
+				outcome.Status = "added"
+			}
+			if opts.Bidirectional {
+				if _, rerr := s.client.addFriend(ctx, agent.RongcloudUserID, owner, ""); rerr != nil {
+					s.logger.Warn("rongcloud: backfill reverse friend failed",
+						"owner", owner, "agent", agent.RongcloudUserID, "error", rerr)
+				}
+			}
+			outcomes = append(outcomes, outcome)
+		}
+	}
+	return outcomes, nil
 }
 
 func (s *NodeService) ListNodeModels(ctx context.Context, nodeID pgtype.UUID) ([]db.RongcloudNodeModelCatalog, error) {
@@ -660,8 +818,10 @@ type MachineAgentCredential struct {
 
 // BindAgents materialises the user's check-box selection: every selected
 // agent becomes its own rongcloud user + node + device credential on the
-// device's machine, idempotent on (machine_id, ai_type).
-func (s *NodeService) BindAgents(ctx context.Context, session db.RongcloudPairingSession, agents []string) ([]BoundAgentResult, error) {
+// device's machine, idempotent on (machine_id, ai_type). ownerRongCloudID is
+// the bound human user's rongcloud id; when set, each newly bound agent (except
+// the internal ops agent) is added to that user's IM friend list.
+func (s *NodeService) BindAgents(ctx context.Context, session db.RongcloudPairingSession, agents []string, ownerRongCloudID string) ([]BoundAgentResult, error) {
 	if session.Status == "expired" || session.ExpiresAt.Time.Before(time.Now()) {
 		return nil, ErrPairingSessionExpired
 	}
@@ -676,7 +836,7 @@ func (s *NodeService) BindAgents(ctx context.Context, session db.RongcloudPairin
 	if err != nil {
 		return nil, fmt.Errorf("rongcloud: get machine node: %w", err)
 	}
-	results, err := s.bindAgentsToMachine(ctx, machineNode, agents)
+	results, err := s.bindAgentsToMachine(ctx, machineNode, agents, ownerRongCloudID)
 	if err != nil {
 		return nil, err
 	}
@@ -722,12 +882,16 @@ func (s *NodeService) BindAgentsByDeviceCredential(ctx context.Context, machineN
 	if err != nil || !hmac.Equal([]byte(plain), []byte(secret)) {
 		return nil, ErrInvalidDeviceCredential
 	}
-	return s.bindAgentsToMachine(ctx, machineNode, agents)
+	// Device-credential binds have no owning human user in scope, so no friend
+	// relation is created here (the ops agent is bound this way anyway).
+	return s.bindAgentsToMachine(ctx, machineNode, agents, "")
 }
 
 // bindAgentsToMachine resolves the machine identity and materialises one
-// node per agent, idempotent on (machine_id, ai_type).
-func (s *NodeService) bindAgentsToMachine(ctx context.Context, machineNode db.RongcloudNode, agents []string) ([]BoundAgentResult, error) {
+// node per agent, idempotent on (machine_id, ai_type). When ownerRongCloudID
+// is set, each bound agent (except the internal ops agent) is also added to
+// that user's IM friend list so it shows up in the contact list.
+func (s *NodeService) bindAgentsToMachine(ctx context.Context, machineNode db.RongcloudNode, agents []string, ownerRongCloudID string) ([]BoundAgentResult, error) {
 	if s.queries == nil {
 		return nil, errors.New("rongcloud: database not configured")
 	}
@@ -755,6 +919,16 @@ func (s *NodeService) bindAgentsToMachine(ctx context.Context, machineNode db.Ro
 		nodeIDText, err := s.ensureAgentNode(ctx, machineNode, machineID, agent)
 		if err != nil {
 			return nil, fmt.Errorf("rongcloud: bind agent %q: %w", agent, err)
+		}
+		// Surface the bound agent in the owner's friend list. The built-in ops
+		// agent is internal plumbing, so it is never added. Best-effort: a
+		// failed friend write must not fail the bind itself.
+		if ownerRongCloudID != "" && agent != OpsAgentType {
+			agentRCUserID := fmt.Sprintf("rc_node_%s_%s", machineIdentityKey(machineID), agent)
+			if _, err := s.client.addFriend(ctx, ownerRongCloudID, agentRCUserID, ""); err != nil {
+				s.logger.Warn("rongcloud: add friend for bound agent failed",
+					"owner", ownerRongCloudID, "agent", agent, "error", err)
+			}
 		}
 		results = append(results, BoundAgentResult{Agent: agent, NodeID: nodeIDText})
 	}

@@ -1614,6 +1614,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	r.Post("/api/register", h.ClawRegister)
 	r.Post("/api/login", h.ClawLogin)
 	r.Get("/api/user/list", h.ClawUserList)
+	r.Get("/api/user/friends", h.ClawUserFriends)
 	r.Get("/api/user/info", h.ClawUserInfo)
 	r.Post("/api/user/info", h.ClawUserInfo)
 	r.Post("/api/user/update", h.ClawUserUpdate)

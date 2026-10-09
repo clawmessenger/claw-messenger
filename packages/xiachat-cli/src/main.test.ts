@@ -116,6 +116,7 @@ describe("clawmessenger pair", () => {
       keystore,
       apiFactory: () => fakeApi as unknown as XiachatApi,
       stdout: process.stdout,
+      ensureOpencode: async () => ({}),
     });
     await expect(
       program.parseAsync(["node", "clawmessenger", "pair", "--ticket", "pt_1"]),
@@ -146,6 +147,7 @@ describe("clawmessenger pair", () => {
       apiFactory: () => fakeApi as unknown as XiachatApi,
       stdout: process.stdout,
       machineId: () => "machine-A",
+      ensureOpencode: async () => ({}),
     });
     // A retried claim after a lost response: same ticket, same machine.
     await program.parseAsync(["node", "clawmessenger", "pair", "--ticket", "pt_same"]);
@@ -176,6 +178,7 @@ describe("clawmessenger pair", () => {
       apiFactory: () => fakeApi as unknown as XiachatApi,
       stdout: process.stdout,
       machineId: () => "machine-B",
+      ensureOpencode: async () => ({}),
     });
     await program.parseAsync(["node", "clawmessenger", "pair", "--ticket", "pt_same"]);
     const machineBKey = seenIdemKeys[0];
@@ -184,6 +187,7 @@ describe("clawmessenger pair", () => {
       apiFactory: () => fakeApi as unknown as XiachatApi,
       stdout: process.stdout,
       machineId: () => "machine-C",
+      ensureOpencode: async () => ({}),
     });
     await program2.parseAsync(["node", "clawmessenger", "pair", "--ticket", "pt_same"]);
     expect(seenIdemKeys[1]).not.toBe(machineBKey);

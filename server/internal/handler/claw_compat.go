@@ -479,6 +479,33 @@ func (h *Handler) ClawUserUpdate(w http.ResponseWriter, r *http.Request) {
 	clawJSON(w, 200, 200, "", clawUserJSON(updated))
 }
 
+// ClawUserFriends GET /api/user/friends —— 旧站好友列表（HTTP 通道兜底）。
+// 认证 = claw_im_users.rongcloud_token；只返回当前账号自己的好友，避免越权。
+func (h *Handler) ClawUserFriends(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.clawRequireClawUser(w, r)
+	if !ok {
+		return
+	}
+	// Frontend sends ?userId=; it must match the authenticated account.
+	if query := strings.TrimSpace(r.URL.Query().Get("userId")); query != "" && query != userID {
+		clawJSON(w, 403, 403, "无权访问该用户好友列表", nil)
+		return
+	}
+	if h.RongCloudNode == nil {
+		clawJSON(w, 200, 200, "", map[string]interface{}{"list": []interface{}{}})
+		return
+	}
+	friends, err := h.RongCloudNode.ListUserFriends(r.Context(), userID)
+	if err != nil {
+		// A failed lookup must not break the client: it falls back to the IM
+		// SDK friend list, so answer with an empty list rather than an error.
+		slog.Warn("claw: list user friends failed", "userId", userID, "error", err)
+		clawJSON(w, 200, 200, "", map[string]interface{}{"list": []interface{}{}})
+		return
+	}
+	clawJSON(w, 200, 200, "", map[string]interface{}{"list": friends})
+}
+
 // ClawUserGuide GET /api/config/user-guide —— 从 rongcloud_system_config 读
 // user_guide 键（与旧系统一致；该表 config 为 jsonb，含 title/content/开关）。
 func (h *Handler) ClawUserGuide(w http.ResponseWriter, r *http.Request) {
@@ -709,7 +736,8 @@ func (h *Handler) ClawListNodes(w http.ResponseWriter, r *http.Request) {
 // ClawBindPairing POST /api/claw/pairing/{ticket}/bind —— 旧站弹窗勾选绑定 agent。
 // 票据必须已 claimed（设备已 pair）；每个被选 agent 独立建 rc user + node + 凭据。
 func (h *Handler) ClawBindPairing(w http.ResponseWriter, r *http.Request) {
-	if _, ok := h.clawRequireClawUser(w, r); !ok {
+	userID, ok := h.clawRequireClawUser(w, r)
+	if !ok {
 		return
 	}
 	if h.RongCloudPairing == nil {
@@ -737,7 +765,7 @@ func (h *Handler) ClawBindPairing(w http.ResponseWriter, r *http.Request) {
 		clawJSON(w, 500, 500, "查询票据失败", nil)
 		return
 	}
-	results, err := h.RongCloudNode.BindAgents(r.Context(), session, req.Agents)
+	results, err := h.RongCloudNode.BindAgents(r.Context(), session, req.Agents, userID)
 	if err != nil {
 		switch {
 		case errors.Is(err, rongcloud.ErrPairingSessionNotClaimed):
