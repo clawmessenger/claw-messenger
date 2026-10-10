@@ -45,12 +45,41 @@ export interface RunAgentTurnOpts {
 // Keep in sync with agentArgvArgs in server discussion_bridge.go.
 type AgentArgvStrategy = (prompt: string, model?: string) => string[];
 
+// The web stores a model as a `provider/model` route. Most agent CLIs take
+// that verbatim, but two split it:
+//   codex  — `-m` takes a bare slug; the provider comes from config, so the
+//            route's provider is applied via `-c model_provider=<id>`.
+//            (`-m quukk_direct/glm-5.2` fails with model_not_found.)
+//   hermes — `-m <slug> --provider <id>`.
+// Verified against codex 0.x and hermes with the 127.0.0.1:49830 gateway.
+const MODEL_ROUTE_RE = /^([A-Za-z0-9][A-Za-z0-9._-]{0,127})\/([A-Za-z0-9][A-Za-z0-9._:-]{0,127})$/;
+
+export function splitModelRoute(route: string): { provider: string; model: string } | null {
+  const match = MODEL_ROUTE_RE.exec(route);
+  return match ? { provider: match[1], model: match[2] } : null;
+}
+
+/** Renders the model-selection flags for one agent. */
+export function buildModelArgs(name: string, model: string | undefined): string[] {
+  if (!model) return [];
+  const route = splitModelRoute(model);
+  if (name === "codex") {
+    return route
+      ? ["-c", `model_provider=${route.provider}`, "-m", route.model]
+      : ["-m", model];
+  }
+  if (name === "hermes") {
+    return route ? ["-m", route.model, "--provider", route.provider] : ["-m", model];
+  }
+  return ["--model", model];
+}
+
 const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
-  claude: (prompt, model) => ["-p", prompt, ...(model ? ["--model", model] : [])],
-  codex: (prompt, model) => ["exec", prompt, ...(model ? ["-m", model] : [])],
-  opencode: (prompt, model) => ["run", prompt, ...(model ? ["--model", model] : [])],
-  openclaw: (prompt, model) => ["agent", "--local", "--json", "-m", prompt, ...(model ? ["--model", model] : [])],
-  hermes: (prompt, model) => ["-z", prompt, ...(model ? ["-m", model] : [])],
+  claude: (prompt, model) => ["-p", prompt, ...buildModelArgs("claude", model)],
+  codex: (prompt, model) => ["exec", prompt, ...buildModelArgs("codex", model)],
+  opencode: (prompt, model) => ["run", prompt, ...buildModelArgs("opencode", model)],
+  openclaw: (prompt, model) => ["agent", "--local", "--json", "-m", prompt, ...buildModelArgs("openclaw", model)],
+  hermes: (prompt, model) => ["-z", prompt, ...buildModelArgs("hermes", model)],
 };
 
 // Windows CreateProcess caps the whole command line near 32k chars (and
@@ -312,7 +341,9 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
       ? buildAgentArgs(opts.agentName, opts.prompt, opts.model)
       : [];
     const argvMode = strategyArgs.length > 0;
-    const agentArgs = argvMode ? strategyArgs : (opts.model ? ["--model", opts.model] : []);
+    const agentArgs = argvMode
+      ? strategyArgs
+      : buildModelArgs(opts.agentName ?? "", opts.model);
     const { file, args } = buildSpawnInvocation(opts.execPath, agentArgs);
     const child = spawn(file, args, {
       stdio: ["pipe", "pipe", "pipe"],

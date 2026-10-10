@@ -1770,6 +1770,54 @@ func TestBuildInvocation(t *testing.T) {
 			wantArgv:  []string{"-p", strings.Repeat("a", 8000)},
 			wantStdin: false,
 		},
+		{
+			name:      "codex splits a provider/model route",
+			agent:     "codex",
+			prompt:    "hi",
+			model:     "quukk_direct/glm-5.2",
+			wantArgv:  []string{"exec", "hi", "-c", "model_provider=quukk_direct", "-m", "glm-5.2"},
+			wantStdin: false,
+		},
+		{
+			name:      "codex keeps a legacy bare model id",
+			agent:     "codex",
+			prompt:    "hi",
+			model:     "glm-5.2",
+			wantArgv:  []string{"exec", "hi", "-m", "glm-5.2"},
+			wantStdin: false,
+		},
+		{
+			name:      "hermes passes the provider separately",
+			agent:     "hermes",
+			prompt:    "hi",
+			model:     "quukk/glm-5.3",
+			wantArgv:  []string{"-z", "hi", "-m", "glm-5.3", "--provider", "quukk"},
+			wantStdin: false,
+		},
+		{
+			name:      "hermes keeps a bare model id",
+			agent:     "hermes",
+			prompt:    "hi",
+			model:     "glm-5.3",
+			wantArgv:  []string{"-z", "hi", "-m", "glm-5.3"},
+			wantStdin: false,
+		},
+		{
+			name:      "openclaw takes the full route verbatim",
+			agent:     "openclaw",
+			prompt:    "hi",
+			model:     "openai/glm-5.2",
+			wantArgv:  []string{"agent", "--local", "-m", "hi", "--model", "openai/glm-5.2"},
+			wantStdin: false,
+		},
+		{
+			name:      "codex route past the argv cap still splits in stdin mode",
+			agent:     "codex",
+			prompt:    strings.Repeat("a", 8001),
+			model:     "quukk_direct/glm-5.2",
+			wantArgv:  []string{"-c", "model_provider=quukk_direct", "-m", "glm-5.2"},
+			wantStdin: true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1781,5 +1829,31 @@ func TestBuildInvocation(t *testing.T) {
 				t.Errorf("stdinPrompt = %v, want %v", spec.stdinPrompt, tt.wantStdin)
 			}
 		})
+	}
+}
+
+func TestSplitModelRoute(t *testing.T) {
+	tests := []struct {
+		in       string
+		provider string
+		model    string
+		ok       bool
+	}{
+		{in: "quukk/glm-5.3", provider: "quukk", model: "glm-5.3", ok: true},
+		{in: "quukk_direct/glm-5.2", provider: "quukk_direct", model: "glm-5.2", ok: true},
+		{in: "openai/gpt-5.6-sol", provider: "openai", model: "gpt-5.6-sol", ok: true},
+		{in: "glm-5.3"},       // bare id: not a route
+		{in: "a/b/c"},         // two slashes
+		{in: "/glm-5.3"},      // empty provider
+		{in: "quukk/"},        // empty model
+		{in: "quukk/glm 5.3"}, // whitespace
+		{in: ""},              // empty
+	}
+	for _, tt := range tests {
+		provider, model, ok := splitModelRoute(tt.in)
+		if provider != tt.provider || model != tt.model || ok != tt.ok {
+			t.Errorf("splitModelRoute(%q) = (%q, %q, %v), want (%q, %q, %v)",
+				tt.in, provider, model, ok, tt.provider, tt.model, tt.ok)
+		}
 	}
 }

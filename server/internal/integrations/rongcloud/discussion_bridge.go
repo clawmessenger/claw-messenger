@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 
@@ -67,46 +68,75 @@ func (b *DiscussionBridge) IsServerManagedByType(aiType string) bool {
 	return ok
 }
 
-// Agents known to reject or hang on stdin-mode invocation get an argv
-// strategy: the prompt rides as a CLI argument instead of stdin.
-//   claude:   print mode (-p), non-interactive
-//   codex:    `exec` subcommand (stdin-mode invocation is rejected)
-//   opencode: `run` subcommand (stdin-mode invocation hangs)
-//   openclaw: `agent --local -m` one-shot message (stdin-mode unsupported)
-//   hermes:   `-z` one-shot prompt (stdin-mode unsupported)
-// Keep in sync with buildAgentArgs in packages/xiachat-cli/src/agents.ts.
-func agentArgvArgs(name, prompt, model string) []string {
-	var args []string
-	switch name {
-	case "claude":
-		args = append(args, "-p", prompt)
-		if model != "" {
-			args = append(args, "--model", model)
-		}
-	case "codex":
-		args = append(args, "exec", prompt)
-		if model != "" {
-			args = append(args, "-m", model)
-		}
-	case "opencode":
-		args = append(args, "run", prompt)
-		if model != "" {
-			args = append(args, "--model", model)
-		}
-	case "openclaw":
-		args = append(args, "agent", "--local", "-m", prompt)
-		if model != "" {
-			args = append(args, "--model", model)
-		}
-	case "hermes":
-		args = append(args, "-z", prompt)
-		if model != "" {
-			args = append(args, "-m", model)
-		}
-	default:
+// The web stores a model as a `provider/model` route. Most agent CLIs take
+// that verbatim, but two split it:
+//
+//	codex  — `-m` takes a bare slug and the provider comes from config, so the
+//	         route's provider rides on `-c model_provider=<id>`. Passing the
+//	         full route fails with model_not_found.
+//	hermes — `-m <slug> --provider <id>`.
+//
+// Keep in sync with buildModelArgs in packages/xiachat-cli/src/agents.ts.
+var modelRouteRE = regexp.MustCompile(
+	`^([A-Za-z0-9][A-Za-z0-9._-]{0,127})/([A-Za-z0-9][A-Za-z0-9._:-]{0,127})$`,
+)
+
+// splitModelRoute splits a `provider/model` route. ok=false means the value is
+// not a route, so legacy bare model ids stay bare.
+func splitModelRoute(route string) (provider, model string, ok bool) {
+	match := modelRouteRE.FindStringSubmatch(route)
+	if match == nil {
+		return "", "", false
+	}
+	return match[1], match[2], true
+}
+
+// modelArgs renders the model-selection flags for one agent.
+func modelArgs(name, model string) []string {
+	if model == "" {
 		return nil
 	}
-	return args
+	provider, slug, ok := splitModelRoute(model)
+	switch name {
+	case "codex":
+		if ok {
+			return []string{"-c", "model_provider=" + provider, "-m", slug}
+		}
+		return []string{"-m", model}
+	case "hermes":
+		if ok {
+			return []string{"-m", slug, "--provider", provider}
+		}
+		return []string{"-m", model}
+	default:
+		return []string{"--model", model}
+	}
+}
+
+// Agents known to reject or hang on stdin-mode invocation get an argv
+// strategy: the prompt rides as a CLI argument instead of stdin.
+//
+//	claude:   print mode (-p), non-interactive
+//	codex:    `exec` subcommand (stdin-mode invocation is rejected)
+//	opencode: `run` subcommand (stdin-mode invocation hangs)
+//	openclaw: `agent --local -m` one-shot message (stdin-mode unsupported)
+//	hermes:   `-z` one-shot prompt (stdin-mode unsupported)
+//
+// Keep in sync with buildAgentArgs in packages/xiachat-cli/src/agents.ts.
+func agentArgvArgs(name, prompt, model string) []string {
+	switch name {
+	case "claude":
+		return append([]string{"-p", prompt}, modelArgs(name, model)...)
+	case "codex":
+		return append([]string{"exec", prompt}, modelArgs(name, model)...)
+	case "opencode":
+		return append([]string{"run", prompt}, modelArgs(name, model)...)
+	case "openclaw":
+		return append([]string{"agent", "--local", "-m", prompt}, modelArgs(name, model)...)
+	case "hermes":
+		return append([]string{"-z", prompt}, modelArgs(name, model)...)
+	}
+	return nil
 }
 
 // Windows CreateProcess caps the whole command line near 32k chars, so
@@ -132,7 +162,7 @@ func buildInvocation(name, prompt, model string) invocationSpec {
 		return invocationSpec{argv: argv}
 	}
 	if model != "" {
-		return invocationSpec{argv: []string{"--model", model}, stdinPrompt: true}
+		return invocationSpec{argv: modelArgs(name, model), stdinPrompt: true}
 	}
 	return invocationSpec{stdinPrompt: true}
 }

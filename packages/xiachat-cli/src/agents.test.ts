@@ -2,12 +2,14 @@
 import { describe, expect, it } from "vitest";
 import {
   buildAgentArgs,
+  buildModelArgs,
   discoverAgents,
   extractOpenclawReply,
   KNOWN_AGENT_CLIS,
   normalizeOpenclawOutput,
   parseOpenclawJsonOutput,
   runAgentTurn,
+  splitModelRoute,
   stripAnsiCodes,
   trimIncompleteUtf8Tail,
 } from "./agents.js";
@@ -45,6 +47,27 @@ describe("buildAgentArgs", () => {
     expect(buildAgentArgs("hermes", "hi", "m1")).toEqual(["-z", "hi", "-m", "m1"]);
   });
 
+  // The panel stores `provider/model`; codex and hermes take the provider
+  // separately, so the route is split rather than passed through. Verified
+  // against the real CLIs: `codex -m quukk_direct/glm-5.2` is model_not_found.
+  it("codex splits a route into -c model_provider + a bare -m", () => {
+    expect(buildAgentArgs("codex", "hi", "quukk_direct/glm-5.2")).toEqual([
+      "exec", "hi", "-c", "model_provider=quukk_direct", "-m", "glm-5.2",
+    ]);
+  });
+
+  it("hermes passes the provider separately", () => {
+    expect(buildAgentArgs("hermes", "hi", "quukk/glm-5.3")).toEqual([
+      "-z", "hi", "-m", "glm-5.3", "--provider", "quukk",
+    ]);
+  });
+
+  it("openclaw keeps the whole route", () => {
+    expect(buildAgentArgs("openclaw", "hi", "openai/glm-5.2")).toEqual([
+      "agent", "--local", "--json", "-m", "hi", "--model", "openai/glm-5.2",
+    ]);
+  });
+
   it("omits model flags when no model is given", () => {
     expect(buildAgentArgs("claude", "hi")).toEqual(["-p", "hi"]);
     expect(buildAgentArgs("codex", "hi")).toEqual(["exec", "hi"]);
@@ -62,6 +85,29 @@ describe("buildAgentArgs", () => {
     expect(buildAgentArgs("claude", "a".repeat(8001))).toEqual([]);
     expect(buildAgentArgs("codex", "a".repeat(8001), "gpt-5")).toEqual([]);
     expect(buildAgentArgs("claude", "a".repeat(8000))).toEqual(["-p", "a".repeat(8000)]);
+  });
+});
+
+describe("splitModelRoute / buildModelArgs", () => {
+  it("splits only well-formed provider/model routes", () => {
+    expect(splitModelRoute("quukk/glm-5.3")).toEqual({ provider: "quukk", model: "glm-5.3" });
+    expect(splitModelRoute("quukk_direct/glm-5.2")).toEqual({
+      provider: "quukk_direct",
+      model: "glm-5.2",
+    });
+    expect(splitModelRoute("glm-5.3")).toBeNull();
+    expect(splitModelRoute("a/b/c")).toBeNull();
+    expect(splitModelRoute("/glm-5.3")).toBeNull();
+    expect(splitModelRoute("quukk/")).toBeNull();
+    expect(splitModelRoute("quukk/glm 5.3")).toBeNull();
+  });
+
+  it("omits flags without a model and defaults to --model", () => {
+    expect(buildModelArgs("opencode", undefined)).toEqual([]);
+    expect(buildModelArgs("opencode", "quukk/glm-5.3")).toEqual(["--model", "quukk/glm-5.3"]);
+    expect(buildModelArgs("claude", "sonnet-4")).toEqual(["--model", "sonnet-4"]);
+    // Unknown agents keep the legacy flags.
+    expect(buildModelArgs("kimi", "m1")).toEqual(["--model", "m1"]);
   });
 });
 
