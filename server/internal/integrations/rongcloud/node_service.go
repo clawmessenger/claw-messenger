@@ -127,15 +127,20 @@ func (s *NodeService) VerifyEnrollmentToken(token, bridgeSecret, serverURL, runt
 // rongcloudRCIdentityLimit is the provider's maximum length for a user id.
 const rongcloudRCIdentityLimit = 64
 
-// machineIdentityKey derives the stable key used inside rongcloud user ids
-// from a raw machine identifier. Rongcloud caps user ids at 64 chars, and CLI
-// machine ids look like "clawmessenger-<uuid>" (51 chars); combined ids such
-// as rc_node_<machine>_<agent> would overflow. Long raw ids are shortened to
-// a stable sha256 prefix while short ones (e.g. real mac addresses) are kept
-// verbatim for backwards compatibility with existing rows.
+// machineIdentityKey derives the stable key embedded in every rongcloud user id
+// a machine owns: "<agent>_<key>" for its agent nodes and "rc_node_<key>" for
+// the machine node itself.
+//
+// Rongcloud caps user ids at 64 chars, and CLI machine ids are numeric (10
+// digits), so the new shape never overflows. Older rows carry
+// "clawmessenger-<uuid>" (51 chars) and legacy MAC addresses, and anything too
+// long is shortened to a stable sha256 prefix.
 func machineIdentityKey(machineID string) string {
-	// "rc_node_" (8) + machine + "_" (1) + agent: reserve room for the longest
-	// suffix we ever append. 24 is the longest agent name we reasonably ship.
+	// Frozen at the value the original "rc_node_<machine>_<agent>" scheme used:
+	// already-registered machines were hashed against it, so widening the budget
+	// would derive a second key for the same machine and duplicate every node
+	// under it. The new "<agent>_<key>" shape only needs
+	// 64 - len("antigravity") - 1 = 52.
 	reserve := 8 + 1 + 24
 	budget := rongcloudRCIdentityLimit - reserve
 	if budget < 8 {
@@ -156,9 +161,9 @@ const OpsAgentType = "ops"
 
 // isMachineNode reports whether n is the per-machine infrastructure node that
 // Register creates for a device, as opposed to a bound agent node that
-// ensureAgentNode creates with an "_<agent>" suffix. The machine node's
-// rongcloud user id is derived from the raw machine identity without an agent
-// suffix, which is what distinguishes it from its agent children.
+// ensureAgentNode creates as "<agent>_<machine key>". The machine node's
+// rongcloud user id is the raw machine key behind the "rc_node_" prefix and
+// carries no agent suffix, which is what distinguishes it from its children.
 func isMachineNode(n db.RongcloudNode) bool {
 	if n.MachineID == "" {
 		return false
@@ -990,45 +995,92 @@ func (s *NodeService) bindAgentsToMachine(ctx context.Context, machineNode db.Ro
 			continue
 		}
 		seen[agent] = true
-		nodeIDText, err := s.ensureAgentNode(ctx, machineNode, machineID, agent)
+		binding, err := s.ensureAgentNode(ctx, machineNode, machineID, agent)
 		if err != nil {
 			return nil, fmt.Errorf("rongcloud: bind agent %q: %w", agent, err)
 		}
 		// Surface the bound agent in the owner's friend list. The built-in ops
 		// agent is internal plumbing, so it is never added. Best-effort: a
 		// failed friend write must not fail the bind itself.
-		if ownerRongCloudID != "" && agent != OpsAgentType {
-			agentRCUserID := fmt.Sprintf("rc_node_%s_%s", machineIdentityKey(machineID), agent)
-			if _, err := s.client.addFriend(ctx, ownerRongCloudID, agentRCUserID, ""); err != nil {
+		if ownerRongCloudID != "" && agent != OpsAgentType && binding.RongcloudUserID != "" {
+			if _, err := s.client.addFriend(ctx, ownerRongCloudID, binding.RongcloudUserID, ""); err != nil {
 				s.logger.Warn("rongcloud: add friend for bound agent failed",
 					"owner", ownerRongCloudID, "agent", agent, "error", err)
 			}
 		}
-		results = append(results, BoundAgentResult{Agent: agent, NodeID: nodeIDText})
+		results = append(results, BoundAgentResult{Agent: agent, NodeID: binding.NodeID})
 	}
 	return results, nil
 }
 
+// agentNodeRCUserID is the RongCloud user id for one agent bound to a machine.
+//
+// Format: "<agent>_<machine key>", e.g. hermes_1234567890. It follows the node
+// id convention the Python server has always used ("<node_type>_<numeric id>",
+// see clawmessenger-server/id_generator.py), which is also what the web parses
+// (clawmessenger-web/src/lib/ai-node-id.ts) and what users read in the device
+// list. The machine node keeps the older "rc_node_<machine key>" form.
+func agentNodeRCUserID(agent, machineID string) string {
+	return agent + "_" + machineIdentityKey(machineID)
+}
+
+// agentNodeBinding is what ensureAgentNode resolves for one agent: the stable
+// node id the web stores, plus the RongCloud user id that owns the agent's IM
+// account (needed to add the node to an owner's friend list).
+type agentNodeBinding struct {
+	NodeID          string
+	RongcloudUserID string
+}
+
+// findMachineAgentNode returns the node already bound to (machine_id, ai_type).
+//
+// Matching on the identity columns rather than on the derived RongCloud user id
+// is deliberate: nodes registered before agentNodeRCUserID existed carry the old
+// "rc_node_<machine>_<agent>" id, and they must be reused rather than duplicated
+// under a second RongCloud account.
+func (s *NodeService) findMachineAgentNode(ctx context.Context, workspaceID pgtype.UUID, machineID, agent string) (db.RongcloudNode, bool, error) {
+	nodes, err := s.queries.ListRongCloudNodesByWorkspace(ctx, workspaceID)
+	if err != nil {
+		return db.RongcloudNode{}, false, fmt.Errorf("list nodes: %w", err)
+	}
+	for _, n := range nodes {
+		if n.MachineID == machineID && n.AiType.String == agent {
+			return n, true, nil
+		}
+	}
+	return db.RongcloudNode{}, false, nil
+}
+
 // ensureAgentNode creates (or reuses) the rongcloud user + node + device
 // credential for one agent on the given machine.
-func (s *NodeService) ensureAgentNode(ctx context.Context, machineNode db.RongcloudNode, machineID, agent string) (string, error) {
-	rcUserID := fmt.Sprintf("rc_node_%s_%s", machineIdentityKey(machineID), agent)
+func (s *NodeService) ensureAgentNode(ctx context.Context, machineNode db.RongcloudNode, machineID, agent string) (agentNodeBinding, error) {
+	existing, found, err := s.findMachineAgentNode(ctx, machineNode.WorkspaceID, machineID, agent)
+	if err != nil {
+		return agentNodeBinding{}, fmt.Errorf("lookup agent node: %w", err)
+	}
+	// A node bound before the "<agent>_<machine>" scheme existed keeps its
+	// RongCloud id: that id is the account's primary key, so re-deriving it
+	// would mint a second account and list the same agent twice.
+	rcUserID := agentNodeRCUserID(agent, machineID)
+	if found && existing.RongcloudUserID != "" {
+		rcUserID = existing.RongcloudUserID
+	}
 	name := fmt.Sprintf("%s (%s)", machineNode.NodeID, agent)
 	token, err := s.client.getUserToken(ctx, rcUserID, name, "")
 	if err != nil {
-		return "", fmt.Errorf("getUserToken: %w", err)
+		return agentNodeBinding{}, fmt.Errorf("getUserToken: %w", err)
 	}
 	encToken := ""
 	if s.box != nil {
 		sealed, err := s.box.Seal([]byte(token))
 		if err != nil {
-			return "", fmt.Errorf("encrypt token: %w", err)
+			return agentNodeBinding{}, fmt.Errorf("encrypt token: %w", err)
 		}
 		encToken = base64.StdEncoding.EncodeToString(sealed)
 	}
 	rcUser, err := s.queries.GetRongCloudUserByRongCloudID(ctx, rcUserID)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return "", fmt.Errorf("lookup user: %w", err)
+		return agentNodeBinding{}, fmt.Errorf("lookup user: %w", err)
 	}
 	if err == nil {
 		_, _ = s.queries.UpdateRongCloudUserToken(ctx, db.UpdateRongCloudUserTokenParams{
@@ -1056,15 +1108,13 @@ func (s *NodeService) ensureAgentNode(ctx context.Context, machineNode db.Rongcl
 			NodeType:        "ai",
 		})
 		if err != nil {
-			return "", fmt.Errorf("create user: %w", err)
+			return agentNodeBinding{}, fmt.Errorf("create user: %w", err)
 		}
 	}
-	nodeIDText := fmt.Sprintf("node_%s", hex.EncodeToString(rcUser.ID.Bytes[:8]))
-	node, err := s.queries.GetRongCloudNodeByRongCloudUserID(ctx, rcUserID)
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return "", fmt.Errorf("lookup node: %w", err)
-	}
-	if err != nil {
+	node := existing
+	nodeIDText := existing.NodeID
+	if !found {
+		nodeIDText = fmt.Sprintf("node_%s", hex.EncodeToString(rcUser.ID.Bytes[:8]))
 		node, err = s.queries.CreateRongCloudNode(ctx, db.CreateRongCloudNodeParams{
 			WorkspaceID:     machineNode.WorkspaceID,
 			OwnerUserID:     machineNode.OwnerUserID,
@@ -1077,18 +1127,20 @@ func (s *NodeService) ensureAgentNode(ctx context.Context, machineNode db.Rongcl
 			MachineID:       machineID,
 		})
 		if err != nil {
-			return "", fmt.Errorf("create node: %w", err)
+			return agentNodeBinding{}, fmt.Errorf("create node: %w", err)
 		}
+	} else if nodeIDText == "" {
+		nodeIDText = fmt.Sprintf("node_%s", hex.EncodeToString(rcUser.ID.Bytes[:8]))
 	}
 	// Device credential: only mint one when none exists yet. The plaintext
 	// secret cannot be recovered later, so re-binding must not clobber it.
 	if _, err := s.queries.GetRongCloudDeviceByNodeID(ctx, node.ID); err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
-			return "", fmt.Errorf("lookup device: %w", err)
+			return agentNodeBinding{}, fmt.Errorf("lookup device: %w", err)
 		}
 		credID, credSecret, err := generateDeviceCredential()
 		if err != nil {
-			return "", fmt.Errorf("generate device credential: %w", err)
+			return agentNodeBinding{}, fmt.Errorf("generate device credential: %w", err)
 		}
 		encSecret := ""
 		if s.box != nil {
@@ -1108,10 +1160,10 @@ func (s *NodeService) ensureAgentNode(ctx context.Context, machineNode db.Rongcl
 			Status:                    "active",
 		})
 		if err != nil {
-			return "", fmt.Errorf("create device: %w", err)
+			return agentNodeBinding{}, fmt.Errorf("create device: %w", err)
 		}
 	}
-	return nodeIDText, nil
+	return agentNodeBinding{NodeID: nodeIDText, RongcloudUserID: rcUserID}, nil
 }
 
 // MachineAgentCredentials authenticates a device supervisor (machine node

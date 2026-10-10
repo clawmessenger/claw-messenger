@@ -19,36 +19,44 @@ export function defaultProcessedUidsPath(nodeId?: string): string {
   return join(homedir(), ".clawmessenger", `processed-uids${suffix}.json`);
 }
 
-// Length of a freshly minted machine id, in base36 characters.
+// Length of a freshly minted machine id, in decimal digits.
 //
 // The machine id is embedded in every RongCloud user id this device owns:
-// "rc_node_<machine>[_<agent>]". RongCloud caps a user id at 64 chars and the
-// server reserves 33 of them for the "rc_node_" prefix, the "_" separator and
-// the longest agent name, leaving 31 for the machine id. The previous
-// "clawmessenger-<uuid>" form was 50 chars, so the server had to sha256 it into
-// an opaque "m_<24 hex>" key — which is why node ids read like
-// rc_node_m_e99ad19f108d9dad78ad07e3_codex.
+// "<agent>_<machine>" for agent nodes and "rc_node_<machine>" for the machine
+// node. The format follows the long-standing node id convention used by the
+// Python server (id_generator.py: generate_numeric_id mints 6-10 digits with a
+// non-zero leading digit, and the RongCloud id is "<node_type>_<id>"), so node
+// ids read like hermes_1234567890.
 //
-// 10 base36 chars fits the budget with room to spare (the server keeps it
-// verbatim, so node ids stay readable) while carrying ~52 bits of randomness:
-// a collision needs on the order of 10^8 machines on one deployment.
+// RongCloud caps a user id at 64 chars and the longest agent prefix is 11
+// (antigravity), so 11 digits still leaves ample room. 10 digits carries
+// 9×10^9 values — collisions need on the order of 10^4-10^5 devices on one
+// deployment before the birthday bound matters, and the id is only ever minted
+// once per machine and persisted.
 export const MACHINE_ID_LENGTH = 10;
-const MACHINE_ID_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz";
 
-// randomMachineId returns a machine id drawn uniformly from
-// MACHINE_ID_ALPHABET. randomBytes gives multiples of 256 values, which is not
-// a multiple of 36, so bytes at or above the cutoff are rejected instead of
-// taken modulo — that keeps the distribution uniform rather than biased toward
-// the first four symbols.
+// drawDigit returns a uniform integer in [min, max]. randomBytes yields
+// multiples of 256 values, and 256 is not a multiple of most spans, so bytes at
+// or above the cutoff are rejected rather than taken modulo — that keeps the
+// distribution uniform instead of favouring the low symbols.
+function drawDigit(min: number, max: number): number {
+  const span = max - min + 1;
+  const cutoff = 256 - (256 % span);
+  for (;;) {
+    const byte = randomBytes(1)[0];
+    if (byte < cutoff) return min + (byte % span);
+  }
+}
+
+// randomMachineId returns a numeric machine id whose first digit is non-zero,
+// matching the ids the Python server has always minted.
 export function randomMachineId(length: number = MACHINE_ID_LENGTH): string {
-  const cutoff = 256 - (256 % MACHINE_ID_ALPHABET.length);
-  let id = "";
+  if (!Number.isInteger(length) || length < 1) {
+    throw new RangeError(`machine id length must be a positive integer, got ${length}`);
+  }
+  let id = String(drawDigit(1, 9));
   while (id.length < length) {
-    for (const byte of randomBytes(length * 2)) {
-      if (byte >= cutoff) continue;
-      id += MACHINE_ID_ALPHABET[byte % MACHINE_ID_ALPHABET.length];
-      if (id.length === length) break;
-    }
+    id += String(drawDigit(0, 9));
   }
   return id;
 }
