@@ -1094,11 +1094,28 @@ func (s *NodeService) findMachineAgentNode(ctx context.Context, workspaceID pgty
 		return db.RongcloudNode{}, false, fmt.Errorf("list nodes: %w", err)
 	}
 	for _, n := range nodes {
-		if n.MachineID == machineID && n.AiType.String == agent {
+		if isAgentNodeOfMachine(n, machineID, agent) {
 			return n, true, nil
 		}
 	}
 	return db.RongcloudNode{}, false, nil
+}
+
+// isAgentNodeOfMachine reports whether n is the node bound to agent on the
+// machine identified by machineID.
+//
+// The machine's own infrastructure node is excluded even though it satisfies
+// the (machine_id, ai_type) match: Register stamps it with the ai_type the
+// device registered under (the CLI's --ai-type, "opencode" by default), so
+// binding that same agent would otherwise resolve to the machinery node and
+// reuse it — and both the device list and the friend list hide that node, so
+// the freshly bound agent would be invisible everywhere. MachineAgentCredentials
+// skips the machine node for exactly the same reason.
+func isAgentNodeOfMachine(n db.RongcloudNode, machineID, agent string) bool {
+	if isMachineNode(n) {
+		return false
+	}
+	return n.MachineID == machineID && n.AiType.String == agent
 }
 
 // ensureAgentNode creates (or reuses) the rongcloud user + node + device

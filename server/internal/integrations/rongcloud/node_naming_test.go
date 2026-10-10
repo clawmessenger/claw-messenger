@@ -124,3 +124,39 @@ func TestRepairLegacyAgentNodeNameIsIdempotent(t *testing.T) {
 		t.Fatalf("second repair changed %q into %q", once, twice)
 	}
 }
+
+// The machine's own node is stamped with the registration ai_type (the CLI's
+// --ai-type, "opencode" by default), so a (machine_id, ai_type) lookup would
+// otherwise resolve it as the opencode agent's node and reuse it. Both the
+// device list and the friend list hide that node, so the agent the user just
+// bound would be invisible everywhere.
+func TestIsAgentNodeOfMachineSkipsTheMachineNode(t *testing.T) {
+	const machine = "1ziviig73i"
+
+	machineNode := testNode(machine, "rc_node_"+machine, "opencode")
+	if isAgentNodeOfMachine(machineNode, machine, "opencode") {
+		t.Fatal("the machine node must never be resolved as an agent's node")
+	}
+
+	opencode := testNode(machine, agentNodeRCUserID("opencode", machine), "opencode")
+	if !isAgentNodeOfMachine(opencode, machine, "opencode") {
+		t.Fatal("the bound opencode node must resolve")
+	}
+
+	// Nodes bound before the "<agent>_<machine>" scheme existed are keyed only
+	// by (machine_id, ai_type) and must still be reused, not duplicated.
+	legacy := testNode(machine, "rc_node_"+machine+"_opencode", "opencode")
+	if !isAgentNodeOfMachine(legacy, machine, "opencode") {
+		t.Fatal("a legacy rc_node_<machine>_<agent> node must still be reused")
+	}
+
+	otherMachine := testNode("9999999999", agentNodeRCUserID("opencode", "9999999999"), "opencode")
+	if isAgentNodeOfMachine(otherMachine, machine, "opencode") {
+		t.Fatal("a node on another machine must not match")
+	}
+
+	hermes := testNode(machine, agentNodeRCUserID("hermes", machine), "hermes")
+	if isAgentNodeOfMachine(hermes, machine, "opencode") {
+		t.Fatal("a different agent on the same machine must not match")
+	}
+}
