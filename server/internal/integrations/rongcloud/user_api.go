@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"strings"
 )
 
 // userInfoResult holds the response from getUserInfo.
@@ -153,4 +154,49 @@ func (c *rongcloudAPIClient) getUserInfo(ctx context.Context, userID string) (us
 		PortraitURI: getString(result, "portraitUri"),
 	}
 	return info, nil
+}
+
+// RemoveFriends deletes the friend edges from userID to targetIDs.
+//
+// The endpoint replaces the whole target set it is given, so passing an empty
+// list is a no-op rather than a "delete everything". RongCloud's hosted friend
+// service counts one call per target, and caps a single request at 100.
+func (c *rongcloudAPIClient) RemoveFriends(ctx context.Context, userID string, targetIDs ...string) error {
+	if len(targetIDs) == 0 {
+		return nil
+	}
+	form := url.Values{
+		"userId":    {userID},
+		"targetIds": {strings.Join(targetIDs, ",")},
+	}
+	_, err := c.postForm(ctx, "/friend/delete.json", form)
+	return err
+}
+
+// FriendIDs returns the ids in a user's RongCloud friend list.
+func (c *rongcloudAPIClient) FriendIDs(ctx context.Context, userID string) ([]string, error) {
+	friends, err := c.getFriends(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(friends))
+	for _, f := range friends {
+		ids = append(ids, f.UserID)
+	}
+	return ids, nil
+}
+
+// DeactivateUser permanently deletes the given users' RongCloud data.
+//
+// RongCloud drops the profile, message history, conversations and push
+// registrations; the user id can only be reactivated empty, so this cannot be
+// undone. It is offered separately from the local row cleanup for that reason,
+// and callers must gate it behind an explicit opt-in.
+func (c *rongcloudAPIClient) DeactivateUser(ctx context.Context, userIDs ...string) error {
+	if len(userIDs) == 0 {
+		return nil
+	}
+	form := url.Values{"userId": {strings.Join(userIDs, ",")}}
+	_, err := c.postForm(ctx, "/user/deactivate.json", form)
+	return err
 }
