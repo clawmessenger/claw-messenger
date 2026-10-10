@@ -238,7 +238,11 @@ describe("createModelCatalogLoader", () => {
 
   it("never rejects and stays empty for agents without a list command", async () => {
     const runCommand = vi.fn();
-    const loader = createModelCatalogLoader({ agentName: "codex", runCommand });
+    const loader = createModelCatalogLoader({
+      agentName: "codex",
+      runCommand,
+      readConfig: () => null,
+    });
     await expect(loader.load()).resolves.toBe(EMPTY_MODEL_CATALOG);
     expect(runCommand).not.toHaveBeenCalled();
   });
@@ -257,6 +261,151 @@ describe("createModelCatalogLoader", () => {
     const [first, second] = await Promise.all([loader.load(), loader.load()]);
     expect(runCommand).toHaveBeenCalledTimes(1);
     expect(first).toBe(second);
+  });
+});
+
+describe("createModelCatalogLoader with provider endpoints", () => {
+  // openclaw's own list is the *built-in* openai catalogue, which is fiction
+  // for a provider that points at a local gateway. Only one entry here so the
+  // replacement is easy to see.
+  const BOGUS_OPENCLAW_LIST = JSON.stringify({
+    count: 1,
+    models: [{ key: "openai/gpt-5.6-sol", name: "GPT-5.6 Sol", tags: ["default"] }],
+  });
+  const OPENCLAW_ENDPOINT = { id: "openai", baseUrl: "http://127.0.0.1:49830/v1" };
+
+  it("unions the CLI list with the endpoint's live models", async () => {
+    const runCommand = vi.fn().mockResolvedValue(BOGUS_OPENCLAW_LIST);
+    const loader = createModelCatalogLoader({
+      agentName: "openclaw",
+      runCommand,
+      readConfig: () => ({ endpoints: [OPENCLAW_ENDPOINT], defaultModel: null }),
+      probe: async () => ["glm-5.2", "deepseek-v4-pro", "kimi-k2.7-code"],
+    });
+
+    const catalog = await loader.load();
+    // The CLI's configured/OAuth entry survives (with its display name) and
+    // the endpoint's pass-through models are added alongside it.
+    expect(catalog.providers).toEqual([
+      {
+        id: "openai",
+        name: "openai",
+        models: [
+          { id: "deepseek-v4-pro", name: "deepseek-v4-pro" },
+          { id: "glm-5.2", name: "glm-5.2" },
+          { id: "gpt-5.6-sol", name: "GPT-5.6 Sol" },
+          { id: "kimi-k2.7-code", name: "kimi-k2.7-code" },
+        ],
+      },
+    ]);
+  });
+
+  it("lets the agent's configured display name win over the raw provider id", async () => {
+    const loader = createModelCatalogLoader({
+      agentName: "openclaw",
+      runCommand: vi.fn().mockResolvedValue(BOGUS_OPENCLAW_LIST),
+      readConfig: () => ({
+        endpoints: [{ ...OPENCLAW_ENDPOINT, name: "Local Gateway" }],
+        defaultModel: null,
+      }),
+      probe: async () => ["glm-5.2"],
+    });
+
+    const catalog = await loader.load();
+    expect(catalog.providers[0].name).toBe("Local Gateway");
+  });
+
+  it("serves codex/hermes purely from their configured endpoint", async () => {
+    const runCommand = vi.fn();
+    const loader = createModelCatalogLoader({
+      agentName: "codex",
+      runCommand,
+      readConfig: () => ({
+        endpoints: [{ id: "quukk_direct", name: "Quukk Direct", baseUrl: "http://127.0.0.1:49830/v1" }],
+        defaultModel: "quukk_direct/glm-5.2",
+      }),
+      probe: async () => ["glm-5.2", "k3"],
+    });
+
+    const catalog = await loader.load();
+    expect(runCommand).not.toHaveBeenCalled();
+    expect(catalog.defaultModel).toBe("quukk_direct/glm-5.2");
+    expect(catalog.providers).toEqual([
+      {
+        id: "quukk_direct",
+        name: "Quukk Direct",
+        models: [
+          { id: "glm-5.2", name: "glm-5.2" },
+          { id: "k3", name: "k3" },
+        ],
+      },
+    ]);
+  });
+
+  it("keeps the CLI list when the endpoint is unreachable", async () => {
+    const loader = createModelCatalogLoader({
+      agentName: "openclaw",
+      runCommand: vi.fn().mockResolvedValue(BOGUS_OPENCLAW_LIST),
+      readConfig: () => ({ endpoints: [OPENCLAW_ENDPOINT], defaultModel: null }),
+      probe: async () => null,
+    });
+
+    const catalog = await loader.load();
+    expect(catalog.providers[0].models.map((m) => m.id)).toEqual(["gpt-5.6-sol"]);
+  });
+
+  it("keeps the CLI list when the endpoint answers with no usable ids", async () => {
+    const loader = createModelCatalogLoader({
+      agentName: "openclaw",
+      runCommand: vi.fn().mockResolvedValue(BOGUS_OPENCLAW_LIST),
+      readConfig: () => ({ endpoints: [OPENCLAW_ENDPOINT], defaultModel: null }),
+      probe: async () => [],
+    });
+
+    const catalog = await loader.load();
+    expect(catalog.providers[0].models.map((m) => m.id)).toEqual(["gpt-5.6-sol"]);
+  });
+
+  it("drops endpoint ids that cannot form a provider/model route", async () => {
+    const loader = createModelCatalogLoader({
+      agentName: "codex",
+      runCommand: vi.fn(),
+      readConfig: () => ({ endpoints: [{ id: "p", baseUrl: "http://127.0.0.1:1/v1" }], defaultModel: null }),
+      probe: async () => ["good", "bad model", "has/slash", "", "also-good"],
+    });
+
+    const catalog = await loader.load();
+    expect(catalog.providers[0].models.map((m) => m.id)).toEqual(["also-good", "good"]);
+  });
+
+  it("still yields the empty catalog when only an unusable endpoint exists", async () => {
+    const loader = createModelCatalogLoader({
+      agentName: "hermes",
+      runCommand: vi.fn(),
+      readConfig: () => ({
+        endpoints: [{ id: "quukk", baseUrl: "https://llmapi.quukk.com/v1" }],
+        defaultModel: "quukk/glm-5.3",
+      }),
+      probe: async () => null,
+    });
+
+    await expect(loader.load()).resolves.toBe(EMPTY_MODEL_CATALOG);
+  });
+
+  it("discards a configured default that is not in the catalog", async () => {
+    const loader = createModelCatalogLoader({
+      agentName: "codex",
+      runCommand: vi.fn(),
+      readConfig: () => ({
+        endpoints: [{ id: "quukk_direct", baseUrl: "http://127.0.0.1:1/v1" }],
+        defaultModel: "quukk_direct/not-served",
+      }),
+      probe: async () => ["glm-5.2"],
+    });
+
+    const catalog = await loader.load();
+    expect(catalog.providers[0].models.map((m) => m.id)).toEqual(["glm-5.2"]);
+    expect(catalog.defaultModel).toBeNull();
   });
 });
 

@@ -1,4 +1,10 @@
 import { stripAnsiCodes } from "./agents.js";
+import {
+  probeProviderModels,
+  readAgentConfig,
+  type AgentConfig,
+  type ProviderEndpoint,
+} from "./model-providers.js";
 
 // Protocol v2 model-catalog responder for the web's 设备管理 → 默认模型 panel.
 //
@@ -46,8 +52,14 @@ export interface ModelListSpec {
 
 // Agents whose CLI can enumerate models as `provider/model` routes — the only
 // shape the web's provider+model dropdowns can persist and hand back to the
-// agent as `--model <provider>/<model>`. openclaw needs the `list` subcommand
-// (`openclaw models` alone prints status, not the catalog).
+// agent. openclaw needs the `list` subcommand (`openclaw models` alone prints
+// status, not the catalog).
+//
+// NOTE: none of these lists is complete on its own. openclaw's covers the
+// provider's configured/OAuth catalogue but not the gateway's pass-through
+// models, and codex/hermes have no usable listing command at all. Endpoint
+// probing (see model-providers.ts) unions the agent's list with the live
+// `/models` answer.
 const AGENT_MODEL_LIST: Readonly<Record<string, ModelListSpec>> = {
   opencode: { argv: ["models"], timeoutMs: 30_000, maxOutputBytes: 256 * 1024 },
   openclaw: { argv: ["models", "list", "--json"], timeoutMs: 60_000, maxOutputBytes: 1024 * 1024 },
@@ -58,34 +70,47 @@ export function modelListSpec(agentName: string | undefined): ModelListSpec | nu
   return AGENT_MODEL_LIST[agentName] ?? null;
 }
 
-/** Groups flat `provider/model` routes into the web's catalog shape. */
-export function catalogFromRoutes(
+interface ProviderGroup {
+  name: string;
+  models: Map<string, string>;
+}
+
+type GroupedProviders = Map<string, ProviderGroup>;
+
+function groupRoutes(
   routes: Iterable<string>,
-  defaultModel: string | null = null,
   names: ReadonlyMap<string, string> = new Map(),
-): DiscussionModelCatalog {
-  const grouped = new Map<string, Map<string, string>>();
+): GroupedProviders {
+  const grouped: GroupedProviders = new Map();
   let scanned = 0;
   for (const route of routes) {
     if (++scanned > MAX_LINES_SCANNED) break;
     const match = ROUTE_RE.exec(route);
     if (!match) continue;
     const [, providerId, modelId] = match;
-    let models = grouped.get(providerId);
-    if (!models) {
+    let group = grouped.get(providerId);
+    if (!group) {
       if (grouped.size >= MAX_PROVIDERS) continue;
-      models = new Map<string, string>();
-      grouped.set(providerId, models);
+      group = { name: providerId, models: new Map() };
+      grouped.set(providerId, group);
     }
-    if (!models.has(modelId) && models.size < MAX_MODELS_PER_PROVIDER) {
-      models.set(modelId, names.get(route) ?? modelId);
+    if (!group.models.has(modelId) && group.models.size < MAX_MODELS_PER_PROVIDER) {
+      group.models.set(modelId, names.get(route) ?? modelId);
     }
   }
+  return grouped;
+}
+
+function finalizeCatalog(
+  grouped: GroupedProviders,
+  defaultModel: string | null,
+): DiscussionModelCatalog {
   const providers = [...grouped.entries()]
-    .map(([id, models]) => ({
+    .filter(([, group]) => group.models.size > 0)
+    .map(([id, group]) => ({
       id,
-      name: id,
-      models: [...models.entries()]
+      name: group.name,
+      models: [...group.models.entries()]
         .map(([modelId, name]) => ({ id: modelId, name }))
         .sort((a, b) => a.id.localeCompare(b.id)),
     }))
@@ -95,7 +120,46 @@ export function catalogFromRoutes(
   const inCatalog = wanted !== null
     && providers.some((provider) => provider.id === wanted.split("/")[0]
       && provider.models.some((model) => model.id === wanted.split("/")[1]));
+  if (providers.length === 0 && !inCatalog) return EMPTY_MODEL_CATALOG;
   return { defaultModel: inCatalog ? wanted : null, providers };
+}
+
+// Folds an endpoint's `/models` answer into the provider group.
+//
+// This is a UNION, not a replacement, and that matters: an agent's own list
+// and the endpoint enumerate different halves. openclaw's `models list` covers
+// the provider's configured/OAuth catalogue (`openai/gpt-5.6-sol`, which the
+// proxy does serve — verified), while `/models` lists the gateway's
+// pass-through models (`glm-5.2`, `deepseek-v4-pro`, …) that openclaw does not
+// know about. Both sets run, so both belong in the panel.
+function mergeEndpointModels(
+  grouped: GroupedProviders,
+  endpoint: ProviderEndpoint,
+  modelIds: readonly string[],
+): number {
+  const group = grouped.get(endpoint.id) ?? { name: endpoint.name ?? endpoint.id, models: new Map() };
+  // A display name from the agent's own config (e.g. codex's
+  // `name = "Quukk Direct"`) beats the raw id.
+  if (endpoint.name) group.name = endpoint.name;
+  let added = 0;
+  for (const modelId of modelIds) {
+    if (group.models.size >= MAX_MODELS_PER_PROVIDER) break;
+    if (group.models.has(modelId)) continue;
+    if (!ROUTE_RE.test(`${endpoint.id}/${modelId}`)) continue;
+    group.models.set(modelId, modelId);
+    added += 1;
+  }
+  grouped.set(endpoint.id, group);
+  return added;
+}
+
+/** Groups flat `provider/model` routes into the web's catalog shape. */
+export function catalogFromRoutes(
+  routes: Iterable<string>,
+  defaultModel: string | null = null,
+  names: ReadonlyMap<string, string> = new Map(),
+): DiscussionModelCatalog {
+  return finalizeCatalog(groupRoutes(routes, names), defaultModel);
 }
 
 // Text output shapes handled here:
@@ -228,6 +292,11 @@ export function buildModelCatalogResponse(
 export interface ModelCatalogLoaderOpts {
   agentName?: string;
   runCommand: (argv: string[], timeoutMs: number, maxOutputBytes: number) => Promise<string>;
+  // Reads the agent's own config (provider endpoints + configured default).
+  // Defaults to the real readers; inject a stub to keep tests hermetic.
+  readConfig?: (agentName: string | undefined) => AgentConfig | null;
+  // Probes one OpenAI-compatible endpoint; `null` = unusable.
+  probe?: (endpoint: ProviderEndpoint) => Promise<string[] | null>;
   logger?: (message: string) => void;
   /** How long a cached catalog is served before a background refresh kicks in. */
   ttlMs?: number;
@@ -243,37 +312,91 @@ export interface ModelCatalogLoader {
 
 const DEFAULT_CACHE_TTL_MS = 5 * 60_000;
 
+function groupsFromCatalog(catalog: DiscussionModelCatalog): GroupedProviders {
+  const grouped: GroupedProviders = new Map();
+  for (const provider of catalog.providers) {
+    if (grouped.size >= MAX_PROVIDERS) break;
+    grouped.set(provider.id, {
+      name: provider.name,
+      models: new Map(provider.models.map((model) => [model.id, model.name])),
+    });
+  }
+  return grouped;
+}
+
 // The web aborts after 8s, while `openclaw models list` alone takes ~10s on a
 // cold start, so a cache-warm path is required for anything beyond opencode.
 export function createModelCatalogLoader(opts: ModelCatalogLoaderOpts): ModelCatalogLoader {
   const spec = modelListSpec(opts.agentName);
+  const readConfig = opts.readConfig ?? ((name: string | undefined) => readAgentConfig(name));
+  const probe = opts.probe ?? ((endpoint: ProviderEndpoint) => probeProviderModels(endpoint));
   const ttlMs = opts.ttlMs ?? DEFAULT_CACHE_TTL_MS;
   const now = opts.now ?? Date.now;
   let cached: DiscussionModelCatalog | null = null;
   let cachedAt = 0;
   let inflight: Promise<DiscussionModelCatalog> | null = null;
 
+  const describe = (err: unknown): string => (err instanceof Error ? err.message : String(err));
+
+  // Never rejects: a failing CLI command or an unreachable endpoint degrades to
+  // whatever we already know rather than taking the panel down with it.
+  const resolveCatalog = async (): Promise<DiscussionModelCatalog> => {
+    const config = readConfig(opts.agentName);
+    const grouped: GroupedProviders = new Map();
+    let defaultModel = config?.defaultModel ?? null;
+
+    if (spec) {
+      const label = `${opts.agentName} ${spec.argv.join(" ")}`;
+      try {
+        const stdout = await opts.runCommand(spec.argv, spec.timeoutMs, spec.maxOutputBytes);
+        const fromCli = parseModelCatalogOutput(opts.agentName, stdout);
+        for (const [id, group] of groupsFromCatalog(fromCli)) grouped.set(id, group);
+        if (!defaultModel) defaultModel = fromCli.defaultModel;
+        opts.logger?.(`model catalog: ${label} -> ${fromCli.providers.length} provider(s)`);
+      } catch (err) {
+        opts.logger?.(`model catalog: ${label} failed: ${describe(err)}`);
+      }
+    }
+
+    const endpoints = config?.endpoints ?? [];
+    if (endpoints.length > 0) {
+      const probed = await Promise.all(
+        endpoints.map(async (endpoint) => ({ endpoint, ids: await probe(endpoint) })),
+      );
+      for (const { endpoint, ids } of probed) {
+        if (!ids) {
+          // A failed probe keeps the CLI's list: a transient outage must not
+          // shrink the panel.
+          opts.logger?.(
+            `model catalog: ${opts.agentName} provider ${endpoint.id} unreachable at ${endpoint.baseUrl}; keeping the CLI list`,
+          );
+          continue;
+        }
+        const added = mergeEndpointModels(grouped, endpoint, ids);
+        opts.logger?.(
+          `model catalog: ${opts.agentName} provider ${endpoint.id} +${added} model(s) from ${endpoint.baseUrl}`,
+        );
+      }
+    }
+
+    return finalizeCatalog(grouped, defaultModel);
+  };
+
   const refresh = (): Promise<DiscussionModelCatalog> => {
     if (inflight) return inflight;
-    if (!spec) {
-      cached = EMPTY_MODEL_CATALOG;
-      cachedAt = now();
-      return Promise.resolve(cached);
-    }
     const startedAt = now();
-    inflight = opts
-      .runCommand(spec.argv, spec.timeoutMs, spec.maxOutputBytes)
-      .then((stdout) => {
-        cached = parseModelCatalogOutput(opts.agentName, stdout);
+    inflight = resolveCatalog()
+      .then((catalog) => {
+        cached = catalog;
         cachedAt = now();
         opts.logger?.(
-          `model catalog: ${opts.agentName} ${spec.argv.join(" ")} -> ${cached.providers.length} provider(s) in ${cachedAt - startedAt}ms`,
+          `model catalog: ${opts.agentName} -> ${catalog.providers.length} provider(s) in ${cachedAt - startedAt}ms`,
         );
-        return cached;
+        return catalog;
       })
       .catch((err: unknown) => {
         opts.logger?.(
-          `model catalog refresh failed after ${now() - startedAt}ms: ${err instanceof Error ? err.message : String(err)}`,
+          `model catalog refresh failed after ${now() - startedAt}ms: ${describe(err)}`,
         );
         return cached ?? EMPTY_MODEL_CATALOG;
       })
