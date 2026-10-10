@@ -224,6 +224,77 @@ export async function discoverAgents(opts: { extraPath?: string }): Promise<Agen
   return found;
 }
 
+export interface RunAgentCommandOpts {
+  execPath: string;
+  argv: string[];
+  timeoutMs?: number;
+  maxOutputBytes?: number;
+  cwd?: string;
+}
+
+const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
+const DEFAULT_COMMAND_MAX_OUTPUT_BYTES = 256 * 1024;
+
+// Runs a short, non-interactive agent subcommand (e.g. `opencode models`) and
+// returns stdout. Shares runAgentTurn's spawn/argv handling but sends no stdin
+// and never applies the prompt-argv strategy.
+export function runAgentCommand(opts: RunAgentCommandOpts): Promise<string> {
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
+  const maxBytes = opts.maxOutputBytes ?? DEFAULT_COMMAND_MAX_OUTPUT_BYTES;
+
+  return new Promise<string>((resolve, reject) => {
+    const { file, args } = buildSpawnInvocation(opts.execPath, opts.argv);
+    const child = spawn(file, args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+      cwd: opts.cwd,
+    });
+
+    const chunks: Buffer[] = [];
+    let totalBytes = 0;
+    let stderr = "";
+    let settled = false;
+
+    const settle = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn();
+    };
+
+    const timer = setTimeout(() => {
+      settle(() => {
+        killProcessTree(child);
+        reject(new Error(`agent command timeout after ${timeoutMs}ms`));
+      });
+    }, timeoutMs);
+
+    child.stdout.on("data", (buf: Buffer) => {
+      if (totalBytes >= maxBytes) return;
+      const room = maxBytes - totalBytes;
+      const slice = buf.length > room ? trimIncompleteUtf8Tail(buf.subarray(0, room)) : buf;
+      chunks.push(slice);
+      totalBytes += slice.length;
+    });
+    child.stderr.on("data", (buf: Buffer) => {
+      stderr = (stderr + buf.toString("utf8")).slice(-2000);
+    });
+    child.on("error", (err) => {
+      settle(() => reject(err));
+    });
+    child.on("close", (code) => {
+      settle(() => {
+        const stdout = Buffer.concat(chunks).toString("utf8");
+        if (code === 0) {
+          resolve(stdout);
+        } else {
+          reject(new Error(`agent command exited with code ${code}: ${stderr}`));
+        }
+      });
+    });
+  });
+}
+
 export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxBytes = opts.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;

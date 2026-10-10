@@ -1,5 +1,12 @@
 import { decodeCommandContent, encodeCommandResult } from "./protocol.js";
 import { buildHtmlCard, extractHtmlFence, htmlRevisePrompt } from "./cards.js";
+import {
+  buildModelCatalogResponse,
+  EMPTY_MODEL_CATALOG,
+  parseModelCatalogRequest,
+  type DiscussionModelCatalog,
+  type ModelCatalogRequest,
+} from "./model-catalog.js";
 
 // Inbound message shape normalized from the IM SDK listener.
 export interface InboundIMMessage {
@@ -22,6 +29,10 @@ export interface IMTransport {
 
 export interface DispatcherDeps {
   send: (toUserId: string, objectName: string, content: string) => Promise<void>;
+  // Enumerates this node's model catalog for the web's 设备管理 → 默认模型 panel.
+  // Omitted (or resolving to an empty catalog) still answers the request, so
+  // the panel degrades to "use the node default model" instead of hanging.
+  loadModelCatalog?: () => Promise<DiscussionModelCatalog>;
 }
 
 export interface TurnRunner {
@@ -61,6 +72,13 @@ export class MessageDispatcher {
     }
 
     if (msg.objectName === "command") {
+      // The model catalog request carries no request_id/action (web protocol
+      // v2), so it can never decode as a discussion command — match it first.
+      const catalogRequest = parseModelCatalogRequest(msg.content);
+      if (catalogRequest) {
+        await this.handleModelCatalogRequest(msg, catalogRequest);
+        return;
+      }
       const cmd = decodeCommandContent(msg.content);
       if (!cmd || cmd.service !== "discussion" || cmd.action !== "your_turn") {
         return;
@@ -96,6 +114,22 @@ export class MessageDispatcher {
         );
       }
     }
+  }
+
+  // Answers the web's 设备管理 → 默认模型 panel. A fetch failure or an agent
+  // with no model-list command still gets a well-formed (empty) catalog back,
+  // so the panel settles on "使用节点默认模型" rather than timing out.
+  private async handleModelCatalogRequest(
+    msg: InboundIMMessage,
+    request: ModelCatalogRequest,
+  ): Promise<void> {
+    let catalog = EMPTY_MODEL_CATALOG;
+    try {
+      catalog = (await this.deps.loadModelCatalog?.()) ?? EMPTY_MODEL_CATALOG;
+    } catch (err) {
+      console.error("model catalog lookup failed:", err instanceof Error ? err.message : err);
+    }
+    await this.deps.send(msg.fromUserId, "command", buildModelCatalogResponse(request, catalog));
   }
 
   // Agent replies containing fenced ```html blocks become preview cards;

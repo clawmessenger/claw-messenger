@@ -1,7 +1,8 @@
 import type { BaseMessage, IAReceivedMessage } from "@rongcloud/imlib-next";
 import type { IMTransport, InboundIMMessage } from "./im.js";
 import { MessageDispatcher } from "./im.js";
-import { runAgentTurn } from "./agents.js";
+import { runAgentTurn, runAgentCommand } from "./agents.js";
+import { createModelCatalogLoader } from "./model-catalog.js";
 import type { StoredCredentials } from "./keystore.js";
 import type { XiachatApi } from "./api.js";
 
@@ -150,8 +151,26 @@ export interface StartRunLoopOpts extends ConnectTransportOpts {
 export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
   await connectTransport(opts);
 
+  // Catalogue the bound agent's models up front: the web's 设备管理 → 默认模型
+  // panel aborts after 8s, and `openclaw models list` alone takes ~10s cold.
+  // Warm-up runs in the background so it never delays message dispatch.
+  const catalogLoader = createModelCatalogLoader({
+    agentName: opts.agentName,
+    runCommand: (argv, timeoutMs, maxOutputBytes) =>
+      runAgentCommand({
+        execPath: opts.agentExecPath,
+        argv,
+        timeoutMs,
+        maxOutputBytes,
+        cwd: opts.cwd,
+      }),
+    logger: (message) => console.error(message),
+  });
+  catalogLoader.warm();
+
   const dispatcher = new MessageDispatcher({
     send: (toUserId, objectName, content) => opts.transport.sendMessage(toUserId, objectName, content),
+    loadModelCatalog: () => catalogLoader.load(),
   });
   // onBusy only receives the conversation key; remember the latest peer per
   // conversation so the busy hint can be addressed (private chat only).
