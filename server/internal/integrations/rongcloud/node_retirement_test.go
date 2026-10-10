@@ -88,6 +88,81 @@ func TestIsLegacyMachineIdentity(t *testing.T) {
 	}
 }
 
+func TestPlanRetirementExplicitMachineIDOverridesLengthRule(t *testing.T) {
+	// "oc5yj7nusm" is 10 base36 chars: it fits the budget, so the length rule
+	// keeps it, yet it is not the "<agent>_<digits>" shape we now mint.
+	nodes := []db.RongcloudNode{
+		retireNode("oc5yj7nusm", "rc_node_oc5yj7nusm"),
+		retireNode("oc5yj7nusm", "rc_node_oc5yj7nusm_hermes"),
+		retireNode("1234567890", "hermes_1234567890"),
+	}
+
+	if got := PlanRetirement(nodes, MachineIdentityBudget, nil); len(got) != 0 {
+		t.Fatalf("length rule planned %d group(s), want none", len(got))
+	}
+
+	groups := PlanRetirement(nodes, MachineIdentityBudget, []string{"oc5yj7nusm"})
+	if len(groups) != 1 {
+		t.Fatalf("planned %d group(s), want 1", len(groups))
+	}
+	if groups[0].MachineID != "oc5yj7nusm" {
+		t.Fatalf("group machine id = %q, want oc5yj7nusm", groups[0].MachineID)
+	}
+	if len(groups[0].Nodes) != 2 {
+		t.Fatalf("group holds %d node(s), want 2", len(groups[0].Nodes))
+	}
+}
+
+func TestPlanRetirementExplicitMachineIDIsExclusive(t *testing.T) {
+	// Naming a group must not drag the length-based sweep along: otherwise a
+	// narrowly scoped retirement silently deletes every legacy device.
+	groups := PlanRetirement([]db.RongcloudNode{
+		retireNode("oc5yj7nusm", "rc_node_oc5yj7nusm"),
+		retireNode(legacyMachineID, "rc_node_m_e99ad19f108d9dad78ad07e3_codex"),
+	}, MachineIdentityBudget, []string{"oc5yj7nusm"})
+
+	if len(groups) != 1 {
+		t.Fatalf("planned %d group(s), want only the named one", len(groups))
+	}
+	if groups[0].MachineID != "oc5yj7nusm" {
+		t.Fatalf("group machine id = %q, want oc5yj7nusm", groups[0].MachineID)
+	}
+}
+
+func TestPlanRetirementExplicitMachineIDTrimsAndIgnoresBlanks(t *testing.T) {
+	nodes := []db.RongcloudNode{retireNode("oc5yj7nusm", "rc_node_oc5yj7nusm")}
+
+	groups := PlanRetirement(nodes, MachineIdentityBudget, []string{" oc5yj7nusm ", "", "   "})
+	if len(groups) != 1 {
+		t.Fatalf("planned %d group(s), want 1", len(groups))
+	}
+
+	if got := PlanRetirement(nodes, MachineIdentityBudget, []string{"", "   "}); len(got) != 0 {
+		t.Fatalf("blank-only allowlist planned %d group(s), want none", len(got))
+	}
+}
+
+func TestPlanRetirementUnmatchedMachineIDFindsNothing(t *testing.T) {
+	groups := PlanRetirement([]db.RongcloudNode{
+		retireNode("oc5yj7nusm", "rc_node_oc5yj7nusm"),
+	}, MachineIdentityBudget, []string{"doesnotexist"})
+
+	if len(groups) != 0 {
+		t.Fatalf("planned %d group(s), want none", len(groups))
+	}
+}
+
+func TestPlanRetirementExplicitMachineIDNeedsARecordedID(t *testing.T) {
+	// A row without a machine id can never be named, so it stays untouched.
+	groups := PlanRetirement([]db.RongcloudNode{
+		retireNode("", "rc_node_clawmessenger-aaaa"),
+	}, MachineIdentityBudget, []string{"oc5yj7nusm"})
+
+	if len(groups) != 0 {
+		t.Fatalf("planned %d group(s), want none", len(groups))
+	}
+}
+
 func TestPlanLegacyNodeRetirementSkipsCurrentNodes(t *testing.T) {
 	groups := PlanLegacyNodeRetirement([]db.RongcloudNode{
 		retireNode("7che3nsv0n", "rc_node_7che3nsv0n"),

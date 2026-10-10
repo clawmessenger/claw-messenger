@@ -11,8 +11,12 @@
 // The CLI used to mint "clawmessenger-<uuid>" (50 chars). RongCloud caps a user
 // id at 64 and the server reserves 33 of them for "rc_node_" + "_" + the
 // longest agent name, leaving 31 for the machine segment; anything longer was
-// sha256-ed into an opaque "m_<24 hex>" key. v0.2.3 mints 10 base36 chars
-// instead, so a device that pairs again gets rc_node_7che3nsv0n_codex.
+// sha256-ed into an opaque "m_<24 hex>" key. v0.2.3 minted 10 base36 chars,
+// which fit the budget but still read as rc_node_oc5yj7nusm_hermes; v0.2.5
+// mints 10 digits, so a device that pairs again gets hermes_1234567890.
+//
+// -max-machine-id sweeps by length. A group that is merely the wrong *shape*
+// but a legal length is retired by naming it: -machine-id oc5yj7nusm.
 //
 // Nothing is written unless -commit is passed. RongCloud account deactivation
 // is irreversible and therefore needs a second, separate opt-in
@@ -22,6 +26,7 @@
 //
 //	go run ./cmd/retire-legacy-nodes -env-file ../.env
 //	go run ./cmd/retire-legacy-nodes -env-file ../.env -commit
+//	go run ./cmd/retire-legacy-nodes -env-file ../.env -machine-id oc5yj7nusm -commit
 //	go run ./cmd/retire-legacy-nodes -env-file ../.env -commit -purge-accounts
 package main
 
@@ -60,7 +65,9 @@ func run() error {
 	workspaceFlag := flag.String("workspace", "", "workspace UUID to scan (default: every workspace that has nodes)")
 	maxMachineID := flag.Int("max-machine-id", rongcloud.MachineIdentityBudget,
 		"retire nodes whose machine id is longer than this; pass 11 to also sweep ids outside the 8-11 character format")
-	commit := flag.Bool("commit", false, "delete the legacy node rows (default is a dry run)")
+	machineIDsFlag := flag.String("machine-id", "",
+		"comma-separated machine ids to retire by name, ignoring the length rule; when set, ONLY these groups are retired")
+	commit := flag.Bool("commit", false, "delete the selected node rows (default is a dry run)")
 	keepFriends := flag.Bool("keep-friends", false, "do not remove the owners' RongCloud friend edges to the retired nodes")
 	purgeAccounts := flag.Bool("purge-accounts", false,
 		"also deactivate the retired nodes' RongCloud accounts; irreversible, deletes their message history")
@@ -121,11 +128,21 @@ func run() error {
 		nodes = append(nodes, wsNodes...)
 	}
 
-	groups := rongcloud.PlanLegacyNodeRetirement(nodes, *maxMachineID)
-	fmt.Printf("scanned %d node(s) across %d workspace(s); %d machine group(s) are legacy\n\n",
-		len(nodes), len(workspaces), len(groups))
+	explicitMachineIDs := splitCSV(*machineIDsFlag)
+	groups := rongcloud.PlanRetirement(nodes, *maxMachineID, explicitMachineIDs)
+	if len(explicitMachineIDs) > 0 {
+		fmt.Printf("scanned %d node(s) across %d workspace(s); %d of %d named machine id(s) matched\n\n",
+			len(nodes), len(workspaces), len(groups), len(explicitMachineIDs))
+	} else {
+		fmt.Printf("scanned %d node(s) across %d workspace(s); %d machine group(s) are legacy\n\n",
+			len(nodes), len(workspaces), len(groups))
+	}
 	if len(groups) == 0 {
-		fmt.Println("nothing to retire — every node already has a short machine id.")
+		if len(explicitMachineIDs) > 0 {
+			fmt.Println("nothing to retire — none of the named machine ids has a node.")
+		} else {
+			fmt.Println("nothing to retire — every node already has a short machine id.")
+		}
 		return nil
 	}
 
@@ -264,6 +281,17 @@ func deleteNodeRows(ctx context.Context, pool *pgxpool.Pool, queries *db.Queries
 		return fmt.Errorf("lookup user: %w", err)
 	}
 	return nil
+}
+
+// splitCSV turns a comma-separated flag into a trimmed, empty-free slice.
+func splitCSV(raw string) []string {
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 func rcUserIDs(nodes []db.RongcloudNode) []string {

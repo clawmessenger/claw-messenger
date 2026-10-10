@@ -6,10 +6,11 @@
 # 背景：RongCloud 用户 id 是账号主键，无法改名。旧版 CLI 铸的 machine id 是
 # clawmessenger-<uuid>（50 字符），超过服务端 31 字符的机器段预算，被 sha256 成
 # m_<24 hex>，于是节点 id 长成 rc_node_m_e99ad19f108d9dad78ad07e3_codex。
-# v0.2.3 起 CLI 改铸 10 位 base36，所以设备【必须重新配对】才能变短：本脚本负责
+# v0.2.3 改铸 10 位 base36（短了但不是想要的形状），v0.2.5 起改铸 10 位纯数字，
+# 节点形如 hermes_1234567890。所以设备【必须重新配对】才能换 id：本脚本负责
 # 删掉老节点组（DB 行 + 好友边 [+ 可选：融云账号]），重新配对由设备端执行。
 #
-# 特性：默认 dry-run（只打印计划，不写任何东西）；自动跳过已经是短 id 的节点组。
+# 特性：默认 dry-run（只打印计划，不写任何东西）；按长度扫描时自动跳过已是短 id 的组。
 #
 # 用法（在 claw-messenger 仓库任意位置执行）：
 #   ./scripts/retire-legacy-nodes.sh                        # 预演：列出将要退役的节点组
@@ -17,11 +18,15 @@
 #   ./scripts/retire-legacy-nodes.sh --commit --purge-accounts
 #                                                           # 同时注销融云账号（不可逆！）
 #   ./scripts/retire-legacy-nodes.sh --max-machine-id 11    # 连 12-31 字符的 id 一起扫
+#   ./scripts/retire-legacy-nodes.sh --machine-id oc5yj7nusm --commit
+#                                                           # 按名字退役指定机器组（忽略长度规则）
 #   ./scripts/retire-legacy-nodes.sh --owner 850509 --commit
 #
 # 透传给底层命令的选项（见 server/cmd/retire-legacy-nodes）：
 #   --workspace <uuid>     只扫指定 workspace（默认：所有含节点的 workspace）
 #   --max-machine-id <n>   机器 id 超过 n 字符即视为老格式（默认 31；传 11 可更严格）
+#   --machine-id <id,..>   按名字退役这些机器组，忽略长度规则；**一旦指定就只退役这些**
+#                          （长度合法的旧形状，如 v0.2.3 的 oc5yj7nusm，只能这样指名退役）
 #   --owner <id[,id...]>   只清理这些 claw 账号的好友边（默认：所有 active 账号）
 #   --keep-friends         不删好友边（只清 DB）
 #   --purge-accounts       同时注销融云账号（不可逆，会删掉该账号的消息历史；需配合 --commit）

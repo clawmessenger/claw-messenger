@@ -20,9 +20,9 @@ const ShortMachineIDMax = 11
 // rc_node_m_e99ad19f108d9dad78ad07e3_codex and the machine identity is lost.
 const MachineIdentityBudget = 31
 
-// LegacyNodeGroup is the set of node rows that belong to one machine and whose
-// RongCloud identities predate short machine ids.
-type LegacyNodeGroup struct {
+// RetirementGroup is the set of node rows that belong to one machine and are to
+// be retired together.
+type RetirementGroup struct {
 	// MachineID is the raw value from rongcloud_node.machine_id. It is empty
 	// for rows created before the column existed, which are legacy by
 	// definition: every registration since has recorded one.
@@ -46,20 +46,39 @@ func IsLegacyMachineIdentity(n db.RongcloudNode, maxMachineIDLength int) bool {
 	return len(id) > maxMachineIDLength
 }
 
-// PlanLegacyNodeRetirement picks the nodes worth retiring and groups them by
-// machine so the caller can report "this device's node group" rather than a
-// flat list. Groups and their nodes are sorted for stable, diffable output.
+// PlanRetirement picks the nodes worth retiring and groups them by machine so
+// the caller can report "this device's node group" rather than a flat list.
+// Groups and their nodes are sorted for stable, diffable output.
 //
-// Retiring is the only way to shrink an existing node id: a RongCloud user id
+// explicitMachineIDs is an allowlist that replaces the length rule: when it is
+// non-empty only those exact machine ids are retired, no matter how short they
+// are. That is how a group that is merely *wrong* rather than *long* gets
+// retired — e.g. the 10-character base36 id v0.2.3 minted, which fits the
+// budget but is not the "<agent>_<digits>" form the panel now shows.
+//
+// Retiring is the only way to change an existing node id: a RongCloud user id
 // is the account's primary key and cannot be renamed, so the device has to
-// re-pair under a fresh short machine id and the old group is deleted. The
+// re-pair under a fresh machine id and the old group is deleted. The
 // alternative — pointing the group at new accounts in place — would rewrite
 // every conversation the owner ever had with the node.
-func PlanLegacyNodeRetirement(nodes []db.RongcloudNode, maxMachineIDLength int) []LegacyNodeGroup {
+func PlanRetirement(nodes []db.RongcloudNode, maxMachineIDLength int, explicitMachineIDs []string) []RetirementGroup {
+	explicit := make(map[string]bool, len(explicitMachineIDs))
+	for _, id := range explicitMachineIDs {
+		if id = strings.TrimSpace(id); id != "" {
+			explicit[id] = true
+		}
+	}
+	selected := func(n db.RongcloudNode) bool {
+		if len(explicit) > 0 {
+			return explicit[strings.TrimSpace(n.MachineID)]
+		}
+		return IsLegacyMachineIdentity(n, maxMachineIDLength)
+	}
+
 	byMachine := make(map[string][]db.RongcloudNode)
 	var order []string
 	for _, n := range nodes {
-		if !IsLegacyMachineIdentity(n, maxMachineIDLength) {
+		if !selected(n) {
 			continue
 		}
 		key := strings.TrimSpace(n.MachineID)
@@ -74,7 +93,7 @@ func PlanLegacyNodeRetirement(nodes []db.RongcloudNode, maxMachineIDLength int) 
 		byMachine[key] = append(byMachine[key], n)
 	}
 
-	groups := make([]LegacyNodeGroup, 0, len(order))
+	groups := make([]RetirementGroup, 0, len(order))
 	for _, key := range order {
 		groupNodes := byMachine[key]
 		sort.Slice(groupNodes, func(i, j int) bool {
@@ -84,7 +103,7 @@ func PlanLegacyNodeRetirement(nodes []db.RongcloudNode, maxMachineIDLength int) 
 		if strings.TrimSpace(groupNodes[0].MachineID) == "" {
 			machineID = ""
 		}
-		groups = append(groups, LegacyNodeGroup{MachineID: machineID, Nodes: groupNodes})
+		groups = append(groups, RetirementGroup{MachineID: machineID, Nodes: groupNodes})
 	}
 	sort.Slice(groups, func(i, j int) bool {
 		if groups[i].MachineID != groups[j].MachineID {
@@ -95,4 +114,11 @@ func PlanLegacyNodeRetirement(nodes []db.RongcloudNode, maxMachineIDLength int) 
 		return groups[i].Nodes[0].RongcloudUserID < groups[j].Nodes[0].RongcloudUserID
 	})
 	return groups
+}
+
+// PlanLegacyNodeRetirement applies the length rule alone: every group whose
+// machine id cannot be derived from a short id is returned. It is
+// PlanRetirement without an explicit allowlist.
+func PlanLegacyNodeRetirement(nodes []db.RongcloudNode, maxMachineIDLength int) []RetirementGroup {
+	return PlanRetirement(nodes, maxMachineIDLength, nil)
 }
