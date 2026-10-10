@@ -772,6 +772,36 @@ func (s *NodeService) DeleteNode(ctx context.Context, id pgtype.UUID) error {
 	return s.queries.DeleteRongCloudNode(ctx, id)
 }
 
+// UnbindNode removes one bound node the way the Python server's claw.unbind did:
+// drop the node row (and its model catalogue), and take the node out of the
+// owner's RongCloud contact list so it also disappears from their friend list.
+//
+// The friend removal is best-effort — a missing edge, or a RongCloud hiccup,
+// must not fail the unbind the user actually asked for. The RongCloud account
+// itself is kept on purpose: "the RongCloud id is the account's primary key",
+// so a later re-bind reuses it instead of minting a duplicate.
+func (s *NodeService) UnbindNode(ctx context.Context, node db.RongcloudNode, ownerRongCloudID string) error {
+	if s.queries == nil {
+		return errors.New("rongcloud: database not configured")
+	}
+	if s.client != nil && ownerRongCloudID != "" && node.RongcloudUserID != "" {
+		if err := s.client.RemoveFriends(ctx, ownerRongCloudID, node.RongcloudUserID); err != nil {
+			s.logger.Warn("rongcloud: remove friend on unbind failed",
+				"owner", ownerRongCloudID, "node_rc", node.RongcloudUserID, "error", err)
+		}
+	}
+	catalogs, err := s.queries.ListRongCloudNodeModelCatalogsByNode(ctx, node.ID)
+	if err != nil {
+		return fmt.Errorf("list node model catalogue: %w", err)
+	}
+	for _, catalog := range catalogs {
+		if err := s.queries.DeleteRongCloudNodeModelCatalog(ctx, catalog.ID); err != nil {
+			return fmt.Errorf("delete node model catalogue: %w", err)
+		}
+	}
+	return s.queries.DeleteRongCloudNode(ctx, node.ID)
+}
+
 func (s *NodeService) DeleteDevice(ctx context.Context, id pgtype.UUID) error {
 	if s.queries == nil {
 		return errors.New("rongcloud: database not configured")

@@ -955,3 +955,41 @@ func (h *Handler) ClawUpdateNode(w http.ResponseWriter, r *http.Request) {
 	}
 	clawJSON(w, 200, 200, "", map[string]interface{}{"ok": true})
 }
+
+// ClawDeleteNode DELETE /api/claw/nodes/{nodeId} —— 旧站「取消绑定 / 删除设备」。
+//
+// 原链路是 IM 通道 claw/unbind，而 Go 兼容层只实现了 ping/chatroom/device/
+// discussion/ai 五个服务，从没有 claw —— 请求被当成 unknown service 丢掉，
+// 浏览器侧的 sendSystemRequest 只能等到超时（用户看到的「claw/unbind 请求超时」）。
+// 与设备列表 / 状态 / 资料更新一样，这里改走 HTTP。
+func (h *Handler) ClawDeleteNode(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.clawRequireClawUser(w, r)
+	if !ok {
+		return
+	}
+	if h.RongCloudNode == nil {
+		clawJSON(w, 503, 503, "RongCloud 渠道未安装", nil)
+		return
+	}
+	nodeID := chi.URLParam(r, "nodeId")
+	if nodeID == "" {
+		clawJSON(w, 400, 400, "缺少节点ID", nil)
+		return
+	}
+	node, err := h.RongCloudNode.GetNodeByNodeID(r.Context(), nodeID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			clawJSON(w, 404, 404, "节点不存在", nil)
+			return
+		}
+		slog.Warn("claw: node delete lookup failed", "nodeId", nodeID, "error", err)
+		clawJSON(w, 500, 500, "查询节点失败", nil)
+		return
+	}
+	if err := h.RongCloudNode.UnbindNode(r.Context(), node, userID); err != nil {
+		slog.Warn("claw: node unbind failed", "nodeId", nodeID, "error", err)
+		clawJSON(w, 500, 500, "取消绑定失败", nil)
+		return
+	}
+	clawJSON(w, 200, 200, "节点删除成功", map[string]interface{}{"ok": true})
+}

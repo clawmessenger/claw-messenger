@@ -1607,6 +1607,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 						r.Post("/api/claw/device/heartbeat", h.ClawDeviceHeartbeat)
 						r.Get("/api/claw/nodes/{nodeId}/status", h.ClawNodeStatus)
 						r.Post("/api/claw/nodes/{nodeId}", h.ClawUpdateNode)
+						r.Delete("/api/claw/nodes/{nodeId}", h.ClawDeleteNode)
 	r.Get("/api/claw/nodes", h.ClawListNodes)
 
 	// ClawMessenger (虾说) compatibility API — 移植自旧 Python 后端的公开契约，
