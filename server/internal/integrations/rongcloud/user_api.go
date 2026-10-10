@@ -28,12 +28,16 @@ func (c *rongcloudAPIClient) getUserToken(ctx context.Context, userID, name, por
 	return token, nil
 }
 
-// refreshUser refreshes a user's info in RongCloud.
+// refreshUser refreshes a user's info in RongCloud. Empty name/portraitURI
+// fields are omitted (RongCloud leaves them untouched), matching the legacy
+// Python client's optional-field semantics.
 func (c *rongcloudAPIClient) refreshUser(ctx context.Context, userID, name, portraitURI string) (string, error) {
-	form := url.Values{
-		"userId":      {userID},
-		"name":        {name},
-		"portraitUri": {portraitURI},
+	form := url.Values{"userId": {userID}}
+	if name != "" {
+		form.Set("name", name)
+	}
+	if portraitURI != "" {
+		form.Set("portraitUri", portraitURI)
 	}
 	result, err := c.postForm(ctx, "/user/refresh.json", form)
 	if err != nil {

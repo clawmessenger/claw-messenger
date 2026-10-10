@@ -1,5 +1,7 @@
 // backfill-friends repairs the RongCloud friend edges for devices that were
-// bound before the bind flow started writing them.
+// bound before the bind flow started writing them, and can re-sync node
+// nicknames to RongCloud (-sync-names) for devices renamed before the rename
+// flow started pushing to RongCloud.
 //
 // The web client's 好友列表 (contact list) reads the RongCloud friend list, so a
 // device bound before BindAgents called /friend/add.json never showed up there.
@@ -15,6 +17,7 @@
 //
 //	go run ./cmd/backfill-friends -env-file ../.env -commit -all-users
 //	go run ./cmd/backfill-friends -env-file ../.env -commit -user 100123,100456
+//	go run ./cmd/backfill-friends -env-file ../.env -commit -sync-names
 package main
 
 import (
@@ -49,6 +52,7 @@ func run() error {
 	commit := flag.Bool("commit", false, "write the friend edges (default is a dry run)")
 	includeOps := flag.Bool("include-ops", false, "also friend the internal ops node (hidden from the friend list by default)")
 	bidirectional := flag.Bool("both", false, "also write the reverse edge (agent -> owner)")
+	syncNames := flag.Bool("sync-names", false, "push every node's database nickname to RongCloud (/user/refresh.json) instead of, or in addition to, friending")
 	dsnFlag := flag.String("dsn", "", "postgres DSN (default: $DATABASE_URL, then $MULTICA_DATABASE_URL)")
 	envFile := flag.String("env-file", "", "load KEY=VALUE environment variables from this file before reading configuration")
 	flag.Parse()
@@ -59,8 +63,8 @@ func run() error {
 		}
 	}
 
-	if *userFlag == "" && !*allUsers {
-		return fmt.Errorf("specify -user <id[,id...]> or -all-users to choose whose friend list to repair")
+	if *userFlag == "" && !*allUsers && !*syncNames {
+		return fmt.Errorf("specify -user <id[,id...]>, -all-users, or -sync-names to choose what to repair")
 	}
 
 	dsn := firstNonEmpty(*dsnFlag, os.Getenv("DATABASE_URL"), os.Getenv("MULTICA_DATABASE_URL"))
@@ -101,7 +105,7 @@ func run() error {
 	if len(workspaces) == 0 {
 		return fmt.Errorf("no rongcloud workspace found to backfill")
 	}
-	if len(users) == 0 {
+	if len(users) == 0 && !*syncNames {
 		return fmt.Errorf("no claw user matched; nothing to do")
 	}
 
@@ -111,39 +115,63 @@ func run() error {
 		DryRun:        !*commit,
 	}
 	if opts.DryRun {
-		fmt.Println("DRY RUN — no friend edges will be written. Re-run with -commit to apply.")
+		fmt.Println("DRY RUN — nothing will be written. Re-run with -commit to apply.")
 	}
-	fmt.Printf("workspaces=%d users=%d include_ops=%v bidirectional=%v\n\n",
-		len(workspaces), len(users), opts.IncludeOps, opts.Bidirectional)
+	fmt.Printf("workspaces=%d users=%d include_ops=%v bidirectional=%v sync_names=%v\n\n",
+		len(workspaces), len(users), opts.IncludeOps, opts.Bidirectional, *syncNames)
 
-	var added, already, failed, planned int
-	for _, ws := range workspaces {
-		outcomes, err := svc.BackfillAgentFriends(ctx, ws, users, opts)
-		if err != nil {
-			return fmt.Errorf("backfill workspace %s: %w", uuidString(ws), err)
-		}
-		for _, o := range outcomes {
-			switch o.Status {
-			case "added":
-				added++
-			case "already":
-				already++
-			case "failed":
-				failed++
-			case "planned":
-				planned++
+	failed := 0
+
+	if *syncNames {
+		for _, ws := range workspaces {
+			outcomes, err := svc.SyncNodeNicknames(ctx, ws, opts)
+			if err != nil {
+				return fmt.Errorf("sync nicknames workspace %s: %w", uuidString(ws), err)
 			}
-			line := fmt.Sprintf("%-7s owner=%s agent=%-10s node=%s", o.Status, o.Owner, o.Agent, o.NodeRC)
-			if o.Error != "" {
-				line += " error=" + o.Error
+			for _, o := range outcomes {
+				if o.Status == "failed" {
+					failed++
+				}
+				line := fmt.Sprintf("%-9s node=%-46s name=%s", o.Status, o.NodeRC, o.Name)
+				if o.Error != "" {
+					line += " error=" + o.Error
+				}
+				fmt.Println(line)
 			}
-			fmt.Println(line)
 		}
+		fmt.Println()
 	}
 
-	fmt.Printf("\nsummary: added=%d already=%d failed=%d planned=%d\n", added, already, failed, planned)
+	if len(users) > 0 {
+		var added, already, planned int
+		for _, ws := range workspaces {
+			outcomes, err := svc.BackfillAgentFriends(ctx, ws, users, opts)
+			if err != nil {
+				return fmt.Errorf("backfill workspace %s: %w", uuidString(ws), err)
+			}
+			for _, o := range outcomes {
+				switch o.Status {
+				case "added":
+					added++
+				case "already":
+					already++
+				case "failed":
+					failed++
+				case "planned":
+					planned++
+				}
+				line := fmt.Sprintf("%-7s owner=%s agent=%-10s node=%s", o.Status, o.Owner, o.Agent, o.NodeRC)
+				if o.Error != "" {
+					line += " error=" + o.Error
+				}
+				fmt.Println(line)
+			}
+		}
+		fmt.Printf("friends summary: added=%d already=%d failed=%d planned=%d\n", added, already, failed, planned)
+	}
+
 	if failed > 0 {
-		return fmt.Errorf("%d friend edge(s) failed", failed)
+		return fmt.Errorf("%d operation(s) failed", failed)
 	}
 	return nil
 }

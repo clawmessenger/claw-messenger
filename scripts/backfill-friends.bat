@@ -9,6 +9,7 @@ REM Usage (from anywhere in the claw-messenger repo):
 REM   scripts\backfill-friends.bat --all-users
 REM   scripts\backfill-friends.bat --all-users --commit
 REM   scripts\backfill-friends.bat --user 100123,100456 --commit
+REM   scripts\backfill-friends.bat --sync-names --commit
 REM
 setlocal enabledelayedexpansion
 

@@ -517,14 +517,25 @@ func (s *NodeService) GetUserByRongCloudID(ctx context.Context, rcUserID string)
 	return s.queries.GetRongCloudUserByRongCloudID(ctx, rcUserID)
 }
 
-// UpdateUserProfile 更新节点关联融云用户的昵称与头像（空串保旧由调用方处理）。
+// UpdateUserProfile 更新节点关联融云用户的昵称与头像（空串保旧由调用方处理），
+// 并同步推送融云侧用户信息（/user/refresh.json）。融云好友列表渲染的是
+// 融云侧的昵称，而 getToken 不会更新已存在用户的信息——若只写本地库，
+// 好友列表会一直显示旧昵称（或裸的用户 id）。
 func (s *NodeService) UpdateUserProfile(ctx context.Context, id pgtype.UUID, name, portrait string) error {
-	_, err := s.queries.UpdateRongCloudUserProfile(ctx, db.UpdateRongCloudUserProfileParams{
+	user, err := s.queries.UpdateRongCloudUserProfile(ctx, db.UpdateRongCloudUserProfileParams{
 		ID:          id,
 		Name:        pgText(name),
 		PortraitUri: pgText(portrait),
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	if s.client != nil && user.RongcloudUserID != "" {
+		if _, err := s.client.refreshUser(ctx, user.RongcloudUserID, name, portrait); err != nil {
+			return fmt.Errorf("rongcloud: refresh user info: %w", err)
+		}
+	}
+	return nil
 }
 
 // ListUserFriends returns a claw/IM user's RongCloud friend list mapped to the
@@ -636,6 +647,69 @@ func (s *NodeService) BackfillAgentFriends(ctx context.Context, workspaceID pgty
 			}
 			outcomes = append(outcomes, outcome)
 		}
+	}
+	return outcomes, nil
+}
+
+// NicknameSyncOutcome records one /user/refresh.json nickname-sync attempt.
+type NicknameSyncOutcome struct {
+	NodeRC string `json:"node_rc"`
+	Name   string `json:"name"`
+	// Status is one of: planned (dry run), refreshed, skipped, failed.
+	Status string `json:"status"`
+	Error  string `json:"error,omitempty"`
+}
+
+// SyncNodeNicknames pushes every node's authoritative database nickname to
+// RongCloud (/user/refresh.json). RongCloud renders the friend list and IM
+// conversations with the RongCloud-side user info, and getToken only sets it
+// at user creation — renames written to the database alone (the behaviour
+// before UpdateUserProfile started pushing to RongCloud) left the friend list
+// showing the initial name or the raw node id. Every node of the workspace is
+// synced, including the hidden machine/ops nodes: they never appear in the
+// friend list, but their IM conversations still render the RongCloud name.
+// Idempotent; nothing is written when opts.DryRun is set.
+func (s *NodeService) SyncNodeNicknames(ctx context.Context, workspaceID pgtype.UUID, opts BackfillFriendsOptions) ([]NicknameSyncOutcome, error) {
+	if s.queries == nil || s.client == nil {
+		return nil, errors.New("rongcloud: service not configured")
+	}
+	nodes, err := s.queries.ListRongCloudNodesByWorkspace(ctx, workspaceID)
+	if err != nil {
+		return nil, fmt.Errorf("rongcloud: list nodes: %w", err)
+	}
+	outcomes := make([]NicknameSyncOutcome, 0, len(nodes))
+	for _, n := range nodes {
+		u, err := s.queries.GetRongCloudUserByRongCloudID(ctx, n.RongcloudUserID)
+		if err != nil {
+			outcomes = append(outcomes, NicknameSyncOutcome{
+				NodeRC: n.RongcloudUserID, Status: "failed",
+				Error: fmt.Sprintf("lookup user: %v", err),
+			})
+			continue
+		}
+		name := u.Name.String
+		if name == "" {
+			outcomes = append(outcomes, NicknameSyncOutcome{
+				NodeRC: n.RongcloudUserID, Status: "skipped",
+				Error: "no nickname stored in database",
+			})
+			continue
+		}
+		if opts.DryRun {
+			outcomes = append(outcomes, NicknameSyncOutcome{
+				NodeRC: n.RongcloudUserID, Name: name, Status: "planned",
+			})
+			continue
+		}
+		if _, err := s.client.refreshUser(ctx, n.RongcloudUserID, name, u.PortraitUri.String); err != nil {
+			outcomes = append(outcomes, NicknameSyncOutcome{
+				NodeRC: n.RongcloudUserID, Name: name, Status: "failed", Error: err.Error(),
+			})
+			continue
+		}
+		outcomes = append(outcomes, NicknameSyncOutcome{
+			NodeRC: n.RongcloudUserID, Name: name, Status: "refreshed",
+		})
 	}
 	return outcomes, nil
 }
@@ -808,12 +882,12 @@ type BoundAgentResult struct {
 // MachineAgentCredential is one bound agent's connection material, handed to
 // the device supervisor so it can spawn the per-agent run loop.
 type MachineAgentCredential struct {
-	Agent          string `json:"agent"`
-	NodeID         string `json:"nodeId"`
-	RongCloudUser  string `json:"rongCloudUser"`
-	Token          string `json:"token"`
-	CredentialID   string `json:"credentialId"`
-	DeviceSecret   string `json:"deviceSecret"`
+	Agent         string `json:"agent"`
+	NodeID        string `json:"nodeId"`
+	RongCloudUser string `json:"rongCloudUser"`
+	Token         string `json:"token"`
+	CredentialID  string `json:"credentialId"`
+	DeviceSecret  string `json:"deviceSecret"`
 }
 
 // BindAgents materialises the user's check-box selection: every selected
@@ -961,6 +1035,17 @@ func (s *NodeService) ensureAgentNode(ctx context.Context, machineNode db.Rongcl
 			ID:             rcUser.ID,
 			TokenEncrypted: pgText(encToken),
 		})
+		// getToken does not update an existing RongCloud user's nickname, so
+		// re-sync the authoritative database name on every re-bind. This also
+		// repairs devices renamed through the web before the rename flow
+		// started pushing to RongCloud. Best-effort: a stale RongCloud-side
+		// nickname must not fail the bind itself.
+		if rcUser.Name.Valid && rcUser.Name.String != "" {
+			if _, err := s.client.refreshUser(ctx, rcUserID, rcUser.Name.String, rcUser.PortraitUri.String); err != nil {
+				s.logger.Warn("rongcloud: refresh agent nickname on rebind failed",
+					"rc_user", rcUserID, "error", err)
+			}
+		}
 	} else {
 		rcUser, err = s.queries.CreateRongCloudUser(ctx, db.CreateRongCloudUserParams{
 			WorkspaceID:     machineNode.WorkspaceID,

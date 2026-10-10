@@ -14,6 +14,7 @@
 #   ./scripts/backfill-friends.sh --all-users --commit   # 真正写入：所有账号
 #   ./scripts/backfill-friends.sh --user 100123,100456 --commit
 #   ./scripts/backfill-friends.sh --user 100123 --workspace <uuid> --commit
+#   ./scripts/backfill-friends.sh --sync-names --commit  # 把库里的节点昵称同步到融云
 #
 # 透传给底层命令的选项（见 server/cmd/backfill-friends）：
 #   --all-users           为所有 status='active' 的 claw 用户补好友
@@ -21,6 +22,8 @@
 #   --workspace <uuid>    只处理指定 workspace（默认：所有含节点的 workspace）
 #   --include-ops         连 ops 运维节点也加好友（默认跳过）
 #   --both                同时写反向好友边（agent -> owner）
+#   --sync-names          把每个节点的库内昵称推送到融云（/user/refresh.json），
+#                         修复"改名后好友列表仍显示节点 id/旧昵称"的历史数据
 #   --commit              真正写库（不加则 dry-run）
 #   --dsn <dsn>           直接指定数据库 DSN
 #   --env-file <path>     指定 .env（默认自动探测仓库根或 server/../.env）
