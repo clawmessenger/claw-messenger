@@ -51,7 +51,22 @@ describe("parseModelCatalogRequest", () => {
       msg_type: "discussion_model_catalog_request",
       protocolVersion: 2,
       requestId: "req-1",
+      timestamp: 1_700_000_000_000,
     });
+  });
+
+  it("accepts a request without a timestamp and rejects a malformed one", () => {
+    expect(parseModelCatalogRequest(JSON.stringify({
+      msg_type: "discussion_model_catalog_request", protocolVersion: 2, requestId: "req-2",
+    }))).toEqual({
+      msg_type: "discussion_model_catalog_request", protocolVersion: 2, requestId: "req-2",
+    });
+    expect(parseModelCatalogRequest(JSON.stringify({
+      msg_type: "discussion_model_catalog_request", protocolVersion: 2, requestId: "req-3", timestamp: "soon",
+    }))).toBeNull();
+    expect(parseModelCatalogRequest(JSON.stringify({
+      msg_type: "discussion_model_catalog_request", protocolVersion: 2, requestId: "req-4", timestamp: 1.5,
+    }))).toBeNull();
   });
 
   it("rejects other commands, wrong versions, bad ids and junk", () => {
@@ -273,7 +288,9 @@ describe("MessageDispatcher model catalog request", () => {
         msg_type: "discussion_model_catalog_request",
         protocolVersion: 2,
         requestId: "req-9",
-        timestamp: 1,
+        // Must be a live timestamp: the dispatcher drops requests the web has
+        // already timed out on (see handleModelCatalogRequest).
+        timestamp: Date.now(),
       }),
       turns,
     );

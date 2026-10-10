@@ -16,6 +16,11 @@ export interface InboundIMMessage {
   targetId: string;
   conversationType: number;
   content: string;
+  // RongCloud's per-message UID, when the SDK provides one. 融云 re-delivers the
+  // full offline history on every reconnect (the Node shim has no IndexDB, so
+  // the SDK cannot record what it already synced), so the run loop uses this to
+  // act on each message exactly once.
+  messageUId?: string;
 }
 
 // Thin transport over @rongcloud/imlib-next so the dispatcher stays testable.
@@ -25,10 +30,18 @@ export interface IMTransport {
   sendMessage(toUserId: string, objectName: string, content: string): Promise<void>;
   onMessage(cb: (msg: InboundIMMessage) => void): void;
   disconnect(): Promise<void>;
+  // The IM user this transport is connected as, once connected. Needed to
+  // drop the node's own echoed messages (see MessageDispatcher.handle).
+  getSelfUserId?: () => string | undefined;
 }
 
 export interface DispatcherDeps {
   send: (toUserId: string, objectName: string, content: string) => Promise<void>;
+  // This node's own RongCloud user id. 融云会把客户端自己发出的消息同步回本端
+  // （多端同步），而 Node 环境没有 IndexDB，SDK 无法去重：节点于是把自己的回复
+  // 当成新的用户提问，无限自问自答，把该会话的队列（每会话并发 1、队列深 1）
+  // 长期占满，真实请求（含模型目录请求）被挤掉或丢弃。
+  selfUserId?: string;
   // Enumerates this node's model catalog for the web's 设备管理 → 默认模型 panel.
   // Omitted (or resolving to an empty catalog) still answers the request, so
   // the panel degrades to "use the node default model" instead of hanging.
@@ -39,14 +52,27 @@ export interface TurnRunner {
   runTurn: (prompt: string, model?: string) => Promise<string>;
 }
 
+// The web's 默认模型 panel aborts after 8s (15s while the node looks offline),
+// so an answer sent later than this can only be wasted — and answering a whole
+// replayed offline backlog at once is what trips RongCloud's send rate limit.
+const STALE_MODEL_CATALOG_REQUEST_MS = 30_000;
+
 export class MessageDispatcher {
   // cardId -> latest html for cards this bridge produced, so card_action
   // iteration (html_revise) can rebuild context. Bounded: evicts oldest.
   private readonly htmlCards = new Map<string, { html: string; fromUserId: string }>();
+  // requestIds already answered, so 融云's per-reconnect offline replay is a
+  // no-op instead of a response burst. Bounded: evicts oldest.
+  private readonly answeredCatalogRequests = new Set<string>();
 
   constructor(private readonly deps: DispatcherDeps) {}
 
   async handle(msg: InboundIMMessage, turns: TurnRunner): Promise<void> {
+    // Never answer our own messages: see DispatcherDeps.selfUserId.
+    if (this.isOwnMessage(msg)) {
+      console.log(`im in: dropping own message type=${msg.objectName} (loop guard)`);
+      return;
+    }
     if (msg.objectName === "RC:TxtMsg") {
       let text = "";
       try {
@@ -116,20 +142,70 @@ export class MessageDispatcher {
     }
   }
 
+  // A node must never treat its own message as a user prompt. 融云 echoes a
+  // client's own outgoing messages back to that same client (multi-device
+  // sync) and the Node shim runs without IndexDB, so the SDK cannot dedupe
+  // them — every reply would come back as a new prompt, forever. That loop
+  // keeps the conversation queue busy (1 slot per conversation) and starves
+  // real traffic: the web's 默认模型 panel then never gets an answer.
+  private isOwnMessage(msg: InboundIMMessage): boolean {
+    const self = this.deps.selfUserId;
+    return Boolean(self) && msg.fromUserId === self;
+  }
+
   // Answers the web's 设备管理 → 默认模型 panel. A fetch failure or an agent
   // with no model-list command still gets a well-formed (empty) catalog back,
   // so the panel settles on "使用节点默认模型" rather than timing out.
+  //
+  // Two guards keep the replay storm from destroying the answer:
+  //  - the web aborts after 8s (15s while offline), so a request older than
+  //    STALE_MODEL_CATALOG_REQUEST_MS is already unanswerable — skip it;
+  //  - 融云 replays the whole offline history on every reconnect, so the same
+  //    requestId arrives again and again — answer each id at most once.
+  // Without these, a single reconnect fires dozens of responses in one tick
+  // and RongCloud rejects them all with 20604 (SEND_FREQUENCY_TOO_FAST).
   private async handleModelCatalogRequest(
     msg: InboundIMMessage,
     request: ModelCatalogRequest,
   ): Promise<void> {
+    if (request.timestamp !== undefined) {
+      const ageMs = Date.now() - request.timestamp;
+      if (ageMs > STALE_MODEL_CATALOG_REQUEST_MS) {
+        console.log(`model catalog: skipping stale request ${request.requestId} (${ageMs}ms old)`);
+        return;
+      }
+    }
+    if (this.answeredCatalogRequests.has(request.requestId)) {
+      console.log(`model catalog: skipping replayed request ${request.requestId} (already answered)`);
+      return;
+    }
     let catalog = EMPTY_MODEL_CATALOG;
+    const startedAt = Date.now();
+    console.log(`model catalog: request ${request.requestId} from ${msg.fromUserId}`);
     try {
       catalog = (await this.deps.loadModelCatalog?.()) ?? EMPTY_MODEL_CATALOG;
     } catch (err) {
       console.error("model catalog lookup failed:", err instanceof Error ? err.message : err);
     }
+    const providers = catalog.providers.length;
+    const models = catalog.providers.reduce((n, p) => n + p.models.length, 0);
     await this.deps.send(msg.fromUserId, "command", buildModelCatalogResponse(request, catalog));
+    // Only remember it once the response is actually on the wire; a failed send
+    // must stay retryable (the transport retries rate-limited sends itself).
+    this.rememberAnsweredCatalogRequest(request.requestId);
+    console.log(
+      `model catalog: answered ${request.requestId} in ${Date.now() - startedAt}ms (${providers} provider(s), ${models} model(s))`,
+    );
+  }
+
+  private rememberAnsweredCatalogRequest(requestId: string): void {
+    this.answeredCatalogRequests.add(requestId);
+    // Bounded: Set keeps insertion order, so drop the oldest entries.
+    while (this.answeredCatalogRequests.size > 256) {
+      const oldest = this.answeredCatalogRequests.values().next().value;
+      if (oldest === undefined) break;
+      this.answeredCatalogRequests.delete(oldest);
+    }
   }
 
   // Agent replies containing fenced ```html blocks become preview cards;

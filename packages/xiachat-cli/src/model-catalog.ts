@@ -176,6 +176,13 @@ export interface ModelCatalogRequest {
   msg_type: "discussion_model_catalog_request";
   protocolVersion: 2;
   requestId: string;
+  // When the web client sent the request (epoch ms), as carried on the wire.
+  // The dispatcher uses it to drop requests the web has already timed out on —
+  // notably 融云's offline backlog, which is replayed in full on every
+  // reconnect (the Node shim has no IndexDB, so the SDK cannot dedupe). Each
+  // replay would otherwise fire dozens of responses at once and trip
+  // RongCloud's SEND_FREQUENCY_TOO_FAST (20604), losing all of them.
+  timestamp?: number;
 }
 
 export function parseModelCatalogRequest(content: string): ModelCatalogRequest | null {
@@ -191,7 +198,16 @@ export function parseModelCatalogRequest(content: string): ModelCatalogRequest |
   if (record.protocolVersion !== 2) return null;
   const requestId = record.requestId;
   if (typeof requestId !== "string" || requestId.length < 1 || requestId.length > 128) return null;
-  return { msg_type: "discussion_model_catalog_request", protocolVersion: 2, requestId };
+  const timestamp = record.timestamp;
+  if (timestamp !== undefined && (typeof timestamp !== "number" || !Number.isSafeInteger(timestamp))) {
+    return null;
+  }
+  return {
+    msg_type: "discussion_model_catalog_request",
+    protocolVersion: 2,
+    requestId,
+    ...(timestamp !== undefined ? { timestamp } : {}),
+  };
 }
 
 export function buildModelCatalogResponse(
@@ -244,16 +260,20 @@ export function createModelCatalogLoader(opts: ModelCatalogLoaderOpts): ModelCat
       cachedAt = now();
       return Promise.resolve(cached);
     }
+    const startedAt = now();
     inflight = opts
       .runCommand(spec.argv, spec.timeoutMs, spec.maxOutputBytes)
       .then((stdout) => {
         cached = parseModelCatalogOutput(opts.agentName, stdout);
         cachedAt = now();
+        opts.logger?.(
+          `model catalog: ${opts.agentName} ${spec.argv.join(" ")} -> ${cached.providers.length} provider(s) in ${cachedAt - startedAt}ms`,
+        );
         return cached;
       })
       .catch((err: unknown) => {
         opts.logger?.(
-          `model catalog refresh failed: ${err instanceof Error ? err.message : String(err)}`,
+          `model catalog refresh failed after ${now() - startedAt}ms: ${err instanceof Error ? err.message : String(err)}`,
         );
         return cached ?? EMPTY_MODEL_CATALOG;
       })

@@ -1,8 +1,70 @@
 // @vitest-environment node
 import { describe, expect, it, vi } from "vitest";
-import { SessionQueue, connectTransport, createBoundedMap } from "./run.js";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { SessionQueue, connectTransport, createBoundedMap, createInboundReplayDedupe } from "./run.js";
 import type { IMTransport } from "./im.js";
 import { XiachatApi } from "./api.js";
+
+describe("createInboundReplayDedupe (offline replay storm)", () => {
+  it("treats each UID as new once, then as a duplicate", () => {
+    const dedupe = createInboundReplayDedupe();
+    expect(dedupe.isDuplicate("uid-1")).toBe(false);
+    expect(dedupe.isDuplicate("uid-1")).toBe(true);
+    expect(dedupe.isDuplicate("uid-2")).toBe(false);
+  });
+
+  it("never dedupes when the SDK omits the UID", () => {
+    const dedupe = createInboundReplayDedupe();
+    expect(dedupe.isDuplicate(undefined)).toBe(false);
+    expect(dedupe.isDuplicate(undefined)).toBe(false);
+  });
+
+  it("stays bounded, forgetting the oldest UIDs", () => {
+    const dedupe = createInboundReplayDedupe(2);
+    expect(dedupe.isDuplicate("a")).toBe(false);
+    expect(dedupe.isDuplicate("b")).toBe(false);
+    expect(dedupe.isDuplicate("c")).toBe(false);
+    expect(dedupe.size).toBe(2);
+    // "a" was evicted, so it looks new again — bounded memory over exactness.
+    expect(dedupe.isDuplicate("a")).toBe(false);
+    expect(dedupe.isDuplicate("c")).toBe(true);
+  });
+
+  it("remembers handled UIDs across restarts so a reconnect is a no-op", () => {
+    const dir = mkdtempSync(join(tmpdir(), "clawmessenger-uids-"));
+    const path = join(dir, "processed-uids.json");
+    try {
+      const first = createInboundReplayDedupe({ path });
+      expect(first.isDuplicate("uid-1")).toBe(false);
+      first.flush();
+
+      // A fresh process (every restart, and every reconnect after a crash)
+      // loads the marker and skips what it already answered.
+      const second = createInboundReplayDedupe({ path });
+      expect(second.size).toBe(1);
+      expect(second.isDuplicate("uid-1")).toBe(true);
+      expect(second.isDuplicate("uid-2")).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("starts clean when the marker file is missing or corrupt", () => {
+    const dir = mkdtempSync(join(tmpdir(), "clawmessenger-uids-"));
+    const path = join(dir, "processed-uids.json");
+    try {
+      expect(createInboundReplayDedupe({ path }).size).toBe(0);
+      writeFileSync(path, "{ not json");
+      expect(createInboundReplayDedupe({ path }).size).toBe(0);
+      writeFileSync(path, JSON.stringify(["ok", 42, null]));
+      expect(createInboundReplayDedupe({ path }).size).toBe(1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("createBoundedMap (busyPeer cap)", () => {
   it("evicts the oldest entry past the cap", () => {

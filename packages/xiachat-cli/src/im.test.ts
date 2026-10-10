@@ -414,3 +414,157 @@ describe("MessageDispatcher Go-server envelope contract", () => {
     expect(content.request_id).toBe("r_no_room");
   });
 });
+
+describe("MessageDispatcher self-echo loop guard", () => {
+  // 融云会把本端自己发出的消息同步回本端；Node 环境没有 IndexDB，SDK 无法
+  // 去重。若节点把自己的回复当用户提问，就会无限自问自答，并把会话队列占满，
+  // 使真实的模型目录请求被丢弃（设备管理 → 默认模型 一直转圈）。
+  it("ignores text messages sent by this node itself", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send, selfUserId: "rc_node_self" });
+    let turns = 0;
+    await dispatcher.handle(
+      {
+        objectName: "RC:TxtMsg",
+        fromUserId: "rc_node_self",
+        toUserId: "",
+        targetId: "rc_node_self",
+        conversationType: 1,
+        content: JSON.stringify({ content: "好的，我在。请发需求。" }),
+      },
+      { runTurn: async () => { turns += 1; return "should not run"; } },
+    );
+    expect(turns).toBe(0);
+    expect(deps.sent).toHaveLength(0);
+  });
+
+  it("still answers the same text when it comes from a real user", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send, selfUserId: "rc_node_self" });
+    await dispatcher.handle(
+      {
+        objectName: "RC:TxtMsg",
+        fromUserId: "user_1",
+        toUserId: "",
+        targetId: "user_1",
+        conversationType: 1,
+        content: JSON.stringify({ content: "在吗" }),
+      },
+      { runTurn: async () => "在的" },
+    );
+    expect(deps.sent).toHaveLength(1);
+    expect(deps.sent[0].to).toBe("user_1");
+  });
+
+  it("answers a model catalog request from a real user even with the guard on", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({
+      send: deps.send,
+      selfUserId: "rc_node_self",
+      loadModelCatalog: async () => ({
+        defaultModel: null,
+        providers: [{ id: "prov", name: "prov", models: [{ id: "m", name: "m" }] }],
+      }),
+    });
+    await dispatcher.handle(
+      {
+        objectName: "command",
+        fromUserId: "user_1",
+        toUserId: "",
+        targetId: "user_1",
+        conversationType: 1,
+        content: JSON.stringify({
+          msg_type: "discussion_model_catalog_request",
+          protocolVersion: 2,
+          requestId: "req-1",
+          timestamp: Date.now(),
+        }),
+      },
+      { runTurn: async () => "unused" },
+    );
+    expect(deps.sent).toHaveLength(1);
+    expect(deps.sent[0].to).toBe("user_1");
+    const body = JSON.parse(deps.sent[0].content);
+    expect(body.msg_type).toBe("discussion_model_catalog_response");
+    expect(body.requestId).toBe("req-1");
+    expect(body.providers).toHaveLength(1);
+  });
+});
+
+describe("MessageDispatcher model catalog replay guards", () => {
+  // 融云在每次重连时会把整段离线消息重放一遍（Node 端没有 IndexDB，SDK 无法
+  // 去重）。若不设防，一次重连就会在同一个 tick 内发出几十条应答，被融云的
+  // 发送频率限制（20604）整体拒绝 —— web 的「默认模型」面板因此永远拿不到目录。
+  function requestContent(requestId: string, timestamp?: number): string {
+    return JSON.stringify({
+      msg_type: "discussion_model_catalog_request",
+      protocolVersion: 2,
+      requestId,
+      ...(timestamp === undefined ? {} : { timestamp }),
+    });
+  }
+
+  function requestMessage(requestId: string, timestamp?: number) {
+    return {
+      objectName: "command",
+      fromUserId: "user_1",
+      toUserId: "",
+      targetId: "user_1",
+      conversationType: 1,
+      content: requestContent(requestId, timestamp),
+    };
+  }
+
+  const catalog = {
+    defaultModel: null,
+    providers: [{ id: "prov", name: "prov", models: [{ id: "m", name: "m" }] }],
+  };
+
+  it("does not answer a request the web has already timed out on", async () => {
+    const deps = makeDeps();
+    let loads = 0;
+    const dispatcher = new MessageDispatcher({
+      send: deps.send,
+      loadModelCatalog: async () => { loads += 1; return catalog; },
+    });
+    await dispatcher.handle(requestMessage("req-old", Date.now() - 5 * 60_000), {
+      runTurn: async () => "unused",
+    });
+    expect(loads).toBe(0);
+    expect(deps.sent).toHaveLength(0);
+  });
+
+  it("answers each requestId at most once, however many times it is replayed", async () => {
+    const deps = makeDeps();
+    let loads = 0;
+    const dispatcher = new MessageDispatcher({
+      send: deps.send,
+      loadModelCatalog: async () => { loads += 1; return catalog; },
+    });
+    const turns = { runTurn: async () => "unused" };
+    for (let i = 0; i < 3; i += 1) {
+      await dispatcher.handle(requestMessage("req-dup", Date.now()), turns);
+    }
+    expect(loads).toBe(1);
+    expect(deps.sent).toHaveLength(1);
+    expect(JSON.parse(deps.sent[0].content).requestId).toBe("req-dup");
+  });
+
+  it("keeps a requestId retryable when the response never left the node", async () => {
+    const sent: string[] = [];
+    let attempts = 0;
+    const dispatcher = new MessageDispatcher({
+      send: async (_to, _objectName, content) => {
+        attempts += 1;
+        if (attempts === 1) throw new Error("imlib sendMessage failed: 20604");
+        sent.push(content);
+      },
+      loadModelCatalog: async () => catalog,
+    });
+    const turns = { runTurn: async () => "unused" };
+    await expect(dispatcher.handle(requestMessage("req-retry", Date.now()), turns)).rejects.toThrow();
+    await dispatcher.handle(requestMessage("req-retry", Date.now()), turns);
+    expect(sent).toHaveLength(1);
+    expect(JSON.parse(sent[0]).requestId).toBe("req-retry");
+  });
+});

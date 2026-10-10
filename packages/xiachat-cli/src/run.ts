@@ -1,8 +1,10 @@
 import type { BaseMessage, IAReceivedMessage } from "@rongcloud/imlib-next";
-import type { IMTransport, InboundIMMessage } from "./im.js";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+import type { IMTransport, InboundIMMessage, TurnRunner } from "./im.js";
 import { MessageDispatcher } from "./im.js";
 import { runAgentTurn, runAgentCommand } from "./agents.js";
-import { createModelCatalogLoader } from "./model-catalog.js";
+import { createModelCatalogLoader, parseModelCatalogRequest } from "./model-catalog.js";
 import type { StoredCredentials } from "./keystore.js";
 import type { XiachatApi } from "./api.js";
 
@@ -103,6 +105,85 @@ export function conversationKeyOf(msg: InboundIMMessage): string {
   return `${msg.conversationType}:${msg.targetId}`;
 }
 
+// RongCloud re-delivers the entire offline history on every reconnect and the
+// Node shim has no IndexDB for the SDK to record what it already synced. Acting
+// on each replay again re-runs agent turns for messages answered long ago — a
+// send storm RongCloud then rejects with 20604 (SEND_FREQUENCY_TOO_FAST), which
+// is what leaves the web's 默认模型 panel without an answer. This keeps the run
+// loop to exactly one dispatch per message UID.
+export interface InboundReplayDedupe {
+  // true when this UID has already been dispatched. A missing UID is never a
+  // duplicate, so an SDK that omits it degrades to the old behaviour.
+  isDuplicate(messageUId: string | undefined): boolean;
+  // Persist immediately instead of waiting for the debounce (flush on shutdown).
+  flush(): void;
+  readonly size: number;
+}
+
+export interface InboundReplayDedupeOpts {
+  // Where to keep the UID set between runs. Omitted -> pure in-memory (tests).
+  path?: string;
+  maxEntries?: number;
+  // Debounce for disk writes; each reconnect can add hundreds of UIDs.
+  flushDelayMs?: number;
+}
+
+export function createInboundReplayDedupe(
+  opts: InboundReplayDedupeOpts | number = {},
+): InboundReplayDedupe {
+  const { path, maxEntries = 2000, flushDelayMs = 1_000 } =
+    typeof opts === "number" ? { maxEntries: opts } : opts;
+  const seen = new Set<string>(readProcessedUids(path));
+  // Insertion order is the eviction order, so the oldest UIDs go first.
+  const evict = (): void => {
+    while (seen.size > maxEntries) {
+      const oldest = seen.values().next().value;
+      if (oldest === undefined) break;
+      seen.delete(oldest);
+    }
+  };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const flush = (): void => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = undefined;
+    }
+    if (!path) return;
+    try {
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, JSON.stringify([...seen]), { mode: 0o600 });
+    } catch (err) {
+      // Best effort: losing the marker only costs a re-dispatch next connect.
+      console.error("processed-uids write failed:", err instanceof Error ? err.message : err);
+    }
+  };
+  return {
+    isDuplicate(messageUId) {
+      if (!messageUId) return false;
+      if (seen.has(messageUId)) return true;
+      seen.add(messageUId);
+      evict();
+      if (path && !timer) timer = setTimeout(flush, flushDelayMs);
+      return false;
+    },
+    flush,
+    get size() {
+      return seen.size;
+    },
+  };
+}
+
+function readProcessedUids(path: string | undefined): string[] {
+  if (!path) return [];
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+    return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === "string") : [];
+  } catch {
+    // Missing or corrupt: start clean rather than refuse to run.
+    return [];
+  }
+}
+
 // Bounded LRU-ish map (the run loop's busyPeer tracker): Map preserves
 // insertion order, so on insert past the cap the oldest entry is evicted;
 // a re-set refreshes recency via delete+set.
@@ -146,6 +227,9 @@ export interface StartRunLoopOpts extends ConnectTransportOpts {
   turnTimeoutMs?: number;
   // Working directory for agent turns; see RunAgentTurnOpts.cwd.
   cwd?: string;
+  // Where to persist the processed-message markers (see
+  // createInboundReplayDedupe). Omitted -> in-memory only.
+  processedUidsPath?: string;
 }
 
 export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
@@ -171,7 +255,19 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
   const dispatcher = new MessageDispatcher({
     send: (toUserId, objectName, content) => opts.transport.sendMessage(toUserId, objectName, content),
     loadModelCatalog: () => catalogLoader.load(),
+    selfUserId: opts.transport.getSelfUserId?.(),
   });
+  const turns: TurnRunner = {
+    runTurn: (prompt, model) =>
+      runAgentTurn({
+        execPath: opts.agentExecPath,
+        agentName: opts.agentName,
+        prompt,
+        model: opts.model ?? model,
+        timeoutMs: opts.turnTimeoutMs ?? 120_000,
+        cwd: opts.cwd,
+      }),
+  };
   // onBusy only receives the conversation key; remember the latest peer per
   // conversation so the busy hint can be addressed (private chat only).
   // Bounded so a hostile/long-lived peer stream cannot grow it forever.
@@ -192,25 +288,46 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
     },
   });
 
+  const selfUserId = opts.transport.getSelfUserId?.();
+  const replayDedupe = createInboundReplayDedupe({ path: opts.processedUidsPath });
+  if (opts.processedUidsPath) {
+    // The write is debounced, so a clean shutdown must not drop the last batch.
+    process.once("exit", () => replayDedupe.flush());
+    const flushAndExit = (): void => {
+      replayDedupe.flush();
+      process.exit(0);
+    };
+    process.once("SIGINT", flushAndExit);
+    process.once("SIGTERM", flushAndExit);
+  }
   opts.transport.onMessage((msg) => {
     // IM observability: every inbound message is logged so smoke runs can
     // tell "message never arrived" from "dispatch failed".
     console.log(`im in: type=${msg.objectName} from=${msg.fromUserId} conv=${msg.conversationType}`);
+    // 融云会把本端自己发出的消息同步回本端。若把它当用户提问，节点就会对自己
+    // 的每条回复再回复一次，形成无限自问自答，并把该会话队列长期占满，真实请求
+    // （包括模型目录请求）会被饿死或直接丢弃。
+    if (selfUserId && msg.fromUserId === selfUserId) {
+      console.log("im in: dropping own message (loop guard)");
+      return;
+    }
+    if (replayDedupe.isDuplicate(msg.messageUId)) {
+      console.log(`im in: dropping replayed message uid=${msg.messageUId}`);
+      return;
+    }
     const key = conversationKeyOf(msg);
     busyPeer.set(key, msg.fromUserId);
+    // 模型目录请求是廉价的协议查询，web 侧只等 8s。若走会话队列，一次长 agent
+    // 回合（最长 120s）会把它拖过超时，或因为队列只有 1 个等待位而被直接丢弃。
+    if (msg.objectName === "command" && parseModelCatalogRequest(msg.content)) {
+      void dispatcher.handle(msg, turns).catch((err: unknown) => {
+        console.error("dispatch failed:", err instanceof Error ? err.message : err);
+      });
+      return;
+    }
     queue.enqueue(key, async () => {
       try {
-        await dispatcher.handle(msg, {
-          runTurn: (prompt, model) =>
-            runAgentTurn({
-              execPath: opts.agentExecPath,
-              agentName: opts.agentName,
-              prompt,
-              model: opts.model ?? model,
-              timeoutMs: opts.turnTimeoutMs ?? 120_000,
-              cwd: opts.cwd,
-            }),
-        });
+        await dispatcher.handle(msg, turns);
       } catch (err) {
         // Carried fix from Task 7 review: dispatcher.handle rejections
         // (including error-path send failures that escape) must never crash
@@ -258,6 +375,18 @@ export async function connectTransport(opts: ConnectTransportOpts): Promise<void
 // test (spec 7.2); unit tests inject fakes.
 type CommandMessageCtor = new (content: Record<string, unknown>) => BaseMessage<Record<string, unknown>>;
 
+// RongCloud rejects a send with 20604 (SEND_FREQUENCY_TOO_FAST) when the client
+// bursts past its per-user rate limit. Reconnects replay the whole offline
+// backlog at once, so this is a normal transient — a dropped response here is
+// what leaves the web's 默认模型 panel hanging. Retry with backoff instead.
+const SEND_FREQUENCY_TOO_FAST = 20604;
+const SEND_RETRY_ATTEMPTS = 4;
+const SEND_RETRY_BASE_MS = 250;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export async function createImlibTransport(): Promise<IMTransport> {
   // imlib-next is browser-built; give it the minimal Node globals it
   // touches (window/localStorage/XHR) before importing.
@@ -266,6 +395,9 @@ export async function createImlibTransport(): Promise<IMTransport> {
   const imlib = await import("@rongcloud/imlib-next");
   const listeners: Array<(msg: InboundIMMessage) => void> = [];
   const customMessages = new Map<string, CommandMessageCtor>();
+  // The user id this transport is logged in as, captured at connect time so
+  // the run loop can drop RongCloud's echoes of our own sent messages.
+  let selfUserId: string | undefined;
 
   const toBaseMessage = (objectName: string, content: string): BaseMessage<never> => {
     if (objectName === "RC:TxtMsg") {
@@ -298,6 +430,7 @@ export async function createImlibTransport(): Promise<IMTransport> {
       if (!res.isOk) {
         throw new Error(`imlib connect failed: ${res.code} ${res.msg}`);
       }
+      selfUserId = res.data?.userId || imlib.getCurrentUserId() || undefined;
       imlib.addEventListener(imlib.Events.MESSAGES, (evt: { messages: IAReceivedMessage[] }) => {
         for (const m of evt.messages) {
           const raw = m.content as unknown;
@@ -310,6 +443,7 @@ export async function createImlibTransport(): Promise<IMTransport> {
               targetId: m.targetId,
               conversationType: m.conversationType,
               content,
+              ...(m.messageUId ? { messageUId: m.messageUId } : {}),
             });
           }
         }
@@ -317,13 +451,22 @@ export async function createImlibTransport(): Promise<IMTransport> {
     },
     async sendMessage(toUserId: string, objectName: string, content: string): Promise<void> {
       const conversation = { conversationType: imlib.ConversationType.PRIVATE, targetId: toUserId };
-      const res = await imlib.sendMessage(conversation, toBaseMessage(objectName, content));
-      if (!res.isOk) {
-        throw new Error(`imlib sendMessage failed: ${res.code} ${res.msg}`);
+      const message = toBaseMessage(objectName, content);
+      for (let attempt = 1; ; attempt += 1) {
+        const res = await imlib.sendMessage(conversation, message);
+        if (res.isOk) return;
+        if (res.code !== SEND_FREQUENCY_TOO_FAST || attempt >= SEND_RETRY_ATTEMPTS) {
+          throw new Error(`imlib sendMessage failed: ${res.code} ${res.msg}`);
+        }
+        // Back off and try again: 250ms, 500ms, 1s.
+        await sleep(SEND_RETRY_BASE_MS * 2 ** (attempt - 1));
       }
     },
     onMessage(cb): void {
       listeners.push(cb);
+    },
+    getSelfUserId(): string | undefined {
+      return selfUserId || imlib.getCurrentUserId() || undefined;
     },
     async disconnect(): Promise<void> {
       await imlib.disconnect();

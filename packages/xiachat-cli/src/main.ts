@@ -5,7 +5,7 @@ import * as os from "node:os";
 import { Keystore, type StoredCredentials } from "./keystore.js";
 import { XiachatApi } from "./api.js";
 import { discoverAgents } from "./agents.js";
-import { DEFAULT_SERVER_URL, machineId } from "./config.js";
+import { DEFAULT_SERVER_URL, machineId, defaultProcessedUidsPath } from "./config.js";
 import { ensureOpencodeInstalled, OPS_AGENT_NAME, OPS_TURN_TIMEOUT_MS, setupOpsWorkdir } from "./ops.js";
 
 // Deterministic per (ticket, machine): a retried claim after a lost
@@ -33,7 +33,7 @@ export function buildProgram(opts: BuildProgramOpts): Command {
   program
     .name("clawmessenger")
     .description("User-device agent CLI over RongCloud IM")
-    .version("0.2.1")
+    .version("0.2.2")
     // Tests parse this program in-process; commander would otherwise
     // process.exit on missing options and kill the vitest runner.
     .exitOverride();
@@ -220,6 +220,7 @@ export function buildProgram(opts: BuildProgramOpts): Command {
           stdout: opts.stdout,
           turnTimeoutMs,
           cwd,
+          processedUidsPath: defaultProcessedUidsPath(creds.nodeId),
         });
       } finally {
         clearInterval(hb);
