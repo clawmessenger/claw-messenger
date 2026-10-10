@@ -123,22 +123,31 @@ func run() error {
 	failed := 0
 
 	if *syncNames {
+		var renamed, refreshed, skipped int
 		for _, ws := range workspaces {
 			outcomes, err := svc.SyncNodeNicknames(ctx, ws, opts)
 			if err != nil {
 				return fmt.Errorf("sync nicknames workspace %s: %w", uuidString(ws), err)
 			}
 			for _, o := range outcomes {
-				if o.Status == "failed" {
+				switch o.Status {
+				case "failed":
 					failed++
+				case "renamed":
+					renamed++
+				case "refreshed":
+					refreshed++
+				case "skipped":
+					skipped++
 				}
-				line := fmt.Sprintf("%-9s node=%-46s name=%s", o.Status, o.NodeRC, o.Name)
+				line := fmt.Sprintf("%-15s node=%-46s name=%s", o.Status, o.NodeRC, o.Name)
 				if o.Error != "" {
 					line += " error=" + o.Error
 				}
 				fmt.Println(line)
 			}
 		}
+		fmt.Printf("nickname summary: renamed=%d refreshed=%d skipped=%d failed=%d\n", renamed, refreshed, skipped, failed)
 		fmt.Println()
 	}
 

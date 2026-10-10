@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -660,7 +661,8 @@ func (s *NodeService) BackfillAgentFriends(ctx context.Context, workspaceID pgty
 type NicknameSyncOutcome struct {
 	NodeRC string `json:"node_rc"`
 	Name   string `json:"name"`
-	// Status is one of: planned (dry run), refreshed, skipped, failed.
+	// Status is one of: planned (dry run), planned-rename (dry run, legacy
+	// default name to rewrite), renamed, refreshed, skipped, failed.
 	Status string `json:"status"`
 	Error  string `json:"error,omitempty"`
 }
@@ -697,6 +699,29 @@ func (s *NodeService) SyncNodeNicknames(ctx context.Context, workspaceID pgtype.
 			outcomes = append(outcomes, NicknameSyncOutcome{
 				NodeRC: n.RongcloudUserID, Status: "skipped",
 				Error: "no nickname stored in database",
+			})
+			continue
+		}
+		// Names minted by the old default embedded the internal machine node id
+		// ("node_587ae8bb0ef54b26 (hermes)"), which is what the contact list
+		// showed for every node the owner had never renamed. Rewriting the row
+		// before pushing keeps the database and RongCloud in step — the device
+		// list reads the stored name, not the RongCloud one.
+		if repaired := repairLegacyAgentNodeName(name); repaired != name {
+			if opts.DryRun {
+				outcomes = append(outcomes, NicknameSyncOutcome{
+					NodeRC: n.RongcloudUserID, Name: repaired, Status: "planned-rename",
+				})
+				continue
+			}
+			if err := s.UpdateUserProfile(ctx, u.ID, repaired, u.PortraitUri.String); err != nil {
+				outcomes = append(outcomes, NicknameSyncOutcome{
+					NodeRC: n.RongcloudUserID, Name: repaired, Status: "failed", Error: err.Error(),
+				})
+				continue
+			}
+			outcomes = append(outcomes, NicknameSyncOutcome{
+				NodeRC: n.RongcloudUserID, Name: repaired, Status: "renamed",
 			})
 			continue
 		}
@@ -1024,6 +1049,31 @@ func agentNodeRCUserID(agent, machineID string) string {
 	return agent + "_" + machineIdentityKey(machineID)
 }
 
+// DefaultAgentNodeName is the display name an agent node carries until its
+// owner renames it: the agent type itself ("hermes"). Everything user-facing —
+// the contact list, IM session titles, the web device list — renders this
+// RongCloud-side name, so it must never embed an internal identifier.
+func DefaultAgentNodeName(agent string) string {
+	return strings.TrimSpace(agent)
+}
+
+// legacyDefaultAgentNodeName matches the display name ensureAgentNode used to
+// mint: "<machine node id> (<agent>)", e.g. "node_587ae8bb0ef54b26 (hermes)".
+// The leading node id is internal plumbing, so the web contact list rendered
+// the node id instead of a name for every node the owner had not renamed.
+var legacyDefaultAgentNodeName = regexp.MustCompile(`^node_[0-9a-f]+ \(([A-Za-z0-9_-]+)\)$`)
+
+// repairLegacyAgentNodeName rewrites one of those legacy defaults into the
+// current default, and returns any other name (i.e. an owner's rename)
+// untouched.
+func repairLegacyAgentNodeName(name string) string {
+	match := legacyDefaultAgentNodeName.FindStringSubmatch(name)
+	if match == nil {
+		return name
+	}
+	return DefaultAgentNodeName(match[1])
+}
+
 // agentNodeBinding is what ensureAgentNode resolves for one agent: the stable
 // node id the web stores, plus the RongCloud user id that owns the agent's IM
 // account (needed to add the node to an owner's friend list).
@@ -1065,7 +1115,9 @@ func (s *NodeService) ensureAgentNode(ctx context.Context, machineNode db.Rongcl
 	if found && existing.RongcloudUserID != "" {
 		rcUserID = existing.RongcloudUserID
 	}
-	name := fmt.Sprintf("%s (%s)", machineNode.NodeID, agent)
+	// Default display name only — a node the owner renamed keeps its name below,
+	// where the stored row wins over this value.
+	name := DefaultAgentNodeName(agent)
 	token, err := s.client.getUserToken(ctx, rcUserID, name, "")
 	if err != nil {
 		return agentNodeBinding{}, fmt.Errorf("getUserToken: %w", err)

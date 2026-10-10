@@ -76,3 +76,51 @@ func TestAgentNodeIsNotTheMachineNode(t *testing.T) {
 		t.Fatal("machine node must stay hidden")
 	}
 }
+
+// The contact list renders the RongCloud-side name, so an agent node that was
+// never renamed must still carry a human-readable name — not the internal
+// machine node id that used to be glued on as "<machine node id> (<agent>)".
+func TestDefaultAgentNodeNameIsTheAgentOnly(t *testing.T) {
+	if got := DefaultAgentNodeName("hermes"); got != "hermes" {
+		t.Fatalf("DefaultAgentNodeName(hermes) = %q, want %q", got, "hermes")
+	}
+	if got := DefaultAgentNodeName("  codex  "); got != "codex" {
+		t.Fatalf("DefaultAgentNodeName should trim, got %q", got)
+	}
+	if strings.HasPrefix(DefaultAgentNodeName("hermes"), "node_") {
+		t.Fatal("default agent name must not look like an internal node id")
+	}
+}
+
+func TestRepairLegacyAgentNodeName(t *testing.T) {
+	cases := []struct {
+		stored string
+		want   string
+	}{
+		// Minted by the old default: machine node id + agent.
+		{"node_587ae8bb0ef54b26 (hermes)", "hermes"},
+		{"node_b6bcaeae05bd4343 (opencode)", "opencode"},
+		{"node_587ae8bb0ef54b26 (ops)", "ops"},
+		// Owner-chosen names must survive untouched.
+		{"我的电脑", "我的电脑"},
+		{"小酒 hermes", "小酒 hermes"},
+		{"node_587ae8bb0ef54b26", "node_587ae8bb0ef54b26"},
+		{"device (hermes)", "device (hermes)"},
+		{"node_587ae8bb0ef54b26 (hermes) 备用", "node_587ae8bb0ef54b26 (hermes) 备用"},
+		{"", ""},
+	}
+	for _, tc := range cases {
+		if got := repairLegacyAgentNodeName(tc.stored); got != tc.want {
+			t.Errorf("repairLegacyAgentNodeName(%q) = %q, want %q", tc.stored, got, tc.want)
+		}
+	}
+}
+
+// Repair is idempotent: a name that is already repaired must not be rewritten
+// again on the next --sync-names run.
+func TestRepairLegacyAgentNodeNameIsIdempotent(t *testing.T) {
+	once := repairLegacyAgentNodeName("node_587ae8bb0ef54b26 (hermes)")
+	if twice := repairLegacyAgentNodeName(once); twice != once {
+		t.Fatalf("second repair changed %q into %q", once, twice)
+	}
+}
