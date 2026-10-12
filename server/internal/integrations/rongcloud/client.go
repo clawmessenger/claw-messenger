@@ -186,3 +186,34 @@ func (c *rongcloudAPIClient) sendCommandResult(ctx context.Context, fromUserID, 
 	_, err = c.sendPrivateMessage(ctx, fromUserID, toUserID, objectNameCommand, string(contentBytes))
 	return err
 }
+
+// sendWebCommandResult answers the web client's system-command channel.
+//
+// The web's handleSystemResponse (clawmessenger-web/src/services/im.ts) walks the
+// message content looking for an object that carries requestId-or-request_id
+// AND a string `status`, then reads `code` and `data` off it. That is a FLAT
+// object, not the device-shaped {request_id, msg_type, payload} envelope the CLI
+// parses, so the two reply paths cannot share an encoder. msg_type
+// "command_result" is still set: it is what keeps the reply from being
+// re-interpreted as a fresh request when 融云 echoes it back to the webhook.
+func (c *rongcloudAPIClient) sendWebCommandResult(ctx context.Context, fromUserID, toUserID, requestID, service, action, status string, code int, data interface{}, message string) error {
+	payload := map[string]interface{}{
+		"requestId": requestID,
+		"service":   service,
+		"action":    action,
+		"status":    status,
+		"code":      code,
+		"message":   message,
+		"msg_type":  "command_result",
+		"timestamp": time.Now().UnixMilli(),
+	}
+	if data != nil {
+		payload["data"] = data
+	}
+	contentBytes, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("rongcloud: marshal web command result: %w", err)
+	}
+	_, err = c.sendPrivateMessage(ctx, fromUserID, toUserID, objectNameCommand, string(contentBytes))
+	return err
+}

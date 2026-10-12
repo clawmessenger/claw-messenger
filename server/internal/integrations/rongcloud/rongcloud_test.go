@@ -440,7 +440,7 @@ func TestHandleCommandPing(t *testing.T) {
 	defer srv.Close()
 
 	client := newRongCloudAPIClient("key", "secret", srv.URL, srv.Client(), testLogger())
-	handler := newSystemHandler(client, "sys_node", testLogger(), nil, nil, nil)
+	handler := newSystemHandler(client, "sys_node", testLogger(), nil, nil, nil, nil)
 
 	msg := NormalizedMessage{
 		ObjectName: objectNameCommand,
@@ -470,7 +470,7 @@ func TestHandleCommandUnknownService(t *testing.T) {
 	defer srv.Close()
 
 	client := newRongCloudAPIClient("key", "secret", srv.URL, srv.Client(), testLogger())
-	handler := newSystemHandler(client, "sys_node", testLogger(), nil, nil, nil)
+	handler := newSystemHandler(client, "sys_node", testLogger(), nil, nil, nil, nil)
 
 	msg := NormalizedMessage{
 		ObjectName: objectNameCommand,
@@ -491,7 +491,7 @@ func TestHandleCommandParseError(t *testing.T) {
 	defer srv.Close()
 
 	client := newRongCloudAPIClient("key", "secret", srv.URL, srv.Client(), testLogger())
-	handler := newSystemHandler(client, "sys_node", testLogger(), nil, nil, nil)
+	handler := newSystemHandler(client, "sys_node", testLogger(), nil, nil, nil, nil)
 
 	msg := NormalizedMessage{
 		ObjectName: objectNameCommand,
@@ -540,7 +540,7 @@ func TestChannelConnectRegistersWebhook(t *testing.T) {
 			SystemNodeID: "sys",
 		},
 		client:        newRongCloudAPIClient("key", "secret", "", nil, testLogger()),
-		systemHandler: newSystemHandler(newRongCloudAPIClient("key", "secret", "", nil, testLogger()), "sys", testLogger(), nil, nil, nil),
+		systemHandler: newSystemHandler(newRongCloudAPIClient("key", "secret", "", nil, testLogger()), "sys", testLogger(), nil, nil, nil, nil),
 		registrar:     dispatcher,
 		handler:       func(ctx context.Context, msg channel.InboundMessage) error { return nil },
 		logger:        testLogger(),
@@ -666,7 +666,7 @@ func newTestWebhookChannel(t *testing.T) (*rongcloudChannel, *httptest.Server) {
 			SystemNodeID: "sys-node",
 		},
 		client:        newRongCloudAPIClient("test-key", "test-secret", srv.URL, srv.Client(), testLogger()),
-		systemHandler: newSystemHandler(newRongCloudAPIClient("test-key", "test-secret", srv.URL, srv.Client(), testLogger()), "sys-node", testLogger(), nil, nil, nil),
+		systemHandler: newSystemHandler(newRongCloudAPIClient("test-key", "test-secret", srv.URL, srv.Client(), testLogger()), "sys-node", testLogger(), nil, nil, nil, nil),
 		registrar:     dispatcher,
 		logger:        testLogger(),
 	}
@@ -1080,7 +1080,7 @@ func TestPairingServiceGenerateTicket(t *testing.T) {
 }
 
 func TestHandleNodeMessage(t *testing.T) {
-	sh := newSystemHandler(nil, "node-123", testLogger(), nil, nil, nil)
+	sh := newSystemHandler(nil, "node-123", testLogger(), nil, nil, nil, nil)
 	msg := NormalizedMessage{
 		MsgUID:     "msg-001",
 		FromUserID: "user-abc",
@@ -1176,7 +1176,7 @@ func TestHandleChatroomCommandNilQueries(t *testing.T) {
 	defer srv.Close()
 
 	client := newRongCloudAPIClient("key", "secret", srv.URL, srv.Client(), testLogger())
-	handler := newSystemHandler(client, "sys_node", testLogger(), nil, nil, nil)
+	handler := newSystemHandler(client, "sys_node", testLogger(), nil, nil, nil, nil)
 
 	msg := NormalizedMessage{
 		ObjectName: objectNameCommand,
@@ -1197,7 +1197,7 @@ func TestHandleChatroomCommandUnknownAction(t *testing.T) {
 	defer srv.Close()
 
 	client := newRongCloudAPIClient("key", "secret", srv.URL, srv.Client(), testLogger())
-	handler := newSystemHandler(client, "sys_node", testLogger(), nil, nil, nil)
+	handler := newSystemHandler(client, "sys_node", testLogger(), nil, nil, nil, nil)
 
 	msg := NormalizedMessage{
 		ObjectName: objectNameCommand,
@@ -1218,7 +1218,7 @@ func TestHandleDeviceCommandNilQueries(t *testing.T) {
 	defer srv.Close()
 
 	client := newRongCloudAPIClient("key", "secret", srv.URL, srv.Client(), testLogger())
-	handler := newSystemHandler(client, "sys_node", testLogger(), nil, nil, nil)
+	handler := newSystemHandler(client, "sys_node", testLogger(), nil, nil, nil, nil)
 
 	msg := NormalizedMessage{
 		ObjectName: objectNameCommand,
@@ -1239,7 +1239,7 @@ func TestHandleDeviceCommandUnknownAction(t *testing.T) {
 	defer srv.Close()
 
 	client := newRongCloudAPIClient("key", "secret", srv.URL, srv.Client(), testLogger())
-	handler := newSystemHandler(client, "sys_node", testLogger(), nil, nil, nil)
+	handler := newSystemHandler(client, "sys_node", testLogger(), nil, nil, nil, nil)
 
 	msg := NormalizedMessage{
 		ObjectName: objectNameCommand,
@@ -1260,7 +1260,7 @@ func TestHandleChatroomCommandInvalidWorkspaceID(t *testing.T) {
 	defer srv.Close()
 
 	client := newRongCloudAPIClient("key", "secret", srv.URL, srv.Client(), testLogger())
-	handler := newSystemHandler(client, "sys_node", testLogger(), nil, nil, nil)
+	handler := newSystemHandler(client, "sys_node", testLogger(), nil, nil, nil, nil)
 
 	msg := NormalizedMessage{
 		ObjectName: objectNameCommand,
@@ -1281,7 +1281,7 @@ func TestHandleChatroomCommandMissingWorkspaceID(t *testing.T) {
 	defer srv.Close()
 
 	client := newRongCloudAPIClient("key", "secret", srv.URL, srv.Client(), testLogger())
-	handler := newSystemHandler(client, "sys_node", testLogger(), nil, nil, nil)
+	handler := newSystemHandler(client, "sys_node", testLogger(), nil, nil, nil, nil)
 
 	msg := NormalizedMessage{
 		ObjectName: objectNameCommand,
@@ -1492,7 +1492,7 @@ func TestHandleDiscussionCommandUnknownAction(t *testing.T) {
 	defer srv.Close()
 
 	client := newRongCloudAPIClient("key", "secret", srv.URL, srv.Client(), testLogger())
-	handler := newSystemHandler(client, "sys_node", testLogger(), nil, nil, nil)
+	handler := newSystemHandler(client, "sys_node", testLogger(), nil, nil, nil, nil)
 
 	msg := NormalizedMessage{
 		ObjectName: objectNameCommand,
@@ -1513,7 +1513,7 @@ func TestHandleDiscussionCommandStatusNoRegistry(t *testing.T) {
 	defer srv.Close()
 
 	client := newRongCloudAPIClient("key", "secret", srv.URL, srv.Client(), testLogger())
-	handler := newSystemHandler(client, "sys_node", testLogger(), nil, nil, nil)
+	handler := newSystemHandler(client, "sys_node", testLogger(), nil, nil, nil, nil)
 
 	msg := NormalizedMessage{
 		ObjectName: objectNameCommand,
@@ -1527,7 +1527,7 @@ func TestHandleDiscussionCommandStatusNoRegistry(t *testing.T) {
 }
 
 func TestHandleNodeMessageNilRegistry(t *testing.T) {
-	sh := newSystemHandler(nil, "node-123", testLogger(), nil, nil, nil)
+	sh := newSystemHandler(nil, "node-123", testLogger(), nil, nil, nil, nil)
 	msg := NormalizedMessage{
 		MsgUID:     "msg-001",
 		FromUserID: "user-abc",
@@ -1603,7 +1603,7 @@ func TestHandleDiscussionCommandYourTurn(t *testing.T) {
 
 	client := newRongCloudAPIClient("key", "secret", srv.URL, srv.Client(), testLogger())
 	registry := NewDiscussionRegistry()
-	handler := newSystemHandler(client, "sys_node", testLogger(), nil, registry, nil)
+	handler := newSystemHandler(client, "sys_node", testLogger(), nil, registry, nil, nil)
 
 	msg := NormalizedMessage{
 		ObjectName: objectNameCommand,

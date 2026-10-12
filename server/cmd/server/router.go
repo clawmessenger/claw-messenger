@@ -1260,6 +1260,9 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				Queries:      queries,
 				Registry:     rcRegistry,
 				NodeRequests: rcNodeRequests,
+				// GroupMirror 的 callbacks 懒查 h.RongCloudNode（构造完才赋值），
+				// 所以这里可以安全地先挂上去。
+				GroupMirror: h.ClawGroupMirror(),
 			})
 
 			// Phase 2a: construct service-layer dependencies.
@@ -1679,9 +1682,15 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// 归属变更：按融云好友边重建（本地 owner_user_id 与 IM 账号体系对不上，见
 	// claw_admin_nodes.go 的 ClawAdminTransferNodeOwner）。
 	r.Put("/api/admin/nodes/{id}/owner", h.ClawAdminTransferNodeOwner)
-	r.Get("/api/admin/groups", h.ClawAdminEmptyPage)
-	r.Get("/api/admin/groups/{id}", h.ClawAdminNotFound)
-	r.Get("/api/admin/groups/{id}/members", h.ClawAdminEmptyList)
+	// 群组：本地镜像表 rongcloud_group / rongcloud_group_member（迁移 588）。
+	// 融云没有「列出全部群」的平台接口，只能按群 ID 或按用户查，所以必须本地留一份；
+	// 群由 C 端的 service=group 命令创建（见 rongcloud/group_command.go）。
+	r.Get("/api/admin/groups", h.ClawAdminGroups)
+	r.Get("/api/admin/groups/{id}", h.ClawAdminGroupDetail)
+	r.Put("/api/admin/groups/{id}", h.ClawAdminUpdateGroup)
+	r.Delete("/api/admin/groups/{id}", h.ClawAdminDeleteGroup)
+	r.Get("/api/admin/groups/{id}/members", h.ClawAdminGroupMembers)
+	r.Delete("/api/admin/groups/{id}/members/{user_id}", h.ClawAdminRemoveGroupMember)
 	r.Get("/api/admin/chatrooms", h.ClawAdminEmptyPage)
 	r.Get("/api/admin/chatrooms/{id}", h.ClawAdminNotFound)
 	r.Get("/api/admin/chatrooms/{id}/messages", h.ClawAdminEmptyList)

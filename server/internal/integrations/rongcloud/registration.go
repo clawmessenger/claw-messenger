@@ -23,6 +23,10 @@ type ChannelDeps struct {
 	// admin API; the channel binds the sender and routes the answers in. Nil
 	// disables the feature.
 	NodeRequests *NodeRequestBroker
+	// GroupMirror supplies the database side of the `service=group` commands
+	// (the RongCloud group APIs live in this package, the tables in the HTTP
+	// layer). Nil disables the group commands.
+	GroupMirror *GroupMirror
 }
 
 func RegisterRongCloud(reg *channel.Registry, deps ChannelDeps) {
@@ -53,7 +57,7 @@ func newRongCloudFactory(deps ChannelDeps) channel.Factory {
 			cfg:           cfg,
 			creds:         creds,
 			client:        client,
-			systemHandler: newSystemHandler(client, creds.SystemNodeID, logger, deps.Queries, deps.Registry, deps.NodeRequests),
+			systemHandler: newSystemHandler(client, creds.SystemNodeID, logger, deps.Queries, deps.Registry, deps.NodeRequests, deps.GroupMirror),
 			registrar:     deps.Registrar,
 			handler:       cfg.Handler,
 			logger:        logger,

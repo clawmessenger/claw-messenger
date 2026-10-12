@@ -17,9 +17,10 @@ type systemHandler struct {
 	logger       *slog.Logger
 	registry     *DiscussionRegistry
 	nodeRequests *NodeRequestBroker
+	groupMirror  *GroupMirror
 }
 
-func newSystemHandler(client *rongcloudAPIClient, nodeID string, logger *slog.Logger, queries *db.Queries, registry *DiscussionRegistry, nodeRequests *NodeRequestBroker) *systemHandler {
+func newSystemHandler(client *rongcloudAPIClient, nodeID string, logger *slog.Logger, queries *db.Queries, registry *DiscussionRegistry, nodeRequests *NodeRequestBroker, groupMirror *GroupMirror) *systemHandler {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -30,10 +31,18 @@ func newSystemHandler(client *rongcloudAPIClient, nodeID string, logger *slog.Lo
 		logger:       logger,
 		registry:     registry,
 		nodeRequests: nodeRequests,
+		groupMirror:  groupMirror,
 	}
 }
 
 func (h *systemHandler) handleCommand(ctx context.Context, msg NormalizedMessage) error {
+	// 忽略服务端自己发出的消息：融云会把本端发出的 command 回执也回灌 webhook，
+	// 不拦住就会被当成新请求再回一次（旧后端同样有这道 guard）。
+	if h.nodeID != "" && msg.FromUserID == h.nodeID {
+		h.logger.Debug("rongcloud: ignoring command from the system node itself", "msgUID", msg.MsgUID)
+		return nil
+	}
+
 	var cmd CommandContent
 	if err := json.Unmarshal([]byte(msg.Content), &cmd); err != nil {
 		h.logger.Error("rongcloud: parse command content", "error", err, "msgUID", msg.MsgUID)
@@ -56,6 +65,8 @@ func (h *systemHandler) handleCommand(ctx context.Context, msg NormalizedMessage
 		return h.handleDiscussionCommand(ctx, msg, cmd)
 	case "ai":
 		return h.handleAICommand(ctx, msg, cmd)
+	case "group":
+		return h.handleGroupCommand(ctx, msg, cmd)
 	default:
 		h.logger.Warn("rongcloud: unknown service", "service", cmd.Service, "msgUID", msg.MsgUID)
 		return h.sendError(ctx, msg, cmd.RequestID, fmt.Sprintf("unknown service: %s", cmd.Service))
