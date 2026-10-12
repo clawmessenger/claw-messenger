@@ -3,8 +3,14 @@ import { describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { SessionQueue, connectTransport, createBoundedMap, createInboundReplayDedupe } from "./run.js";
-import type { IMTransport } from "./im.js";
+import {
+  SessionQueue,
+  connectTransport,
+  createBoundedMap,
+  createInboundReplayDedupe,
+  startRunLoop,
+} from "./run.js";
+import type { IMTransport, InboundIMMessage } from "./im.js";
 import { XiachatApi } from "./api.js";
 
 describe("createInboundReplayDedupe (offline replay storm)", () => {
@@ -269,3 +275,81 @@ describe("connectTransport (token-expiry auto-reconnect, spec 9.1)", () => {
     expect(refresh).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("startRunLoop fast path", () => {
+  interface SentFrame {
+    to: string
+    objectName: string
+    content: string
+  }
+
+  function harness() {
+    const sent: SentFrame[] = []
+    const listeners: Array<(msg: InboundIMMessage) => void> = []
+    let onWired: () => void = () => {}
+    const wired = new Promise<void>((resolve) => { onWired = resolve })
+    const transport: IMTransport = {
+      connect: async () => {},
+      sendMessage: async (to, objectName, content) => { sent.push({ to, objectName, content }) },
+      onMessage: (cb) => { listeners.push(cb) },
+      disconnect: async () => {},
+      getSelfUserId: () => "rc_node_self",
+    }
+    const api = new XiachatApi("http://unused.local")
+    vi.spyOn(api, "getConfig").mockImplementation(async () => ({ appKey: "appkey-1" }))
+    return {
+      sent,
+      wired,
+      transport,
+      api,
+      start: () =>
+        void startRunLoop({
+          creds: { nodeId: "node_1", token: "tok", serverUrl: "http://unused.local", appKey: "appkey-1" },
+          api,
+          transport,
+          // Deliberately absent: the probe answers not_found without spawning,
+          // which keeps this test free of real child processes.
+          agentExecPath: join(tmpdir(), "clawmessenger-definitely-missing-opencode"),
+          agentName: "opencode",
+          stdout: { write: () => { onWired(); return true } } as unknown as NodeJS.WriteStream,
+        }),
+      emit: (content: string, objectName = "command") => {
+        for (const cb of listeners) {
+          cb({ objectName, fromUserId: "user_1", toUserId: "", targetId: "user_1", conversationType: 1, content })
+        }
+      },
+    }
+  }
+
+  it("answers a runtime-recovery request end to end over the transport", async () => {
+    const h = harness()
+    h.start()
+    await h.wired
+    h.emit(JSON.stringify({
+      msg_type: "claw_runtime_recovery_request",
+      protocolVersion: 1,
+      requestId: "rec-run-1",
+      timestamp: Date.now(),
+      action: "recover",
+    }))
+    await vi.waitFor(() => expect(h.sent).toHaveLength(1))
+    const frame = JSON.parse(h.sent[0].content) as { msg_type: string; requestId: string; code: string }
+    expect(h.sent[0].objectName).toBe("command")
+    expect(h.sent[0].to).toBe("user_1")
+    expect(frame.msg_type).toBe("claw_runtime_recovery_response")
+    expect(frame.requestId).toBe("rec-run-1")
+    expect(frame.code).toBe("not_found")
+  })
+
+  it("leaves ordinary traffic alone (a recovery request is not a command)", async () => {
+    const h = harness()
+    h.start()
+    await h.wired
+    // A discussion command payload must still reach its own branch, not the
+    // recovery one; nothing here should be answered as a recovery response.
+    h.emit(JSON.stringify({ msg_type: "claw_runtime_recovery_request", requestId: "x" }))
+    h.emit(JSON.stringify({ content: "hello" }), "RC:TxtMsg")
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    expect(h.sent.every((frame) => !frame.content.includes("claw_runtime_recovery_response"))).toBe(true)
+  })
+})

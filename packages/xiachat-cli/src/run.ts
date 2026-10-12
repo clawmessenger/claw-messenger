@@ -5,6 +5,12 @@ import type { IMTransport, InboundIMMessage, TurnRunner } from "./im.js";
 import { MessageDispatcher } from "./im.js";
 import { runAgentTurn, runAgentCommand } from "./agents.js";
 import { createModelCatalogLoader, parseModelCatalogRequest } from "./model-catalog.js";
+import {
+  createRuntimeProber,
+  createSerialGate,
+  parseRuntimeRecoveryRequest,
+  type RuntimeRecoveryAction,
+} from "./runtime-recovery.js";
 import type { StoredCredentials } from "./keystore.js";
 import type { XiachatApi } from "./api.js";
 
@@ -230,7 +236,16 @@ export interface StartRunLoopOpts extends ConnectTransportOpts {
   // Where to persist the processed-message markers (see
   // createInboundReplayDedupe). Omitted -> in-memory only.
   processedUidsPath?: string;
+  // Idempotent local repair for action="recover" (main.ts passes
+  // ensureOpencodeInstalled for opencode nodes). Omitted -> recover can only
+  // diagnose, never install.
+  ensureRuntime?: () => Promise<void>;
 }
+
+// Two recovers closer together than this would re-run the (installing)
+// ensureRuntime and pile up agent spawns; queued requests still get answered,
+// they just wait their turn.
+const RUNTIME_RECOVERY_MIN_INTERVAL_MS = 5_000;
 
 export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
   await connectTransport(opts);
@@ -252,9 +267,38 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
   });
   catalogLoader.warm();
 
+  // 「一键唤醒」: the probe runs locally on this device and the answer rides
+  // back over the same browser<->node "command" channel the model catalog uses.
+  // Serialized with a 5s floor so a burst of wake requests cannot stack up
+  // agent spawns; a successful recover also warms the catalog, which is the
+  // exact query the user's next action would otherwise ask for cold.
+  const prober = createRuntimeProber({
+    agentName: opts.agentName,
+    execPath: opts.agentExecPath,
+    runCommand: (argv, timeoutMs, maxOutputBytes) =>
+      runAgentCommand({
+        execPath: opts.agentExecPath,
+        argv,
+        timeoutMs,
+        maxOutputBytes,
+        cwd: opts.cwd,
+      }),
+    ensureRuntime: opts.ensureRuntime,
+    logger: (message) => console.error(message),
+  });
+  const recoveryGate = createSerialGate({ minIntervalMs: RUNTIME_RECOVERY_MIN_INTERVAL_MS });
+  const probeRuntime = (action: RuntimeRecoveryAction) =>
+    recoveryGate(async () => {
+      const result = await prober.probe(action);
+      if (action === "recover" && result.code === "ready") catalogLoader.warm();
+      return result;
+    });
+
   const dispatcher = new MessageDispatcher({
     send: (toUserId, objectName, content) => opts.transport.sendMessage(toUserId, objectName, content),
     loadModelCatalog: () => catalogLoader.load(),
+    probeRuntime,
+    agentName: opts.agentName,
     selfUserId: opts.transport.getSelfUserId?.(),
   });
   const turns: TurnRunner = {
@@ -324,6 +368,18 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
         console.error("dispatch failed:", err instanceof Error ? err.message : err);
       });
       return;
+    }
+    // Same reason as the catalog above, and one more: a recover can spend up to
+    // 20s in an agent spawn, which would both blow the web's window and starve
+    // the conversation queue (depth 1) it was waiting in.
+    if (msg.objectName === "command") {
+      const recoveryRequest = parseRuntimeRecoveryRequest(msg.content);
+      if (recoveryRequest) {
+        void dispatcher.handleRuntimeRecovery(msg, recoveryRequest).catch((err: unknown) => {
+          console.error("runtime recovery failed:", err instanceof Error ? err.message : err);
+        });
+        return;
+      }
     }
     queue.enqueue(key, async () => {
       try {

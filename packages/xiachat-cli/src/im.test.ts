@@ -568,3 +568,130 @@ describe("MessageDispatcher model catalog replay guards", () => {
     expect(JSON.parse(sent[0]).requestId).toBe("req-retry");
   });
 });
+
+describe("MessageDispatcher runtime recovery (一键唤醒)", () => {
+  function recoveryMessage(requestId: string, action = "recover", timestamp = Date.now()) {
+    return {
+      objectName: "command",
+      fromUserId: "user_1",
+      toUserId: "",
+      targetId: "user_1",
+      conversationType: 1,
+      content: JSON.stringify({
+        msg_type: "claw_runtime_recovery_request",
+        protocolVersion: 1,
+        requestId,
+        timestamp,
+        action,
+      }),
+    };
+  }
+
+  it("answers over the same command channel, echoing the requestId", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({
+      send: deps.send,
+      agentName: "opencode",
+      probeRuntime: async () => ({ code: "ready", message: "runtime ready" }),
+    });
+    await dispatcher.handle(recoveryMessage("rec-1"), { runTurn: async () => "unused" });
+    expect(deps.sent).toHaveLength(1);
+    expect(deps.sent[0].objectName).toBe("command");
+    expect(deps.sent[0].to).toBe("user_1");
+    const frame = JSON.parse(deps.sent[0].content);
+    expect(frame.msg_type).toBe("claw_runtime_recovery_response");
+    expect(frame.requestId).toBe("rec-1");
+    expect(frame.code).toBe("ready");
+    expect(frame.data).toEqual({ runtime: "ready", worker: "online", agent: "opencode" });
+  });
+
+  it("passes the requested action through to the prober", async () => {
+    const deps = makeDeps();
+    const seen: string[] = [];
+    const dispatcher = new MessageDispatcher({
+      send: deps.send,
+      probeRuntime: async (action) => { seen.push(action); return { code: "ready", message: "ok" } },
+    });
+    await dispatcher.handle(recoveryMessage("rec-probe", "probe"), { runTurn: async () => "unused" });
+    await dispatcher.handle(recoveryMessage("rec-recover", "recover"), { runTurn: async () => "unused" });
+    expect(seen).toEqual(["probe", "recover"]);
+  });
+
+  it("runs the probe once per requestId even when 融云 replays the backlog", async () => {
+    const deps = makeDeps();
+    let probes = 0;
+    const dispatcher = new MessageDispatcher({
+      send: deps.send,
+      probeRuntime: async () => { probes += 1; return { code: "ready", message: "ok" } },
+    });
+    const msg = recoveryMessage("rec-dup");
+    for (let i = 0; i < 3; i += 1) {
+      await dispatcher.handle(msg, { runTurn: async () => "unused" });
+    }
+    expect(probes).toBe(1);
+    expect(deps.sent).toHaveLength(1);
+  });
+
+  it("skips a request the web has already timed out on", async () => {
+    const deps = makeDeps();
+    let probes = 0;
+    const dispatcher = new MessageDispatcher({
+      send: deps.send,
+      probeRuntime: async () => { probes += 1; return { code: "ready", message: "ok" } },
+    });
+    await dispatcher.handle(
+      recoveryMessage("rec-old", "recover", Date.now() - 5 * 60_000),
+      { runTurn: async () => "unused" },
+    );
+    expect(probes).toBe(0);
+    expect(deps.sent).toHaveLength(0);
+  });
+
+  it("still answers when this node has no prober wired up, so the browser never hangs", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    await dispatcher.handle(recoveryMessage("rec-none"), { runTurn: async () => "unused" });
+    expect(deps.sent).toHaveLength(1);
+    expect(JSON.parse(deps.sent[0].content).code).toBe("probe_failed");
+  });
+
+  it("degrades a throwing prober into probe_failed instead of dropping the answer", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({
+      send: deps.send,
+      probeRuntime: async () => { throw new Error("EPERM") },
+    });
+    await dispatcher.handle(recoveryMessage("rec-boom"), { runTurn: async () => "unused" });
+    expect(deps.sent).toHaveLength(1);
+    expect(JSON.parse(deps.sent[0].content).code).toBe("probe_failed");
+  });
+
+  it("never answers its own echoed message", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({
+      send: deps.send,
+      selfUserId: "user_1",
+      probeRuntime: async () => ({ code: "ready", message: "ok" }),
+    });
+    await dispatcher.handle(recoveryMessage("rec-self"), { runTurn: async () => "unused" });
+    expect(deps.sent).toHaveLength(0);
+  });
+
+  it("keeps a requestId retryable when the response never left the node", async () => {
+    const sent: string[] = [];
+    let attempts = 0;
+    const dispatcher = new MessageDispatcher({
+      send: async (_to, _objectName, content) => {
+        attempts += 1;
+        if (attempts === 1) throw new Error("imlib sendMessage failed: 20604");
+        sent.push(content);
+      },
+      probeRuntime: async () => ({ code: "ready", message: "ok" }),
+    });
+    const turns = { runTurn: async () => "unused" };
+    await expect(dispatcher.handle(recoveryMessage("rec-retry"), turns)).rejects.toThrow();
+    await dispatcher.handle(recoveryMessage("rec-retry"), turns);
+    expect(sent).toHaveLength(1);
+    expect(JSON.parse(sent[0]).requestId).toBe("rec-retry");
+  });
+});

@@ -26,6 +26,11 @@ export interface BuildProgramOpts {
   // Injectable for tests; defaults to ensureOpencodeInstalled. Called on bind
   // (pair) and at supervisor start so a device that lacks opencode installs it.
   ensureOpencode?: () => Promise<unknown>;
+  // Injectable for tests; defaults to child_process.spawn.
+  spawnChild?: typeof spawn;
+  // Injectable for tests; defaults to registering the supervisor's shutdown on
+  // process SIGINT/SIGTERM.
+  onSupervisorSignal?: (shutdown: () => void) => void;
 }
 
 export function buildProgram(opts: BuildProgramOpts): Command {
@@ -188,6 +193,7 @@ export function buildProgram(opts: BuildProgramOpts): Command {
       let agentName: string;
       let turnTimeoutMs: number | undefined;
       let cwd: string | undefined;
+      let ensureRuntime: (() => Promise<void>) | undefined;
       if (cmdOpts.agent === OPS_AGENT_NAME) {
         const opencode = await ensureOpencodeInstalled();
         const workdir = await setupOpsWorkdir();
@@ -195,12 +201,18 @@ export function buildProgram(opts: BuildProgramOpts): Command {
         agentName = "opencode";
         turnTimeoutMs = OPS_TURN_TIMEOUT_MS;
         cwd = workdir;
+        // opencode is the one runtime this CLI knows how to install, so it is
+        // the one that can be repaired by 「一键唤醒」 (see runtime-recovery.ts).
+        ensureRuntime = async () => { await ensureOpencodeInstalled() };
       } else {
         const found = await discoverAgents({});
         const agent = found.find((a) => a.name === cmdOpts.agent);
         if (!agent) throw new Error(`agent CLI ${cmdOpts.agent} not found on PATH; run clawmessenger agents`);
         agentExecPath = agent.path;
         agentName = agent.name;
+        if (agent.name === "opencode") {
+          ensureRuntime = async () => { await (opts.ensureOpencode ?? ensureOpencodeInstalled)() };
+        }
       }
       const { startRunLoop, createImlibTransport } = await import("./run.js");
       const transport = await createImlibTransport();
@@ -221,6 +233,7 @@ export function buildProgram(opts: BuildProgramOpts): Command {
           turnTimeoutMs,
           cwd,
           processedUidsPath: defaultProcessedUidsPath(creds.nodeId),
+          ensureRuntime,
         });
       } finally {
         clearInterval(hb);
@@ -254,7 +267,45 @@ interface RunSupervisorOpts {
   model?: string;
 }
 
-async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void> {
+// --- supervised child restarts --------------------------------------------
+// The old supervisor only logged `agent X exited with code N`. That is the most
+// common way a device goes dark: the agent child dies, its heartbeat stops, the
+// node shows up offline in the web's device list, and the user has to walk back
+// to that machine and re-run `clawmessenger run` by hand.
+//
+// Backoff: 1s -> 2s -> 4s -> 8s -> 16s for the first five consecutive failures,
+// then a slow lane of one attempt every five minutes. The slow lane exists so a
+// permanently broken agent (an uninstalled CLI, a corrupted config) cannot spin
+// the CPU forever; it still recovers by itself once the user fixes the machine.
+export const SUPERVISOR_RESTART_BASE_MS = 1_000;
+export const SUPERVISOR_RESTART_MAX_MS = 60_000;
+/** Consecutive fast retries before switching to the slow lane. */
+export const SUPERVISOR_RESTART_BACKOFF_AFTER = 5;
+export const SUPERVISOR_RESTART_BACKOFF_MS = 5 * 60_000;
+/** A child that stayed up this long is treated as healthy; its next exit is a
+ * fresh failure (backoff restarts from 1s), not the continuation of a crash loop. */
+export const SUPERVISOR_HEALTHY_UPTIME_MS = 60_000;
+
+/** Delay before the `restarts`-th consecutive restart (1-based). */
+export function supervisorRestartDelayMs(restarts: number): number {
+  if (restarts > SUPERVISOR_RESTART_BACKOFF_AFTER) return SUPERVISOR_RESTART_BACKOFF_MS;
+  return Math.min(SUPERVISOR_RESTART_MAX_MS, SUPERVISOR_RESTART_BASE_MS * 2 ** (Math.max(1, restarts) - 1));
+}
+
+interface SupervisedAgent {
+  agent: string;
+  runArgs: string[];
+  childCreds: StoredCredentials;
+  child?: ChildProcess;
+  /** Consecutive failures; reset when the previous run looked healthy. */
+  restarts: number;
+  startedAt: number;
+  lastExitCode: number | null;
+  state: "running" | "restarting" | "stopped";
+  timer?: NodeJS.Timeout;
+}
+
+export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void> {
   const { opts, creds, api } = supervisor;
   if (!creds.credentialId || !creds.deviceSecret) {
     throw new Error("no machine device credential; run clawmessenger pair on this device first");
@@ -285,7 +336,47 @@ async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void> {
   // the bundle entry so argv keeps the [execPath, script, ...] shape.
   const script = process.argv[1];
   const isSea = !script || !script.endsWith(".js");
-  const children: ChildProcess[] = [];
+  const spawnChild = opts.spawnChild ?? spawn;
+  const managed = new Map<string, SupervisedAgent>();
+  // Set by shutdown so a SIGTERM'd child is never resurrected by its own exit
+  // handler — the previous supervisor had no such guard and would have kept
+  // (re)starting agents after being told to stop.
+  let stopping = false;
+  let resolveStopped: () => void = () => {};
+  const stopped = new Promise<void>((resolve) => { resolveStopped = resolve; });
+
+  const launch = (entry: SupervisedAgent): void => {
+    if (stopping) return;
+    const child = spawnChild(
+      process.execPath,
+      isSea ? entry.runArgs : [script as string, ...entry.runArgs],
+      { env: { ...process.env, CLAWMESSENGER_AGENT_CREDS: JSON.stringify(entry.childCreds) } },
+    );
+    entry.child = child;
+    entry.startedAt = Date.now();
+    entry.state = "running";
+    child.stdout?.on("data", (chunk: Buffer) => opts.stdout.write(`[${entry.agent}] ${chunk}`));
+    child.stderr?.on("data", (chunk: Buffer) => process.stderr.write(`[${entry.agent}] ${chunk}`));
+    child.on("exit", (code) => {
+      entry.lastExitCode = code;
+      if (stopping) {
+        entry.state = "stopped";
+        return;
+      }
+      const uptimeMs = Date.now() - entry.startedAt;
+      entry.restarts = uptimeMs >= SUPERVISOR_HEALTHY_UPTIME_MS ? 1 : entry.restarts + 1;
+      const delayMs = supervisorRestartDelayMs(entry.restarts);
+      entry.state = "restarting";
+      console.error(
+        `agent ${entry.agent} exited (code=${code}) after ${uptimeMs}ms, restarting in ${delayMs}ms (attempt ${entry.restarts})`,
+      );
+      entry.timer = setTimeout(() => {
+        entry.timer = undefined;
+        launch(entry);
+      }, delayMs);
+    });
+  };
+
   for (const agent of bound) {
     // The built-in ops agent has no PATH-installed CLI of its own; the child
     // (`clawmessenger run --agent ops`) installs opencode itself before connecting.
@@ -296,33 +387,51 @@ async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void> {
         continue;
       }
     }
-    const childCreds: StoredCredentials = {
-      nodeId: agent.nodeId,
-      token: agent.token,
-      credentialId: agent.credentialId,
-      deviceSecret: agent.deviceSecret,
-      serverUrl: creds.serverUrl,
-    };
     const runArgs = ["run", "--agent", agent.agent];
     if (supervisor.model) runArgs.push("--model", supervisor.model);
-    const child = spawn(process.execPath, isSea ? runArgs : [script as string, ...runArgs], {
-      env: { ...process.env, CLAWMESSENGER_AGENT_CREDS: JSON.stringify(childCreds) },
-    });
-    child.stdout?.on("data", (chunk: Buffer) => opts.stdout.write(`[${agent.agent}] ${chunk}`));
-    child.stderr?.on("data", (chunk: Buffer) => process.stderr.write(`[${agent.agent}] ${chunk}`));
-    child.on("exit", (code) => {
-      console.error(`agent ${agent.agent} exited with code ${code}`);
-    });
-    children.push(child);
+    const entry: SupervisedAgent = {
+      agent: agent.agent,
+      runArgs,
+      childCreds: {
+        nodeId: agent.nodeId,
+        token: agent.token,
+        credentialId: agent.credentialId,
+        deviceSecret: agent.deviceSecret,
+        serverUrl: creds.serverUrl,
+      },
+      restarts: 0,
+      startedAt: Date.now(),
+      lastExitCode: null,
+      state: "running",
+    };
+    managed.set(agent.agent, entry);
+    launch(entry);
   }
-  if (children.length === 0) {
+  if (managed.size === 0) {
     throw new Error("none of the bound agent CLIs is available on this machine's PATH");
   }
-  opts.stdout.write(`clawmessenger supervisor: ${children.length} agent(s) online\n`);
+  opts.stdout.write(`clawmessenger supervisor: ${managed.size} agent(s) online\n`);
+
   const shutdown = (): void => {
-    for (const child of children) child.kill("SIGTERM");
+    stopping = true;
+    for (const entry of managed.values()) {
+      if (entry.timer) {
+        clearTimeout(entry.timer);
+        entry.timer = undefined;
+      }
+      entry.state = "stopped";
+      entry.child?.kill("SIGTERM");
+    }
+    // Returning instead of looping forever lets the process exit once the
+    // children are gone; `process.on` below replaces Node's default SIGTERM
+    // behaviour, so without this the supervisor would outlive its agents.
+    resolveStopped();
   };
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
-  await new Promise<void>(() => {}); // supervise until process exit
+  if (opts.onSupervisorSignal) {
+    opts.onSupervisorSignal(shutdown);
+  } else {
+    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
+  }
+  await stopped; // supervise until told to stop
 }

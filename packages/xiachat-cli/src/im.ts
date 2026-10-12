@@ -7,6 +7,13 @@ import {
   type DiscussionModelCatalog,
   type ModelCatalogRequest,
 } from "./model-catalog.js";
+import {
+  buildRuntimeRecoveryResponse,
+  parseRuntimeRecoveryRequest,
+  type RuntimeRecoveryAction,
+  type RuntimeRecoveryRequest,
+  type RuntimeRecoveryResult,
+} from "./runtime-recovery.js";
 
 // Inbound message shape normalized from the IM SDK listener.
 export interface InboundIMMessage {
@@ -46,6 +53,13 @@ export interface DispatcherDeps {
   // Omitted (or resolving to an empty catalog) still answers the request, so
   // the panel degrades to "use the node default model" instead of hanging.
   loadModelCatalog?: () => Promise<DiscussionModelCatalog>;
+  // Probes / repairs this node's local agent runtime for the web's
+  // 设备详情 → 一键唤醒 (see runtime-recovery.ts). Omitted -> the request is
+  // still answered, with an honest probe_failed, so the browser never hangs.
+  probeRuntime?: (action: RuntimeRecoveryAction) => Promise<RuntimeRecoveryResult>;
+  // Echoed back in the response's data.agent so the web can show which runtime
+  // it was talking to. Purely informational.
+  agentName?: string;
 }
 
 export interface TurnRunner {
@@ -57,6 +71,11 @@ export interface TurnRunner {
 // replayed offline backlog at once is what trips RongCloud's send rate limit.
 const STALE_MODEL_CATALOG_REQUEST_MS = 30_000;
 
+// The web waits 8s for a probe and 20s for a recover, so a replay older than
+// this can no longer be delivered to anyone waiting — skip it instead of
+// spending an install + a 20s agent spawn on it.
+const STALE_RUNTIME_RECOVERY_REQUEST_MS = 60_000;
+
 export class MessageDispatcher {
   // cardId -> latest html for cards this bridge produced, so card_action
   // iteration (html_revise) can rebuild context. Bounded: evicts oldest.
@@ -64,6 +83,9 @@ export class MessageDispatcher {
   // requestIds already answered, so 融云's per-reconnect offline replay is a
   // no-op instead of a response burst. Bounded: evicts oldest.
   private readonly answeredCatalogRequests = new Set<string>();
+  // Same guard for the runtime-recovery exchange: a replayed recover must not
+  // re-run the install + agent spawn. Bounded: evicts oldest.
+  private readonly answeredRecoveryRequests = new Set<string>();
 
   constructor(private readonly deps: DispatcherDeps) {}
 
@@ -103,6 +125,13 @@ export class MessageDispatcher {
       const catalogRequest = parseModelCatalogRequest(msg.content);
       if (catalogRequest) {
         await this.handleModelCatalogRequest(msg, catalogRequest);
+        return;
+      }
+      // Same shape, same reason to match before decodeCommandContent: the
+      // v1 recovery packet carries requestId/action, not request_id/params.
+      const recoveryRequest = parseRuntimeRecoveryRequest(msg.content);
+      if (recoveryRequest) {
+        await this.handleRuntimeRecovery(msg, recoveryRequest);
         return;
       }
       const cmd = decodeCommandContent(msg.content);
@@ -196,6 +225,65 @@ export class MessageDispatcher {
     console.log(
       `model catalog: answered ${request.requestId} in ${Date.now() - startedAt}ms (${providers} provider(s), ${models} model(s))`,
     );
+  }
+
+  /**
+   * Answers the web's 设备详情 → 一键唤醒.
+   *
+   * Always answers, even when the probe itself blows up: a well-formed
+   * probe_failed settles the browser's promise in milliseconds, whereas a
+   * dropped packet leaves it waiting out the full timeout (the exact failure
+   * mode this whole exchange replaces).
+   */
+  async handleRuntimeRecovery(
+    msg: InboundIMMessage,
+    request: RuntimeRecoveryRequest,
+  ): Promise<void> {
+    if (request.timestamp !== undefined) {
+      const ageMs = Date.now() - request.timestamp;
+      if (ageMs > STALE_RUNTIME_RECOVERY_REQUEST_MS) {
+        console.log(`runtime recovery: skipping stale request ${request.requestId} (${ageMs}ms old)`);
+        return;
+      }
+    }
+    if (this.answeredRecoveryRequests.has(request.requestId)) {
+      console.log(`runtime recovery: skipping replayed request ${request.requestId} (already answered)`);
+      return;
+    }
+    const startedAt = Date.now();
+    console.log(
+      `runtime recovery: action=${request.action} id=${request.requestId} from ${msg.fromUserId}`,
+    );
+    let result: RuntimeRecoveryResult = {
+      code: "probe_failed",
+      message: "runtime probe unavailable on this node",
+    };
+    try {
+      result = (await this.deps.probeRuntime?.(request.action)) ?? result;
+    } catch (err) {
+      console.error("runtime recovery failed:", err instanceof Error ? err.message : err);
+    }
+    await this.deps.send(
+      msg.fromUserId,
+      "command",
+      buildRuntimeRecoveryResponse(request, result, this.deps.agentName),
+    );
+    // Remembered only once the response is actually on the wire, so a failed
+    // send stays retryable (the transport retries rate-limited sends itself).
+    this.rememberAnsweredRecoveryRequest(request.requestId);
+    console.log(
+      `runtime recovery: action=${request.action} code=${result.code} in ${Date.now() - startedAt}ms`,
+    );
+  }
+
+  private rememberAnsweredRecoveryRequest(requestId: string): void {
+    this.answeredRecoveryRequests.add(requestId);
+    // Bounded: Set keeps insertion order, so drop the oldest entries.
+    while (this.answeredRecoveryRequests.size > 256) {
+      const oldest = this.answeredRecoveryRequests.values().next().value;
+      if (oldest === undefined) break;
+      this.answeredRecoveryRequests.delete(oldest);
+    }
   }
 
   private rememberAnsweredCatalogRequest(requestId: string): void {
