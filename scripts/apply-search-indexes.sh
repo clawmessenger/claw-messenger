@@ -14,7 +14,7 @@
 #
 # ⚠ pg_trgm 是 contrib 扩展，SQL 装不了它。若预检报「pg_trgm not available」，
 #   请先到【数据库主机】上执行（装完不需要重启 PostgreSQL）：
-#     dnf install -y postgresql16-contrib
+#     dnf install -y postgresql16-contrib                # Debian/Ubuntu 用 postgresql-contrib-16
 #     ls /usr/pgsql-16/share/extension/pg_trgm.control   # 看到文件即成功
 #
 # 用法（在 claw-messenger 仓库任意位置执行）：
@@ -26,6 +26,9 @@
 #   ./scripts/apply-search-indexes.sh --install-contrib   # 在数据库主机上顺手装 contrib（需 root）
 #   ./scripts/apply-search-indexes.sh --dsn 'postgres://user:pass@host:5432/db'
 #   ./scripts/apply-search-indexes.sh --env-file /path/to/.env
+#
+# 若预检发现缺 pg_trgm，脚本会从服务端报错里读出控制文件的真实路径，据此告诉你
+# 该装哪个包、本机是不是数据库主机 —— 不必再猜主机名和包名。
 #
 # 说明：默认不用 CONCURRENTLY。CREATE INDEX CONCURRENTLY 不能在事务/多语句里
 # 执行，整段粘贴必失败；而这几张表是空的，普通 CREATE INDEX 瞬时完成、不阻塞。
@@ -47,7 +50,8 @@ DSN=""
 ENV_FILE=""
 
 usage() {
-  sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^#\{1,\} \{0,1\}//'
+  # 打印文件开头的整段注释，不受行数增减影响
+  awk 'NR>1 && /^#/ { sub(/^# ?/, ""); print; next } NR>1 { exit }' "${BASH_SOURCE[0]}"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -109,17 +113,42 @@ print_plan() {
 
 # ---------- --install-contrib：只在数据库主机上才有意义 ----------
 if [[ "${INSTALL_CONTRIB}" == true ]]; then
-  echo "==> 安装 postgresql16-contrib（仅当本机就是数据库主机时才有意义）"
+  echo "==> 安装 postgresql-contrib（仅当本机就是数据库主机时才有意义）"
   echo "    本机 hostname: $(hostname)"
   if [[ "$(id -u)" != "0" ]]; then
     echo "错误：安装系统包需要 root。" >&2; exit 1
   fi
+
+  # 服务器实际用的主版本号，从已装的 PGDG 目录推断，避免在 15/17 上装错包
+  pg_major="$(ls -d /usr/pgsql-* 2>/dev/null | head -n 1 | sed 's#.*/pgsql-##' || true)"
+  pg_major="${pg_major:-16}"
+
   if command -v dnf > /dev/null 2>&1; then
-    dnf install -y postgresql16-contrib
+    if ! dnf install -y "postgresql${pg_major}-contrib"; then
+      echo "==> 仓库里没有 postgresql${pg_major}-contrib，补上 PGDG 源后重试…" >&2
+      os_rel="$(rpm -E '%{rhel}' 2>/dev/null || true)"
+      os_rel="${os_rel:-9}"
+      if dnf install -y \
+          "https://download.postgresql.org/pub/repos/yum/reporpms/EL-${os_rel}-x86_64/pgdg-redhat-repo-latest.noarch.rpm" \
+          && dnf install -y "postgresql${pg_major}-contrib"; then
+        :
+      else
+        echo "错误：仍装不上。若本机无外网，请到能联网的机器取 postgresql${pg_major}-contrib 的 rpm 后 rpm -ivh 安装；" >&2
+        echo "      若 PostgreSQL 是源码编译安装的，需在同版本源码树里 make -C contrib/pg_trgm install。" >&2
+        exit 1
+      fi
+    fi
   elif command -v apt-get > /dev/null 2>&1; then
-    apt-get install -y postgresql-contrib-16
+    apt-get install -y "postgresql-contrib-${pg_major}"
   else
-    echo "错误：没找到 dnf/apt-get，请手工安装 postgresql16-contrib。" >&2; exit 1
+    echo "错误：没找到 dnf/apt-get，请手工安装 postgresql${pg_major}-contrib。" >&2; exit 1
+  fi
+
+  if compgen -G "/usr/pgsql-*/share/extension/pg_trgm.control" > /dev/null \
+     || compgen -G "/usr/share/postgresql/*/extension/pg_trgm.control" > /dev/null; then
+    echo "    pg_trgm.control 已就位 ✓（无需重启 PostgreSQL）"
+  else
+    echo "    警告：没在标准扩展目录看到 pg_trgm.control，下面的预检会给出确切路径。" >&2
   fi
   echo
 fi
@@ -217,6 +246,49 @@ PSQL=(psql -X -q -v ON_ERROR_STOP=1)
 run_sql() { "${PSQL[@]}" -c "$1"; }
 scalar()  { "${PSQL[@]}" -At -c "$1"; }
 
+# ---------- 诊断辅助 ----------
+
+# 服务端的报错里带着它期望的控制文件绝对路径，比硬编码猜测可靠：
+#   DETAIL: Could not open extension control file "/usr/pgsql-16/share/extension/pg_trgm.control"
+# 多语句由 psql 隐式包在一个事务里，失败即整体回滚，不会留下半个扩展。
+probe_extension_control_path() {
+  local ext="$1" out
+  out="$("${PSQL[@]}" -At -c "CREATE EXTENSION IF NOT EXISTS ${ext};" 2>&1 || true)"
+  printf '%s\n' "${out}" | sed -n 's/.*control file "\([^"]*\)".*/\1/p' | head -n 1
+}
+
+# 由控制文件路径反推该用哪个包（PGDG/RHEL 与 Debian 的目录布局不同）
+contrib_hint_for_path() {
+  local ctl="$1" dir major
+  [[ -z "${ctl}" ]] && return 0
+  dir="$(dirname "${ctl}")"
+  case "${ctl}" in
+    /usr/pgsql-*)                 # /usr/pgsql-16/share/extension/...
+      major="${dir%/share/extension}"; major="${major##*/pgsql-}"
+      echo "dnf install -y postgresql${major}-contrib" ;;
+    /usr/share/postgresql/*)      # /usr/share/postgresql/16/extension/...
+      major="${dir%/extension}"; major="${major##*/}"
+      echo "apt-get install -y postgresql-contrib-${major}" ;;
+    *) echo "" ;;
+  esac
+}
+
+# 数据库主机是不是本机？（DB_HOST 出现在本机网卡上 / 是回环地址）
+is_local_db_host() {
+  local h="$1"
+  [[ -z "${h}" ]] && return 1
+  case "${h}" in
+    127.0.0.1|localhost|::1) return 0 ;;
+  esac
+  if command -v ip > /dev/null 2>&1; then
+    ip -o -4 addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -qx "${h}" && return 0
+  fi
+  if command -v hostname > /dev/null 2>&1; then
+    hostname -I 2>/dev/null | tr ' ' '\n' | grep -qx "${h}" && return 0
+  fi
+  return 1
+}
+
 # ---------- 预检 ----------
 echo "==> 连接数据库…"
 if ! scalar "SELECT 1" > /dev/null 2>&1; then
@@ -235,13 +307,34 @@ fi
 
 trgm_ok="$(scalar "SELECT (EXISTS (SELECT 1 FROM pg_extension WHERE extname='pg_trgm') OR EXISTS (SELECT 1 FROM pg_available_extensions WHERE name='pg_trgm'))::text")"
 if [[ "${trgm_ok}" != "true" ]]; then
-  echo "错误：本服务器的 PostgreSQL 没有 pg_trgm（缺 postgresql16-contrib）。" >&2
-  cat >&2 <<TIP
-  SQL 装不了它，必须先在【数据库主机 $( [[ -n "${DB_HOST}" ]] && echo "${DB_HOST}" )】上以 root 执行：
-      dnf install -y postgresql16-contrib
-      ls /usr/pgsql-16/share/extension/pg_trgm.control   # 看到文件即成功
-  装完不需要重启 PostgreSQL。
-TIP
+  ctl_path="$(probe_extension_control_path pg_trgm)"
+  [[ -z "${ctl_path}" ]] && ctl_path="/usr/pgsql-16/share/extension/pg_trgm.control"
+  install_cmd="$(contrib_hint_for_path "${ctl_path}")"
+  [[ -z "${install_cmd}" ]] && install_cmd="dnf install -y postgresql16-contrib"
+
+  echo "错误：这台 PostgreSQL 没有 pg_trgm 扩展（缺 postgresql-contrib 包）。" >&2
+  echo "      SQL 装不了它 —— 控制文件必须先由操作系统装上。" >&2
+  echo >&2
+  echo "      服务端期望的控制文件路径（从 PG 报错里读出，不是猜的）：" >&2
+  echo "          ${ctl_path}" >&2
+  echo "      在数据库主机上以 root 执行：" >&2
+  echo "          ${install_cmd}" >&2
+  echo "          ls -l ${ctl_path}        # 看到文件即成功" >&2
+  echo "      装完不需要重启 PostgreSQL。" >&2
+  echo >&2
+  if is_local_db_host "${DB_HOST}"; then
+    echo "  ✔ 本机就是数据库主机（${DB_HOST:-回环}），直接在本地执行即可：" >&2
+    echo "        ${install_cmd}" >&2
+    echo "        bash scripts/apply-search-indexes.sh" >&2
+    echo "    或用本脚本代劳（需 root，装完自动继续建索引）：" >&2
+    echo "        sudo bash scripts/apply-search-indexes.sh --install-contrib" >&2
+  else
+    echo "  ✘ 本机不是数据库主机：本机是 $(hostname)，库在 ${DB_HOST:-<见 .env>}。" >&2
+    echo "    要在${DB_HOST:-库主机}上操作，先登录过去：" >&2
+    echo "        ssh root@${DB_HOST:-<db-host>}" >&2
+    echo "    登不上也无妨：issue / project / comment 现在都是空表，缺这 3 个索引" >&2
+    echo "    不影响搜索（毫秒级全表扫），只在大数据量下才有意义。" >&2
+  fi
   exit 3
 fi
 echo "    pg_trgm 可用 ✓"
