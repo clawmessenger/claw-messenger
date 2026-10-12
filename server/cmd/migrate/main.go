@@ -83,6 +83,20 @@ var pgBigmOperatorClass = extensionOperatorClass{
 	Extension:     "pg_bigm",
 }
 
+// pgTrgmOperatorClass gates the trigram fallback indexes migrations 138, 141 and
+// 142 build. Like pg_bigm, pg_trgm ships with contrib rather than core
+// Postgres, so a self-hosted server built without it has no gin_trgm_ops and the
+// ungated CREATE INDEX CONCURRENTLY would abort the run — and with it backend
+// startup — for indexes that are only a search optimization. Migration 137
+// installs the extension where it is available, so this gate follows it: the
+// three indexes stay skipped in exactly the environment where 137 could not
+// install pg_trgm.
+var pgTrgmOperatorClass = extensionOperatorClass{
+	AccessMethod:  "gin",
+	OperatorClass: "gin_trgm_ops",
+	Extension:     "pg_trgm",
+}
+
 // preMigrationHooks wires migration version → hook. The version key is
 // the file basename without the `.up.sql` suffix, matching what
 // `migrations.ExtractVersion` returns.
@@ -470,6 +484,16 @@ var upMigrationConditions = map[string]migrationCondition{
 	// else, rather than failing the run (and with it backend startup) on every
 	// database without the extension.
 	"446_issue_properties_bigm_index": whenOperatorClassAvailable(pgBigmOperatorClass),
+	// The trigram fallback indexes are the same kind of optional optimization:
+	// pg_trgm is not part of core Postgres, so a self-hosted server installed
+	// without contrib cannot build them. An ungated CONCURRENTLY build of an
+	// absent operator class aborts the migration run, which is how a fresh
+	// install dies partway through on exactly these versions while 139/140 sit
+	// behind skipMigration in the same file range. Migration 137 installs the
+	// extension first, so gating on gin_trgm_ops matches its outcome.
+	"138_issue_title_trgm_index":         whenOperatorClassAvailable(pgTrgmOperatorClass),
+	"141_project_title_trgm_index":       whenOperatorClassAvailable(pgTrgmOperatorClass),
+	"142_project_description_trgm_index": whenOperatorClassAvailable(pgTrgmOperatorClass),
 }
 
 // Migrations 454 and 455 restore the mutually exclusive comment search index

@@ -1,5 +1,19 @@
--- Enable extensions
-CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+-- Enable extensions.
+--
+-- gen_random_uuid() has been a core function since PostgreSQL 13, so nothing
+-- below needs pgcrypto on a supported server. Install it only where the build
+-- actually ships it: a self-hosted Postgres installed without the contrib
+-- package has no pgcrypto to install, and an unprotected CREATE EXTENSION
+-- aborts the whole fresh install here — before a single table exists, and with
+-- no later migration able to repair it. Mirrors the graceful-skip pattern of
+-- migration 032 (pg_bigm) and 076 (pg_cron).
+DO $$
+BEGIN
+    CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'pgcrypto not available; skipping. gen_random_uuid() is core on PostgreSQL 13+.';
+END
+$$;
 
 -- Users
 CREATE TABLE "user" (
