@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -13,25 +14,42 @@ import (
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
+// HostPersonaLoader returns the operator-written 「人设提示词」 configured on the
+// admin page (discussion_host_prompt). It lives in the HTTP layer because the
+// config row is resolved with the same workspace fallback the admin API uses;
+// nil, or "" returned, means the host node keeps its own role prompt.
+type HostPersonaLoader func(ctx context.Context) string
+
 type DiscussionService struct {
-	queries  *db.Queries
-	client   *rongcloudAPIClient
-	registry *DiscussionRegistry
-	bridge   *DiscussionBridge
-	logger   *slog.Logger
+	queries     *db.Queries
+	client      *rongcloudAPIClient
+	registry    *DiscussionRegistry
+	bridge      *DiscussionBridge
+	hostPersona HostPersonaLoader
+	logger      *slog.Logger
 }
 
-func NewDiscussionService(queries *db.Queries, client *rongcloudAPIClient, registry *DiscussionRegistry, bridge *DiscussionBridge, logger *slog.Logger) *DiscussionService {
+func NewDiscussionService(queries *db.Queries, client *rongcloudAPIClient, registry *DiscussionRegistry, bridge *DiscussionBridge, hostPersona HostPersonaLoader, logger *slog.Logger) *DiscussionService {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &DiscussionService{
-		queries:  queries,
-		client:   client,
-		registry: registry,
-		bridge:   bridge,
-		logger:   logger,
+		queries:     queries,
+		client:      client,
+		registry:    registry,
+		bridge:      bridge,
+		hostPersona: hostPersona,
+		logger:      logger,
 	}
+}
+
+// hostPrompt resolves the host persona for one discussion. A nil loader, or an
+// unconfigured/blank value, yields "" and the host falls back to its role.
+func (s *DiscussionService) hostPrompt(ctx context.Context) string {
+	if s.hostPersona == nil {
+		return ""
+	}
+	return strings.TrimSpace(s.hostPersona(ctx))
 }
 
 func (s *DiscussionService) StartDiscussion(ctx context.Context, chatroomID pgtype.UUID) (DiscussionState, error) {
@@ -67,6 +85,7 @@ func (s *DiscussionService) StartDiscussion(ctx context.Context, chatroomID pgty
 			NodeID:          m.NodeID,
 			SpeakingOrder:   int(m.SpeakingOrder.Int32),
 			RoleName:        m.RoleName.String,
+			RolePrompt:      strings.TrimSpace(m.RoleInstructions.String),
 			Model:           m.Model.String,
 			RongcloudUserID: node.RongcloudUserID,
 			AiType:          node.AiType.String,
@@ -86,9 +105,12 @@ func (s *DiscussionService) StartDiscussion(ctx context.Context, chatroomID pgty
 		ChatroomID:  chatroomID,
 		WorkspaceID: chatroom.WorkspaceID,
 		HostNodeID:  hostNodeID,
-		Status:      StatusStarting,
-		Speakers:    speakers,
-		StartedAt:   time.Now(),
+		// Read once at start: a config edit mid-discussion must not make the
+		// host change personality between rounds.
+		HostPrompt: s.hostPrompt(ctx),
+		Status:     StatusStarting,
+		Speakers:   speakers,
+		StartedAt:  time.Now(),
 	}
 
 	eventStore := NewDiscussionEventStore(s.queries, s.logger)

@@ -1617,7 +1617,7 @@ func TestHandleDiscussionCommandYourTurn(t *testing.T) {
 }
 
 func TestNewDiscussionServiceWithBridge(t *testing.T) {
-	svc := NewDiscussionService(nil, nil, nil, nil, testLogger())
+	svc := NewDiscussionService(nil, nil, nil, nil, nil, testLogger())
 	if svc == nil {
 		t.Fatal("expected non-nil DiscussionService")
 	}

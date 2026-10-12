@@ -308,6 +308,76 @@ describe("MessageDispatcher discussion your_turn", () => {
     }
     expect(deps.sent).toHaveLength(0);
   });
+
+  it("adopts the server-assembled persona for this turn", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    let seenPrompt = "";
+    await dispatcher.handle(
+      {
+        objectName: "command",
+        fromUserId: "host_node",
+        toUserId: "rc_node_x",
+        targetId: "rc_node_x",
+        conversationType: 1,
+        content: JSON.stringify({
+          request_id: "turn_1_1_persona",
+          service: "discussion",
+          action: "your_turn",
+          params: {
+            round: 1,
+            speaking_order: 1,
+            role_name: "架构师",
+            chatroom_id: CHATROOM_ID,
+            // The host sends the operator's 人设提示词 and the role's 角色人设
+            // already joined by "\n\n"; the node must feed both to the agent
+            // verbatim rather than picking one.
+            role_prompt: "你是主持人，负责收敛分歧。\n\n你是架构师，先给结论再讲理由。",
+          },
+        }),
+      },
+      { runTurn: async (prompt) => { seenPrompt = prompt; return "ok"; } },
+    );
+    expect(seenPrompt).toContain("[discussion] round=1 speaking_order=1");
+    expect(seenPrompt).toContain("role: 架构师");
+    expect(seenPrompt).toContain("你是主持人，负责收敛分歧。");
+    expect(seenPrompt).toContain("你是架构师，先给结论再讲理由。");
+    expect(seenPrompt).toContain("Stay in character");
+  });
+
+  it("keeps the legacy prompt exactly when no persona is sent", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    // A coordinator older than the persona plumbing omits role_prompt
+    // entirely; a hand-written one may send blanks. Both must degrade to the
+    // prompt shape this node has always sent.
+    for (const rolePrompt of [undefined, "", "   "]) {
+      let seenPrompt = "";
+      const params: Record<string, unknown> = {
+        round: 1,
+        speaking_order: 1,
+        role_name: "reviewer",
+        chatroom_id: CHATROOM_ID,
+      };
+      if (rolePrompt !== undefined) params.role_prompt = rolePrompt;
+      await dispatcher.handle(
+        {
+          objectName: "command",
+          fromUserId: "host_node",
+          toUserId: "rc_node_x",
+          targetId: "rc_node_x",
+          conversationType: 1,
+          content: JSON.stringify({ request_id: "r", service: "discussion", action: "your_turn", params }),
+        },
+        { runTurn: async (prompt) => { seenPrompt = prompt; return "ok"; } },
+      );
+      expect(seenPrompt.split("\n")).toEqual([
+        "[discussion] round=1 speaking_order=1",
+        "role: reviewer",
+        "Answer as this node in the discussion.",
+      ]);
+    }
+  });
 });
 
 // Cross-contract suite: pins the envelope the Go webhook gate requires

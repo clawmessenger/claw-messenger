@@ -144,6 +144,22 @@ func (h *Handler) clawAdminDiscussionHostLoad(ctx context.Context) (clawAdminDis
 	return cfg, true, nil
 }
 
+// ClawDiscussionHostPersona hands the operator-written 「人设提示词」 to the
+// discussion coordinator; it is wired in as rongcloud.HostPersonaLoader.
+//
+// Before this existed the field was stored, echoed back to the admin page, and
+// then read by nobody — writing it had no effect on the host's behaviour. It is
+// resolved through clawAdminDiscussionHostLoad so the same workspace fallback
+// the admin API uses applies here too. Any failure degrades to "no persona"
+// rather than blocking the discussion.
+func (h *Handler) ClawDiscussionHostPersona(ctx context.Context) string {
+	cfg, found, err := h.clawAdminDiscussionHostLoad(ctx)
+	if err != nil || !found {
+		return ""
+	}
+	return cfg.DiscussionHostPrompt
+}
+
 // applyClawAdminDiscussionHostStored copies the recognised fields out of the
 // stored jsonb object, ignoring anything of the wrong type so a hand-edited row
 // degrades to defaults instead of failing the whole read.

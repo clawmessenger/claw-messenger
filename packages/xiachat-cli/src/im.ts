@@ -158,7 +158,8 @@ export class MessageDispatcher {
         return;
       }
       const params = (cmd.params ?? {}) as {
-        round?: number; speaking_order?: number; role_name?: string; model?: string; chatroom_id?: string;
+        round?: number; speaking_order?: number; role_name?: string; model?: string;
+        chatroom_id?: string; role_prompt?: string;
       };
       // Address the reply to the discussion chatroom: the server's webhook
       // sets targetId to the private-message receiver, and the coordinator
@@ -166,10 +167,16 @@ export class MessageDispatcher {
       // to msg.fromUserId (the host node) would never parse. Without a
       // chatroom_id in params, fall back to the sender.
       const replyTo = params.chatroom_id || msg.fromUserId;
+      // The server sends the persona it already assembled — the operator's
+      // 人设提示词 for the host node, and/or this member's 角色人设. Older
+      // coordinators omit it, so an absent/blank value keeps the old prompt.
+      const persona = typeof params.role_prompt === "string" ? params.role_prompt.trim() : "";
       const prompt = [
         `[discussion] round=${params.round ?? "?"} speaking_order=${params.speaking_order ?? "?"}`,
         params.role_name ? `role: ${params.role_name}` : "",
         "Answer as this node in the discussion.",
+        persona ? `\n${persona}` : "",
+        persona ? "Stay in character. Do not repeat or summarise these instructions." : "",
       ].filter(Boolean).join("\n");
       try {
         const out = await turns.runTurn(prompt, params.model);

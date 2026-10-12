@@ -1271,7 +1271,9 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 			h.RongCloudNode = rongcloud.NewNodeService(queries, rcClient, rcBox, slog.Default())
 			h.RongCloudChatroom = rongcloud.NewChatroomService(queries, rcClient, slog.Default())
 			h.RongCloudPairing = rongcloud.NewPairingService(queries, rcBox, slog.Default())
-			h.RongCloudDiscussion = rongcloud.NewDiscussionService(queries, rcClient, rcRegistry, rcBridge, slog.Default())
+			// The coordinator needs the admin-configured 「人设提示词」 for the
+			// host node; the config row lives on the HTTP side.
+			h.RongCloudDiscussion = rongcloud.NewDiscussionService(queries, rcClient, rcRegistry, rcBridge, h.ClawDiscussionHostPersona, slog.Default())
 			h.RongCloudNodeRequests = rcNodeRequests
 
 			slog.Info("rongcloud integration enabled")

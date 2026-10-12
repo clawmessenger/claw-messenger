@@ -176,24 +176,49 @@ func (c *DiscussionCoordinator) handleStreamResponse(ctx context.Context, resp N
 	}
 }
 
+// personaFor assembles the persona text one speaker must adopt this turn:
+// the operator's 「人设提示词」 for the host node, and the member's own
+// 「角色人设」 for everybody (the host may carry both — the operator text is the
+// moderator role, the membership text an additional assignment).
+//
+// Both were collected but never delivered before: role_instructions was read
+// into SpeakerInfo and dropped, and discussion_host_prompt had no reader at all.
+func (c *DiscussionCoordinator) personaFor(speaker SpeakerInfo) string {
+	parts := make([]string, 0, 2)
+	if c.state.HostPrompt != "" && speaker.NodeID == c.state.HostNodeID {
+		parts = append(parts, c.state.HostPrompt)
+	}
+	if speaker.RolePrompt != "" {
+		parts = append(parts, speaker.RolePrompt)
+	}
+	return strings.Join(parts, "\n\n")
+}
+
 func (c *DiscussionCoordinator) sendYourTurn(ctx context.Context, speaker SpeakerInfo, round int, speakingOrder int32) error {
 	if c.bridge != nil && c.bridge.IsServerManagedByType(speaker.AiType) {
 		go c.executeBridgeTurn(ctx, speaker, round, int(speakingOrder))
 		return nil
 	}
 
+	params := map[string]interface{}{
+		"round":           round,
+		"speaking_order":  speakingOrder,
+		"role_name":       speaker.RoleName,
+		"model":           speaker.Model,
+		"chatroom_id":     chatroomKey(c.chatroomID),
+		"discussion_kind": c.state.Status,
+	}
+	// Omitted rather than sent empty, so a reader that predates the field sees
+	// the same payload shape it always did.
+	if persona := c.personaFor(speaker); persona != "" {
+		params["role_prompt"] = persona
+	}
+
 	payload, _ := json.Marshal(map[string]interface{}{
-		"request_id":     fmt.Sprintf("turn_%d_%d_%s", round, speakingOrder, time.Now().Format("20060102150405")),
-		"service":        "discussion",
-		"action":         "your_turn",
-		"params": map[string]interface{}{
-			"round":           round,
-			"speaking_order":  speakingOrder,
-			"role_name":       speaker.RoleName,
-			"model":           speaker.Model,
-			"chatroom_id":     chatroomKey(c.chatroomID),
-			"discussion_kind": c.state.Status,
-		},
+		"request_id": fmt.Sprintf("turn_%d_%d_%s", round, speakingOrder, time.Now().Format("20060102150405")),
+		"service":    "discussion",
+		"action":     "your_turn",
+		"params":     params,
 	})
 	fromUserID := ""
 	for _, s := range c.state.Speakers {
@@ -246,6 +271,11 @@ func (c *DiscussionCoordinator) buildPrompt(speaker SpeakerInfo, round, speaking
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("You are participating in a multi-agent discussion (round %d).\n", round))
 	sb.WriteString(fmt.Sprintf("Your role: %s\n", speaker.RoleName))
+	if persona := c.personaFor(speaker); persona != "" {
+		sb.WriteString("\n")
+		sb.WriteString(persona)
+		sb.WriteString("\n")
+	}
 	sb.WriteString(fmt.Sprintf("Speaking order: %d\n", speakingOrder))
 	if speaker.Model != "" {
 		sb.WriteString(fmt.Sprintf("Model: %s\n", speaker.Model))

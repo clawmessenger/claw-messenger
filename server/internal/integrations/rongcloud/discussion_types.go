@@ -27,14 +27,22 @@ type DiscussionState struct {
 	CurrentSpeaker pgtype.UUID
 	Speakers       []SpeakerInfo
 	HostNodeID     pgtype.UUID
-	StartedAt      time.Time
-	EndedAt        *time.Time
+	// HostPrompt is the operator-written 「人设提示词」 (the admin page's
+	// discussion_host_prompt) and applies to the host node only. "" leaves the
+	// host on whatever role prompt its chatroom membership carries.
+	HostPrompt string
+	StartedAt  time.Time
+	EndedAt    *time.Time
 }
 
 type SpeakerInfo struct {
-	NodeID          pgtype.UUID
-	SpeakingOrder   int
-	RoleName        string
+	NodeID        pgtype.UUID
+	SpeakingOrder int
+	RoleName      string
+	// RolePrompt is this member's 「角色人设」, persisted as
+	// rongcloud_chatroom_member.role_instructions. It is what makes two nodes
+	// on the same model behave as different participants.
+	RolePrompt      string
 	Model           string
 	RongcloudUserID string
 	AiType          string
