@@ -375,6 +375,10 @@ type Handler struct {
 	RongCloudChatroom   *rongcloud.ChatroomService
 	RongCloudPairing    *rongcloud.PairingService
 	RongCloudDiscussion *rongcloud.DiscussionService
+	// RongCloudNodeRequests brokers server-initiated device requests over the
+	// command channel; see rongcloud.NodeRequestBroker. Shared with the channel
+	// via ChannelDeps, which is why it lives here rather than inside a service.
+	RongCloudNodeRequests *rongcloud.NodeRequestBroker
 
 	// channelFileDelivery names the channel types that can, IN THIS
 	// DEPLOYMENT, carry a file the agent produced the last hop into the

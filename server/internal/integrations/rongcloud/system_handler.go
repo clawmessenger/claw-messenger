@@ -11,23 +11,25 @@ import (
 )
 
 type systemHandler struct {
-	queries  *db.Queries
-	client   *rongcloudAPIClient
-	nodeID   string
-	logger   *slog.Logger
-	registry *DiscussionRegistry
+	queries      *db.Queries
+	client       *rongcloudAPIClient
+	nodeID       string
+	logger       *slog.Logger
+	registry     *DiscussionRegistry
+	nodeRequests *NodeRequestBroker
 }
 
-func newSystemHandler(client *rongcloudAPIClient, nodeID string, logger *slog.Logger, queries *db.Queries, registry *DiscussionRegistry) *systemHandler {
+func newSystemHandler(client *rongcloudAPIClient, nodeID string, logger *slog.Logger, queries *db.Queries, registry *DiscussionRegistry, nodeRequests *NodeRequestBroker) *systemHandler {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &systemHandler{
-		queries:  queries,
-		client:   client,
-		nodeID:   nodeID,
-		logger:   logger,
-		registry: registry,
+		queries:      queries,
+		client:       client,
+		nodeID:       nodeID,
+		logger:       logger,
+		registry:     registry,
+		nodeRequests: nodeRequests,
 	}
 }
 

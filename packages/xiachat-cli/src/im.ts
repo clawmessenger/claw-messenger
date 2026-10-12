@@ -14,6 +14,15 @@ import {
   type RuntimeRecoveryRequest,
   type RuntimeRecoveryResult,
 } from "./runtime-recovery.js";
+import {
+  buildRoleRecommendPrompt,
+  buildRoleRecommendationError,
+  buildRoleRecommendationResponse,
+  parseRoleRecommendRequest,
+  parseRoleRecommendationOutput,
+  ROLE_RECOMMEND_ACTION,
+  STALE_ROLE_RECOMMEND_REQUEST_MS,
+} from "./role-recommend.js";
 
 // Inbound message shape normalized from the IM SDK listener.
 export interface InboundIMMessage {
@@ -86,6 +95,9 @@ export class MessageDispatcher {
   // Same guard for the runtime-recovery exchange: a replayed recover must not
   // re-run the install + agent spawn. Bounded: evicts oldest.
   private readonly answeredRecoveryRequests = new Set<string>();
+  // Same guard for the admin role-recommendation preview: a replayed request
+  // must not spend a whole agent turn again. Bounded: evicts oldest.
+  private readonly answeredRoleRecommendRequests = new Set<string>();
 
   constructor(private readonly deps: DispatcherDeps) {}
 
@@ -135,7 +147,14 @@ export class MessageDispatcher {
         return;
       }
       const cmd = decodeCommandContent(msg.content);
-      if (!cmd || cmd.service !== "discussion" || cmd.action !== "your_turn") {
+      if (!cmd || cmd.service !== "discussion") {
+        return;
+      }
+      if (cmd.action === ROLE_RECOMMEND_ACTION) {
+        await this.handleRoleRecommend(msg, cmd, turns);
+        return;
+      }
+      if (cmd.action !== "your_turn") {
         return;
       }
       const params = (cmd.params ?? {}) as {
@@ -283,6 +302,83 @@ export class MessageDispatcher {
       const oldest = this.answeredRecoveryRequests.values().next().value;
       if (oldest === undefined) break;
       this.answeredRecoveryRequests.delete(oldest);
+    }
+  }
+
+  /**
+   * Answers the admin 「测试角色推荐」 button.
+   *
+   * Asks this node's agent to propose the discussion roles for a topic, then
+   * replies with a command_result carrying them. Always replies — even on a bad
+   * model answer — because a silent drop leaves the admin waiting out its whole
+   * timeout, which is indistinguishable from a dead node.
+   *
+   * Two guards, same reasoning as the model-catalog exchange: the admin's wait
+   * is bounded, so a replay older than STALE_ROLE_RECOMMEND_REQUEST_MS is
+   * already unanswerable; and 融云 replays the offline history on every
+   * reconnect, so each requestId is answered at most once.
+   */
+  async handleRoleRecommend(
+    msg: InboundIMMessage,
+    cmd: { request_id: string; params?: Record<string, unknown> },
+    turns: TurnRunner,
+  ): Promise<void> {
+    // The caller has already matched service/action; re-parse for the params.
+    const request = parseRoleRecommendRequest({
+      request_id: cmd.request_id,
+      service: "discussion",
+      action: ROLE_RECOMMEND_ACTION,
+      params: cmd.params,
+    });
+    if (!request) {
+      return;
+    }
+    if (request.timestamp !== undefined) {
+      const ageMs = Date.now() - request.timestamp;
+      if (ageMs > STALE_ROLE_RECOMMEND_REQUEST_MS) {
+        console.log(
+          `role recommend: skipping stale request ${request.requestId} (${ageMs}ms old)`,
+        );
+        return;
+      }
+    }
+    if (this.answeredRoleRecommendRequests.has(request.requestId)) {
+      console.log(`role recommend: skipping replayed request ${request.requestId} (already answered)`);
+      return;
+    }
+
+    const startedAt = Date.now();
+    console.log(
+      `role recommend: request ${request.requestId} max_roles=${request.maxRoles} from ${msg.fromUserId}`,
+    );
+    let reply: string;
+    try {
+      const output = await turns.runTurn(buildRoleRecommendPrompt(request));
+      const roles = parseRoleRecommendationOutput(output, request.maxRoles);
+      reply = roles
+        ? buildRoleRecommendationResponse(request.requestId, roles)
+        : buildRoleRecommendationError(request.requestId, "role recommendation invalid");
+      if (roles) {
+        console.log(
+          `role recommend: answered ${request.requestId} with ${roles.length} role(s) in ${Date.now() - startedAt}ms`,
+        );
+      } else {
+        console.error(`role recommend: could not parse an answer for ${request.requestId}`);
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "agent turn failed";
+      console.error(`role recommend: agent turn failed for ${request.requestId}: ${message}`);
+      reply = buildRoleRecommendationError(request.requestId, message);
+    }
+
+    await this.deps.send(msg.fromUserId, "command", reply);
+    // Remembered only once the reply is on the wire, so a failed send stays
+    // retryable (the transport retries rate-limited sends itself).
+    this.answeredRoleRecommendRequests.add(request.requestId);
+    while (this.answeredRoleRecommendRequests.size > 256) {
+      const oldest = this.answeredRoleRecommendRequests.values().next().value;
+      if (oldest === undefined) break;
+      this.answeredRoleRecommendRequests.delete(oldest);
     }
   }
 

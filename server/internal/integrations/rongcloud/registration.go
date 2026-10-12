@@ -1,6 +1,7 @@
 package rongcloud
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 
@@ -16,6 +17,12 @@ type ChannelDeps struct {
 	HTTPClient *http.Client
 	Queries    *db.Queries
 	Registry   *DiscussionRegistry
+	// NodeRequests brokers server-initiated requests answered by a device over
+	// the command channel (currently the admin role-recommendation preview). The
+	// same instance is held by the HTTP layer, which starts requests from the
+	// admin API; the channel binds the sender and routes the answers in. Nil
+	// disables the feature.
+	NodeRequests *NodeRequestBroker
 }
 
 func RegisterRongCloud(reg *channel.Registry, deps ChannelDeps) {
@@ -33,11 +40,20 @@ func newRongCloudFactory(deps ChannelDeps) channel.Factory {
 			logger = slog.Default()
 		}
 		client := newRongCloudAPIClient(creds.AppKey, creds.AppSecret, deps.APIBase, deps.HTTPClient, logger)
+		// The broker needs the credential-resolved system node id to send, which
+		// only exists here — hence the bind rather than a constructor argument.
+		if deps.NodeRequests != nil {
+			systemNodeID := creds.SystemNodeID
+			deps.NodeRequests.BindSender(func(ctx context.Context, toUserID, content string) error {
+				_, err := client.sendPrivateMessage(ctx, systemNodeID, toUserID, objectNameCommand, content)
+				return err
+			})
+		}
 		return &rongcloudChannel{
 			cfg:           cfg,
 			creds:         creds,
 			client:        client,
-			systemHandler: newSystemHandler(client, creds.SystemNodeID, logger, deps.Queries, deps.Registry),
+			systemHandler: newSystemHandler(client, creds.SystemNodeID, logger, deps.Queries, deps.Registry, deps.NodeRequests),
 			registrar:     deps.Registrar,
 			handler:       cfg.Handler,
 			logger:        logger,

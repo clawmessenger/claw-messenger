@@ -695,3 +695,111 @@ describe("MessageDispatcher runtime recovery (一键唤醒)", () => {
     expect(JSON.parse(sent[0]).requestId).toBe("rec-retry");
   });
 });
+
+describe("MessageDispatcher discussion recommend_roles", () => {
+  const roleRequest = (
+    requestId: string,
+    params: Record<string, unknown> = {},
+    fromUserId = "system",
+  ) => ({
+    objectName: "command",
+    fromUserId,
+    toUserId: "rc_node_host",
+    targetId: "rc_node_host",
+    conversationType: 1,
+    content: JSON.stringify({
+      request_id: requestId,
+      service: "discussion",
+      action: "recommend_roles",
+      params: { topic: "AI 与就业", max_roles: 3, ...params },
+    }),
+  });
+
+  it("runs the agent and replies with roles as a command_result", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    const roles = [
+      { role_name: "主持人", role_prompt: "引导", speaking_order: 0 },
+      { role_name: "质疑者", role_prompt: "反驳", speaking_order: 1 },
+    ];
+    let seenPrompt = "";
+    await dispatcher.handle(roleRequest("roles_1"), {
+      runTurn: async (prompt) => {
+        seenPrompt = prompt;
+        return JSON.stringify({ roles });
+      },
+    });
+
+    expect(seenPrompt).toContain("Topic: AI 与就业");
+    expect(deps.sent).toHaveLength(1);
+    expect(deps.sent[0].to).toBe("system");
+    expect(deps.sent[0].objectName).toBe("command");
+    const parsed = JSON.parse(deps.sent[0].content);
+    expect(parsed.request_id).toBe("roles_1");
+    expect(parsed.msg_type).toBe("command_result");
+    expect(parsed.payload.kind).toBe("text");
+    expect(parsed.payload.roles).toEqual(roles);
+  });
+
+  it("replies with an error command_result when the answer has no valid roles", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    await dispatcher.handle(roleRequest("roles_bad"), {
+      runTurn: async () => "I would rather not.",
+    });
+
+    const parsed = JSON.parse(deps.sent[0].content);
+    expect(parsed.request_id).toBe("roles_bad");
+    expect(parsed.payload.kind).toBe("error");
+  });
+
+  it("answers a replayed requestId exactly once", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    let runs = 0;
+    const turns = {
+      runTurn: async () => {
+        runs += 1;
+        return JSON.stringify({
+          roles: [{ role_name: "A", role_prompt: "p", speaking_order: 0 }],
+        });
+      },
+    };
+    await dispatcher.handle(roleRequest("roles_replay"), turns);
+    await dispatcher.handle(roleRequest("roles_replay"), turns);
+
+    expect(runs).toBe(1);
+    expect(deps.sent).toHaveLength(1);
+  });
+
+  it("skips a request whose timestamp is already too old", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    let runs = 0;
+    await dispatcher.handle(
+      roleRequest("roles_stale", { timestamp: Date.now() - 61 * 60 * 1000 }),
+      {
+        runTurn: async () => {
+          runs += 1;
+          return "{}";
+        },
+      },
+    );
+    expect(runs).toBe(0);
+    expect(deps.sent).toHaveLength(0);
+  });
+
+  it("ignores a recommend_roles request with an unusable param set", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    let runs = 0;
+    await dispatcher.handle(roleRequest("roles_nomax", { max_roles: 99 }), {
+      runTurn: async () => {
+        runs += 1;
+        return "{}";
+      },
+    });
+    expect(runs).toBe(0);
+    expect(deps.sent).toHaveLength(0);
+  });
+});

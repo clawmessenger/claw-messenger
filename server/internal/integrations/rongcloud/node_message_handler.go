@@ -15,6 +15,15 @@ func (h *systemHandler) handleNodeMessage(ctx context.Context, msg NormalizedMes
 		"objectName", msg.ObjectName,
 	)
 
+	// A command_result may answer a server-initiated request (the admin
+	// role-recommendation preview) rather than a discussion turn. Offer it to the
+	// broker first: it returns true only for a request id it issued, so real
+	// discussion turns still fall through to the coordinator below.
+	if msg.ObjectName == objectNameCommand && h.nodeRequests != nil &&
+		h.nodeRequests.AcceptResponse(msg.FromUserID, msg.Content) {
+		return
+	}
+
 	switch msg.ObjectName {
 	case objectNameCommand:
 		h.handleCommandResult(ctx, msg)
@@ -90,10 +99,10 @@ func (h *systemHandler) handleTextResponse(ctx context.Context, msg NormalizedMe
 	}
 
 	resp := NodeResponse{
-		NodeID:   msg.FromUserID,
-		MsgType:  "text",
-		Content:  msg.Content,
-		TurnID:   msg.MsgUID,
+		NodeID:  msg.FromUserID,
+		MsgType: "text",
+		Content: msg.Content,
+		TurnID:  msg.MsgUID,
 	}
 
 	h.dispatchToCoordinator(ctx, msg.TargetID, resp)

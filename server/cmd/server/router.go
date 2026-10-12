@@ -1250,12 +1250,16 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 			rcWebhookDispatcher = rcDispatcher
 			rcRegistry := rongcloud.NewDiscussionRegistry()
 			rcBridge := rongcloud.NewDiscussionBridge(queries, slog.Default())
+			// One broker, two users: the channel binds the sender and routes
+			// device answers in, the admin API starts requests.
+			rcNodeRequests := rongcloud.NewNodeRequestBroker(slog.Default())
 			rongcloud.RegisterRongCloud(channelRegistry, rongcloud.ChannelDeps{
-				Registrar: rcDispatcher,
-				Decrypt:   rcBox.Open,
-				Logger:    slog.Default(),
-				Queries:   queries,
-				Registry:  rcRegistry,
+				Registrar:    rcDispatcher,
+				Decrypt:      rcBox.Open,
+				Logger:       slog.Default(),
+				Queries:      queries,
+				Registry:     rcRegistry,
+				NodeRequests: rcNodeRequests,
 			})
 
 			// Phase 2a: construct service-layer dependencies.
@@ -1265,6 +1269,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 			h.RongCloudChatroom = rongcloud.NewChatroomService(queries, rcClient, slog.Default())
 			h.RongCloudPairing = rongcloud.NewPairingService(queries, rcBox, slog.Default())
 			h.RongCloudDiscussion = rongcloud.NewDiscussionService(queries, rcClient, rcRegistry, rcBridge, slog.Default())
+			h.RongCloudNodeRequests = rcNodeRequests
 
 			slog.Info("rongcloud integration enabled")
 		}
@@ -1648,6 +1653,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	r.Get("/api/admin/system/discussion-host", h.ClawAdminDiscussionHostGet)
 	r.Put("/api/admin/system/discussion-host", h.ClawAdminDiscussionHostPut)
 	r.Get("/api/admin/system/discussion-host/eligible-nodes", h.ClawAdminDiscussionHostEligibleNodes)
+	r.Post("/api/admin/system/discussion-host/test-recommendation", h.ClawAdminDiscussionHostTestRecommendation)
 	r.Get("/api/admin/admins", h.ClawAdminListAdmins)
 	r.Post("/api/admin/admins", h.ClawAdminCreateAdmin)
 	r.Get("/api/admin/admins/{id}", h.ClawAdminGetAdmin)

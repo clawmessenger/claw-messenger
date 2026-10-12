@@ -22,6 +22,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -500,4 +501,118 @@ func clawAdminRequiredField(value *string, _ string, maximum int) (string, bool)
 		return "", false
 	}
 	return trimmed, true
+}
+
+// ---- POST /api/admin/system/discussion-host/test-recommendation ----
+//
+// 把「测试话题」发给已配置的主持节点，请它返回一组讨论角色，供页面预览。
+// 这是一次真实的往返：服务端经融云 command 通道下发 recommend_roles，设备端
+// CLI 调起本机 agent 产出角色 JSON 后回包（见 node_request_broker.go）。
+//
+// 旧后端的错误码（DISCUSSION_HOST_PUBLIC_ERRORS）原样保留，前端已有对应文案；
+// 未配置/被停用/节点离线属于 400 + 具名错误码，服务本身不可用才是 503。
+const (
+	clawAdminRecommendMaxTopic = 4000
+	clawAdminRecommendMaxGoal  = 8000
+)
+
+func (h *Handler) ClawAdminDiscussionHostTestRecommendation(w http.ResponseWriter, r *http.Request) {
+	ident := h.requireClawAdmin("system:write", w, r)
+	if ident == nil {
+		return
+	}
+
+	var body struct {
+		Topic    *string `json:"topic"`
+		Goal     *string `json:"goal"`
+		MaxRoles *int    `json:"max_roles"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
+		clawAdminFail(w, 400, "JSON object is required")
+		return
+	}
+	topic, ok := clawAdminRequiredField(body.Topic, "topic", clawAdminRecommendMaxTopic)
+	if !ok {
+		clawAdminFail(w, 400, "topic is required")
+		return
+	}
+	goal := ""
+	if body.Goal != nil {
+		goal = strings.TrimSpace(*body.Goal)
+		if len([]rune(goal)) > clawAdminRecommendMaxGoal {
+			clawAdminFail(w, 400, "goal has invalid length")
+			return
+		}
+	}
+	maxRoles := 3
+	if body.MaxRoles != nil {
+		maxRoles = *body.MaxRoles
+	}
+	if maxRoles < 1 || maxRoles > rongcloud.RecommendRolesMaxRoles {
+		clawAdminFail(w, 400, "max_roles must be between 1 and 8")
+		return
+	}
+
+	cfg, found, err := h.clawAdminDiscussionHostLoad(r.Context())
+	if err != nil {
+		clawAdminFail(w, 503, "discussion host config unavailable")
+		return
+	}
+	if !found || cfg.NodeID == "" {
+		h.clawAdminRecommendFail(w, r, ident, rongcloud.NodeRequestCodeHostNotConfigured, maxRoles)
+		return
+	}
+	if !cfg.Enabled {
+		h.clawAdminRecommendFail(w, r, ident, rongcloud.NodeRequestCodeHostDisabled, maxRoles)
+		return
+	}
+	if cfg.AIUserID == "" {
+		// 保存时已校验节点存在；读回来却没有融云 id，说明节点被删了。
+		h.clawAdminRecommendFail(w, r, ident, rongcloud.NodeRequestCodeHostNotConfigured, maxRoles)
+		return
+	}
+	if h.RongCloudNodeRequests == nil {
+		clawAdminFail(w, 503, "Role recommendation service is unavailable")
+		return
+	}
+
+	host := rongcloud.NodeRequestHost{
+		AIUserID:             cfg.AIUserID,
+		DisplayName:          cfg.DisplayName,
+		Avatar:               cfg.Avatar,
+		RecommendationPrompt: cfg.RoleRecommendationPrompt,
+		TimeoutSeconds:       cfg.TimeoutSeconds,
+		ConfigVersion:        cfg.ConfigVersion,
+	}
+
+	// 等待期间不要被服务端自己的读超时打断：设备端可能要跑完一次完整的
+	// agent 调用。上限仍由 host.TimeoutSeconds 决定（broker 内计时）。
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(cfg.TimeoutSeconds+5)*time.Second)
+	defer cancel()
+
+	payload, code := h.RongCloudNodeRequests.RecommendRoles(ctx, host, topic, goal, maxRoles)
+	if code != "" {
+		h.clawAdminRecommendFail(w, r, ident, code, maxRoles)
+		return
+	}
+
+	h.clawAdminAudit(r, ident, "test_discussion_host_recommendation", "system_config",
+		clawAdminDiscussionHostKey, map[string]interface{}{
+			"max_roles":         maxRoles,
+			"recommendation_id": payload["recommendation_id"],
+			"result_role_count": len(payload["roles"].([]map[string]interface{})),
+		})
+	clawAdminOK(w, payload)
+}
+
+// clawAdminRecommendFail renders a public role-recommendation error. The codes
+// the legacy backend returned as `400 {code,message}` keep that shape so the
+// admin page's existing error copy still applies.
+func (h *Handler) clawAdminRecommendFail(w http.ResponseWriter, r *http.Request, ident *clawAdminIdentity, code string, maxRoles int) {
+	h.clawAdminAudit(r, ident, "test_discussion_host_recommendation", "system_config",
+		clawAdminDiscussionHostKey, map[string]interface{}{
+			"max_roles":  maxRoles,
+			"error_code": code,
+		})
+	clawAdminFail(w, 400, code)
 }
