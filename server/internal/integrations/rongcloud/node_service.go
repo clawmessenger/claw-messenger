@@ -49,6 +49,10 @@ type NodeService struct {
 	logger     *slog.Logger
 	mu         sync.Mutex
 	heartbeats map[pgtype.UUID]time.Time
+	// claimMu guards the memoised friend-edge inversion behind NodeClaimants.
+	claimMu      sync.Mutex
+	claimCache   map[string]string
+	claimCacheAt time.Time
 }
 
 func NewNodeService(queries *db.Queries, client *rongcloudAPIClient, box *secretbox.Box, logger *slog.Logger) *NodeService {
@@ -240,7 +244,10 @@ func (s *NodeService) Register(ctx context.Context, params NodeRegisterParams) (
 		}
 	}
 	nodeID := fmt.Sprintf("node_%s", hex.EncodeToString(rcUser.ID.Bytes[:8]))
-	capabilitiesJSON, _ := json.Marshal(params.Capabilities)
+	// The device reports few (usually zero) capabilities; the discussion set the
+	// runtime will actually ask this node for is derived from its ai_type. See
+	// node_capabilities.go.
+	capabilitiesJSON := nodeCapabilitiesJSON(params.Capabilities, params.AIType)
 	node, err := s.queries.GetRongCloudNodeByRongCloudUserID(ctx, rcUserID)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return NodeRegisterResult{}, fmt.Errorf("rongcloud: lookup node: %w", err)
@@ -259,6 +266,16 @@ func (s *NodeService) Register(ctx context.Context, params NodeRegisterParams) (
 		})
 		if err != nil {
 			return NodeRegisterResult{}, fmt.Errorf("rongcloud: create node: %w", err)
+		}
+	} else if refreshed := nodeCapabilitiesJSONFromStored(node.Capabilities, params.AIType); string(refreshed) != string(node.Capabilities) {
+		// Register is idempotent per machine, so a device that registered before
+		// the discussion capability set existed keeps its row. Repair it in place
+		// on the next pair instead of leaving it without any capabilities.
+		if updated, err := s.queries.UpdateRongCloudNodeCapabilities(ctx, db.UpdateRongCloudNodeCapabilitiesParams{
+			ID:           node.ID,
+			Capabilities: refreshed,
+		}); err == nil {
+			node = updated
 		}
 	}
 	credID, credSecret, err := generateDeviceCredential()
@@ -309,7 +326,7 @@ func (s *NodeService) Register(ctx context.Context, params NodeRegisterParams) (
 	return NodeRegisterResult{
 		NodeID:                 nodeID,
 		Token:                  token,
-		Capabilities:           params.Capabilities,
+		Capabilities:           MergeNodeCapabilities(params.Capabilities, params.AIType),
 		DeviceCredentialTicket: credID,
 		BindingVersion:         int(node.BindingVersion),
 	}, nil
@@ -1273,16 +1290,32 @@ func (s *NodeService) ensureAgentNode(ctx context.Context, machineNode db.Rongcl
 			RongcloudUserID: rcUserID,
 			NodeID:          nodeIDText,
 			AiType:          pgText(agent),
-			Capabilities:    []byte("[]"),
-			DeployStatus:    "offline",
-			BindingVersion:  1,
-			MachineID:       machineID,
+			// A bound agent node is exactly what the discussion runtime
+			// dispatches turns to, so it advertises the discussion capability
+			// set rather than the empty list this used to hard-code. See
+			// node_capabilities.go.
+			Capabilities:   nodeCapabilitiesJSON(nil, agent),
+			DeployStatus:   "offline",
+			BindingVersion: 1,
+			MachineID:      machineID,
 		})
 		if err != nil {
 			return agentNodeBinding{}, fmt.Errorf("create node: %w", err)
 		}
 	} else if nodeIDText == "" {
 		nodeIDText = fmt.Sprintf("node_%s", hex.EncodeToString(rcUser.ID.Bytes[:8]))
+	}
+	if found {
+		// Re-binding an agent node is the natural repair point for a row created
+		// before the discussion capability set existed.
+		if refreshed := nodeCapabilitiesJSONFromStored(node.Capabilities, agent); string(refreshed) != string(node.Capabilities) {
+			if updated, err := s.queries.UpdateRongCloudNodeCapabilities(ctx, db.UpdateRongCloudNodeCapabilitiesParams{
+				ID:           node.ID,
+				Capabilities: refreshed,
+			}); err == nil {
+				node = updated
+			}
+		}
 	}
 	// Device credential: only mint one when none exists yet. The plaintext
 	// secret cannot be recovered later, so re-binding must not clobber it.

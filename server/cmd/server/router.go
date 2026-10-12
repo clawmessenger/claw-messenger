@@ -1604,10 +1604,14 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// clawmessenger supervisor auto-binds its built-in ops agent on the paired
 	// machine via this device-credential-authenticated endpoint.
 	r.Post("/api/claw/device/bind-agents", h.ClawDeviceBindAgents)
-						r.Post("/api/claw/device/heartbeat", h.ClawDeviceHeartbeat)
-						r.Get("/api/claw/nodes/{nodeId}/status", h.ClawNodeStatus)
-						r.Post("/api/claw/nodes/{nodeId}", h.ClawUpdateNode)
-						r.Delete("/api/claw/nodes/{nodeId}", h.ClawDeleteNode)
+	r.Post("/api/claw/device/heartbeat", h.ClawDeviceHeartbeat)
+	// clawmessenger supervisor 轮询管理端下发的期望运行状态（启停）。走 HTTP 而不是
+	// IM：能真正拉起/杀掉 agent 的 supervisor 主进程不持有融云连接，且被停掉的子进程
+	// 没有任何进程能收到「启动」。详见 internal/handler/claw_device_control.go。
+	r.Post("/api/claw/device/control", h.ClawDeviceControl)
+	r.Get("/api/claw/nodes/{nodeId}/status", h.ClawNodeStatus)
+	r.Post("/api/claw/nodes/{nodeId}", h.ClawUpdateNode)
+	r.Delete("/api/claw/nodes/{nodeId}", h.ClawDeleteNode)
 	r.Get("/api/claw/nodes", h.ClawListNodes)
 
 	// ClawMessenger (虾说) compatibility API — 移植自旧 Python 后端的公开契约，
@@ -1638,6 +1642,12 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	r.Get("/api/admin/system/config", h.ClawAdminSystemConfigList)
 	r.Get("/api/admin/system/config/{key}", h.ClawAdminSystemConfigGet)
 	r.Put("/api/admin/system/config/{key}", h.ClawAdminSystemConfigPut)
+	// 管理端「系统 → 讨论主持 AI」。旧 Python 后端把这组接口挂在
+	// /api/system/discussion-host（见 admin/routes/system.py），迁 Go 时漏了，
+	// 这里收进 /api/admin 命名空间，前端同步改路径。
+	r.Get("/api/admin/system/discussion-host", h.ClawAdminDiscussionHostGet)
+	r.Put("/api/admin/system/discussion-host", h.ClawAdminDiscussionHostPut)
+	r.Get("/api/admin/system/discussion-host/eligible-nodes", h.ClawAdminDiscussionHostEligibleNodes)
 	r.Get("/api/admin/admins", h.ClawAdminListAdmins)
 	r.Post("/api/admin/admins", h.ClawAdminCreateAdmin)
 	r.Get("/api/admin/admins/{id}", h.ClawAdminGetAdmin)
@@ -1649,10 +1659,20 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	r.Get("/api/admin/roles/{id}", h.ClawAdminGetRole)
 	r.Put("/api/admin/roles/{id}", h.ClawAdminUpdateRole)
 	r.Delete("/api/admin/roles/{id}", h.ClawAdminDeleteRole)
-	r.Get("/api/admin/nodes", h.ClawAdminEmptyPage)
-	r.Get("/api/admin/nodes/status/all", h.ClawAdminEmptyList)
-	r.Get("/api/admin/nodes/{id}", h.ClawAdminNotFound)
-	r.Get("/api/admin/nodes/{id}/status", h.ClawAdminNotFound)
+	// 管理端「设备管理」。这一片原先整片是空桩（列表空页、详情 404），页面列不出任何
+	// 设备；现在换成真实实现，数据源与可见性判据全部复用 rongcloud 集成层。
+	r.Get("/api/admin/nodes", h.ClawAdminListNodes)
+	r.Get("/api/admin/nodes/status/all", h.ClawAdminAllNodeStatuses)
+	r.Get("/api/admin/nodes/{id}", h.ClawAdminGetNode)
+	r.Put("/api/admin/nodes/{id}", h.ClawAdminUpdateNode)
+	r.Delete("/api/admin/nodes/{id}", h.ClawAdminDeleteNode)
+	r.Get("/api/admin/nodes/{id}/status", h.ClawAdminGetNodeStatus)
+	// 启停：写期望状态，由设备 supervisor 轮询执行（见 claw_device_control.go）。
+	r.Post("/api/admin/nodes/{id}/start", h.ClawAdminStartNode)
+	r.Post("/api/admin/nodes/{id}/stop", h.ClawAdminStopNode)
+	// 归属变更：按融云好友边重建（本地 owner_user_id 与 IM 账号体系对不上，见
+	// claw_admin_nodes.go 的 ClawAdminTransferNodeOwner）。
+	r.Put("/api/admin/nodes/{id}/owner", h.ClawAdminTransferNodeOwner)
 	r.Get("/api/admin/groups", h.ClawAdminEmptyPage)
 	r.Get("/api/admin/groups/{id}", h.ClawAdminNotFound)
 	r.Get("/api/admin/groups/{id}/members", h.ClawAdminEmptyList)
