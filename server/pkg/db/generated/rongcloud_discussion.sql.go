@@ -191,6 +191,56 @@ func (q *Queries) GetActiveRongCloudDiscussionByChatroom(ctx context.Context, ch
 	return i, err
 }
 
+const getClawIMUserByUserID = `-- name: GetClawIMUserByUserID :one
+SELECT user_id, username, nickname, portrait_uri, status
+FROM claw_im_users
+WHERE user_id = $1 AND status = 'active'
+LIMIT 1
+`
+
+type GetClawIMUserByUserIDRow struct {
+	UserID      string      `json:"user_id"`
+	Username    string      `json:"username"`
+	Nickname    pgtype.Text `json:"nickname"`
+	PortraitUri pgtype.Text `json:"portrait_uri"`
+	Status      string      `json:"status"`
+}
+
+// P4：C 端真人的身份兜底。claw 注册时融云 id = user_id 本身，但这批账号不在
+// rongcloud_user 镜像表里（clawRong 直接调融云 API 不写镜像），所以 service=
+// discussion 的 actor 解析必须同时能查到这张表。讨论身份域统一用融云侧 TEXT id，
+// 对 claw 用户而言就是 user_id。
+func (q *Queries) GetClawIMUserByUserID(ctx context.Context, userID string) (GetClawIMUserByUserIDRow, error) {
+	row := q.db.QueryRow(ctx, getClawIMUserByUserID, userID)
+	var i GetClawIMUserByUserIDRow
+	err := row.Scan(
+		&i.UserID,
+		&i.Username,
+		&i.Nickname,
+		&i.PortraitUri,
+		&i.Status,
+	)
+	return i, err
+}
+
+const getFirstActiveRongCloudInstallationWorkspace = `-- name: GetFirstActiveRongCloudInstallationWorkspace :one
+SELECT ci.workspace_id
+FROM channel_installation ci
+JOIN workspace w ON w.id = ci.workspace_id
+WHERE ci.status = 'active' AND ci.channel_type = 'rongcloud'
+ORDER BY ci.created_at ASC
+LIMIT 1
+`
+
+// P4：claw 用户镜像行补建时需要的 workspace 归属（单安装假设，与 HTTP 层
+// clawSingleInstallWorkspace 同一查询）。
+func (q *Queries) GetFirstActiveRongCloudInstallationWorkspace(ctx context.Context) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, getFirstActiveRongCloudInstallationWorkspace)
+	var workspace_id pgtype.UUID
+	err := row.Scan(&workspace_id)
+	return workspace_id, err
+}
+
 const getLatestRongCloudArtifactByDiscussion = `-- name: GetLatestRongCloudArtifactByDiscussion :one
 SELECT artifact_id, discussion_id, artifact_type, title, content, version, base_version, created_at, updated_at FROM rongcloud_artifact
 WHERE discussion_id = $1
@@ -232,6 +282,58 @@ func (q *Queries) GetRongCloudArtifact(ctx context.Context, artifactID string) (
 		&i.BaseVersion,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const getRongCloudChatroomViewByRongCloudID = `-- name: GetRongCloudChatroomViewByRongCloudID :one
+SELECT c.id, c.workspace_id, c.rongcloud_chatroom_id, c.owner_user_id, c.host_node_id, c.max_rounds, c.conversation_kind, c.config, c.status, c.created_at, c.updated_at, c.name, c.portrait_uri,
+       u.rongcloud_user_id AS owner_rc_user_id,
+       n.node_id          AS host_business_node_id
+FROM rongcloud_chatroom c
+LEFT JOIN rongcloud_user  u ON u.id = c.owner_user_id
+LEFT JOIN rongcloud_node  n ON n.id = c.host_node_id
+WHERE c.rongcloud_chatroom_id = $1
+`
+
+type GetRongCloudChatroomViewByRongCloudIDRow struct {
+	ID                  pgtype.UUID        `json:"id"`
+	WorkspaceID         pgtype.UUID        `json:"workspace_id"`
+	RongcloudChatroomID string             `json:"rongcloud_chatroom_id"`
+	OwnerUserID         pgtype.UUID        `json:"owner_user_id"`
+	HostNodeID          pgtype.UUID        `json:"host_node_id"`
+	MaxRounds           int32              `json:"max_rounds"`
+	ConversationKind    pgtype.Text        `json:"conversation_kind"`
+	Config              []byte             `json:"config"`
+	Status              string             `json:"status"`
+	CreatedAt           pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt           pgtype.Timestamptz `json:"updated_at"`
+	Name                string             `json:"name"`
+	PortraitUri         string             `json:"portrait_uri"`
+	OwnerRcUserID       pgtype.Text        `json:"owner_rc_user_id"`
+	HostBusinessNodeID  pgtype.Text        `json:"host_business_node_id"`
+}
+
+// P4：讨论的 room access 校验（status 不过滤 active：讨论存在即可访问历史）。
+func (q *Queries) GetRongCloudChatroomViewByRongCloudID(ctx context.Context, rongcloudChatroomID string) (GetRongCloudChatroomViewByRongCloudIDRow, error) {
+	row := q.db.QueryRow(ctx, getRongCloudChatroomViewByRongCloudID, rongcloudChatroomID)
+	var i GetRongCloudChatroomViewByRongCloudIDRow
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.RongcloudChatroomID,
+		&i.OwnerUserID,
+		&i.HostNodeID,
+		&i.MaxRounds,
+		&i.ConversationKind,
+		&i.Config,
+		&i.Status,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Name,
+		&i.PortraitUri,
+		&i.OwnerRcUserID,
+		&i.HostBusinessNodeID,
 	)
 	return i, err
 }
@@ -278,6 +380,49 @@ func (q *Queries) GetRongCloudDiscussionEventMaxSeq(ctx context.Context, discuss
 	var max_seq int64
 	err := row.Scan(&max_seq)
 	return max_seq, err
+}
+
+const listActiveRongCloudDiscussionTargets = `-- name: ListActiveRongCloudDiscussionTargets :many
+SELECT n.rongcloud_user_id AS node_rc_user_id, m.member_id, m.member_type, m.enabled
+FROM rongcloud_chatroom_member m
+JOIN rongcloud_chatroom c ON c.id = m.chatroom_id
+JOIN rongcloud_node n ON n.id = m.node_id
+WHERE c.rongcloud_chatroom_id = $1 AND m.enabled = TRUE
+`
+
+type ListActiveRongCloudDiscussionTargetsRow struct {
+	NodeRcUserID string      `json:"node_rc_user_id"`
+	MemberID     pgtype.Text `json:"member_id"`
+	MemberType   string      `json:"member_type"`
+	Enabled      bool        `json:"enabled"`
+}
+
+// P4：事件广播目标 = 该讨论所属聊天室的启用成员（AI 成员的融云账号）+ owner
+// （融云 id）。host_turn_requested 不广播（只私发给 host），其余事件广播给
+// 聊天室。这里取出 AI 成员的 rc 账号用于私发 your_turn / discussion_cancel。
+func (q *Queries) ListActiveRongCloudDiscussionTargets(ctx context.Context, rongcloudChatroomID string) ([]ListActiveRongCloudDiscussionTargetsRow, error) {
+	rows, err := q.db.Query(ctx, listActiveRongCloudDiscussionTargets, rongcloudChatroomID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListActiveRongCloudDiscussionTargetsRow{}
+	for rows.Next() {
+		var i ListActiveRongCloudDiscussionTargetsRow
+		if err := rows.Scan(
+			&i.NodeRcUserID,
+			&i.MemberID,
+			&i.MemberType,
+			&i.Enabled,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listActiveRongCloudDiscussions = `-- name: ListActiveRongCloudDiscussions :many

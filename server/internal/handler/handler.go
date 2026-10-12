@@ -379,6 +379,11 @@ type Handler struct {
 	// command channel; see rongcloud.NodeRequestBroker. Shared with the channel
 	// via ChannelDeps, which is why it lives here rather than inside a service.
 	RongCloudNodeRequests *rongcloud.NodeRequestBroker
+	// RongCloudDiscussionRepo 是 P2 的圆桌仓库层，C 端扁平 REST（P4）读它。
+	// 与 RongCloudDiscussion（旧固定轮流链路）并存：旧链路 P6 后退役。
+	RongCloudDiscussionRepo *rongcloud.DiscussionRepository
+	// RongCloudDiscussionAccess 校验 C 端用户对聊天室的成员资格（P4 REST 用）。
+	RongCloudDiscussionAccess *rongcloud.DiscussionRoomAccess
 
 	// channelFileDelivery names the channel types that can, IN THIS
 	// DEPLOYMENT, carry a file the agent produced the last hop into the

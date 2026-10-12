@@ -49,7 +49,7 @@ func (s *webReplyServer) last(t *testing.T) map[string]interface{} {
 func testHandler(t *testing.T, srv *httptest.Server, registry *DiscussionRegistry) *systemHandler {
 	t.Helper()
 	client := newRongCloudAPIClient("key", "secret", srv.URL, srv.Client(), testLogger())
-	return newSystemHandler(client, "sys_node", testLogger(), nil, registry, nil, nil)
+	return newSystemHandler(client, "sys_node", testLogger(), nil, registry, nil, nil, nil)
 }
 
 // --- 信封方言 ----------------------------------------------------------------

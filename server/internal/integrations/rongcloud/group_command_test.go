@@ -176,7 +176,7 @@ func (s *groupMirrorStub) mirror() *GroupMirror {
 func newGroupCommandHandler(t *testing.T, rec *groupTestServer, srv *httptest.Server, mirror *GroupMirror) *systemHandler {
 	t.Helper()
 	client := newRongCloudAPIClient("key", "secret", srv.URL, srv.Client(), testLogger())
-	return newSystemHandler(client, "sys-node", testLogger(), nil, nil, nil, mirror)
+	return newSystemHandler(client, "sys-node", testLogger(), nil, nil, nil, mirror, nil)
 }
 
 // ---- create ------------------------------------------------------------------

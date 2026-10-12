@@ -18,20 +18,23 @@ type systemHandler struct {
 	registry     *DiscussionRegistry
 	nodeRequests *NodeRequestBroker
 	groupMirror  *GroupMirror
+	// discussionRuntime 承载 service=discussion 的生命周期 action（P4）。
+	discussionRuntime *discussionRuntime
 }
 
-func newSystemHandler(client *rongcloudAPIClient, nodeID string, logger *slog.Logger, queries *db.Queries, registry *DiscussionRegistry, nodeRequests *NodeRequestBroker, groupMirror *GroupMirror) *systemHandler {
+func newSystemHandler(client *rongcloudAPIClient, nodeID string, logger *slog.Logger, queries *db.Queries, registry *DiscussionRegistry, nodeRequests *NodeRequestBroker, groupMirror *GroupMirror, discussionRuntime *discussionRuntime) *systemHandler {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &systemHandler{
-		queries:      queries,
-		client:       client,
-		nodeID:       nodeID,
-		logger:       logger,
-		registry:     registry,
-		nodeRequests: nodeRequests,
-		groupMirror:  groupMirror,
+		queries:           queries,
+		client:            client,
+		nodeID:            nodeID,
+		logger:            logger,
+		registry:          registry,
+		nodeRequests:      nodeRequests,
+		groupMirror:       groupMirror,
+		discussionRuntime: discussionRuntime,
 	}
 }
 
@@ -333,35 +336,63 @@ func parseUUIDParam(s string) (pgtype.UUID, error) {
 }
 
 func (h *systemHandler) handleDiscussionCommand(ctx context.Context, msg NormalizedMessage, cmd CommandContent) error {
-	if h.registry == nil {
-		return h.replyErr(ctx, msg, cmd, 503, "discussion registry not available")
+	// 只读 action 不需要 actor
+	switch cmd.Action {
+	case "getWorkflowCapabilities":
+		if h.discussionRuntime == nil {
+			return h.replyErr(ctx, msg, cmd, 503, "discussion runtime not available")
+		}
+		return h.replyCommandResult(ctx, msg, cmd, h.discussionRuntime.actionGetWorkflowCapabilities(cmd))
+	case "getSystemHostStatus":
+		if h.discussionRuntime == nil {
+			return h.replyErr(ctx, msg, cmd, 503, "discussion runtime not available")
+		}
+		return h.replyCommandResult(ctx, msg, cmd, h.discussionRuntime.actionGetSystemHostStatus(ctx))
 	}
 
-	switch cmd.Action {
-	case "status":
-		chatroomIDStr := getStringAny(cmd.Params, "chatroom_id", "chatroomId")
-		chatroomID, err := parseUUIDParam(chatroomIDStr)
-		if err != nil {
-			return h.replyErr(ctx, msg, cmd, 400, "invalid or missing chatroom_id")
-		}
-		_, exists := h.registry.Get(chatroomID)
-		return h.replyOK(ctx, msg, cmd, map[string]interface{}{
-			"ok":     true,
-			"active": exists,
-		})
-
-	case "your_turn":
-		return h.replyOK(ctx, msg, cmd, map[string]interface{}{
-			"ok":      true,
-			"message": "your_turn acknowledged",
-		})
-
-	default:
-		// Same 404 contract as chatroom: the web matches on code 404 +
-		// "discussion/<action>" + "未知" to treat an action the server has not
-		// learned yet as a legacy no-op instead of a hard failure.
+	// P4：service=discussion 的生命周期 action。resolveActor 兼容 C 端真人
+	// （claw_im_users）与节点/安装账号（rongcloud_user）两个身份域。
+	// P5 动作（recommendRoles / createRoundtable / resumeRoundtable）尚未注册，
+	// 走 default 的 404 契约 —— 与「runtime 未装配」的语义区分开：
+	// 未装配只影响已注册的动作（503），未注册的动作永远 404 降级。
+	known := map[string]bool{
+		"start": true, "getActive": true, "continue": true, "finish": true,
+		"cancel": true, "interject": true, "retry": true, "stop": true,
+	}
+	if !known[cmd.Action] {
 		return h.replyErr(ctx, msg, cmd, 404, unknownServiceOrActionMessage(cmd))
 	}
+	if h.discussionRuntime == nil {
+		return h.replyErr(ctx, msg, cmd, 503, "discussion runtime not available")
+	}
+
+	actor, err := h.discussionRuntime.resolveActor(ctx, msg.FromUserID)
+	if err != nil {
+		return h.replyErr(ctx, msg, cmd, 400, "AUTHENTICATED_USER_NOT_FOUND")
+	}
+
+	var result commandResult
+	switch cmd.Action {
+	case "start":
+		result = h.discussionRuntime.actionStart(ctx, cmd, actor)
+	case "getActive":
+		result = h.discussionRuntime.actionGetActive(ctx, cmd, actor)
+	case "continue":
+		result = h.discussionRuntime.actionContinue(ctx, cmd, actor)
+	case "finish":
+		result = h.discussionRuntime.actionFinish(ctx, cmd, actor)
+	case "cancel":
+		result = h.discussionRuntime.actionCancel(ctx, cmd, actor)
+	case "interject":
+		result = h.discussionRuntime.actionInterject(ctx, cmd, actor)
+	case "retry":
+		result = h.discussionRuntime.actionRetry(ctx, cmd, actor)
+	case "stop":
+		result = h.discussionRuntime.actionStop(ctx, cmd, actor)
+	default:
+		return h.replyErr(ctx, msg, cmd, 404, unknownServiceOrActionMessage(cmd))
+	}
+	return h.replyCommandResult(ctx, msg, cmd, result)
 }
 
 // unknownServiceOrActionMessage mirrors the legacy backend's handler-not-found
@@ -399,6 +430,23 @@ func (h *systemHandler) replyOK(ctx context.Context, msg NormalizedMessage, cmd 
 
 // replyErr is replyOK's error twin. code carries the same meaning in both
 // dialects (404/400/403/409/503), so the legacy-404 tolerance keeps working.
+// replyCommandResult 把 commandResult（P3 chatroom / P4 discussion action 的
+// 内部返回形状）翻译成按方言自适应的回包。409 时 data 里带 latestSnapshot ——
+// 前端 conflictSnapshot 读 error.data.latestSnapshot 做重同步。
+func (h *systemHandler) replyCommandResult(ctx context.Context, msg NormalizedMessage, cmd CommandContent, result commandResult) error {
+	if result.code == 200 {
+		return h.replyOK(ctx, msg, cmd, result.data)
+	}
+	if cmd.WebEnvelope {
+		return h.client.sendWebCommandResult(ctx, h.nodeID, msg.FromUserID, cmd.RequestID,
+			cmd.Service, cmd.Action, "error", result.code, result.data, result.message)
+	}
+	return h.client.sendCommandResult(ctx, h.nodeID, msg.FromUserID, cmd.RequestID, map[string]interface{}{
+		"ok":    false,
+		"error": result.message,
+	})
+}
+
 func (h *systemHandler) replyErr(ctx context.Context, msg NormalizedMessage, cmd CommandContent, code int, errMsg string) error {
 	if cmd.WebEnvelope {
 		return h.client.sendWebCommandResult(ctx, h.nodeID, msg.FromUserID, cmd.RequestID,

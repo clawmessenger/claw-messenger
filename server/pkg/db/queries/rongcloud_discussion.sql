@@ -97,3 +97,43 @@ SELECT * FROM rongcloud_artifact
 WHERE discussion_id = $1
 ORDER BY updated_at DESC
 LIMIT 1;
+
+-- name: GetClawIMUserByUserID :one
+-- P4：C 端真人的身份兜底。claw 注册时融云 id = user_id 本身，但这批账号不在
+-- rongcloud_user 镜像表里（clawRong 直接调融云 API 不写镜像），所以 service=
+-- discussion 的 actor 解析必须同时能查到这张表。讨论身份域统一用融云侧 TEXT id，
+-- 对 claw 用户而言就是 user_id。
+SELECT user_id, username, nickname, portrait_uri, status
+FROM claw_im_users
+WHERE user_id = $1 AND status = 'active'
+LIMIT 1;
+
+-- name: ListActiveRongCloudDiscussionTargets :many
+-- P4：事件广播目标 = 该讨论所属聊天室的启用成员（AI 成员的融云账号）+ owner
+-- （融云 id）。host_turn_requested 不广播（只私发给 host），其余事件广播给
+-- 聊天室。这里取出 AI 成员的 rc 账号用于私发 your_turn / discussion_cancel。
+SELECT n.rongcloud_user_id AS node_rc_user_id, m.member_id, m.member_type, m.enabled
+FROM rongcloud_chatroom_member m
+JOIN rongcloud_chatroom c ON c.id = m.chatroom_id
+JOIN rongcloud_node n ON n.id = m.node_id
+WHERE c.rongcloud_chatroom_id = $1 AND m.enabled = TRUE;
+
+-- name: GetRongCloudChatroomViewByRongCloudID :one
+-- P4：讨论的 room access 校验（status 不过滤 active：讨论存在即可访问历史）。
+SELECT c.*,
+       u.rongcloud_user_id AS owner_rc_user_id,
+       n.node_id          AS host_business_node_id
+FROM rongcloud_chatroom c
+LEFT JOIN rongcloud_user  u ON u.id = c.owner_user_id
+LEFT JOIN rongcloud_node  n ON n.id = c.host_node_id
+WHERE c.rongcloud_chatroom_id = $1;
+
+-- name: GetFirstActiveRongCloudInstallationWorkspace :one
+-- P4：claw 用户镜像行补建时需要的 workspace 归属（单安装假设，与 HTTP 层
+-- clawSingleInstallWorkspace 同一查询）。
+SELECT ci.workspace_id
+FROM channel_installation ci
+JOIN workspace w ON w.id = ci.workspace_id
+WHERE ci.status = 'active' AND ci.channel_type = 'rongcloud'
+ORDER BY ci.created_at ASC
+LIMIT 1;

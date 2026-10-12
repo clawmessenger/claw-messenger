@@ -632,3 +632,18 @@ func (h *Handler) clawAdminRecommendFail(w http.ResponseWriter, r *http.Request,
 		})
 	clawAdminFail(w, 400, code)
 }
+
+// ClawDiscussionSystemHostConfig 供圆桌运行时（P4）读取管理端配置的 system
+// host 展示信息。复用 clawAdminDiscussionHostLoad 的解析（含 workspace 回落），
+// 翻译成 rongcloud 包的轻量形状。
+func (h *Handler) ClawDiscussionSystemHostConfig(ctx context.Context) (rongcloud.DiscussionSystemHostConfig, bool, error) {
+	cfg, found, err := h.clawAdminDiscussionHostLoad(ctx)
+	if err != nil || !found {
+		return rongcloud.DiscussionSystemHostConfig{}, found, err
+	}
+	return rongcloud.DiscussionSystemHostConfig{
+		NodeID:      cfg.NodeID,
+		DisplayName: cfg.DisplayName,
+		Avatar:      cfg.Avatar,
+	}, true, nil
+}

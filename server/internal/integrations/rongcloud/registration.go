@@ -27,6 +27,13 @@ type ChannelDeps struct {
 	// (the RongCloud group APIs live in this package, the tables in the HTTP
 	// layer). Nil disables the group commands.
 	GroupMirror *GroupMirror
+	// DiscussionRepository is the roundtable persistence layer (P2). The
+	// service=discussion lifecycle actions (P4) drive it. Nil disables those
+	// actions.
+	DiscussionRepository *DiscussionRepository
+	// SystemHostConfig loads the admin-configured discussion system host
+	// (display name / avatar / node). Nil falls back to NOT_CONFIGURED.
+	SystemHostConfig func(ctx context.Context) (DiscussionSystemHostConfig, bool, error)
 }
 
 func RegisterRongCloud(reg *channel.Registry, deps ChannelDeps) {
@@ -53,11 +60,16 @@ func newRongCloudFactory(deps ChannelDeps) channel.Factory {
 				return err
 			})
 		}
+		var discussionRuntime *discussionRuntime
+		if deps.DiscussionRepository != nil {
+			discussionRuntime = newDiscussionRuntime(deps.Queries, deps.DiscussionRepository, client, creds.SystemNodeID, logger)
+			discussionRuntime.systemHostLoader = deps.SystemHostConfig
+		}
 		return &rongcloudChannel{
 			cfg:           cfg,
 			creds:         creds,
 			client:        client,
-			systemHandler: newSystemHandler(client, creds.SystemNodeID, logger, deps.Queries, deps.Registry, deps.NodeRequests, deps.GroupMirror),
+			systemHandler: newSystemHandler(client, creds.SystemNodeID, logger, deps.Queries, deps.Registry, deps.NodeRequests, deps.GroupMirror, discussionRuntime),
 			registrar:     deps.Registrar,
 			handler:       cfg.Handler,
 			logger:        logger,

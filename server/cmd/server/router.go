@@ -1263,6 +1263,10 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				// GroupMirror 的 callbacks 懒查 h.RongCloudNode（构造完才赋值），
 				// 所以这里可以安全地先挂上去。
 				GroupMirror: h.ClawGroupMirror(),
+				// P4：service=discussion 的生命周期 action 驱动 P2 的仓库层；
+				// system host 展示名/头像从管理端配置行读。
+				DiscussionRepository: rongcloud.NewDiscussionRepository(queries, slog.Default()),
+				SystemHostConfig:     h.ClawDiscussionSystemHostConfig,
 			})
 
 			// Phase 2a: construct service-layer dependencies.
@@ -1275,6 +1279,9 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 			// host node; the config row lives on the HTTP side.
 			h.RongCloudDiscussion = rongcloud.NewDiscussionService(queries, rcClient, rcRegistry, rcBridge, h.ClawDiscussionHostPersona, slog.Default())
 			h.RongCloudNodeRequests = rcNodeRequests
+			// P4：C 端扁平 REST（/api/discussions/*）读 P2 的仓库层。
+			h.RongCloudDiscussionRepo = rongcloud.NewDiscussionRepository(queries, slog.Default())
+			h.RongCloudDiscussionAccess = rongcloud.NewDiscussionRoomAccess(queries)
 
 			slog.Info("rongcloud integration enabled")
 		}
@@ -1628,6 +1635,10 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// 供 clawmessenger-web / clawmessenger-uniapp 前端直连。
 	r.Post("/api/register", h.ClawRegister)
 	r.Post("/api/login", h.ClawLogin)
+	// P4：C 端圆桌扁平 REST（对齐旧 Python app.py:3042-3084 的路由与鉴权契约）。
+	r.Get("/api/chatrooms/{chatroomId}/discussions", h.ClawListChatroomDiscussions)
+	r.Get("/api/discussions/{discussionId}", h.ClawGetDiscussion)
+	r.Get("/api/discussions/{discussionId}/events", h.ClawGetDiscussionEvents)
 	r.Get("/api/user/list", h.ClawUserList)
 	r.Get("/api/user/friends", h.ClawUserFriends)
 	r.Get("/api/user/info", h.ClawUserInfo)
