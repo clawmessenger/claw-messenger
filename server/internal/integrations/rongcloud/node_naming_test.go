@@ -160,3 +160,35 @@ func TestIsAgentNodeOfMachineSkipsTheMachineNode(t *testing.T) {
 		t.Fatal("a different agent on the same machine must not match")
 	}
 }
+
+// The device list shows machineDisplayName as the machine badge. It exists so
+// three agents on one box stop rendering as three identical rows.
+func TestMachineDisplayName(t *testing.T) {
+	cases := []struct {
+		name   string
+		aiType string
+		want   string
+	}{
+		// What the CLI actually registers: "<os.hostname()> <aiType>".
+		{"小久 opencode", "opencode", "小久"},
+		{"SHGuoZiWei-JiaZhiZhiShu1-LiuZhiGuang-10.1.1.225 opencode", "opencode",
+			"SHGuoZiWei-JiaZhiZhiShu1-LiuZhiGuang-10.1.1.225"},
+		{"macbook hermes", "hermes", "macbook"},
+		// Already a bare hostname: machines registered by an older CLI or by an
+		// automated bind probe carry no agent suffix.
+		{"bind-probe-node", "opencode", "bind-probe-node"},
+		{"probe-node-108075", "", "probe-node-108075"},
+		// A hostname that merely looks agent-ish must survive untouched.
+		{"my-opencode", "opencode", "my-opencode"},
+		{"buildhost opencode", "codex", "buildhost opencode"},
+		// Degenerate input must not turn into an empty badge.
+		{"opencode", "opencode", "opencode"},
+		{"  spaced   ", "opencode", "spaced"},
+		{"", "opencode", ""},
+	}
+	for _, tc := range cases {
+		if got := machineDisplayName(tc.name, tc.aiType); got != tc.want {
+			t.Errorf("machineDisplayName(%q, %q) = %q, want %q", tc.name, tc.aiType, got, tc.want)
+		}
+	}
+}

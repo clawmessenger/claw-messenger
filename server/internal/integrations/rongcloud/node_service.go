@@ -467,9 +467,26 @@ func (s *NodeService) LegacyNodeRecords(ctx context.Context) ([]map[string]inter
 	// must not surface as its own device row. Index it by machine so the
 	// visible agent nodes can advertise the capability via om_rongcloud_id.
 	opsByMachine := make(map[string]string)
+	// The machine's own infrastructure node is hidden too, but its nickname is
+	// the only human-readable label for the box ("小久", "SHGuoZiWei-10.1.1.225").
+	// Agent nodes are named after their agent and the machine key the web
+	// derives from the RongCloud id is an opaque hash, so without this a machine
+	// running three agents shows three indistinguishable rows — the exact
+	// "which one is which" the device list is supposed to answer.
+	machineNameByMachine := make(map[string]string)
 	for _, n := range nodes {
 		if n.AiType.String == OpsAgentType && n.MachineID != "" {
 			opsByMachine[n.MachineID] = n.RongcloudUserID
+		}
+		if !isMachineNode(n) {
+			continue
+		}
+		u, err := s.queries.GetRongCloudUserByRongCloudID(ctx, n.RongcloudUserID)
+		if err != nil || !u.Name.Valid {
+			continue
+		}
+		if label := machineDisplayName(u.Name.String, n.AiType.String); label != "" {
+			machineNameByMachine[n.MachineID] = label
 		}
 	}
 	records := make([]map[string]interface{}, 0, len(nodes))
@@ -500,6 +517,12 @@ func (s *NodeService) LegacyNodeRecords(ctx context.Context) ([]map[string]inter
 		if opsRC, ok := opsByMachine[n.MachineID]; ok && opsRC != "" {
 			record["om_rongcloud_id"] = opsRC
 			record["has_om_capability"] = true
+		}
+		// The box this agent runs on. Sibling agent nodes of one machine all
+		// carry the same value, which is what lets the list tell "three agents
+		// on 小久" apart from "three different machines".
+		if label, ok := machineNameByMachine[n.MachineID]; ok && label != "" {
+			record["machine_name"] = label
 		}
 		if len(n.Capabilities) > 0 {
 			record["capabilities"] = json.RawMessage(n.Capabilities)
@@ -1085,6 +1108,36 @@ func agentNodeRCUserID(agent, machineID string) string {
 // RongCloud-side name, so it must never embed an internal identifier.
 func DefaultAgentNodeName(agent string) string {
 	return strings.TrimSpace(agent)
+}
+
+// machineDisplayName reduces the name a device registered under to the host
+// part alone.
+//
+// The CLI registers a machine as "<os.hostname()> <aiType>" (see
+// packages/xiachat-cli/src/main.ts), so the infrastructure node's stored
+// nickname carries whichever agent happened to run `pair`. In the device list
+// that suffix is noise: the row already says which agent it is, and the point
+// of exposing the machine name at all is that three agents on one box render
+// as three identical rows.
+//
+// The suffix is matched against the node's own ai_type rather than a hard-coded
+// agent list, so an agent we do not ship still works and a hostname that merely
+// ends in an agent-like word is not mangled.
+func machineDisplayName(name, aiType string) string {
+	name = strings.TrimSpace(name)
+	aiType = strings.TrimSpace(aiType)
+	if name == "" || aiType == "" {
+		return name
+	}
+	suffix := " " + aiType
+	if !strings.HasSuffix(name, suffix) {
+		return name
+	}
+	host := strings.TrimSpace(strings.TrimSuffix(name, suffix))
+	if host == "" {
+		return name
+	}
+	return host
 }
 
 // legacyDefaultAgentNodeName matches the display name ensureAgentNode used to
