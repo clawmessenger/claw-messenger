@@ -1396,6 +1396,18 @@ type QuickAction struct {
 	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
 }
 
+type RongcloudArtifact struct {
+	ArtifactID   string             `json:"artifact_id"`
+	DiscussionID string             `json:"discussion_id"`
+	ArtifactType string             `json:"artifact_type"`
+	Title        string             `json:"title"`
+	Content      string             `json:"content"`
+	Version      int32              `json:"version"`
+	BaseVersion  int32              `json:"base_version"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+}
+
 type RongcloudChatroom struct {
 	ID                  pgtype.UUID        `json:"id"`
 	WorkspaceID         pgtype.UUID        `json:"workspace_id"`
@@ -1408,6 +1420,8 @@ type RongcloudChatroom struct {
 	Status              string             `json:"status"`
 	CreatedAt           pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt           pgtype.Timestamptz `json:"updated_at"`
+	Name                string             `json:"name"`
+	PortraitUri         string             `json:"portrait_uri"`
 }
 
 type RongcloudChatroomMember struct {
@@ -1424,6 +1438,9 @@ type RongcloudChatroomMember struct {
 	DiscussionModel  pgtype.Text        `json:"discussion_model"`
 	CreatedAt        pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
+	MemberID         pgtype.Text        `json:"member_id"`
+	Nickname         string             `json:"nickname"`
+	PortraitUri      string             `json:"portrait_uri"`
 }
 
 type RongcloudDevice struct {
@@ -1440,17 +1457,120 @@ type RongcloudDevice struct {
 	UpdatedAt                 pgtype.Timestamptz `json:"updated_at"`
 }
 
+type RongcloudDiscussion struct {
+	DiscussionID       string             `json:"discussion_id"`
+	ChatroomID         string             `json:"chatroom_id"`
+	WorkspaceID        pgtype.UUID        `json:"workspace_id"`
+	CreatedBy          string             `json:"created_by"`
+	Topic              string             `json:"topic"`
+	Goal               string             `json:"goal"`
+	MaxRounds          pgtype.Int4        `json:"max_rounds"`
+	Mode               string             `json:"mode"`
+	Status             string             `json:"status"`
+	CurrentRound       int32              `json:"current_round"`
+	Version            int32              `json:"version"`
+	RoleSnapshot       []byte             `json:"role_snapshot"`
+	HostConfigSnapshot []byte             `json:"host_config_snapshot"`
+	RecommendationID   pgtype.Text        `json:"recommendation_id"`
+	ClientRequestID    pgtype.Text        `json:"client_request_id"`
+	RoundPolicy        string             `json:"round_policy"`
+	RoundRevision      int32              `json:"round_revision"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
+}
+
+type RongcloudDiscussionCommand struct {
+	CommandID    string             `json:"command_id"`
+	DiscussionID string             `json:"discussion_id"`
+	RequestID    string             `json:"request_id"`
+	Kind         string             `json:"kind"`
+	Payload      []byte             `json:"payload"`
+	State        string             `json:"state"`
+	Attempts     int32              `json:"attempts"`
+	AvailableAt  pgtype.Timestamptz `json:"available_at"`
+	LeaseUntil   pgtype.Timestamptz `json:"lease_until"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+}
+
+type RongcloudDiscussionDeliveryLock struct {
+	ID int32 `json:"id"`
+}
+
+type RongcloudDiscussionDeltaBuffer struct {
+	DiscussionID   string `json:"discussion_id"`
+	RequestID      string `json:"request_id"`
+	AssignmentID   string `json:"assignment_id"`
+	ActorID        string `json:"actor_id"`
+	NodeSeq        int64  `json:"node_seq"`
+	Payload        string `json:"payload"`
+	IdempotencyKey string `json:"idempotency_key"`
+	ByteCount      int64  `json:"byte_count"`
+	Emitted        int32  `json:"emitted"`
+	ExpiresAt      int64  `json:"expires_at"`
+}
+
 type RongcloudDiscussionEvent struct {
-	ID            pgtype.UUID        `json:"id"`
-	ChatroomID    pgtype.UUID        `json:"chatroom_id"`
-	WorkspaceID   pgtype.UUID        `json:"workspace_id"`
-	EventType     string             `json:"event_type"`
-	RoundNumber   int32              `json:"round_number"`
-	SpeakingOrder int32              `json:"speaking_order"`
-	NodeID        pgtype.UUID        `json:"node_id"`
-	Content       []byte             `json:"content"`
-	MsgUid        pgtype.Text        `json:"msg_uid"`
-	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	ID             pgtype.UUID        `json:"id"`
+	ChatroomID     pgtype.UUID        `json:"chatroom_id"`
+	WorkspaceID    pgtype.UUID        `json:"workspace_id"`
+	EventType      string             `json:"event_type"`
+	RoundNumber    int32              `json:"round_number"`
+	SpeakingOrder  int32              `json:"speaking_order"`
+	NodeID         pgtype.UUID        `json:"node_id"`
+	Content        []byte             `json:"content"`
+	MsgUid         pgtype.Text        `json:"msg_uid"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	DiscussionID   pgtype.Text        `json:"discussion_id"`
+	Seq            pgtype.Int8        `json:"seq"`
+	ActorID        pgtype.Text        `json:"actor_id"`
+	TargetID       pgtype.Text        `json:"target_id"`
+	Payload        []byte             `json:"payload"`
+	IdempotencyKey pgtype.Text        `json:"idempotency_key"`
+	V3Envelope     []byte             `json:"v3_envelope"`
+}
+
+type RongcloudDiscussionRoundDocument struct {
+	DocumentID      string             `json:"document_id"`
+	DiscussionID    string             `json:"discussion_id"`
+	Round           int32              `json:"round"`
+	Revision        int32              `json:"revision"`
+	SourceRequestID string             `json:"source_request_id"`
+	Title           string             `json:"title"`
+	Content         string             `json:"content"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+}
+
+type RongcloudDiscussionWireBuffer struct {
+	SenderID  string `json:"sender_id"`
+	MessageID string `json:"message_id"`
+	Frames    string `json:"frames"`
+	ByteCount int64  `json:"byte_count"`
+	Ready     int32  `json:"ready"`
+	ExpiresAt int64  `json:"expires_at"`
+}
+
+type RongcloudGroup struct {
+	ID                pgtype.UUID        `json:"id"`
+	GroupID           string             `json:"group_id"`
+	GroupName         string             `json:"group_name"`
+	OwnerID           string             `json:"owner_id"`
+	PortraitUri       string             `json:"portrait_uri"`
+	Description       string             `json:"description"`
+	MemberCount       int32              `json:"member_count"`
+	OpenclawMaxRounds pgtype.Int4        `json:"openclaw_max_rounds"`
+	OpenclawStopped   bool               `json:"openclaw_stopped"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+}
+
+type RongcloudGroupMember struct {
+	ID        pgtype.UUID        `json:"id"`
+	GroupID   string             `json:"group_id"`
+	UserID    string             `json:"user_id"`
+	Nickname  string             `json:"nickname"`
+	Role      string             `json:"role"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
 }
 
 type RongcloudNode struct {
@@ -1468,6 +1588,16 @@ type RongcloudNode struct {
 	MachineID       string             `json:"machine_id"`
 }
 
+type RongcloudNodeControl struct {
+	NodeID         pgtype.UUID        `json:"node_id"`
+	WorkspaceID    pgtype.UUID        `json:"workspace_id"`
+	DesiredState   string             `json:"desired_state"`
+	DesiredVersion int64              `json:"desired_version"`
+	ChangedBy      pgtype.Text        `json:"changed_by"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
+}
+
 type RongcloudNodeModelCatalog struct {
 	ID          pgtype.UUID        `json:"id"`
 	WorkspaceID pgtype.UUID        `json:"workspace_id"`
@@ -1478,6 +1608,21 @@ type RongcloudNodeModelCatalog struct {
 	Config      []byte             `json:"config"`
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
+}
+
+type RongcloudNodeRequest struct {
+	RequestID       string             `json:"request_id"`
+	RequestKind     string             `json:"request_kind"`
+	RequesterUserID string             `json:"requester_user_id"`
+	TargetNodeID    string             `json:"target_node_id"`
+	TargetAiUserID  string             `json:"target_ai_user_id"`
+	Status          string             `json:"status"`
+	RequestPayload  []byte             `json:"request_payload"`
+	ResponsePayload []byte             `json:"response_payload"`
+	ErrorCode       pgtype.Text        `json:"error_code"`
+	ExpiresAt       pgtype.Timestamptz `json:"expires_at"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
 }
 
 type RongcloudPairingSession struct {
@@ -1493,6 +1638,34 @@ type RongcloudPairingSession struct {
 	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
 	ReportedAgents   []byte             `json:"reported_agents"`
 	BoundAgents      []byte             `json:"bound_agents"`
+}
+
+type RongcloudRoleRecommendation struct {
+	RecommendationID string             `json:"recommendation_id"`
+	RequestID        string             `json:"request_id"`
+	UserID           string             `json:"user_id"`
+	HostNodeID       string             `json:"host_node_id"`
+	HostAiUserID     string             `json:"host_ai_user_id"`
+	ConfigVersion    string             `json:"config_version"`
+	Topic            string             `json:"topic"`
+	Goal             string             `json:"goal"`
+	Roles            []byte             `json:"roles"`
+	ExpiresAt        pgtype.Timestamptz `json:"expires_at"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+}
+
+type RongcloudRoundtableCreateRequest struct {
+	UserID             string             `json:"user_id"`
+	ClientRequestID    string             `json:"client_request_id"`
+	RecommendationID   pgtype.Text        `json:"recommendation_id"`
+	Status             string             `json:"status"`
+	RequestPayload     []byte             `json:"request_payload"`
+	RequestPayloadHash pgtype.Text        `json:"request_payload_hash"`
+	ChatroomID         pgtype.Text        `json:"chatroom_id"`
+	DiscussionID       pgtype.Text        `json:"discussion_id"`
+	ErrorCode          pgtype.Text        `json:"error_code"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
 }
 
 type RongcloudSystemConfig struct {

@@ -1,0 +1,6 @@
+DROP INDEX IF EXISTS rongcloud_discussion_command_discussion_idx;
+DROP INDEX IF EXISTS rongcloud_discussion_command_dispatch_idx;
+DROP TABLE IF EXISTS rongcloud_discussion_command;
+
+DROP INDEX IF EXISTS rongcloud_discussion_round_document_discussion_idx;
+DROP TABLE IF EXISTS rongcloud_discussion_round_document;

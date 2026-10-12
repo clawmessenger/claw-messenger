@@ -46,7 +46,7 @@ const createRongCloudChatroom = `-- name: CreateRongCloudChatroom :one
 
 INSERT INTO rongcloud_chatroom (workspace_id, rongcloud_chatroom_id, owner_user_id, host_node_id, max_rounds, conversation_kind, config, status)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-RETURNING id, workspace_id, rongcloud_chatroom_id, owner_user_id, host_node_id, max_rounds, conversation_kind, config, status, created_at, updated_at
+RETURNING id, workspace_id, rongcloud_chatroom_id, owner_user_id, host_node_id, max_rounds, conversation_kind, config, status, created_at, updated_at, name, portrait_uri
 `
 
 type CreateRongCloudChatroomParams struct {
@@ -87,6 +87,8 @@ func (q *Queries) CreateRongCloudChatroom(ctx context.Context, arg CreateRongClo
 		&i.Status,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Name,
+		&i.PortraitUri,
 	)
 	return i, err
 }
@@ -95,7 +97,7 @@ const createRongCloudChatroomMember = `-- name: CreateRongCloudChatroomMember :o
 
 INSERT INTO rongcloud_chatroom_member (chatroom_id, node_id, member_type, role_name, role_instructions, capabilities, model, speaking_order, enabled, discussion_model)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-RETURNING id, chatroom_id, node_id, member_type, role_name, role_instructions, capabilities, model, speaking_order, enabled, discussion_model, created_at, updated_at
+RETURNING id, chatroom_id, node_id, member_type, role_name, role_instructions, capabilities, model, speaking_order, enabled, discussion_model, created_at, updated_at, member_id, nickname, portrait_uri
 `
 
 type CreateRongCloudChatroomMemberParams struct {
@@ -142,6 +144,9 @@ func (q *Queries) CreateRongCloudChatroomMember(ctx context.Context, arg CreateR
 		&i.DiscussionModel,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.MemberID,
+		&i.Nickname,
+		&i.PortraitUri,
 	)
 	return i, err
 }
@@ -203,7 +208,7 @@ INSERT INTO rongcloud_discussion_event (
 ) VALUES (
     $1, $2, $3, $4, $5,
     $6, $7, $8
-) RETURNING id, chatroom_id, workspace_id, event_type, round_number, speaking_order, node_id, content, msg_uid, created_at
+) RETURNING id, chatroom_id, workspace_id, event_type, round_number, speaking_order, node_id, content, msg_uid, created_at, discussion_id, seq, actor_id, target_id, payload, idempotency_key, v3_envelope
 `
 
 type CreateRongCloudDiscussionEventParams struct {
@@ -243,6 +248,13 @@ func (q *Queries) CreateRongCloudDiscussionEvent(ctx context.Context, arg Create
 		&i.Content,
 		&i.MsgUid,
 		&i.CreatedAt,
+		&i.DiscussionID,
+		&i.Seq,
+		&i.ActorID,
+		&i.TargetID,
+		&i.Payload,
+		&i.IdempotencyKey,
+		&i.V3Envelope,
 	)
 	return i, err
 }
@@ -533,7 +545,7 @@ func (q *Queries) DeleteRongCloudUser(ctx context.Context, id pgtype.UUID) error
 }
 
 const getRongCloudChatroomByID = `-- name: GetRongCloudChatroomByID :one
-SELECT id, workspace_id, rongcloud_chatroom_id, owner_user_id, host_node_id, max_rounds, conversation_kind, config, status, created_at, updated_at FROM rongcloud_chatroom WHERE id = $1
+SELECT id, workspace_id, rongcloud_chatroom_id, owner_user_id, host_node_id, max_rounds, conversation_kind, config, status, created_at, updated_at, name, portrait_uri FROM rongcloud_chatroom WHERE id = $1
 `
 
 func (q *Queries) GetRongCloudChatroomByID(ctx context.Context, id pgtype.UUID) (RongcloudChatroom, error) {
@@ -551,12 +563,14 @@ func (q *Queries) GetRongCloudChatroomByID(ctx context.Context, id pgtype.UUID) 
 		&i.Status,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Name,
+		&i.PortraitUri,
 	)
 	return i, err
 }
 
 const getRongCloudChatroomByRongCloudID = `-- name: GetRongCloudChatroomByRongCloudID :one
-SELECT id, workspace_id, rongcloud_chatroom_id, owner_user_id, host_node_id, max_rounds, conversation_kind, config, status, created_at, updated_at FROM rongcloud_chatroom WHERE rongcloud_chatroom_id = $1
+SELECT id, workspace_id, rongcloud_chatroom_id, owner_user_id, host_node_id, max_rounds, conversation_kind, config, status, created_at, updated_at, name, portrait_uri FROM rongcloud_chatroom WHERE rongcloud_chatroom_id = $1
 `
 
 func (q *Queries) GetRongCloudChatroomByRongCloudID(ctx context.Context, rongcloudChatroomID string) (RongcloudChatroom, error) {
@@ -574,6 +588,8 @@ func (q *Queries) GetRongCloudChatroomByRongCloudID(ctx context.Context, rongclo
 		&i.Status,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Name,
+		&i.PortraitUri,
 	)
 	return i, err
 }
@@ -848,7 +864,7 @@ func (q *Queries) GetRongCloudUserByWorkspaceAndID(ctx context.Context, arg GetR
 }
 
 const listRongCloudChatroomMembers = `-- name: ListRongCloudChatroomMembers :many
-SELECT id, chatroom_id, node_id, member_type, role_name, role_instructions, capabilities, model, speaking_order, enabled, discussion_model, created_at, updated_at FROM rongcloud_chatroom_member WHERE chatroom_id = $1 ORDER BY speaking_order ASC NULLS LAST, created_at ASC
+SELECT id, chatroom_id, node_id, member_type, role_name, role_instructions, capabilities, model, speaking_order, enabled, discussion_model, created_at, updated_at, member_id, nickname, portrait_uri FROM rongcloud_chatroom_member WHERE chatroom_id = $1 ORDER BY speaking_order ASC NULLS LAST, created_at ASC
 `
 
 func (q *Queries) ListRongCloudChatroomMembers(ctx context.Context, chatroomID pgtype.UUID) ([]RongcloudChatroomMember, error) {
@@ -874,6 +890,9 @@ func (q *Queries) ListRongCloudChatroomMembers(ctx context.Context, chatroomID p
 			&i.DiscussionModel,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.MemberID,
+			&i.Nickname,
+			&i.PortraitUri,
 		); err != nil {
 			return nil, err
 		}
@@ -886,7 +905,7 @@ func (q *Queries) ListRongCloudChatroomMembers(ctx context.Context, chatroomID p
 }
 
 const listRongCloudChatroomsByOwner = `-- name: ListRongCloudChatroomsByOwner :many
-SELECT id, workspace_id, rongcloud_chatroom_id, owner_user_id, host_node_id, max_rounds, conversation_kind, config, status, created_at, updated_at FROM rongcloud_chatroom WHERE owner_user_id = $1 AND status = 'active' ORDER BY created_at ASC
+SELECT id, workspace_id, rongcloud_chatroom_id, owner_user_id, host_node_id, max_rounds, conversation_kind, config, status, created_at, updated_at, name, portrait_uri FROM rongcloud_chatroom WHERE owner_user_id = $1 AND status = 'active' ORDER BY created_at ASC
 `
 
 func (q *Queries) ListRongCloudChatroomsByOwner(ctx context.Context, ownerUserID pgtype.UUID) ([]RongcloudChatroom, error) {
@@ -910,6 +929,8 @@ func (q *Queries) ListRongCloudChatroomsByOwner(ctx context.Context, ownerUserID
 			&i.Status,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.Name,
+			&i.PortraitUri,
 		); err != nil {
 			return nil, err
 		}
@@ -922,7 +943,7 @@ func (q *Queries) ListRongCloudChatroomsByOwner(ctx context.Context, ownerUserID
 }
 
 const listRongCloudChatroomsByWorkspace = `-- name: ListRongCloudChatroomsByWorkspace :many
-SELECT id, workspace_id, rongcloud_chatroom_id, owner_user_id, host_node_id, max_rounds, conversation_kind, config, status, created_at, updated_at FROM rongcloud_chatroom WHERE workspace_id = $1 AND status = 'active' ORDER BY created_at ASC
+SELECT id, workspace_id, rongcloud_chatroom_id, owner_user_id, host_node_id, max_rounds, conversation_kind, config, status, created_at, updated_at, name, portrait_uri FROM rongcloud_chatroom WHERE workspace_id = $1 AND status = 'active' ORDER BY created_at ASC
 `
 
 func (q *Queries) ListRongCloudChatroomsByWorkspace(ctx context.Context, workspaceID pgtype.UUID) ([]RongcloudChatroom, error) {
@@ -946,6 +967,8 @@ func (q *Queries) ListRongCloudChatroomsByWorkspace(ctx context.Context, workspa
 			&i.Status,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.Name,
+			&i.PortraitUri,
 		); err != nil {
 			return nil, err
 		}
@@ -1030,7 +1053,7 @@ func (q *Queries) ListRongCloudDevicesByWorkspace(ctx context.Context, workspace
 }
 
 const listRongCloudDiscussionEventsByChatroom = `-- name: ListRongCloudDiscussionEventsByChatroom :many
-SELECT id, chatroom_id, workspace_id, event_type, round_number, speaking_order, node_id, content, msg_uid, created_at FROM rongcloud_discussion_event
+SELECT id, chatroom_id, workspace_id, event_type, round_number, speaking_order, node_id, content, msg_uid, created_at, discussion_id, seq, actor_id, target_id, payload, idempotency_key, v3_envelope FROM rongcloud_discussion_event
 WHERE chatroom_id = $1
 ORDER BY created_at ASC
 `
@@ -1055,6 +1078,13 @@ func (q *Queries) ListRongCloudDiscussionEventsByChatroom(ctx context.Context, c
 			&i.Content,
 			&i.MsgUid,
 			&i.CreatedAt,
+			&i.DiscussionID,
+			&i.Seq,
+			&i.ActorID,
+			&i.TargetID,
+			&i.Payload,
+			&i.IdempotencyKey,
+			&i.V3Envelope,
 		); err != nil {
 			return nil, err
 		}
@@ -1317,7 +1347,7 @@ func (q *Queries) ListRongCloudUsersByWorkspace(ctx context.Context, workspaceID
 }
 
 const updateRongCloudChatroom = `-- name: UpdateRongCloudChatroom :one
-UPDATE rongcloud_chatroom SET host_node_id = $1, max_rounds = $2, conversation_kind = $3, config = $4, updated_at = now() WHERE id = $5 RETURNING id, workspace_id, rongcloud_chatroom_id, owner_user_id, host_node_id, max_rounds, conversation_kind, config, status, created_at, updated_at
+UPDATE rongcloud_chatroom SET host_node_id = $1, max_rounds = $2, conversation_kind = $3, config = $4, updated_at = now() WHERE id = $5 RETURNING id, workspace_id, rongcloud_chatroom_id, owner_user_id, host_node_id, max_rounds, conversation_kind, config, status, created_at, updated_at, name, portrait_uri
 `
 
 type UpdateRongCloudChatroomParams struct {
@@ -1349,6 +1379,8 @@ func (q *Queries) UpdateRongCloudChatroom(ctx context.Context, arg UpdateRongClo
 		&i.Status,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Name,
+		&i.PortraitUri,
 	)
 	return i, err
 }
