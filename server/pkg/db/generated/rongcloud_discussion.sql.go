@@ -286,6 +286,27 @@ func (q *Queries) GetRongCloudArtifact(ctx context.Context, artifactID string) (
 	return i, err
 }
 
+const getRongCloudArtifactByID = `-- name: GetRongCloudArtifactByID :one
+SELECT artifact_id, discussion_id, artifact_type, title, content, version, base_version, created_at, updated_at FROM rongcloud_artifact WHERE artifact_id = $1
+`
+
+func (q *Queries) GetRongCloudArtifactByID(ctx context.Context, artifactID string) (RongcloudArtifact, error) {
+	row := q.db.QueryRow(ctx, getRongCloudArtifactByID, artifactID)
+	var i RongcloudArtifact
+	err := row.Scan(
+		&i.ArtifactID,
+		&i.DiscussionID,
+		&i.ArtifactType,
+		&i.Title,
+		&i.Content,
+		&i.Version,
+		&i.BaseVersion,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const getRongCloudChatroomViewByRongCloudID = `-- name: GetRongCloudChatroomViewByRongCloudID :one
 SELECT c.id, c.workspace_id, c.rongcloud_chatroom_id, c.owner_user_id, c.host_node_id, c.max_rounds, c.conversation_kind, c.config, c.status, c.created_at, c.updated_at, c.name, c.portrait_uri,
        u.rongcloud_user_id AS owner_rc_user_id,
@@ -380,6 +401,220 @@ func (q *Queries) GetRongCloudDiscussionEventMaxSeq(ctx context.Context, discuss
 	var max_seq int64
 	err := row.Scan(&max_seq)
 	return max_seq, err
+}
+
+const getRongCloudRoleRecommendation = `-- name: GetRongCloudRoleRecommendation :one
+SELECT recommendation_id, request_id, user_id, host_node_id, host_ai_user_id, config_version, topic, goal, roles, expires_at, created_at FROM rongcloud_role_recommendation WHERE recommendation_id = $1
+`
+
+func (q *Queries) GetRongCloudRoleRecommendation(ctx context.Context, recommendationID string) (RongcloudRoleRecommendation, error) {
+	row := q.db.QueryRow(ctx, getRongCloudRoleRecommendation, recommendationID)
+	var i RongcloudRoleRecommendation
+	err := row.Scan(
+		&i.RecommendationID,
+		&i.RequestID,
+		&i.UserID,
+		&i.HostNodeID,
+		&i.HostAiUserID,
+		&i.ConfigVersion,
+		&i.Topic,
+		&i.Goal,
+		&i.Roles,
+		&i.ExpiresAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getRongCloudRoleRecommendationByRequest = `-- name: GetRongCloudRoleRecommendationByRequest :one
+SELECT recommendation_id, request_id, user_id, host_node_id, host_ai_user_id, config_version, topic, goal, roles, expires_at, created_at FROM rongcloud_role_recommendation WHERE request_id = $1
+`
+
+func (q *Queries) GetRongCloudRoleRecommendationByRequest(ctx context.Context, requestID string) (RongcloudRoleRecommendation, error) {
+	row := q.db.QueryRow(ctx, getRongCloudRoleRecommendationByRequest, requestID)
+	var i RongcloudRoleRecommendation
+	err := row.Scan(
+		&i.RecommendationID,
+		&i.RequestID,
+		&i.UserID,
+		&i.HostNodeID,
+		&i.HostAiUserID,
+		&i.ConfigVersion,
+		&i.Topic,
+		&i.Goal,
+		&i.Roles,
+		&i.ExpiresAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getRongCloudRoundDocument = `-- name: GetRongCloudRoundDocument :one
+SELECT document_id, discussion_id, round, revision, source_request_id, title, content, created_at FROM rongcloud_discussion_round_document WHERE document_id = $1
+`
+
+func (q *Queries) GetRongCloudRoundDocument(ctx context.Context, documentID string) (RongcloudDiscussionRoundDocument, error) {
+	row := q.db.QueryRow(ctx, getRongCloudRoundDocument, documentID)
+	var i RongcloudDiscussionRoundDocument
+	err := row.Scan(
+		&i.DocumentID,
+		&i.DiscussionID,
+		&i.Round,
+		&i.Revision,
+		&i.SourceRequestID,
+		&i.Title,
+		&i.Content,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getRoundtableCreateRequest = `-- name: GetRoundtableCreateRequest :one
+SELECT user_id, client_request_id, recommendation_id, status, request_payload, request_payload_hash, chatroom_id, discussion_id, error_code, created_at, updated_at FROM rongcloud_roundtable_create_request
+WHERE user_id = $1 AND client_request_id = $2
+`
+
+type GetRoundtableCreateRequestParams struct {
+	UserID          string `json:"user_id"`
+	ClientRequestID string `json:"client_request_id"`
+}
+
+func (q *Queries) GetRoundtableCreateRequest(ctx context.Context, arg GetRoundtableCreateRequestParams) (RongcloudRoundtableCreateRequest, error) {
+	row := q.db.QueryRow(ctx, getRoundtableCreateRequest, arg.UserID, arg.ClientRequestID)
+	var i RongcloudRoundtableCreateRequest
+	err := row.Scan(
+		&i.UserID,
+		&i.ClientRequestID,
+		&i.RecommendationID,
+		&i.Status,
+		&i.RequestPayload,
+		&i.RequestPayloadHash,
+		&i.ChatroomID,
+		&i.DiscussionID,
+		&i.ErrorCode,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const getRoundtableCreateRequestByChatroom = `-- name: GetRoundtableCreateRequestByChatroom :one
+SELECT user_id, client_request_id, recommendation_id, status, request_payload, request_payload_hash, chatroom_id, discussion_id, error_code, created_at, updated_at FROM rongcloud_roundtable_create_request WHERE chatroom_id = $1 ORDER BY updated_at DESC LIMIT 1
+`
+
+func (q *Queries) GetRoundtableCreateRequestByChatroom(ctx context.Context, chatroomID pgtype.Text) (RongcloudRoundtableCreateRequest, error) {
+	row := q.db.QueryRow(ctx, getRoundtableCreateRequestByChatroom, chatroomID)
+	var i RongcloudRoundtableCreateRequest
+	err := row.Scan(
+		&i.UserID,
+		&i.ClientRequestID,
+		&i.RecommendationID,
+		&i.Status,
+		&i.RequestPayload,
+		&i.RequestPayloadHash,
+		&i.ChatroomID,
+		&i.DiscussionID,
+		&i.ErrorCode,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const insertRongCloudRoleRecommendation = `-- name: InsertRongCloudRoleRecommendation :one
+INSERT INTO rongcloud_role_recommendation (recommendation_id, request_id, user_id, host_node_id, host_ai_user_id, config_version, topic, goal, roles, expires_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+ON CONFLICT (request_id) DO NOTHING
+RETURNING recommendation_id, request_id, user_id, host_node_id, host_ai_user_id, config_version, topic, goal, roles, expires_at, created_at
+`
+
+type InsertRongCloudRoleRecommendationParams struct {
+	RecommendationID string             `json:"recommendation_id"`
+	RequestID        string             `json:"request_id"`
+	UserID           string             `json:"user_id"`
+	HostNodeID       string             `json:"host_node_id"`
+	HostAiUserID     string             `json:"host_ai_user_id"`
+	ConfigVersion    string             `json:"config_version"`
+	Topic            string             `json:"topic"`
+	Goal             string             `json:"goal"`
+	Roles            []byte             `json:"roles"`
+	ExpiresAt        pgtype.Timestamptz `json:"expires_at"`
+}
+
+// 落推荐结果：request_id 唯一约束兜底重复回包。
+func (q *Queries) InsertRongCloudRoleRecommendation(ctx context.Context, arg InsertRongCloudRoleRecommendationParams) (RongcloudRoleRecommendation, error) {
+	row := q.db.QueryRow(ctx, insertRongCloudRoleRecommendation,
+		arg.RecommendationID,
+		arg.RequestID,
+		arg.UserID,
+		arg.HostNodeID,
+		arg.HostAiUserID,
+		arg.ConfigVersion,
+		arg.Topic,
+		arg.Goal,
+		arg.Roles,
+		arg.ExpiresAt,
+	)
+	var i RongcloudRoleRecommendation
+	err := row.Scan(
+		&i.RecommendationID,
+		&i.RequestID,
+		&i.UserID,
+		&i.HostNodeID,
+		&i.HostAiUserID,
+		&i.ConfigVersion,
+		&i.Topic,
+		&i.Goal,
+		&i.Roles,
+		&i.ExpiresAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const insertRoundtableCreateRequest = `-- name: InsertRoundtableCreateRequest :one
+INSERT INTO rongcloud_roundtable_create_request (user_id, client_request_id, recommendation_id, status, request_payload, request_payload_hash, chatroom_id, discussion_id)
+VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7)
+ON CONFLICT (user_id, client_request_id) DO UPDATE SET updated_at = now()
+RETURNING user_id, client_request_id, recommendation_id, status, request_payload, request_payload_hash, chatroom_id, discussion_id, error_code, created_at, updated_at
+`
+
+type InsertRoundtableCreateRequestParams struct {
+	UserID             string      `json:"user_id"`
+	ClientRequestID    string      `json:"client_request_id"`
+	RecommendationID   pgtype.Text `json:"recommendation_id"`
+	RequestPayload     []byte      `json:"request_payload"`
+	RequestPayloadHash pgtype.Text `json:"request_payload_hash"`
+	ChatroomID         pgtype.Text `json:"chatroom_id"`
+	DiscussionID       pgtype.Text `json:"discussion_id"`
+}
+
+// 幂等 claim：同 (user_id, client_request_id) 只插一行；唯一冲突时返回既存行。
+func (q *Queries) InsertRoundtableCreateRequest(ctx context.Context, arg InsertRoundtableCreateRequestParams) (RongcloudRoundtableCreateRequest, error) {
+	row := q.db.QueryRow(ctx, insertRoundtableCreateRequest,
+		arg.UserID,
+		arg.ClientRequestID,
+		arg.RecommendationID,
+		arg.RequestPayload,
+		arg.RequestPayloadHash,
+		arg.ChatroomID,
+		arg.DiscussionID,
+	)
+	var i RongcloudRoundtableCreateRequest
+	err := row.Scan(
+		&i.UserID,
+		&i.ClientRequestID,
+		&i.RecommendationID,
+		&i.Status,
+		&i.RequestPayload,
+		&i.RequestPayloadHash,
+		&i.ChatroomID,
+		&i.DiscussionID,
+		&i.ErrorCode,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
 }
 
 const listActiveRongCloudDiscussionTargets = `-- name: ListActiveRongCloudDiscussionTargets :many
@@ -565,6 +800,83 @@ func (q *Queries) ListRongCloudDiscussionsByChatroom(ctx context.Context, chatro
 		return nil, err
 	}
 	return items, nil
+}
+
+const listRongCloudRoundDocumentsForDiscussion = `-- name: ListRongCloudRoundDocumentsForDiscussion :many
+SELECT document_id, discussion_id, round, revision, source_request_id, title, content, created_at FROM rongcloud_discussion_round_document
+WHERE discussion_id = $1 ORDER BY round ASC, revision DESC
+`
+
+func (q *Queries) ListRongCloudRoundDocumentsForDiscussion(ctx context.Context, discussionID string) ([]RongcloudDiscussionRoundDocument, error) {
+	rows, err := q.db.Query(ctx, listRongCloudRoundDocumentsForDiscussion, discussionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []RongcloudDiscussionRoundDocument{}
+	for rows.Next() {
+		var i RongcloudDiscussionRoundDocument
+		if err := rows.Scan(
+			&i.DocumentID,
+			&i.DiscussionID,
+			&i.Round,
+			&i.Revision,
+			&i.SourceRequestID,
+			&i.Title,
+			&i.Content,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const transitionRoundtableCreateRequest = `-- name: TransitionRoundtableCreateRequest :one
+UPDATE rongcloud_roundtable_create_request
+SET status = $3, chatroom_id = COALESCE($4, chatroom_id), discussion_id = COALESCE($5, discussion_id), error_code = NULL, updated_at = now()
+WHERE user_id = $1 AND client_request_id = $2 AND status = $6
+RETURNING user_id, client_request_id, recommendation_id, status, request_payload, request_payload_hash, chatroom_id, discussion_id, error_code, created_at, updated_at
+`
+
+type TransitionRoundtableCreateRequestParams struct {
+	UserID          string      `json:"user_id"`
+	ClientRequestID string      `json:"client_request_id"`
+	Status          string      `json:"status"`
+	ChatroomID      pgtype.Text `json:"chatroom_id"`
+	DiscussionID    pgtype.Text `json:"discussion_id"`
+	Status_2        string      `json:"status_2"`
+}
+
+// CAS 推进：只有 expected_status 匹配时才推进到 next_status。
+func (q *Queries) TransitionRoundtableCreateRequest(ctx context.Context, arg TransitionRoundtableCreateRequestParams) (RongcloudRoundtableCreateRequest, error) {
+	row := q.db.QueryRow(ctx, transitionRoundtableCreateRequest,
+		arg.UserID,
+		arg.ClientRequestID,
+		arg.Status,
+		arg.ChatroomID,
+		arg.DiscussionID,
+		arg.Status_2,
+	)
+	var i RongcloudRoundtableCreateRequest
+	err := row.Scan(
+		&i.UserID,
+		&i.ClientRequestID,
+		&i.RecommendationID,
+		&i.Status,
+		&i.RequestPayload,
+		&i.RequestPayloadHash,
+		&i.ChatroomID,
+		&i.DiscussionID,
+		&i.ErrorCode,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
 }
 
 const updateRongCloudDiscussionState = `-- name: UpdateRongCloudDiscussionState :one

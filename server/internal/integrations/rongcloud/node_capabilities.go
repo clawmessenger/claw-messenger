@@ -35,6 +35,7 @@ import (
 var discussionCapabilities = []string{
 	"discussion_host",
 	"discussion_model_routing",
+	"discussion_participant",
 	"discussion_role_recommendation",
 	"discussion_roundtable",
 }

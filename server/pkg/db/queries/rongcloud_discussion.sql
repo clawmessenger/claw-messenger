@@ -137,3 +137,47 @@ JOIN workspace w ON w.id = ci.workspace_id
 WHERE ci.status = 'active' AND ci.channel_type = 'rongcloud'
 ORDER BY ci.created_at ASC
 LIMIT 1;
+
+-- name: GetRoundtableCreateRequest :one
+SELECT * FROM rongcloud_roundtable_create_request
+WHERE user_id = $1 AND client_request_id = $2;
+
+-- name: InsertRoundtableCreateRequest :one
+-- 幂等 claim：同 (user_id, client_request_id) 只插一行；唯一冲突时返回既存行。
+INSERT INTO rongcloud_roundtable_create_request (user_id, client_request_id, recommendation_id, status, request_payload, request_payload_hash, chatroom_id, discussion_id)
+VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7)
+ON CONFLICT (user_id, client_request_id) DO UPDATE SET updated_at = now()
+RETURNING *;
+
+-- name: TransitionRoundtableCreateRequest :one
+-- CAS 推进：只有 expected_status 匹配时才推进到 next_status。
+UPDATE rongcloud_roundtable_create_request
+SET status = $3, chatroom_id = COALESCE($4, chatroom_id), discussion_id = COALESCE($5, discussion_id), error_code = NULL, updated_at = now()
+WHERE user_id = $1 AND client_request_id = $2 AND status = $6
+RETURNING *;
+
+-- name: InsertRongCloudRoleRecommendation :one
+-- 落推荐结果：request_id 唯一约束兜底重复回包。
+INSERT INTO rongcloud_role_recommendation (recommendation_id, request_id, user_id, host_node_id, host_ai_user_id, config_version, topic, goal, roles, expires_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+ON CONFLICT (request_id) DO NOTHING
+RETURNING *;
+
+-- name: GetRongCloudRoleRecommendation :one
+SELECT * FROM rongcloud_role_recommendation WHERE recommendation_id = $1;
+
+-- name: GetRongCloudRoleRecommendationByRequest :one
+SELECT * FROM rongcloud_role_recommendation WHERE request_id = $1;
+
+-- name: ListRongCloudRoundDocumentsForDiscussion :many
+SELECT * FROM rongcloud_discussion_round_document
+WHERE discussion_id = $1 ORDER BY round ASC, revision DESC;
+
+-- name: GetRongCloudRoundDocument :one
+SELECT * FROM rongcloud_discussion_round_document WHERE document_id = $1;
+
+-- name: GetRongCloudArtifactByID :one
+SELECT * FROM rongcloud_artifact WHERE artifact_id = $1;
+
+-- name: GetRoundtableCreateRequestByChatroom :one
+SELECT * FROM rongcloud_roundtable_create_request WHERE chatroom_id = $1 ORDER BY updated_at DESC LIMIT 1;

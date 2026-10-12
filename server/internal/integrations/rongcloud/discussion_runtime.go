@@ -37,6 +37,10 @@ type discussionRuntime struct {
 	systemHostLoader func(ctx context.Context) (DiscussionSystemHostConfig, bool, error)
 	// systemNodeID 是融云侧系统账号（发件人），在 channel 装配时绑定。
 	systemNodeID string
+	// roundtable 承载 createRoundtable 的五阶段幂等状态机（P5）。
+	roundtable *roundtableCreationService
+	// nodeRequests 是发给设备端的推荐请求 broker（recommendRoles 用）。
+	nodeRequests *NodeRequestBroker
 }
 
 // DiscussionSystemHostConfig 是管理端 system_host 配置的运行时视图（P4）。
@@ -45,6 +49,15 @@ type DiscussionSystemHostConfig struct {
 	NodeID      string
 	DisplayName string
 	Avatar      string
+	// ConfigVersion / HostPrompt / Enabled / TimeoutSeconds 供 P5 的创建编排
+	//（推荐一致性校验 + host 快照落库）。Enabled=false 时按未配置处理。
+	ConfigVersion  string
+	HostPrompt     string
+	Enabled        bool
+	TimeoutSeconds int
+	// RecommendationPrompt 是运营配置的「角色推荐提示词」（P5 的 recommendRoles
+	// 下发给设备端，拼在推荐 prompt 最前）。
+	RecommendationPrompt string
 }
 
 // discussionActor 是讨论身份域里的操作者。两个来源：
@@ -65,6 +78,13 @@ func newDiscussionRuntime(queries *db.Queries, repo *DiscussionRepository, clien
 		logger = slog.Default()
 	}
 	return &discussionRuntime{queries: queries, repo: repo, client: client, systemNodeID: systemNodeID, logger: logger}
+}
+
+// attachRoundtable 把 P5 的创建编排挂到运行时（channel 装配时调用）。
+// nodeOwner 按「融云好友边」列一个用户归属的节点（node_claim 语义的反向查询）。
+func (rt *discussionRuntime) attachRoundtable(creation *roundtableCreationService, nodeRequests *NodeRequestBroker) {
+	rt.roundtable = creation
+	rt.nodeRequests = nodeRequests
 }
 
 // resolveActor 把 IM 发送者的融云 id 解析成讨论身份域的 actor。先查

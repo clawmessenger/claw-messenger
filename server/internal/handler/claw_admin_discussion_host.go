@@ -21,6 +21,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -642,8 +643,13 @@ func (h *Handler) ClawDiscussionSystemHostConfig(ctx context.Context) (rongcloud
 		return rongcloud.DiscussionSystemHostConfig{}, found, err
 	}
 	return rongcloud.DiscussionSystemHostConfig{
-		NodeID:      cfg.NodeID,
-		DisplayName: cfg.DisplayName,
-		Avatar:      cfg.Avatar,
+		NodeID:               cfg.NodeID,
+		DisplayName:          cfg.DisplayName,
+		Avatar:               cfg.Avatar,
+		ConfigVersion:        strconv.Itoa(cfg.ConfigVersion),
+		HostPrompt:           cfg.DiscussionHostPrompt,
+		Enabled:              cfg.Enabled,
+		TimeoutSeconds:       cfg.TimeoutSeconds,
+		RecommendationPrompt: cfg.RoleRecommendationPrompt,
 	}, true, nil
 }
