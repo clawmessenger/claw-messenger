@@ -36,6 +36,11 @@ type CommandContent struct {
 	Service   string                 `json:"service"`
 	Action    string                 `json:"action"`
 	Params    map[string]interface{} `json:"params,omitempty"`
+	// WebEnvelope records which dialect the request arrived in so the reply can
+	// be encoded the same way: the web parses a flat object carrying a string
+	// `status`, the device CLI parses {request_id, msg_type, payload}. Set by
+	// UnmarshalJSON; never marshalled.
+	WebEnvelope bool `json:"-"`
 }
 
 // UnmarshalJSON accepts both spellings of the command envelope.
@@ -73,6 +78,12 @@ func (c *CommandContent) UnmarshalJSON(data []byte) error {
 	if c.Params == nil {
 		c.Params = map[string]interface{}{}
 	}
+	// Which dialect was this? The web always sends camelCase and never mixes
+	// keys; the CLI always sends snake_case. Recording it here lets the message
+	// handler answer in kind, which is what chatroom/discussion need: those
+	// services are spoken to by BOTH clients.
+	c.WebEnvelope = raw.RequestIDSnake == "" && raw.Params == nil &&
+		(raw.RequestIDCamel != "" || raw.Payload != nil)
 	return nil
 }
 
@@ -88,6 +99,19 @@ func getString(m map[string]interface{}, key string) string {
 	if v, ok := m[key]; ok {
 		if s, ok := v.(string); ok {
 			return s
+		}
+	}
+	return ""
+}
+
+// getStringAny reads the first non-empty key among the given spellings. The two
+// clients name params differently — the web sends camelCase (chatroomId), the
+// CLI snake_case (chatroom_id) — and chatroom/discussion accept both, so the
+// lookups must too.
+func getStringAny(m map[string]interface{}, keys ...string) string {
+	for _, key := range keys {
+		if v := getString(m, key); v != "" {
+			return v
 		}
 	}
 	return ""

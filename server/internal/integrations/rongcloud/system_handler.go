@@ -69,7 +69,7 @@ func (h *systemHandler) handleCommand(ctx context.Context, msg NormalizedMessage
 		return h.handleGroupCommand(ctx, msg, cmd)
 	default:
 		h.logger.Warn("rongcloud: unknown service", "service", cmd.Service, "msgUID", msg.MsgUID)
-		return h.sendError(ctx, msg, cmd.RequestID, fmt.Sprintf("unknown service: %s", cmd.Service))
+		return h.replyErr(ctx, msg, cmd, 404, unknownServiceOrActionMessage(cmd))
 	}
 }
 
@@ -86,44 +86,49 @@ func (h *systemHandler) handlePing(ctx context.Context, msg NormalizedMessage, c
 
 func (h *systemHandler) handleChatroomCommand(ctx context.Context, msg NormalizedMessage, cmd CommandContent) error {
 	if h.queries == nil {
-		return h.sendError(ctx, msg, cmd.RequestID, "database not available")
+		return h.replyErr(ctx, msg, cmd, 503, "database not available")
 	}
 
 	switch cmd.Action {
 	case "list":
-		wsIDStr := getString(cmd.Params, "workspace_id")
+		wsIDStr := getStringAny(cmd.Params, "workspace_id", "workspaceId")
 		wsID, err := parseUUIDParam(wsIDStr)
 		if err != nil {
-			return h.sendError(ctx, msg, cmd.RequestID, "invalid or missing workspace_id")
+			return h.replyErr(ctx, msg, cmd, 400, "invalid or missing workspace_id")
 		}
 		chatrooms, err := h.queries.ListRongCloudChatroomsByWorkspace(ctx, wsID)
 		if err != nil {
 			h.logger.Error("rongcloud: list chatrooms", "error", err)
-			return h.sendError(ctx, msg, cmd.RequestID, "failed to list chatrooms")
+			return h.replyErr(ctx, msg, cmd, 500, "failed to list chatrooms")
 		}
-		return h.client.sendCommandResult(ctx, h.nodeID, msg.FromUserID, cmd.RequestID, map[string]interface{}{
+		return h.replyOK(ctx, msg, cmd, map[string]interface{}{
 			"ok":        true,
 			"chatrooms": chatrooms,
 		})
 
-	case "get", "info":
-		chatroomIDStr := getString(cmd.Params, "chatroom_id")
+	case "get", "info", "getInfo":
+		chatroomIDStr := getStringAny(cmd.Params, "chatroom_id", "chatroomId")
 		chatroomID, err := parseUUIDParam(chatroomIDStr)
 		if err != nil {
-			return h.sendError(ctx, msg, cmd.RequestID, "invalid or missing chatroom_id")
+			return h.replyErr(ctx, msg, cmd, 400, "invalid or missing chatroom_id")
 		}
 		chatroom, err := h.queries.GetRongCloudChatroomByID(ctx, chatroomID)
 		if err != nil {
 			h.logger.Error("rongcloud: get chatroom", "error", err)
-			return h.sendError(ctx, msg, cmd.RequestID, "chatroom not found")
+			return h.replyErr(ctx, msg, cmd, 404, "chatroom not found")
 		}
-		return h.client.sendCommandResult(ctx, h.nodeID, msg.FromUserID, cmd.RequestID, map[string]interface{}{
+		return h.replyOK(ctx, msg, cmd, map[string]interface{}{
 			"ok":       true,
 			"chatroom": chatroom,
 		})
 
 	default:
-		return h.sendError(ctx, msg, cmd.RequestID, fmt.Sprintf("unsupported chatroom action: %s", cmd.Action))
+		// The 404 + 「未知的服务或操作」 wording is a contract, not cosmetics:
+		// the web's isLegacyChatroomActionError matches on code===404 AND the
+		// message containing both "chatroom/<action>" and "未知" to degrade
+		// silently during a rolling deploy. A different phrasing makes join/
+		// leave/invite/destroy throw instead of falling back.
+		return h.replyErr(ctx, msg, cmd, 404, unknownServiceOrActionMessage(cmd))
 	}
 }
 
@@ -248,29 +253,78 @@ func parseUUIDParam(s string) (pgtype.UUID, error) {
 
 func (h *systemHandler) handleDiscussionCommand(ctx context.Context, msg NormalizedMessage, cmd CommandContent) error {
 	if h.registry == nil {
-		return h.sendError(ctx, msg, cmd.RequestID, "discussion registry not available")
+		return h.replyErr(ctx, msg, cmd, 503, "discussion registry not available")
 	}
 
 	switch cmd.Action {
 	case "status":
-		chatroomIDStr := getString(cmd.Params, "chatroom_id")
+		chatroomIDStr := getStringAny(cmd.Params, "chatroom_id", "chatroomId")
 		chatroomID, err := parseUUIDParam(chatroomIDStr)
 		if err != nil {
-			return h.sendError(ctx, msg, cmd.RequestID, "invalid or missing chatroom_id")
+			return h.replyErr(ctx, msg, cmd, 400, "invalid or missing chatroom_id")
 		}
 		_, exists := h.registry.Get(chatroomID)
-		return h.client.sendCommandResult(ctx, h.nodeID, msg.FromUserID, cmd.RequestID, map[string]interface{}{
+		return h.replyOK(ctx, msg, cmd, map[string]interface{}{
 			"ok":     true,
 			"active": exists,
 		})
 
 	case "your_turn":
-		return h.client.sendCommandResult(ctx, h.nodeID, msg.FromUserID, cmd.RequestID, map[string]interface{}{
+		return h.replyOK(ctx, msg, cmd, map[string]interface{}{
 			"ok":      true,
 			"message": "your_turn acknowledged",
 		})
 
 	default:
-		return h.sendError(ctx, msg, cmd.RequestID, fmt.Sprintf("unsupported discussion action: %s", cmd.Action))
+		// Same 404 contract as chatroom: the web matches on code 404 +
+		// "discussion/<action>" + "未知" to treat an action the server has not
+		// learned yet as a legacy no-op instead of a hard failure.
+		return h.replyErr(ctx, msg, cmd, 404, unknownServiceOrActionMessage(cmd))
 	}
+}
+
+// unknownServiceOrActionMessage mirrors the legacy backend's handler-not-found
+// error (command_handler.py: "未知的服务或操作: <service>/<action>"). The exact
+// wording is matched by the C-end web (isLegacyChatroomActionError), so it must
+// not be reworded.
+func unknownServiceOrActionMessage(cmd CommandContent) string {
+	return fmt.Sprintf("未知的服务或操作: %s/%s", cmd.Service, cmd.Action)
+}
+
+// replyOK answers a request in the dialect it arrived in.
+//
+// The chatroom/discussion services are spoken to by BOTH clients: the web
+// browses rooms over them, and the device CLI replies to discussion turns. The
+// web parses a flat object carrying a string `status`
+// (rongcloudAPIClient.sendWebCommandResult); the CLI parses the device-shaped
+// {request_id, msg_type, payload} (sendCommandResult). Encoding every reply the
+// device way left the web unable to find a `status`, so its requests hung until
+// timeout. The request's own envelope decides the reply shape.
+func (h *systemHandler) replyOK(ctx context.Context, msg NormalizedMessage, cmd CommandContent, data interface{}) error {
+	if cmd.WebEnvelope {
+		return h.client.sendWebCommandResult(ctx, h.nodeID, msg.FromUserID, cmd.RequestID,
+			cmd.Service, cmd.Action, "success", 200, data, "ok")
+	}
+	payload := map[string]interface{}{"ok": true}
+	if fields, ok := data.(map[string]interface{}); ok {
+		for k, v := range fields {
+			payload[k] = v
+		}
+	} else if data != nil {
+		payload["data"] = data
+	}
+	return h.client.sendCommandResult(ctx, h.nodeID, msg.FromUserID, cmd.RequestID, payload)
+}
+
+// replyErr is replyOK's error twin. code carries the same meaning in both
+// dialects (404/400/403/409/503), so the legacy-404 tolerance keeps working.
+func (h *systemHandler) replyErr(ctx context.Context, msg NormalizedMessage, cmd CommandContent, code int, errMsg string) error {
+	if cmd.WebEnvelope {
+		return h.client.sendWebCommandResult(ctx, h.nodeID, msg.FromUserID, cmd.RequestID,
+			cmd.Service, cmd.Action, "error", code, nil, errMsg)
+	}
+	return h.client.sendCommandResult(ctx, h.nodeID, msg.FromUserID, cmd.RequestID, map[string]interface{}{
+		"ok":    false,
+		"error": errMsg,
+	})
 }
