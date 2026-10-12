@@ -44,8 +44,8 @@ func (q *Queries) BackfillRongCloudPairingSessionCandidates(ctx context.Context,
 
 const createRongCloudChatroom = `-- name: CreateRongCloudChatroom :one
 
-INSERT INTO rongcloud_chatroom (workspace_id, rongcloud_chatroom_id, owner_user_id, host_node_id, max_rounds, conversation_kind, config, status)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+INSERT INTO rongcloud_chatroom (workspace_id, rongcloud_chatroom_id, owner_user_id, host_node_id, max_rounds, conversation_kind, config, status, name, portrait_uri)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 RETURNING id, workspace_id, rongcloud_chatroom_id, owner_user_id, host_node_id, max_rounds, conversation_kind, config, status, created_at, updated_at, name, portrait_uri
 `
 
@@ -58,6 +58,8 @@ type CreateRongCloudChatroomParams struct {
 	ConversationKind    pgtype.Text `json:"conversation_kind"`
 	Config              []byte      `json:"config"`
 	Status              string      `json:"status"`
+	Name                string      `json:"name"`
+	PortraitUri         string      `json:"portrait_uri"`
 }
 
 // =====================
@@ -73,6 +75,8 @@ func (q *Queries) CreateRongCloudChatroom(ctx context.Context, arg CreateRongClo
 		arg.ConversationKind,
 		arg.Config,
 		arg.Status,
+		arg.Name,
+		arg.PortraitUri,
 	)
 	var i RongcloudChatroom
 	err := row.Scan(

@@ -89,8 +89,14 @@ func (h *systemHandler) handleChatroomCommand(ctx context.Context, msg Normalize
 		return h.replyErr(ctx, msg, cmd, 503, "database not available")
 	}
 
+	// Actions that mutate or check ownership need the actor. The read-only
+	// actions (getList/getInfo/getMembers) do not — the web calls them before
+	// the user has a stable member row, and requiring a registered rongcloud_user
+	// would break the hydration flow.
 	switch cmd.Action {
 	case "list":
+		// Legacy workspace-scoped list (device CLI). Kept for back-compat;
+		// the web uses getList.
 		wsIDStr := getStringAny(cmd.Params, "workspace_id", "workspaceId")
 		wsID, err := parseUUIDParam(wsIDStr)
 		if err != nil {
@@ -106,21 +112,88 @@ func (h *systemHandler) handleChatroomCommand(ctx context.Context, msg Normalize
 			"chatrooms": chatrooms,
 		})
 
+	case "getList":
+		actor, err := h.resolveActor(ctx, msg.FromUserID)
+		if err != nil {
+			return h.replyErr(ctx, msg, cmd, 401, "sender not recognized")
+		}
+		return h.commitResult(ctx, msg, cmd, h.actionChatroomGetList(ctx, cmd, actor))
+
 	case "get", "info", "getInfo":
-		chatroomIDStr := getStringAny(cmd.Params, "chatroom_id", "chatroomId")
-		chatroomID, err := parseUUIDParam(chatroomIDStr)
+		return h.commitResult(ctx, msg, cmd, h.actionChatroomGetInfo(ctx, cmd))
+
+	case "update":
+		actor, err := h.resolveActor(ctx, msg.FromUserID)
 		if err != nil {
-			return h.replyErr(ctx, msg, cmd, 400, "invalid or missing chatroom_id")
+			return h.replyErr(ctx, msg, cmd, 401, "sender not recognized")
 		}
-		chatroom, err := h.queries.GetRongCloudChatroomByID(ctx, chatroomID)
+		return h.commitResult(ctx, msg, cmd, h.actionChatroomUpdate(ctx, cmd, actor))
+
+	case "destroy":
+		actor, err := h.resolveActor(ctx, msg.FromUserID)
 		if err != nil {
-			h.logger.Error("rongcloud: get chatroom", "error", err)
-			return h.replyErr(ctx, msg, cmd, 404, "chatroom not found")
+			return h.replyErr(ctx, msg, cmd, 401, "sender not recognized")
 		}
-		return h.replyOK(ctx, msg, cmd, map[string]interface{}{
-			"ok":       true,
-			"chatroom": chatroom,
-		})
+		return h.commitResult(ctx, msg, cmd, h.actionChatroomDestroy(ctx, cmd, actor))
+
+	case "join":
+		actor, err := h.resolveActor(ctx, msg.FromUserID)
+		if err != nil {
+			return h.replyErr(ctx, msg, cmd, 401, "sender not recognized")
+		}
+		return h.commitResult(ctx, msg, cmd, h.actionChatroomJoin(ctx, cmd, actor))
+
+	case "leave":
+		actor, err := h.resolveActor(ctx, msg.FromUserID)
+		if err != nil {
+			return h.replyErr(ctx, msg, cmd, 401, "sender not recognized")
+		}
+		return h.commitResult(ctx, msg, cmd, h.actionChatroomLeave(ctx, cmd, actor))
+
+	case "invite":
+		actor, err := h.resolveActor(ctx, msg.FromUserID)
+		if err != nil {
+			return h.replyErr(ctx, msg, cmd, 401, "sender not recognized")
+		}
+		return h.commitResult(ctx, msg, cmd, h.actionChatroomInvite(ctx, cmd, actor))
+
+	case "removeMember":
+		actor, err := h.resolveActor(ctx, msg.FromUserID)
+		if err != nil {
+			return h.replyErr(ctx, msg, cmd, 401, "sender not recognized")
+		}
+		return h.commitResult(ctx, msg, cmd, h.actionChatroomRemoveMember(ctx, cmd, actor))
+
+	case "getMembers":
+		return h.commitResult(ctx, msg, cmd, h.actionChatroomGetMembers(ctx, cmd))
+
+	case "create":
+		actor, err := h.resolveActor(ctx, msg.FromUserID)
+		if err != nil {
+			return h.replyErr(ctx, msg, cmd, 401, "sender not recognized")
+		}
+		return h.commitResult(ctx, msg, cmd, h.actionChatroomCreate(ctx, cmd, actor))
+
+	case "setHost":
+		actor, err := h.resolveActor(ctx, msg.FromUserID)
+		if err != nil {
+			return h.replyErr(ctx, msg, cmd, 401, "sender not recognized")
+		}
+		return h.commitResult(ctx, msg, cmd, h.actionChatroomSetHost(ctx, cmd, actor))
+
+	case "setMemberRole":
+		actor, err := h.resolveActor(ctx, msg.FromUserID)
+		if err != nil {
+			return h.replyErr(ctx, msg, cmd, 401, "sender not recognized")
+		}
+		return h.commitResult(ctx, msg, cmd, h.actionChatroomSetMemberRole(ctx, cmd, actor))
+
+	case "setDiscussionTeam":
+		actor, err := h.resolveActor(ctx, msg.FromUserID)
+		if err != nil {
+			return h.replyErr(ctx, msg, cmd, 401, "sender not recognized")
+		}
+		return h.commitResult(ctx, msg, cmd, h.actionChatroomSetDiscussionTeam(ctx, cmd, actor))
 
 	default:
 		// The 404 + 「未知的服务或操作」 wording is a contract, not cosmetics:
@@ -130,6 +203,14 @@ func (h *systemHandler) handleChatroomCommand(ctx context.Context, msg Normalize
 		// leave/invite/destroy throw instead of falling back.
 		return h.replyErr(ctx, msg, cmd, 404, unknownServiceOrActionMessage(cmd))
 	}
+}
+
+// commitResult turns a commandResult into the right reply shape.
+func (h *systemHandler) commitResult(ctx context.Context, msg NormalizedMessage, cmd CommandContent, r commandResult) error {
+	if r.code == 200 {
+		return h.replyOK(ctx, msg, cmd, r.data)
+	}
+	return h.replyErr(ctx, msg, cmd, r.code, r.message)
 }
 
 func (h *systemHandler) handleAICommand(ctx context.Context, msg NormalizedMessage, cmd CommandContent) error {

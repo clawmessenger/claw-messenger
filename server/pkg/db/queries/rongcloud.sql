@@ -80,8 +80,8 @@ DELETE FROM rongcloud_node WHERE id = $1;
 -- =====================
 
 -- name: CreateRongCloudChatroom :one
-INSERT INTO rongcloud_chatroom (workspace_id, rongcloud_chatroom_id, owner_user_id, host_node_id, max_rounds, conversation_kind, config, status)
-VALUES (@workspace_id, @rongcloud_chatroom_id, @owner_user_id, @host_node_id, @max_rounds, @conversation_kind, @config, @status)
+INSERT INTO rongcloud_chatroom (workspace_id, rongcloud_chatroom_id, owner_user_id, host_node_id, max_rounds, conversation_kind, config, status, name, portrait_uri)
+VALUES (@workspace_id, @rongcloud_chatroom_id, @owner_user_id, @host_node_id, @max_rounds, @conversation_kind, @config, @status, @name, @portrait_uri)
 RETURNING *;
 
 -- name: GetRongCloudChatroomByID :one

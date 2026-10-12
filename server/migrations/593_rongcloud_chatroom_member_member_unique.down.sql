@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS uq_rongcloud_chatroom_member_member_id;
