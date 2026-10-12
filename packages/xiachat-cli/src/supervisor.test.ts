@@ -8,10 +8,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   buildProgram,
   supervisorRestartDelayMs,
+  SUPERVISOR_CONTROL_POLL_MS,
   SUPERVISOR_RESTART_BACKOFF_MS,
 } from "./main.js";
 import { Keystore } from "./keystore.js";
-import { XiachatApi } from "./api.js";
+import { XiachatApi, type AgentControlState } from "./api.js";
 
 interface FakeChild extends EventEmitter {
   stdout: null;
@@ -34,6 +35,9 @@ function fakeChild(): FakeChild {
 
 interface Harness {
   spawned: Array<{ args: string[]; env: NodeJS.ProcessEnv; child: FakeChild }>;
+  /** Everything the supervisor wrote to its stdout stream. */
+  output: string[];
+  api: XiachatApi;
   getShutdown: () => () => void;
   run: Promise<unknown>;
   /** Always resolves, so a failing assertion can never leak a live supervisor. */
@@ -48,13 +52,26 @@ const BOUND_OPS = [{
   deviceSecret: "sec",
 }];
 
-function makeHarness(): Harness {
+/**
+ * The supervisor registers its start/stop poll interval during startup, which
+ * happens *before* these tests install fake timers — so advancing the fake clock
+ * would never fire it. Tests therefore run the poll on a short real interval and
+ * wait on the real clock. `realSetTimeout` is captured up front for that: once
+ * fake timers are installed, the global setTimeout is no longer the real one.
+ */
+const CONTROL_TICK_MS = 20;
+const realSetTimeout = globalThis.setTimeout;
+const realSleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => { realSetTimeout(resolve, ms); });
+
+function makeHarness(initialControl: AgentControlState[] = []): Harness {
   const dir = mkdtempSync(join(tmpdir(), "clawmessenger-supervisor-"));
   dirs.push(dir);
   const keystore = new Keystore(join(dir, "creds.json"));
   keystore.save({ nodeId: "node_machine", token: "t", credentialId: "dc", deviceSecret: "sec", serverUrl: "http://unused.local" });
 
   const spawned: Harness["spawned"] = [];
+  const output: string[] = [];
   let shutdown: (() => void) | undefined;
   let onFirstSpawn: () => void = () => {};
   const firstSpawn = new Promise<void>((resolve) => { onFirstSpawn = resolve });
@@ -62,11 +79,14 @@ function makeHarness(): Harness {
   const api = new XiachatApi("http://unused.local");
   vi.spyOn(api, "bindDeviceAgents").mockImplementation(async () => ({}) as never);
   vi.spyOn(api, "fetchDeviceNodes").mockImplementation(async () => BOUND_OPS as never);
+  // The control poll runs on a timer, so leaving it unmocked would fire real
+  // requests at http://unused.local the moment the clock advances.
+  vi.spyOn(api, "fetchDeviceControl").mockImplementation(async () => initialControl);
 
   const program = buildProgram({
     keystore,
     apiFactory: () => api,
-    stdout: { write: () => true } as unknown as NodeJS.WriteStream,
+    stdout: { write: (chunk: unknown) => { output.push(String(chunk)); return true } } as unknown as NodeJS.WriteStream,
     ensureOpencode: async () => ({}),
     spawnChild: ((_command: string, args: string[], options: { env: NodeJS.ProcessEnv }) => {
       const child = fakeChild();
@@ -75,11 +95,14 @@ function makeHarness(): Harness {
       return child;
     }) as unknown as typeof spawn,
     onSupervisorSignal: (fn) => { shutdown = fn },
+    supervisorControlPollMs: CONTROL_TICK_MS,
   });
 
   const run = program.parseAsync(["node", "clawmessenger", "run"]);
   const harness: Harness = {
     spawned,
+    output,
+    api,
     run,
     getShutdown: () => {
       if (!shutdown) throw new Error("supervisor never registered a shutdown hook");
@@ -235,6 +258,62 @@ describe("runSupervisor restart backoff", () => {
     h.spawned[0].child.emit("exit", 1); // schedules a 1s restart
     h.getShutdown()();
     await vi.advanceTimersByTimeAsync(120_000);
+    expect(h.spawned).toHaveLength(1);
+  });
+});
+
+describe("operator-driven start/stop", () => {
+  const stopped = (version: number): AgentControlState[] =>
+    [{ agent: "ops", nodeId: "node_ops", desiredState: "stopped", version }];
+  const running = (version: number): AgentControlState[] =>
+    [{ agent: "ops", nodeId: "node_ops", desiredState: "running", version }];
+
+  it("defaults to a 10s poll cadence", () => {
+    expect(SUPERVISOR_CONTROL_POLL_MS).toBe(10_000);
+  });
+
+  it("kills the agent when the server reports desired=stopped, and keeps it down", async () => {
+    const h = await startSupervisor();
+    vi.mocked(h.api.fetchDeviceControl).mockResolvedValue(stopped(1));
+
+    await realSleep(CONTROL_TICK_MS * 3);
+    expect(h.spawned[0].child.kills).toEqual(["SIGTERM"]);
+
+    // The stopped child's own exit must not be mistaken for a crash.
+    h.spawned[0].child.emit("exit", 0);
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(h.spawned).toHaveLength(1);
+  });
+
+  it("brings the agent back when the operator starts it again", async () => {
+    const h = await startSupervisor();
+    const control = vi.mocked(h.api.fetchDeviceControl);
+
+    control.mockResolvedValue(stopped(1));
+    await realSleep(CONTROL_TICK_MS * 3);
+    h.spawned[0].child.emit("exit", 0);
+    expect(h.spawned).toHaveLength(1);
+
+    control.mockResolvedValue(running(2));
+    await realSleep(CONTROL_TICK_MS * 3);
+    expect(h.spawned).toHaveLength(2);
+    expect(h.spawned[1].args.slice(-3)).toEqual(["run", "--agent", "ops"]);
+  });
+
+  it("leaves an already-stopped agent down on boot", async () => {
+    const h = makeHarness(stopped(3));
+    // No child is spawned, so wait for the supervisor's banner instead.
+    await vi.waitFor(() => expect(h.output.join("")).toContain("supervisor:"), { timeout: 5_000 });
+    expect(h.spawned).toHaveLength(0);
+    expect(h.output.join("")).toContain("0 of 1 agent(s) online");
+  });
+
+  it("does not stop anything when the control poll fails", async () => {
+    const h = await startSupervisor();
+    vi.mocked(h.api.fetchDeviceControl).mockRejectedValue(new Error("network down"));
+
+    await realSleep(CONTROL_TICK_MS * 5);
+    expect(h.spawned[0].child.kills).toEqual([]);
     expect(h.spawned).toHaveLength(1);
   });
 });

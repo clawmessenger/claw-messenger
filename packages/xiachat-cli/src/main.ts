@@ -31,6 +31,10 @@ export interface BuildProgramOpts {
   // Injectable for tests; defaults to registering the supervisor's shutdown on
   // process SIGINT/SIGTERM.
   onSupervisorSignal?: (shutdown: () => void) => void;
+  // Injectable for tests; the supervisor's start/stop poll cadence. Tests need
+  // it short because the interval is registered before they install fake
+  // timers, so advancing the fake clock would never fire it.
+  supervisorControlPollMs?: number;
 }
 
 export function buildProgram(opts: BuildProgramOpts): Command {
@@ -183,7 +187,15 @@ export function buildProgram(opts: BuildProgramOpts): Command {
       if (!creds) throw new Error("no credentials; run clawmessenger register or pair first");
       const api = opts.apiFactory(creds.serverUrl);
       if (!cmdOpts.agent) {
-        await runSupervisor({ opts, creds, api, model: cmdOpts.model });
+        await runSupervisor({
+          opts,
+          creds,
+          api,
+          model: cmdOpts.model,
+          ...(opts.supervisorControlPollMs !== undefined
+            ? { controlPollIntervalMs: opts.supervisorControlPollMs }
+            : {}),
+        });
         return;
       }
       // The built-in ops agent runs on the local opencode CLI (auto-installed
@@ -265,6 +277,8 @@ interface RunSupervisorOpts {
   creds: StoredCredentials;
   api: XiachatApi;
   model?: string;
+  /** Poll cadence override, for tests. */
+  controlPollIntervalMs?: number;
 }
 
 // --- supervised child restarts --------------------------------------------
@@ -285,6 +299,8 @@ export const SUPERVISOR_RESTART_BACKOFF_MS = 5 * 60_000;
 /** A child that stayed up this long is treated as healthy; its next exit is a
  * fresh failure (backoff restarts from 1s), not the continuation of a crash loop. */
 export const SUPERVISOR_HEALTHY_UPTIME_MS = 60_000;
+/** How often the supervisor asks the server for operator-desired run-states. */
+export const SUPERVISOR_CONTROL_POLL_MS = 10_000;
 
 /** Delay before the `restarts`-th consecutive restart (1-based). */
 export function supervisorRestartDelayMs(restarts: number): number {
@@ -302,6 +318,9 @@ interface SupervisedAgent {
   startedAt: number;
   lastExitCode: number | null;
   state: "running" | "restarting" | "stopped";
+  /** Operator intent, as last seen from the server. A child that exits while
+   * this is "stopped" was stopped on purpose and must not be resurrected. */
+  desired: "running" | "stopped";
   timer?: NodeJS.Timeout;
 }
 
@@ -359,7 +378,9 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
     child.stderr?.on("data", (chunk: Buffer) => process.stderr.write(`[${entry.agent}] ${chunk}`));
     child.on("exit", (code) => {
       entry.lastExitCode = code;
-      if (stopping) {
+      // `desired === "stopped"` covers a child the operator stopped: its exit is
+      // the point, not a crash, so it must not enter the backoff path.
+      if (stopping || entry.desired === "stopped") {
         entry.state = "stopped";
         return;
       }
@@ -377,6 +398,71 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
     });
   };
 
+  // --- operator-driven start/stop ------------------------------------------
+  // The server owns the desired state; this process owns the processes. A poll
+  // reconciles them. IM cannot carry this: only this supervisor can start or
+  // stop an agent, and it holds no RongCloud connection — and a stopped agent
+  // has no process left to receive a "start". So we ask, rather than listen.
+  const nodeID = creds.nodeId ?? "";
+  const credentialID = creds.credentialId ?? "";
+  const deviceSecret = creds.deviceSecret ?? "";
+
+  /** Last-known desired state per agent. Failures yield an empty map, which
+   * applyControlStates reads as "change nothing" — a server blip must never
+   * stop agents that the operator left running. */
+  const fetchControlStates = async (): Promise<Map<string, "running" | "stopped">> => {
+    const desired = new Map<string, "running" | "stopped">();
+    try {
+      const states = await api.fetchDeviceControl(nodeID, credentialID, deviceSecret);
+      for (const state of states) {
+        if (state.agent) desired.set(state.agent, state.desiredState === "stopped" ? "stopped" : "running");
+      }
+    } catch (err) {
+      console.error("supervisor: control poll failed:", err instanceof Error ? err.message : String(err));
+    }
+    return desired;
+  };
+
+  const stopAgent = (entry: SupervisedAgent): void => {
+    if (entry.desired === "stopped") return;
+    entry.desired = "stopped";
+    if (entry.timer) {
+      clearTimeout(entry.timer);
+      entry.timer = undefined;
+    }
+    entry.state = "stopped";
+    entry.child?.kill("SIGTERM");
+  };
+
+  const startAgent = (entry: SupervisedAgent): void => {
+    if (entry.desired === "running") return;
+    entry.desired = "running";
+    if (entry.timer) {
+      clearTimeout(entry.timer);
+      entry.timer = undefined;
+    }
+    // Fresh budget: an operator-stopped-then-started agent must not inherit the
+    // backoff tier of a crash that predated the stop.
+    entry.restarts = 0;
+    launch(entry);
+  };
+
+  const applyControlStates = (desired: Map<string, "running" | "stopped">): void => {
+    for (const [agent, state] of desired) {
+      const entry = managed.get(agent);
+      // An agent the supervisor never started (its CLI is not on PATH) is not
+      // ours to converge; the server still lists it because the node is bound.
+      if (!entry) continue;
+      if (state === "stopped") stopAgent(entry);
+      else startAgent(entry);
+    }
+  };
+
+  // Ask once before spawning: without this, rebooting a machine would briefly
+  // start every agent the operator had stopped, then kill them again on the
+  // first poll — visible as a spurious online blip on the admin page.
+  const initialDesired = await fetchControlStates();
+
   for (const agent of bound) {
     // The built-in ops agent has no PATH-installed CLI of its own; the child
     // (`clawmessenger run --agent ops`) installs opencode itself before connecting.
@@ -389,6 +475,7 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
     }
     const runArgs = ["run", "--agent", agent.agent];
     if (supervisor.model) runArgs.push("--model", supervisor.model);
+    const desired = initialDesired.get(agent.agent) ?? "running";
     const entry: SupervisedAgent = {
       agent: agent.agent,
       runArgs,
@@ -402,18 +489,33 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
       restarts: 0,
       startedAt: Date.now(),
       lastExitCode: null,
-      state: "running",
+      state: desired === "running" ? "running" : "stopped",
+      desired,
     };
     managed.set(agent.agent, entry);
-    launch(entry);
+    if (desired === "running") {
+      launch(entry);
+    } else {
+      console.error(`agent ${agent.agent} is stopped by the operator; leaving it down`);
+    }
   }
   if (managed.size === 0) {
     throw new Error("none of the bound agent CLIs is available on this machine's PATH");
   }
-  opts.stdout.write(`clawmessenger supervisor: ${managed.size} agent(s) online\n`);
+  const runningCount = [...managed.values()].filter((entry) => entry.desired === "running").length;
+  opts.stdout.write(`clawmessenger supervisor: ${runningCount} of ${managed.size} agent(s) online\n`);
+
+  const controlPollMs = supervisor.controlPollIntervalMs ?? SUPERVISOR_CONTROL_POLL_MS;
+  const controlTimer = setInterval(() => {
+    void fetchControlStates().then(applyControlStates);
+  }, controlPollMs);
+  // The poll must never be the reason the process stays alive; `await stopped`
+  // is what holds the supervisor open.
+  if (typeof controlTimer.unref === "function") controlTimer.unref();
 
   const shutdown = (): void => {
     stopping = true;
+    clearInterval(controlTimer);
     for (const entry of managed.values()) {
       if (entry.timer) {
         clearTimeout(entry.timer);

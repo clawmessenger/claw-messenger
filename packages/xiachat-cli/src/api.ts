@@ -41,6 +41,17 @@ export interface MachineAgentCredential {
   deviceSecret: string;
 }
 
+// One bound agent's operator-desired run-state, as returned by
+// POST /api/claw/device/control. `version` is 0 when the server has never
+// recorded an intent for this agent — the same "run it" baseline the supervisor
+// assumes on a fresh bind.
+export interface AgentControlState {
+  agent: string;
+  nodeId: string;
+  desiredState: "running" | "stopped" | string;
+  version: number;
+}
+
 export class XiachatApi {
   constructor(private readonly baseUrl: string) {}
 
@@ -132,6 +143,27 @@ export class XiachatApi {
   // legacy device list can show online/offline without an IM probe.
   async heartbeat(nodeId: string, credentialId: string, secret: string): Promise<void> {
     await this.request("POST", "/api/claw/device/heartbeat", { nodeId, credentialId, secret });
+  }
+
+  // Operator-desired run-state for one bound agent, as polled by the
+  // supervisor. The server holds the intent rather than pushing it: the only
+  // process that can start or stop an agent is the supervisor, and it holds no
+  // IM connection (its children own those), so it has to come and ask.
+  async fetchDeviceControl(
+    nodeId: string,
+    credentialId: string,
+    secret: string,
+  ): Promise<AgentControlState[]> {
+    const raw = await this.request<{ data?: { agents?: AgentControlState[] } }>(
+      "POST",
+      "/api/claw/device/control",
+      { nodeId, credentialId, secret },
+    );
+    const agents = raw.data?.agents;
+    if (!Array.isArray(agents)) {
+      throw new Error("POST /api/claw/device/control: unexpected response shape");
+    }
+    return agents;
   }
 
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
