@@ -51,6 +51,15 @@ func errResult(code int, msg string) commandResult { return commandResult{code: 
 
 // resolveActor maps the IM sender (a RongCloud user id) to the rongcloud_user
 // row. Every ownership / membership check goes through this.
+//
+// 双域解析，与讨论域的 resolveActor 保持同一语义：先查 rongcloud_user
+// （节点 / 安装账号）；miss 后查 claw_im_users —— C 端真人注册时融云 id 就是
+// user_id 本身，但注册链路（clawRong）直接调融云 API、不写 rongcloud_user
+// 镜像，所以必须兜底，命中后幂等补镜像行再返回。
+//
+// 缺了这一兜底，真人发来的 chatroom 命令会一律 401 sender not recognized：
+// 前端表现为聊天室列表/元数据加载失败（chatroom/getList 拿不到房间），
+// 且房间生命周期写动作（create/join/setHost…）全部不可用。
 func (h *systemHandler) resolveActor(ctx context.Context, fromUserID string) (db.RongcloudUser, error) {
 	if h.queries == nil {
 		return db.RongcloudUser{}, errors.New("database not available")
@@ -58,7 +67,50 @@ func (h *systemHandler) resolveActor(ctx context.Context, fromUserID string) (db
 	if fromUserID == "" {
 		return db.RongcloudUser{}, errors.New("missing sender")
 	}
-	return h.queries.GetRongCloudUserByRongCloudID(ctx, fromUserID)
+	if u, err := h.queries.GetRongCloudUserByRongCloudID(ctx, fromUserID); err == nil {
+		return u, nil
+	}
+	row, err := h.queries.GetClawIMUserByUserID(ctx, fromUserID)
+	if err != nil {
+		return db.RongcloudUser{}, fmt.Errorf("rongcloud: resolve actor %s: %w", fromUserID, err)
+	}
+	name := stringOrNull(row.Nickname)
+	if name == "" {
+		name = row.Username
+	}
+	return mirrorClawUserToRongCloudUser(ctx, h.queries, row.UserID, name, stringOrNull(row.PortraitUri))
+}
+
+// mirrorClawUserToRongCloudUser 幂等补建 claw 真人的 rongcloud_user 镜像行并
+// 返回该行。claw 注册链路不写镜像，但 chatroom 的写动作（create/join 等）拿
+// actor 的 UUID 做 owner_user_id 外键，所以第一次进命令通道时补上。
+// workspace 走单安装归属（已有镜像行则直接返回，不重复插入）。
+func mirrorClawUserToRongCloudUser(ctx context.Context, queries *db.Queries, rcID, name, portrait string) (db.RongcloudUser, error) {
+	if queries == nil {
+		return db.RongcloudUser{}, errors.New("database not available")
+	}
+	if u, err := queries.GetRongCloudUserByRongCloudID(ctx, rcID); err == nil {
+		return u, nil
+	}
+	wsID, err := queries.GetFirstActiveRongCloudInstallationWorkspace(ctx)
+	if err != nil {
+		return db.RongcloudUser{}, fmt.Errorf("rongcloud: resolve install workspace: %w", err)
+	}
+	mirror, err := queries.CreateRongCloudUser(ctx, db.CreateRongCloudUserParams{
+		WorkspaceID:     wsID,
+		RongcloudUserID: rcID,
+		Name:            textOrNull(name),
+		PortraitUri:     textOrNull(portrait),
+		NodeType:        "human",
+	})
+	if err == nil {
+		return mirror, nil
+	}
+	// 并发下另一路已插入：查回即可；仍失败才把原始错误抛出去。
+	if u, gErr := queries.GetRongCloudUserByRongCloudID(ctx, rcID); gErr == nil {
+		return u, nil
+	}
+	return db.RongcloudUser{}, err
 }
 
 // getStringList extracts a string slice from a params value, trimming and

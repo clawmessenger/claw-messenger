@@ -114,40 +114,17 @@ func (rt *discussionRuntime) resolveActor(ctx context.Context, fromUserID string
 		Portrait:   stringOrNull(row.PortraitUri),
 		IsClawUser: true,
 	}
-	// 幂等补 rongcloud_user 镜像行：P3 的 chatroom 写 action（create/join 等）
-	// 拿 actor 的 UUID 做 owner_user_id 外键；claw 注册链路不写镜像（clawRong
-	// 直接调融云 API），第一次进讨论/聊天室命令时补上，之后 rongcloud_user
-	// 优先命中、走快路径。workspace 用单安装归属。
-	if wsID, ok := rt.resolveSingleInstallWorkspace(ctx); ok {
-		mirror, mErr := rt.queries.CreateRongCloudUser(ctx, db.CreateRongCloudUserParams{
-			WorkspaceID:     wsID,
-			RongcloudUserID: actor.RcID,
-			Name:            textOrNull(actor.Name),
-			PortraitUri:     textOrNull(actor.Portrait),
-			NodeType:        "human",
-		})
-		if mErr == nil {
-			actor.MirrorID = mirror.ID
-			actor.WorkspaceID = mirror.WorkspaceID
-		} else {
-			// 已存在（并发或此前补过）：直接查回
-			if u, gErr := rt.queries.GetRongCloudUserByRongCloudID(ctx, actor.RcID); gErr == nil {
-				actor.MirrorID = u.ID
-				actor.WorkspaceID = u.WorkspaceID
-			}
-		}
+	// 幂等补 rongcloud_user 镜像行（与 chatroom 域共用同一实现）：P3 的 chatroom
+	// 写 action（create/join 等）拿 actor 的 UUID 做 owner_user_id 外键；claw 注册
+	// 链路不写镜像（clawRong 直接调融云 API），第一次进讨论/聊天室命令时补上，
+	// 之后 rongcloud_user 优先命中、走快路径。workspace 用单安装归属。
+	// 补建失败不阻断 actor 解析 —— 讨论域的读写只依赖融云 TEXT id，镜像只影响
+	// UUID 域的外键写入。
+	if mirror, mErr := mirrorClawUserToRongCloudUser(ctx, rt.queries, actor.RcID, actor.Name, actor.Portrait); mErr == nil {
+		actor.MirrorID = mirror.ID
+		actor.WorkspaceID = mirror.WorkspaceID
 	}
 	return actor, nil
-}
-
-// resolveSingleInstallWorkspace 取最早的 active rongcloud 渠道安装的 workspace
-//（与 claw_compat 的 clawSingleInstallWorkspace 同一假设）。
-func (rt *discussionRuntime) resolveSingleInstallWorkspace(ctx context.Context) (pgtype.UUID, bool) {
-	wsID, err := rt.queries.GetFirstActiveRongCloudInstallationWorkspace(ctx)
-	if err != nil {
-		return pgtype.UUID{}, false
-	}
-	return wsID, true
 }
 
 func stringOrNull(s pgtype.Text) string {
