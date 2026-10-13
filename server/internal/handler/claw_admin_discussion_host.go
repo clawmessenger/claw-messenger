@@ -9,10 +9,12 @@
 // 的那一行（Python 用的是 im_system_config 的 discussion_system_host；线上后端是 Go，
 // 只有 system_host 有意义，而且它给指定节点单开了 node_id(uuid) 列）。
 //
-// ⚠️ 注意：Go 的讨论运行时目前**不读**这条配置 —— 主持人取自每条聊天室自己的
-// rongcloud_chatroom.host_node_id。所以这里保存的是"平台级默认主持"的声明，要等运行时
-// 接入后才会真正生效。同时 eligible-nodes 会按 REQUIRED_HOST_CAPABILITIES 过滤，
-// 而设备端目前上报的能力里还没有这几个值，因此列表可能为空 —— 这是数据现实，不是接口故障。
+// ⚠️ 注意：保存配置会**强制解绑**该节点的原用户（删融云好友边，见
+// clawAdminUnbindHostNode）—— 主持是平台级基础设施，不该同时挂在某个普通用户的
+// 设备列表里。这与旧后端 _persist 的 DELETE FROM im_user_nodes 一致。
+//
+// 运行时的主持解析（P5）走 rongcloud_system_config 这一行：讨论运行时用它取
+// 展示名/头像/提示词/超时，节点在线判定按融云 presence（node_presence.go）。
 package handler
 
 import (
@@ -25,9 +27,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/integrations/rongcloud"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
 const (
@@ -192,6 +196,10 @@ func applyClawAdminDiscussionHostStored(stored map[string]interface{}, cfg *claw
 // the runtime stores in rongcloud_system_config.node_id, which is a uuid).
 // Returns the node's rongcloud user id, the capabilities it advertises, and
 // whether some user currently owns it.
+//
+// userBound 读的是 owner_user_id 这一列的遗留语义，**不是**设备归属的真相：
+// 归属看的是融云好友边（clawAdminNodeClaimants / node_claim.go），那才是设备列表
+// 的依据。调用方要判断"是否已绑定用户"请用后者。
 func (h *Handler) clawAdminDiscussionHostNodeByUUID(ctx context.Context, nodeUUID string) (aiUserID string, capabilities []string, userBound bool, found bool, err error) {
 	var caps []byte
 	err = h.DB.QueryRow(ctx, `
@@ -304,6 +312,10 @@ func (h *Handler) ClawAdminDiscussionHostGet(w http.ResponseWriter, r *http.Requ
 // so the visibility contract (machine infrastructure nodes and the ops
 // maintenance agent stay internal) and the online judgement (server heartbeat,
 // not the stale deploy_status column) cannot drift from the rest of the平台.
+//
+// is_user_bound 由「融云好友边」判定（node_claim.go 的反查），与设备列表用的是
+// 同一份归属真相：指定主持会把该节点从原用户名下摘下来，前端据此显示
+// 「已绑定普通用户 → 强制解绑并保存」的提示。
 func (h *Handler) ClawAdminDiscussionHostEligibleNodes(w http.ResponseWriter, r *http.Request) {
 	if h.requireClawAdmin("system:read", w, r) == nil {
 		return
@@ -330,7 +342,13 @@ func (h *Handler) ClawAdminDiscussionHostEligibleNodes(w http.ResponseWriter, r 
 		return
 	}
 
-	out := []interface{}{}
+	type hostCandidate struct {
+		node         db.RongcloudNode
+		name         string
+		capabilities []string
+	}
+	candidates := make([]hostCandidate, 0, len(nodes))
+	rcUserIDs := make([]string, 0, len(nodes))
 	for _, node := range nodes {
 		if !rongcloud.IsDisplayNode(node) {
 			continue
@@ -344,6 +362,15 @@ func (h *Handler) ClawAdminDiscussionHostEligibleNodes(w http.ResponseWriter, r 
 		if u, err := h.RongCloudNode.GetUserByRongCloudID(r.Context(), node.RongcloudUserID); err == nil && u.Name.Valid && u.Name.String != "" {
 			name = u.Name.String
 		}
+		candidates = append(candidates, hostCandidate{node: node, name: name, capabilities: capabilities})
+		rcUserIDs = append(rcUserIDs, node.RongcloudUserID)
+	}
+	// 一次反查算出所有候选的归属（内部按 15s 记忆化，不会每个节点各扫一遍）。
+	claimants := h.clawAdminNodeClaimants(r.Context(), rcUserIDs)
+
+	out := []interface{}{}
+	for _, candidate := range candidates {
+		node := candidate.node
 		status := "offline"
 		if h.RongCloudNode.IsOnline(node.ID) {
 			status = "online"
@@ -351,14 +378,10 @@ func (h *Handler) ClawAdminDiscussionHostEligibleNodes(w http.ResponseWriter, r 
 		out = append(out, map[string]interface{}{
 			"node_id":       node.ID.String(),
 			"ai_user_id":    node.RongcloudUserID,
-			"name":          name,
+			"name":          candidate.name,
 			"deploy_status": status,
-			// 旧后端的 is_user_bound 用来提醒"指定主持会从普通用户名下抢走设备"。
-			// Go 侧的主持配置是 rongcloud_system_config 里独立的一行，指定主持
-			// 不改动 rongcloud_node.owner_user_id，不存在抢占，因此恒为 false ——
-			// 否则前端会一直显示一条并不成立的"强制解绑"警告。
-			"is_user_bound": false,
-			"capabilities":  capabilities,
+			"is_user_bound": claimants[node.RongcloudUserID] != "",
+			"capabilities":  candidate.capabilities,
 		})
 	}
 	clawAdminOK(w, map[string]interface{}{"nodes": out})
@@ -431,6 +454,13 @@ func (h *Handler) ClawAdminDiscussionHostPut(w http.ResponseWriter, r *http.Requ
 		clawAdminFail(w, 400, "missing required capabilities: "+strings.Join(missing, ", "))
 		return
 	}
+	// 上面按 id 查到了节点，说明 node_id 就是本表主键的文本形式，这里必然可解析。
+	nodeUUID, err := uuid.Parse(nodeID)
+	if err != nil {
+		clawAdminFail(w, 400, "node_id is not a valid node id")
+		return
+	}
+	hostNodeUUID := pgtype.UUID{Bytes: nodeUUID, Valid: true}
 
 	wsID, err := h.clawAdminDiscussionHostWorkspaceID(r.Context())
 	if err != nil {
@@ -487,12 +517,26 @@ func (h *Handler) ClawAdminDiscussionHostPut(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// 指定主持即从原用户名下摘走这台设备（旧后端 _persist 的 DELETE FROM
+	// im_user_nodes）。放在落库之后：配置一旦生效，主持节点就不该再出现在
+	// 普通用户的设备列表里。解绑失败要如实上报，不能假装成功。
+	unboundFrom, unbindErr := h.clawAdminUnbindHostNode(r.Context(), hostNodeUUID)
+	if unbindErr != nil {
+		h.clawAdminAudit(r, ident, "admin_system_discussion_host_unbind_failed", "system_config",
+			clawAdminDiscussionHostKey, map[string]interface{}{
+				"node_id": nodeID, "error": unbindErr.Error(),
+			})
+		clawAdminFail(w, 502, "配置已保存，但解除该节点原用户绑定失败，请重试")
+		return
+	}
+
 	h.clawAdminAudit(r, ident, "admin_system_discussion_host_update", "system_config",
 		clawAdminDiscussionHostKey, map[string]interface{}{
 			"node_id":          nodeID,
 			"config_version":   version,
 			"expected_version": *body.ExpectedConfigVersion,
 			"enabled":          *body.Enabled,
+			"unbound_from":     unboundFrom,
 		})
 
 	clawAdminOK(w, clawAdminDiscussionHostConfig{
@@ -506,6 +550,62 @@ func (h *Handler) ClawAdminDiscussionHostPut(w http.ResponseWriter, r *http.Requ
 		TimeoutSeconds:           *body.TimeoutSeconds,
 		ConfigVersion:            version,
 	})
+}
+
+// clawAdminUnbindHostNode 把被指定为系统主持的节点从原用户名下摘掉。
+//
+// 设备归属的唯一真相是「融云好友边」（node_claim.go 的反查）：C 端 /api/claw/nodes
+// 只列出调用者好友列表里的节点，所以只要删掉这条边，该节点就不再出现在该用户的
+// 设备列表里 —— 这正是旧 Python 后端 _persist 里
+// `DELETE FROM im_user_nodes WHERE node_id = …` 那一步，Go 移植时漏掉了。
+// 同步把 rongcloud_node.owner_user_id 清空、并把该节点标为系统保留（同一时刻
+// 只有一个主持），与旧后端 `user_id = NULL, is_system_reserved = TRUE` 对齐。
+//
+// 返回被解绑的账号 id（空串表示本来就没绑定）。调用方在失败时按 502 上报：
+// 配置已经落库，但「强制解绑」这一半没做成，不能假装成功。
+func (h *Handler) clawAdminUnbindHostNode(ctx context.Context, nodeUUID pgtype.UUID) (string, error) {
+	if h.RongCloudNode == nil {
+		return "", nil
+	}
+	var aiUserID string
+	if err := h.DB.QueryRow(ctx,
+		`SELECT rongcloud_user_id FROM rongcloud_node WHERE id = $1`, nodeUUID).Scan(&aiUserID); err != nil {
+		return "", err
+	}
+	if aiUserID == "" {
+		return "", nil
+	}
+
+	// 归属来自 15s 记忆化的好友边反查，先失效缓存才能看到当前真实归属。
+	h.RongCloudNode.InvalidateNodeClaimants()
+	owner := h.clawAdminNodeClaimants(ctx, []string{aiUserID})[aiUserID]
+	if owner != "" {
+		if err := h.RongCloudNode.RevokeFriendship(ctx, owner, aiUserID); err != nil {
+			return "", err
+		}
+		h.RongCloudNode.InvalidateNodeClaimants()
+	}
+
+	// 好友边是设备列表的依据，这两步只是让库内状态与之一致（旧后端同样写了）。
+	if _, err := h.DB.Exec(ctx, `
+		UPDATE rongcloud_node SET owner_user_id = NULL, updated_at = now() WHERE id = $1`,
+		nodeUUID); err != nil {
+		return owner, err
+	}
+	// 同一时刻只有一个主持：把上一个主持的保留标记摘掉（只动 AI 节点，
+	// 别碰真人账号）。
+	if _, err := h.DB.Exec(ctx, `
+		UPDATE rongcloud_user SET is_system_reserved = TRUE
+		WHERE rongcloud_user_id = $1 AND is_ai_node = TRUE`, aiUserID); err != nil {
+		return owner, err
+	}
+	if _, err := h.DB.Exec(ctx, `
+		UPDATE rongcloud_user SET is_system_reserved = FALSE
+		WHERE is_system_reserved = TRUE AND is_ai_node = TRUE AND rongcloud_user_id <> $1`,
+		aiUserID); err != nil {
+		return owner, err
+	}
+	return owner, nil
 }
 
 // clawAdminRequiredField trims and bounds a required string field.
