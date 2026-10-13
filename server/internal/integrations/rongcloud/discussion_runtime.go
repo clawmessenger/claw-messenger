@@ -224,13 +224,17 @@ func isoTime(t time.Time) string {
 // 降级成 discussion_progress + 空 data —— 事件本体仍在表里（审计/重放要用），
 // 只是不往 C 端暴露未定契约的内部推进。
 func discussionEventView(e DiscussionEventRecord) map[string]interface{} {
+	// actorId / targetId 在 DB 里是可为 NULL 的列：空串读回来必须转 nil（JSON
+	// null），不能原样回 "" —— 前端 v3 契约里这两个是 nullable(id)，空串过不了
+	// id 校验（要求非空），一条不合规就让 getDiscussionEvents 整段抛「讨论历史
+	// 响应无效」。Python event_json 对缺失 actor/target 也回 None（null）。
 	view := map[string]interface{}{
 		"eventId":      eventUUIDString(e.ID),
 		"discussionId": e.DiscussionID,
 		"seq":          e.Seq,
 		"eventType":    e.EventType,
-		"actorId":      e.ActorID,
-		"targetId":     e.TargetID,
+		"actorId":      nullableString(e.ActorID),
+		"targetId":     nullableString(e.TargetID),
 		"payload":      jsonObjectValue(e.Payload),
 		"createdAt":    isoTime(e.CreatedAt),
 	}

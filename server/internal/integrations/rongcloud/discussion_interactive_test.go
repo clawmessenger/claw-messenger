@@ -110,6 +110,47 @@ func TestDiscussionEventViewKeepsV2Events(t *testing.T) {
 	}
 }
 
+// TestDiscussionEventViewNullsEmptyIds 钉住「讨论历史响应无效」的根因回归：
+// actor_id / target_id 是可为 NULL 的列，Go 读回来是空串；若原样回 ""，前端
+// v3 契约（nullable(id)，要求 null 或合法 id）会把整条事件判无效，而
+// getDiscussionEvents 的 map 是不放行的 —— 一条不合规整段就炸。所以这两个
+// 字段的空串必须转成 JSON null。线上 2026-10-13 的讨论 discussion_started /
+// round_started（target 无指代对象）正是因此整段失败。
+func TestDiscussionEventViewNullsEmptyIds(t *testing.T) {
+	envelope := mustJSON(map[string]interface{}{
+		"protocolVersion": 3, "discussionId": "d1", "chatroomId": "c1",
+		"requestId": "req-1", "stateVersion": 2, "round": 1, "roundRevision": 0,
+		"timestamp": int64(1700000000000),
+	})
+	// 修复点：空串 → null（前端 nullable(id) 只接受 null 或合法 id）。
+	view := discussionEventView(DiscussionEventRecord{
+		DiscussionID: "d1", Seq: 1, EventType: "discussion_started",
+		ActorID: "", TargetID: "",
+		Payload:    mustJSON(map[string]interface{}{"roundPolicy": "user_confirmed"}),
+		V3Envelope: envelope,
+	})
+	if view["actorId"] != nil {
+		t.Errorf("actorId = %#v, want nil (JSON null)", view["actorId"])
+	}
+	if view["targetId"] != nil {
+		t.Errorf("targetId = %#v, want nil (JSON null)", view["targetId"])
+	}
+
+	// 非空值必须原样保留（正常事件的 actor/target 是融云账号）。
+	filled := discussionEventView(DiscussionEventRecord{
+		DiscussionID: "d1", Seq: 4, EventType: "contribution_completed",
+		ActorID: "rc_node_3300776275_opencode", TargetID: "rc_node_3300776275_opencode",
+		Payload:    mustJSON(map[string]interface{}{"round": 1, "content": "x"}),
+		V3Envelope: envelope,
+	})
+	if filled["actorId"] != "rc_node_3300776275_opencode" {
+		t.Errorf("actorId = %#v, want rc id", filled["actorId"])
+	}
+	if filled["targetId"] != "rc_node_3300776275_opencode" {
+		t.Errorf("targetId = %#v, want rc id", filled["targetId"])
+	}
+}
+
 // TestInteractiveRolesParsing 验证角色板解析：按 speakingOrder 排序、host 单列、
 // 缺 host 或缺普通成员时返回 ok=false（引擎据此拒绝推进）。
 func TestInteractiveRolesParsing(t *testing.T) {
