@@ -270,26 +270,54 @@ func (rt *discussionRuntime) interactiveBroadcast(ctx context.Context, d Discuss
 	if err != nil {
 		return
 	}
-	if err := rt.sendChatroomJSON(ctx, d.ChatroomID, content); err != nil {
+	sender := discussionEventSender(d, rec, rt.systemNodeID)
+	if err := rt.sendChatroomJSON(ctx, sender, d.ChatroomID, content); err != nil {
 		rt.logger.Warn("discussion: v3 event broadcast failed",
 			"discussionId", d.DiscussionID, "eventType", rec.EventType, "error", err)
 	}
 }
 
-// sendChatroomJSON 用平台账号把一条 command 消息发到融云聊天室。
+// discussionEventSender 决定一条 v3 事件广播的融云发件人。
 //
-// 没有绑定 systemNodeID 时**不发**（退化到「C 端靠 HTTP 重同步」），而不是像旧
-// 后端那样伪造一个 "system" 发件人：融云会把本端发出的消息回灌 webhook，而
-// handleCommand 的自环守卫只认「fromUserId == 系统账号」，伪造发件人会让这些
-// 广播被当成新的命令请求再回一次包。
-func (rt *discussionRuntime) sendChatroomJSON(ctx context.Context, chatroomID string, content []byte) error {
+// 讨论组本质是群聊：成员发言（contribution_completed）与主持人纪要
+// （round_summary_completed）以**发言节点自己的融云账号**广播，C 端与原生
+// IM 客户端都能按发送者归属。只有 actorId 是角色板里的成员（memberId 即节点
+// 融云账号）才用节点身份；引擎事件（actorId="system"）、用户操作事件
+// （actorId=操作者 rc id，不在角色板里）等一律回落到平台系统账号。
+func discussionEventSender(d DiscussionRecord, rec DiscussionEventRecord, fallback string) string {
+	actor := strings.TrimSpace(rec.ActorID)
+	if actor == "" || actor == "system" {
+		return fallback
+	}
+	ordinary, host, ok := interactiveRoles(d)
+	if !ok {
+		return fallback
+	}
+	if host.MemberID == actor {
+		return actor
+	}
+	for _, role := range ordinary {
+		if role.MemberID == actor {
+			return actor
+		}
+	}
+	return fallback
+}
+
+// sendChatroomJSON 把一条 command 消息发到融云聊天室，发件人由 senderID 指定
+// （发言事件是节点账号，引擎/操作事件是平台系统账号）。
+//
+// senderID 为空时**不发**（退化到「C 端靠 HTTP 重同步」）。融云会把本端发出的
+// 消息回灌 webhook：系统账号发的由 handleCommand 自环守卫拦，节点账号发的由
+// handleWebhook 的 isDiscussionEventBroadcast 内容嗅探拦，两道缺一不可。
+func (rt *discussionRuntime) sendChatroomJSON(ctx context.Context, senderID, chatroomID string, content []byte) error {
 	if rt.client == nil {
 		return errors.New("rongcloud client not available")
 	}
-	if rt.systemNodeID == "" {
-		return errors.New("system node id not bound; skipped chatroom broadcast")
+	if senderID == "" {
+		return errors.New("broadcast sender not available; skipped chatroom broadcast")
 	}
-	_, err := rt.client.sendChatroomMessage(ctx, rt.systemNodeID, chatroomID, objectNameCommand, string(content))
+	_, err := rt.client.sendChatroomMessage(ctx, senderID, chatroomID, objectNameCommand, string(content))
 	return err
 }
 

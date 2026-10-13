@@ -1554,6 +1554,30 @@ func TestIsCommandResult(t *testing.T) {
 	}
 }
 
+func TestIsDiscussionEventBroadcast(t *testing.T) {
+	// 服务端代发的讨论事件广播（发送者可能是发言节点）：必须被识别并在路由层丢弃。
+	broadcast := NormalizedMessage{
+		ObjectName: objectNameCommand,
+		Content:    `{"msg_type":"discussion_event","protocolVersion":3,"discussionId":"d1","requestId":"req-1","eventType":"contribution_completed","actorId":"ai-a"}`,
+	}
+	if !isDiscussionEventBroadcast(broadcast) {
+		t.Error("expected isDiscussionEventBroadcast=true for a v3 event broadcast")
+	}
+	// 设备回包与命令请求都不是广播。
+	result := NormalizedMessage{ObjectName: objectNameCommand, Content: `{"request_id":"r1","msg_type":"command_result"}`}
+	if isDiscussionEventBroadcast(result) {
+		t.Error("expected false for command_result")
+	}
+	command := NormalizedMessage{ObjectName: objectNameCommand, Content: `{"request_id":"r1","service":"ping"}`}
+	if isDiscussionEventBroadcast(command) {
+		t.Error("expected false for a real command")
+	}
+	other := NormalizedMessage{ObjectName: objectNameText, Content: `{"msg_type":"discussion_event"}`}
+	if isDiscussionEventBroadcast(other) {
+		t.Error("expected false for non-command objectName")
+	}
+}
+
 func TestIsStreamMessage(t *testing.T) {
 	if !isStreamMessage(objectNameStream) {
 		t.Error("expected isStreamMessage=true for RC:StreamMsg")

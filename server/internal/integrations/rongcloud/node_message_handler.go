@@ -154,6 +154,23 @@ func isCommandResult(msg NormalizedMessage) bool {
 	return peek.MsgType == "command_result"
 }
 
+// isDiscussionEventBroadcast 识别服务端代发的 v3 讨论事件广播。融云会把本端
+// 发出的消息回灌 webhook；广播以发言节点身份发送后 fromUserId 不再是系统账号，
+// handleCommand 的自环守卫拦不住，必须在路由层按内容特征丢弃——它不是命令
+// 也不是回包，进入命令分发只会白占去重表并朝节点回一条莫名其妙的 404。
+func isDiscussionEventBroadcast(msg NormalizedMessage) bool {
+	if msg.ObjectName != objectNameCommand {
+		return false
+	}
+	var peek struct {
+		MsgType string `json:"msg_type"`
+	}
+	if err := json.Unmarshal([]byte(msg.Content), &peek); err != nil {
+		return false
+	}
+	return peek.MsgType == "discussion_event"
+}
+
 func isStreamMessage(objectName string) bool {
 	return objectName == objectNameStream
 }

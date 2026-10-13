@@ -107,6 +107,12 @@ func (c *rongcloudChannel) handleWebhook(w http.ResponseWriter, r *http.Request)
 	}
 
 	if isCommandMessage(msg.ObjectName) {
+		if isDiscussionEventBroadcast(msg) {
+			// 服务端代发的讨论事件广播回灌（发送者可能是发言节点）。不是命令，
+			// 直接确认丢弃，别进命令分发。
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		if isCommandResult(msg) {
 			// 设备回包只做内存里的一次转交（唤醒 broker / 投给讨论协调器），
 			// 必须同步且立即，别拖慢等待方。

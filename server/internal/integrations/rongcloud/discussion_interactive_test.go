@@ -151,6 +151,42 @@ func TestDiscussionEventViewNullsEmptyIds(t *testing.T) {
 	}
 }
 
+// TestDiscussionEventSender 验证广播发件人选择：角色板成员（普通成员/主持人）
+// 以自己的融云账号发言；引擎事件（"system"）、操作者事件（不在角色板里的
+// rc id）、空 actor 一律回落到平台系统账号。
+func TestDiscussionEventSender(t *testing.T) {
+	snapshot := mustJSON(map[string]interface{}{
+		"ai-a": map[string]interface{}{
+			"memberId": "ai-a", "nodeId": "n-a", "roleName": "A", "speakingOrder": 0,
+		},
+		"host": map[string]interface{}{
+			"memberId": "ai-host", "nodeId": "n-host", "isHost": true, "speakingOrder": -1,
+		},
+	})
+	d := DiscussionRecord{RoleSnapshot: snapshot}
+	cases := []struct {
+		name   string
+		actor  string
+		want   string
+	}{
+		{"member speaks as itself", "ai-a", "ai-a"},
+		{"host speaks as itself", "ai-host", "ai-host"},
+		{"engine event falls back", "system", "claw-system"},
+		{"empty actor falls back", "", "claw-system"},
+		{"operator rc id not in roles falls back", "rc-user-1", "claw-system"},
+	}
+	for _, tc := range cases {
+		if got := discussionEventSender(d, DiscussionEventRecord{ActorID: tc.actor}, "claw-system"); got != tc.want {
+			t.Errorf("%s: sender = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+	// 角色板不可用（坏快照）→ 一律回落，不 panic。
+	bad := DiscussionRecord{RoleSnapshot: []byte("{")}
+	if got := discussionEventSender(bad, DiscussionEventRecord{ActorID: "ai-a"}, "claw-system"); got != "claw-system" {
+		t.Errorf("bad snapshot: sender = %q, want fallback", got)
+	}
+}
+
 // TestInteractiveRolesParsing 验证角色板解析：按 speakingOrder 排序、host 单列、
 // 缺 host 或缺普通成员时返回 ok=false（引擎据此拒绝推进）。
 func TestInteractiveRolesParsing(t *testing.T) {
