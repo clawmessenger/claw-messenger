@@ -463,11 +463,33 @@ func (s *NodeService) EnrollDeviceCredential(ctx context.Context, nodeID string)
 	return credID, secret, nil
 }
 
-// LegacyNodeRecords returns all nodes in the installation workspace mapped to
-// the legacy NodeRecord shape consumed by the old web client's device list.
-func (s *NodeService) LegacyNodeRecords(ctx context.Context) ([]map[string]interface{}, error) {
+// LegacyNodeRecords returns the nodes the given claw user owns, mapped to the
+// legacy NodeRecord shape consumed by the old web client's device list.
+// Ownership truth is the RongCloud friend edge (same as NodeClaimants inverts):
+// the claw user_id doubles as its rc account id (the login flow issues the rc
+// token with user_id as the rc id), so FriendIDs(user_id) lists exactly the
+// bound agent nodes. Every returned record carries binding_role=owner — the
+// legacy web/mini-program device lists gate discussion participation on
+// binding_role === 'owner', and a missing field used to blank the
+// eligible-device set ("当前没有可参与讨论的设备"). An empty userID falls back
+// to the old workspace-wide listing without filtering for internal callers.
+func (s *NodeService) LegacyNodeRecords(ctx context.Context, userID string) ([]map[string]interface{}, error) {
 	if s.queries == nil {
 		return nil, errors.New("rongcloud: no queries")
+	}
+	var ownedRC map[string]bool
+	if userID != "" {
+		if s.client == nil {
+			return nil, errors.New("rongcloud: API client not configured")
+		}
+		friends, err := s.client.FriendIDs(ctx, userID)
+		if err != nil {
+			return nil, err
+		}
+		ownedRC = make(map[string]bool, len(friends))
+		for _, friend := range friends {
+			ownedRC[friend] = true
+		}
 	}
 	insts, err := s.queries.ListActiveChannelInstallations(ctx, string(TypeRongCloud))
 	if err != nil {
@@ -513,6 +535,12 @@ func (s *NodeService) LegacyNodeRecords(ctx context.Context) ([]map[string]inter
 		if isHiddenNode(n) {
 			continue
 		}
+		// When the caller is a claw user, only their friend-edge-owned nodes
+		// surface — the HTTP list is per-user, not workspace-wide. Internal
+		// callers (userID == "") keep the workspace-wide view.
+		if ownedRC != nil && !ownedRC[n.RongcloudUserID] {
+			continue
+		}
 		aiType := n.AiType.String
 		online := "offline"
 		if s.IsOnline(n.ID) {
@@ -523,6 +551,7 @@ func (s *NodeService) LegacyNodeRecords(ctx context.Context) ([]map[string]inter
 			"node_type":       aiType,
 			"name":            aiType,
 			"rongcloud_id":    n.RongcloudUserID,
+			"binding_role":    "owner",
 			"deploy_status":   online,
 			"realtime_status": online,
 			"status":          "active",

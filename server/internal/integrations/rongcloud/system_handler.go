@@ -235,6 +235,24 @@ func (h *systemHandler) handleAICommand(ctx context.Context, msg NormalizedMessa
 			h.logger.Error("rongcloud: ai getNodes list nodes", "error", err)
 			return h.sendError(ctx, msg, cmd.RequestID, "failed to list nodes")
 		}
+		// Ownership filter + binding_role: the mini-program gates discussion
+		// participation on binding_role === 'owner' over this list, and the
+		// sender is the claw user (its user_id doubles as the rc account id),
+		// so the friend edge of msg.FromUserID is exactly their bound nodes.
+		ownedRC := map[string]bool{}
+		if h.client != nil {
+			friends, err := h.client.FriendIDs(ctx, msg.FromUserID)
+			if err != nil {
+				h.logger.Warn("rongcloud: ai getNodes friend lookup failed, listing workspace-wide", "from", msg.FromUserID, "error", err)
+				ownedRC = nil
+			} else {
+				for _, friend := range friends {
+					ownedRC[friend] = true
+				}
+			}
+		} else {
+			ownedRC = nil
+		}
 		records := make([]map[string]interface{}, 0, len(nodes))
 		for _, n := range nodes {
 			// Keep the same visibility contract as the HTTP device list: the
@@ -243,12 +261,16 @@ func (h *systemHandler) handleAICommand(ctx context.Context, msg NormalizedMessa
 			if isHiddenNode(n) {
 				continue
 			}
+			if ownedRC != nil && !ownedRC[n.RongcloudUserID] {
+				continue
+			}
 			aiType := n.AiType.String
 			record := map[string]interface{}{
 				"node_id":       n.NodeID,
 				"node_type":     aiType,
 				"name":          aiType,
 				"rongcloud_id":  n.RongcloudUserID,
+				"binding_role":  "owner",
 				"deploy_status": n.DeployStatus,
 				"status":        "active",
 				"created_at":    n.CreatedAt.Time,

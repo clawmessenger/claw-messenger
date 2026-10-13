@@ -717,14 +717,15 @@ func (h *Handler) ClawGetPairing(w http.ResponseWriter, r *http.Request) {
 
 // ClawListNodes GET /api/claw/nodes —— 旧站远程设备列表（HTTP 通道，不依赖浏览器 IM 连接）。
 func (h *Handler) ClawListNodes(w http.ResponseWriter, r *http.Request) {
-	if _, ok := h.clawRequireClawUser(w, r); !ok {
+	userID, ok := h.clawRequireClawUser(w, r)
+	if !ok {
 		return
 	}
 	if h.RongCloudNode == nil {
 		clawJSON(w, 503, 503, "RongCloud 未配置", nil)
 		return
 	}
-	records, err := h.RongCloudNode.LegacyNodeRecords(r.Context())
+	records, err := h.RongCloudNode.LegacyNodeRecords(r.Context(), userID)
 	if err != nil {
 		slog.Warn("claw nodes list failed", "error", err)
 		clawJSON(w, 500, 500, "获取设备列表失败", nil)
