@@ -393,6 +393,12 @@ func (h *systemHandler) handleDiscussionCommand(ctx context.Context, msg Normali
 		return h.replyErr(ctx, msg, cmd, 400, "AUTHENTICATED_USER_NOT_FOUND")
 	}
 
+	// P7：user_confirmed（v3）讨论的用户动作由交互轮次引擎接管；它不是 v3 讨论
+	// 就回落下面的 legacy 实现（两种状态机互斥，不能同时套）。
+	if result, handled := h.discussionRuntime.interactiveLifecycleAction(ctx, cmd.Action, cmd, actor); handled {
+		return h.replyCommandResult(ctx, msg, cmd, result)
+	}
+
 	var result commandResult
 	switch cmd.Action {
 	case "start":

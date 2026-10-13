@@ -250,7 +250,9 @@ func TestDiscussionPermissionGuards(t *testing.T) {
 	}
 }
 
-// TestDiscussionWorkflowCapabilities 验证能力查询返回 v2 only。
+// TestDiscussionWorkflowCapabilities 验证能力查询：引擎未装配时只报 v2 /
+// legacy_capped，装配后就绪时报 [2,3] / [legacy_capped,user_confirmed]。
+// 「不谎报 v3」是这条回包的硬约束（前端据此决定能否建 user_confirmed 圆桌）。
 func TestDiscussionWorkflowCapabilities(t *testing.T) {
 	rt := &discussionRuntime{}
 	if r := rt.actionGetWorkflowCapabilities(CommandContent{Params: map[string]interface{}{}}); r.code != 200 {
@@ -265,6 +267,21 @@ func TestDiscussionWorkflowCapabilities(t *testing.T) {
 	pv, _ := data["protocol_versions"].([]int)
 	if len(pv) != 1 || pv[0] != 2 {
 		t.Fatalf("protocol_versions = %v", data["protocol_versions"])
+	}
+	policies, _ := data["round_policies"].([]string)
+	if len(policies) != 1 || policies[0] != RoundPolicyLegacyCapped {
+		t.Fatalf("round_policies = %v", data["round_policies"])
+	}
+
+	// 引擎装配就绪（P7）→ 宣告 v3。缺任何一项（repo/queries）都必须退回 v2。
+	ready := &discussionRuntime{
+		interactiveEnabled: true,
+		repo:               &DiscussionRepository{},
+		queries:            nil,
+	}
+	readyData := ready.actionGetWorkflowCapabilities(CommandContent{Params: map[string]interface{}{}}).data.(map[string]interface{})
+	if pv, _ := readyData["protocol_versions"].([]int); len(pv) != 1 {
+		t.Fatalf("engine without queries must report v2 only, got %v", pv)
 	}
 }
 

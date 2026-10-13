@@ -172,6 +172,31 @@ func (c *rongcloudAPIClient) sendPrivateMessage(ctx context.Context, fromUserID,
 	return "", nil
 }
 
+// sendChatroomMessage publishes a message into a RongCloud chatroom.
+//
+// P7 uses it for the v3 discovery events: the coordinator writes one row per event
+// and then fans the same payload out to the room so the C-end timeline updates
+// without polling. The legacy Python transport did exactly this with
+// from_user_id="system" / object_name="command" and no persistence flags, and the
+// device-side protocol never relied on these being durable — the web re-syncs
+// over HTTP when it opens a room — so we keep the same shape.
+func (c *rongcloudAPIClient) sendChatroomMessage(ctx context.Context, fromUserID, chatroomID, objectName, content string) (string, error) {
+	form := url.Values{
+		"fromUserId":   {fromUserID},
+		"toChatroomId": {chatroomID},
+		"objectName":   {objectName},
+		"content":      {content},
+	}
+	result, err := c.postForm(ctx, "/message/chatroom/publish.json", form)
+	if err != nil {
+		return "", err
+	}
+	if msgUID, ok := result["msgUID"].(string); ok {
+		return msgUID, nil
+	}
+	return "", nil
+}
+
 // sendCommandResult sends a command_result message back to the requesting user.
 func (c *rongcloudAPIClient) sendCommandResult(ctx context.Context, fromUserID, toUserID, requestID string, payload map[string]interface{}) error {
 	resultContent := CommandResultContent{

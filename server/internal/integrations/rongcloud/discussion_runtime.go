@@ -41,6 +41,10 @@ type discussionRuntime struct {
 	roundtable *roundtableCreationService
 	// nodeRequests 是发给设备端的推荐请求 broker（recommendRoles 用）。
 	nodeRequests *NodeRequestBroker
+	// interactiveEnabled 是 P7 v3 交互轮次引擎的总开关，装配完成时由
+	// registration 置为 true。它是 getWorkflowCapabilities 翻面的唯一依据：
+	// 只有引擎真能推进时才对 C 端宣告 protocol_versions=[2,3]。
+	interactiveEnabled bool
 }
 
 // DiscussionSystemHostConfig 是管理端 system_host 配置的运行时视图（P4）。
@@ -212,6 +216,13 @@ func isoTime(t time.Time) string {
 }
 
 // discussionEventView 对齐 Python event_json：v2 字段 + v3 信封展开。
+//
+// v3 事件是**白名单制**：前端 lib/discussion-v3.ts 的 eventData 逐类型校验，任何
+// 一个不合规的 v3 事件都会让 getDiscussionEvents 整段抛错（它 map 时不让过）。
+// 引擎内部仍有若干控制事件不在白名单里（assignment_created / host_turn_requested /
+// control_accepted / task_timeout / retry_accepted / task_failed），它们对外必须
+// 降级成 discussion_progress + 空 data —— 事件本体仍在表里（审计/重放要用），
+// 只是不往 C 端暴露未定契约的内部推进。
 func discussionEventView(e DiscussionEventRecord) map[string]interface{} {
 	view := map[string]interface{}{
 		"eventId":      eventUUIDString(e.ID),
@@ -234,6 +245,10 @@ func discussionEventView(e DiscussionEventRecord) map[string]interface{} {
 			}
 		}
 		view["protocolVersion"] = 3
+		if !isInteractiveV3EventType(e.EventType) {
+			view["eventType"] = "discussion_progress"
+			view["payload"] = map[string]interface{}{}
+		}
 	}
 	return view
 }
@@ -803,15 +818,26 @@ func (rt *discussionRuntime) actionGetSystemHostStatus(ctx context.Context) comm
 	})
 }
 
-// actionGetWorkflowCapabilities：P4 返回 v2 + legacy_capped。v3（user_confirmed）
-// 在 P7 落地后开放。
+// actionGetWorkflowCapabilities 对齐 Python workflow_capabilities.py 的
+// get_workflow_capabilities：v2 / legacy_capped 恒可；v3 / user_confirmed 只在
+// 交互轮次引擎（P7）装配就绪时宣告。
+//
+// 这条回包是前端 RoundtableSetupDialog 决定「能否建 user_confirmed 圆桌」的唯一
+// 依据，所以宁可少报也不能多报：引擎缺失（interactiveReady=false）时仍只回 [2]，
+// 前端就会走 legacy 路径，而不是建出一个跑不起来的讨论。
 func (rt *discussionRuntime) actionGetWorkflowCapabilities(cmd CommandContent) commandResult {
 	if len(cmd.Params) != 0 {
 		return errResult(400, "INVALID_ROUNDTABLE_REQUEST")
 	}
+	versions := []int{2}
+	policies := []string{RoundPolicyLegacyCapped}
+	if rt.interactiveReady() {
+		versions = append(versions, 3)
+		policies = append(policies, RoundPolicyUserConfirmed)
+	}
 	return okResult(map[string]interface{}{
-		"protocol_versions": []int{2},
-		"round_policies":    []string{RoundPolicyLegacyCapped},
+		"protocol_versions": versions,
+		"round_policies":    policies,
 	})
 }
 
@@ -966,6 +992,30 @@ func DiscussionSnapshotView(d DiscussionRecord, artifact *ArtifactRecord) map[st
 // DiscussionEventView 序列化事件（含 v3 信封展开）。
 func DiscussionEventView(e DiscussionEventRecord) map[string]interface{} {
 	return discussionEventView(e)
+}
+
+// ArtifactView 序列化产物（camelCase，对齐 Python artifact_json）。
+func ArtifactView(a ArtifactRecord) map[string]interface{} {
+	return artifactView(a)
+}
+
+// RoundDocumentView 序列化逐轮纪要（**snake_case**，对齐 Python document_json ——
+// C 端 services/discussion.ts 的 documentMetadata 直接读 snake_case 键，不能改成
+// camelCase）。includeContent=false 时省掉正文（列表接口只回元数据）。
+func RoundDocumentView(d RoundDocumentRecord, includeContent bool) map[string]interface{} {
+	view := map[string]interface{}{
+		"document_id":       d.DocumentID,
+		"discussion_id":     d.DiscussionID,
+		"round":             d.Round,
+		"revision":          d.Revision,
+		"source_request_id": d.SourceRequestID,
+		"title":             d.Title,
+		"created_at":        isoTime(d.CreatedAt),
+	}
+	if includeContent {
+		view["content"] = d.Content
+	}
+	return view
 }
 
 // ---- C 端 REST 的成员资格校验（P4） ---------------------------------------

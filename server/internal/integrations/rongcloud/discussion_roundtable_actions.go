@@ -24,8 +24,9 @@ import (
 // 「角色推荐结果无效」，与真正的原因（提示词与设备数不匹配）毫无关联。
 //
 // 前端契约：RoundtableSetupDialog 固定发 round_policy='user_confirmed'。这条路径
-// 按 round_policies 判定，v3 运行时（interactive rounds）尚未装配时诚实回 503
-// DISCUSSION_WORKFLOW_UNAVAILABLE，不谎报支持（谎报会让前端建出跑不起来的讨论）。
+// 按 round_policies 判定，未开放时诚实回 503 DISCUSSION_WORKFLOW_UNAVAILABLE，
+// 不谎报支持（谎报会让前端建出跑不起来的讨论）。P7 装配好交互轮次引擎后
+// roundtablePolicyAvailable(user_confirmed) 为真，此路径自然放行。
 func (rt *discussionRuntime) actionRecommendRoles(ctx context.Context, cmd CommandContent, actor discussionActor) commandResult {
 	if rt.roundtable == nil {
 		return errResult(503, "discussion runtime not available")
@@ -140,6 +141,7 @@ func (rt *discussionRuntime) actionCreateRoundtable(ctx context.Context, cmd Com
 	if rErr != nil {
 		return roundtableErrorResult(rErr)
 	}
+	rt.beginInteractiveSafe(ctx, result)
 	return okResult(result)
 }
 
@@ -160,9 +162,6 @@ func (rt *discussionRuntime) actionResumeRoundtable(ctx context.Context, cmd Com
 	if req.UserID != actor.RcID {
 		return errResult(403, "ROUNDTABLE_CREATE_REQUEST_NOT_FOUND")
 	}
-	if req.Status == "ready" {
-		return okResult(roundtableReadyResponse(req))
-	}
 	// 重放原始 payload（canonical 结构已存 request_payload）。
 	var params map[string]interface{}
 	if err := json.Unmarshal(req.RequestPayload, &params); err != nil {
@@ -172,7 +171,25 @@ func (rt *discussionRuntime) actionResumeRoundtable(ctx context.Context, cmd Com
 	if rErr != nil {
 		return roundtableErrorResult(rErr)
 	}
+	rt.beginInteractiveSafe(ctx, result)
 	return okResult(result)
+}
+
+// beginInteractiveSafe 在创建编排到达 ready 后启动 v3 轮次引擎（仅
+// user_confirmed 讨论）。best-effort：引擎内部幂等（'start:<id>' 事件），创建
+// 重放或由 resume 重入时不会重复开局；开局失败不回滚已建成的一室一组一讨论 ——
+// 用户可以稍后 resume 重试，而把已提交的创建结果报成失败只会让前端反复重试。
+func (rt *discussionRuntime) beginInteractiveSafe(ctx context.Context, result map[string]interface{}) {
+	if !rt.interactiveReady() {
+		return
+	}
+	discussionID, _ := result["discussion_id"].(string)
+	if discussionID == "" {
+		return
+	}
+	if err := rt.interactiveBegin(ctx, discussionID); err != nil {
+		rt.logger.Warn("discussion: interactive begin failed", "discussionId", discussionID, "error", err)
+	}
 }
 
 // ---- 辅助 ----------------------------------------------------------------
@@ -188,7 +205,7 @@ func payloadRoles(payload map[string]interface{}) []map[string]interface{} {
 //
 // C 端的校验是「每个角色的 node_id 互不相同，且都在用户所选设备内」，缺一个字段
 // 就整份判无效（ROLE_RECOMMENDATION_INVALID）。Python 里这一步由设备端模型完成
-// （严格模式下设备拿得到 candidates，逐角色回 node_id/model）；Go 侧还没有把这套
+//（严格模式下设备拿得到 candidates，逐角色回 node_id/model）；Go 侧还没有把这套
 // 候选清单下发到设备，于是服务端按候选顺序确定性补齐 —— 设备端将来若自己回了合法
 // 且未重复的分配，这里会尊重它，只补它没选到的角色。
 func assignRoleNodes(roles []map[string]interface{}, candidates []string) {
@@ -236,9 +253,18 @@ func assignRoleNodes(roles []map[string]interface{}, candidates []string) {
 	}
 }
 
-// roundtablePolicyAvailable 判定 round_policy 是否已开放（P5 只有 legacy_capped）。
+// roundtablePolicyAvailable 判定 round_policy 是否已开放。legacy_capped 由 P5
+// 提供；user_confirmed（v3 交互轮次）自 P7 起随引擎装配一起开放 —— 引擎未装配
+//（interactiveReady=false）时仍诚实返回 false，避免前端走一条死路。
 func (rt *discussionRuntime) roundtablePolicyAvailable(policy string) bool {
-	return policy == RoundPolicyLegacyCapped
+	switch policy {
+	case RoundPolicyLegacyCapped:
+		return true
+	case RoundPolicyUserConfirmed:
+		return rt.interactiveReady()
+	default:
+		return false
+	}
 }
 
 // roundtableErrorResult 把 RoundtableError 翻译成 commandResult。错误码语义：

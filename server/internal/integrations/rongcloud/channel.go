@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/multica-ai/multica/server/internal/integrations/channel"
 )
@@ -42,10 +43,30 @@ func (c *rongcloudChannel) Connect(ctx context.Context) error {
 	}
 
 	c.logger.Info("rongcloud channel connected", "installation_id", installationID)
+	// P7：交互轮次引擎的恢复扫描。派发命令的 available_at 就是该轮的等待上限，
+	// 到点仍未被设备回包的命令按超时处理（重试 / 跳过 / 判定失败）。它是持久
+	// outbox 上的扫描，因此进程重启后也能接着推进，不需要内存态。
+	if rt := c.systemHandler.discussionRuntime; rt != nil {
+		go c.runInteractiveSweep(ctx, rt)
+	}
 	<-ctx.Done()
 	c.registrar.Unregister(installationID)
 	c.logger.Info("rongcloud channel disconnected", "installation_id", installationID)
 	return nil
+}
+
+// runInteractiveSweep 周期驱动 v3 轮次引擎的超时恢复，直到 channel 上下文结束。
+func (c *rongcloudChannel) runInteractiveSweep(ctx context.Context, rt *discussionRuntime) {
+	ticker := time.NewTicker(interactiveSweepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			rt.interactiveSweep(ctx)
+		}
+	}
 }
 
 func (c *rongcloudChannel) Disconnect(ctx context.Context) error {

@@ -43,6 +43,22 @@ func (h *systemHandler) handleCommandResult(ctx context.Context, msg NormalizedM
 		return
 	}
 
+	// P7：先给 v3 交互轮次引擎一次机会。设备对 your_turn 的回包也走这条
+	// command_result 通道，引擎按 requestId 在 outbox 里查得到派发才算它的
+	// （返回 false 时这条消息属于别的消费方，继续往下走旧协调器）。
+	if h.discussionRuntime != nil {
+		content := ""
+		if s, ok := result.Payload["content"].(string); ok {
+			content = s
+		}
+		kind, _ := result.Payload["kind"].(string)
+		errMsg, _ := result.Payload["error"].(string)
+		if h.discussionRuntime.interactiveAcceptTurn(ctx, msg.FromUserID, result.RequestID,
+			content, kind == "error", errMsg) {
+			return
+		}
+	}
+
 	resp := NodeResponse{
 		NodeID:    msg.FromUserID,
 		MsgType:   "command_result",

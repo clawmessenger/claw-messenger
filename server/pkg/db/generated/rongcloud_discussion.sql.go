@@ -390,6 +390,65 @@ func (q *Queries) GetRongCloudDiscussion(ctx context.Context, discussionID strin
 	return i, err
 }
 
+const getRongCloudDiscussionCommand = `-- name: GetRongCloudDiscussionCommand :one
+SELECT command_id, discussion_id, request_id, kind, payload, state, attempts, available_at, lease_until, created_at FROM rongcloud_discussion_command WHERE command_id = $1
+`
+
+func (q *Queries) GetRongCloudDiscussionCommand(ctx context.Context, commandID string) (RongcloudDiscussionCommand, error) {
+	row := q.db.QueryRow(ctx, getRongCloudDiscussionCommand, commandID)
+	var i RongcloudDiscussionCommand
+	err := row.Scan(
+		&i.CommandID,
+		&i.DiscussionID,
+		&i.RequestID,
+		&i.Kind,
+		&i.Payload,
+		&i.State,
+		&i.Attempts,
+		&i.AvailableAt,
+		&i.LeaseUntil,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getRongCloudDiscussionEventByIdempotency = `-- name: GetRongCloudDiscussionEventByIdempotency :one
+SELECT id, chatroom_id, workspace_id, event_type, round_number, speaking_order, node_id, content, msg_uid, created_at, discussion_id, seq, actor_id, target_id, payload, idempotency_key, v3_envelope FROM rongcloud_discussion_event
+WHERE discussion_id = $1 AND idempotency_key = $2
+`
+
+type GetRongCloudDiscussionEventByIdempotencyParams struct {
+	DiscussionID   pgtype.Text `json:"discussion_id"`
+	IdempotencyKey pgtype.Text `json:"idempotency_key"`
+}
+
+// P7：交互式轮次的所有推进都按 idempotency_key 做重放保护（融云回调 at-least-once、
+// 设备重连会整段重放离线历史），落事件前先按幂等键查一次就能把重放变成无操作。
+func (q *Queries) GetRongCloudDiscussionEventByIdempotency(ctx context.Context, arg GetRongCloudDiscussionEventByIdempotencyParams) (RongcloudDiscussionEvent, error) {
+	row := q.db.QueryRow(ctx, getRongCloudDiscussionEventByIdempotency, arg.DiscussionID, arg.IdempotencyKey)
+	var i RongcloudDiscussionEvent
+	err := row.Scan(
+		&i.ID,
+		&i.ChatroomID,
+		&i.WorkspaceID,
+		&i.EventType,
+		&i.RoundNumber,
+		&i.SpeakingOrder,
+		&i.NodeID,
+		&i.Content,
+		&i.MsgUid,
+		&i.CreatedAt,
+		&i.DiscussionID,
+		&i.Seq,
+		&i.ActorID,
+		&i.TargetID,
+		&i.Payload,
+		&i.IdempotencyKey,
+		&i.V3Envelope,
+	)
+	return i, err
+}
+
 const getRongCloudDiscussionEventMaxSeq = `-- name: GetRongCloudDiscussionEventMaxSeq :one
 SELECT COALESCE(MAX(seq), 0)::bigint AS max_seq
 FROM rongcloud_discussion_event
@@ -469,6 +528,43 @@ func (q *Queries) GetRongCloudRoundDocument(ctx context.Context, documentID stri
 	return i, err
 }
 
+const getRongCloudRoundDocumentByIdentity = `-- name: GetRongCloudRoundDocumentByIdentity :one
+SELECT document_id, discussion_id, round, revision, source_request_id, title, content, created_at FROM rongcloud_discussion_round_document
+WHERE discussion_id = $1
+  AND (source_request_id = $2 OR (round = $3 AND revision = $4))
+ORDER BY created_at ASC
+LIMIT 1
+`
+
+type GetRongCloudRoundDocumentByIdentityParams struct {
+	DiscussionID    string `json:"discussion_id"`
+	SourceRequestID string `json:"source_request_id"`
+	Round           int32  `json:"round"`
+	Revision        int32  `json:"revision"`
+}
+
+// 幂等查回：同一 source_request_id 或同一 (round, revision) 的既存文档。
+func (q *Queries) GetRongCloudRoundDocumentByIdentity(ctx context.Context, arg GetRongCloudRoundDocumentByIdentityParams) (RongcloudDiscussionRoundDocument, error) {
+	row := q.db.QueryRow(ctx, getRongCloudRoundDocumentByIdentity,
+		arg.DiscussionID,
+		arg.SourceRequestID,
+		arg.Round,
+		arg.Revision,
+	)
+	var i RongcloudDiscussionRoundDocument
+	err := row.Scan(
+		&i.DocumentID,
+		&i.DiscussionID,
+		&i.Round,
+		&i.Revision,
+		&i.SourceRequestID,
+		&i.Title,
+		&i.Content,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const getRoundtableCreateRequest = `-- name: GetRoundtableCreateRequest :one
 SELECT user_id, client_request_id, recommendation_id, status, request_payload, request_payload_hash, chatroom_id, discussion_id, error_code, created_at, updated_at FROM rongcloud_roundtable_create_request
 WHERE user_id = $1 AND client_request_id = $2
@@ -521,6 +617,105 @@ func (q *Queries) GetRoundtableCreateRequestByChatroom(ctx context.Context, chat
 	return i, err
 }
 
+const insertRongCloudDiscussionCommand = `-- name: InsertRongCloudDiscussionCommand :one
+INSERT INTO rongcloud_discussion_command (
+    command_id, discussion_id, request_id, kind, payload, available_at
+) VALUES (
+    $1, $2, $3, $4, $5, $6
+)
+ON CONFLICT (command_id) DO NOTHING
+RETURNING command_id, discussion_id, request_id, kind, payload, state, attempts, available_at, lease_until, created_at
+`
+
+type InsertRongCloudDiscussionCommandParams struct {
+	CommandID    string             `json:"command_id"`
+	DiscussionID string             `json:"discussion_id"`
+	RequestID    string             `json:"request_id"`
+	Kind         string             `json:"kind"`
+	Payload      []byte             `json:"payload"`
+	AvailableAt  pgtype.Timestamptz `json:"available_at"`
+}
+
+// P7 outbox：派发（kind=dispatch）/ 取消（kind=cancel）先落库再发送，进程重启不丢。
+// command_id 就是 v3 信封里的 requestId —— 设备回包按它索引到这条命令。
+func (q *Queries) InsertRongCloudDiscussionCommand(ctx context.Context, arg InsertRongCloudDiscussionCommandParams) (RongcloudDiscussionCommand, error) {
+	row := q.db.QueryRow(ctx, insertRongCloudDiscussionCommand,
+		arg.CommandID,
+		arg.DiscussionID,
+		arg.RequestID,
+		arg.Kind,
+		arg.Payload,
+		arg.AvailableAt,
+	)
+	var i RongcloudDiscussionCommand
+	err := row.Scan(
+		&i.CommandID,
+		&i.DiscussionID,
+		&i.RequestID,
+		&i.Kind,
+		&i.Payload,
+		&i.State,
+		&i.Attempts,
+		&i.AvailableAt,
+		&i.LeaseUntil,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const insertRongCloudNodeRequest = `-- name: InsertRongCloudNodeRequest :one
+INSERT INTO rongcloud_node_request (
+    request_id, request_kind, requester_user_id, target_node_id, target_ai_user_id,
+    status, request_payload, expires_at
+) VALUES (
+    $1, $2, $3, $4, $5,
+    $6, $7, $8
+)
+ON CONFLICT (request_id) DO NOTHING
+RETURNING request_id, request_kind, requester_user_id, target_node_id, target_ai_user_id, status, request_payload, response_payload, error_code, expires_at, created_at, updated_at
+`
+
+type InsertRongCloudNodeRequestParams struct {
+	RequestID       string             `json:"request_id"`
+	RequestKind     string             `json:"request_kind"`
+	RequesterUserID string             `json:"requester_user_id"`
+	TargetNodeID    string             `json:"target_node_id"`
+	TargetAiUserID  string             `json:"target_ai_user_id"`
+	Status          string             `json:"status"`
+	RequestPayload  []byte             `json:"request_payload"`
+	ExpiresAt       pgtype.Timestamptz `json:"expires_at"`
+}
+
+// P7：服务器→节点请求-应答的持久记录（角色推荐经此下发）。
+func (q *Queries) InsertRongCloudNodeRequest(ctx context.Context, arg InsertRongCloudNodeRequestParams) (RongcloudNodeRequest, error) {
+	row := q.db.QueryRow(ctx, insertRongCloudNodeRequest,
+		arg.RequestID,
+		arg.RequestKind,
+		arg.RequesterUserID,
+		arg.TargetNodeID,
+		arg.TargetAiUserID,
+		arg.Status,
+		arg.RequestPayload,
+		arg.ExpiresAt,
+	)
+	var i RongcloudNodeRequest
+	err := row.Scan(
+		&i.RequestID,
+		&i.RequestKind,
+		&i.RequesterUserID,
+		&i.TargetNodeID,
+		&i.TargetAiUserID,
+		&i.Status,
+		&i.RequestPayload,
+		&i.ResponsePayload,
+		&i.ErrorCode,
+		&i.ExpiresAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const insertRongCloudRoleRecommendation = `-- name: InsertRongCloudRoleRecommendation :one
 INSERT INTO rongcloud_role_recommendation (recommendation_id, request_id, user_id, host_node_id, host_ai_user_id, config_version, topic, goal, roles, expires_at)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
@@ -567,6 +762,51 @@ func (q *Queries) InsertRongCloudRoleRecommendation(ctx context.Context, arg Ins
 		&i.Goal,
 		&i.Roles,
 		&i.ExpiresAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const insertRongCloudRoundDocument = `-- name: InsertRongCloudRoundDocument :one
+INSERT INTO rongcloud_discussion_round_document (
+    document_id, discussion_id, round, revision, source_request_id, title, content
+) VALUES (
+    $1, $2, $3, $4, $5, $6, $7
+)
+ON CONFLICT (discussion_id, round, revision) DO NOTHING
+RETURNING document_id, discussion_id, round, revision, source_request_id, title, content, created_at
+`
+
+type InsertRongCloudRoundDocumentParams struct {
+	DocumentID      string `json:"document_id"`
+	DiscussionID    string `json:"discussion_id"`
+	Round           int32  `json:"round"`
+	Revision        int32  `json:"revision"`
+	SourceRequestID string `json:"source_request_id"`
+	Title           string `json:"title"`
+	Content         string `json:"content"`
+}
+
+// P7：主持人的本轮纪要。唯一键 (discussion_id, round, revision) 让重放变无操作。
+func (q *Queries) InsertRongCloudRoundDocument(ctx context.Context, arg InsertRongCloudRoundDocumentParams) (RongcloudDiscussionRoundDocument, error) {
+	row := q.db.QueryRow(ctx, insertRongCloudRoundDocument,
+		arg.DocumentID,
+		arg.DiscussionID,
+		arg.Round,
+		arg.Revision,
+		arg.SourceRequestID,
+		arg.Title,
+		arg.Content,
+	)
+	var i RongcloudDiscussionRoundDocument
+	err := row.Scan(
+		&i.DocumentID,
+		&i.DiscussionID,
+		&i.Round,
+		&i.Revision,
+		&i.SourceRequestID,
+		&i.Title,
+		&i.Content,
 		&i.CreatedAt,
 	)
 	return i, err
@@ -695,6 +935,85 @@ func (q *Queries) ListActiveRongCloudDiscussions(ctx context.Context) ([]Rongclo
 			&i.RoundRevision,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listDueRongCloudDiscussionCommands = `-- name: ListDueRongCloudDiscussionCommands :many
+SELECT command_id, discussion_id, request_id, kind, payload, state, attempts, available_at, lease_until, created_at FROM rongcloud_discussion_command
+WHERE kind = 'dispatch'
+  AND state IN ('pending', 'sent')
+  AND available_at <= now()
+ORDER BY available_at ASC
+LIMIT $1
+`
+
+// P7 恢复扫描：到期的未终结派发命令（available_at 在派发时被置为「超时时刻」）。
+func (q *Queries) ListDueRongCloudDiscussionCommands(ctx context.Context, limit int32) ([]RongcloudDiscussionCommand, error) {
+	rows, err := q.db.Query(ctx, listDueRongCloudDiscussionCommands, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []RongcloudDiscussionCommand{}
+	for rows.Next() {
+		var i RongcloudDiscussionCommand
+		if err := rows.Scan(
+			&i.CommandID,
+			&i.DiscussionID,
+			&i.RequestID,
+			&i.Kind,
+			&i.Payload,
+			&i.State,
+			&i.Attempts,
+			&i.AvailableAt,
+			&i.LeaseUntil,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listRongCloudDiscussionCommandsByDiscussion = `-- name: ListRongCloudDiscussionCommandsByDiscussion :many
+SELECT command_id, discussion_id, request_id, kind, payload, state, attempts, available_at, lease_until, created_at FROM rongcloud_discussion_command
+WHERE discussion_id = $1
+ORDER BY created_at ASC, command_id ASC
+`
+
+// 取该讨论的全部命令，供「当前活跃派发」判定（引擎按 payload->>'round' 与 state 过滤）。
+func (q *Queries) ListRongCloudDiscussionCommandsByDiscussion(ctx context.Context, discussionID string) ([]RongcloudDiscussionCommand, error) {
+	rows, err := q.db.Query(ctx, listRongCloudDiscussionCommandsByDiscussion, discussionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []RongcloudDiscussionCommand{}
+	for rows.Next() {
+		var i RongcloudDiscussionCommand
+		if err := rows.Scan(
+			&i.CommandID,
+			&i.DiscussionID,
+			&i.RequestID,
+			&i.Kind,
+			&i.Payload,
+			&i.State,
+			&i.Attempts,
+			&i.AvailableAt,
+			&i.LeaseUntil,
+			&i.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -836,6 +1155,26 @@ func (q *Queries) ListRongCloudRoundDocumentsForDiscussion(ctx context.Context, 
 	return items, nil
 }
 
+const settleRongCloudDiscussionCommand = `-- name: SettleRongCloudDiscussionCommand :execrows
+UPDATE rongcloud_discussion_command
+SET state = $1, lease_until = NULL
+WHERE command_id = $2
+`
+
+type SettleRongCloudDiscussionCommandParams struct {
+	State     string `json:"state"`
+	CommandID string `json:"command_id"`
+}
+
+// 命令终结：设备回包或判定超时后把命令置为终结态（acknowledged / failed）。
+func (q *Queries) SettleRongCloudDiscussionCommand(ctx context.Context, arg SettleRongCloudDiscussionCommandParams) (int64, error) {
+	result, err := q.db.Exec(ctx, settleRongCloudDiscussionCommand, arg.State, arg.CommandID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const transitionRoundtableCreateRequest = `-- name: TransitionRoundtableCreateRequest :one
 UPDATE rongcloud_roundtable_create_request
 SET status = $3, chatroom_id = COALESCE($4, chatroom_id), discussion_id = COALESCE($5, discussion_id), error_code = NULL, updated_at = now()
@@ -932,6 +1271,35 @@ func (q *Queries) UpdateRongCloudDiscussionState(ctx context.Context, arg Update
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const updateRongCloudNodeRequestResult = `-- name: UpdateRongCloudNodeRequestResult :execrows
+UPDATE rongcloud_node_request
+SET status = $1,
+    response_payload = $2,
+    error_code = $3,
+    updated_at = now()
+WHERE request_id = $4
+`
+
+type UpdateRongCloudNodeRequestResultParams struct {
+	Status          string      `json:"status"`
+	ResponsePayload []byte      `json:"response_payload"`
+	ErrorCode       pgtype.Text `json:"error_code"`
+	RequestID       string      `json:"request_id"`
+}
+
+func (q *Queries) UpdateRongCloudNodeRequestResult(ctx context.Context, arg UpdateRongCloudNodeRequestResultParams) (int64, error) {
+	result, err := q.db.Exec(ctx, updateRongCloudNodeRequestResult,
+		arg.Status,
+		arg.ResponsePayload,
+		arg.ErrorCode,
+		arg.RequestID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const upsertRongCloudArtifact = `-- name: UpsertRongCloudArtifact :one

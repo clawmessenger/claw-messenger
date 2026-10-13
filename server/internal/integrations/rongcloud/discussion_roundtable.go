@@ -261,6 +261,11 @@ type roundtableCreationService struct {
 	hostLoader func(ctx context.Context) (DiscussionSystemHostConfig, bool, error)
 	// nodeOwner 按用户列「归属」节点（融云好友边语义，node_claim.go）。
 	nodeOwner func(ctx context.Context, userID string) ([]db.RongcloudNode, error)
+	// workflowAvailable 判定某个 round_policy 此刻是否真的可跑。P5 只有
+	// legacy_capped；P7 装配好交互轮次引擎后 user_confirmed 才为真。它与
+	// discussionRuntime.roundtablePolicyAvailable 是同一个开关（registration
+	// 把后者注入到这里），确保「推荐/创建/能力宣告」三处对 v3 的判定永不漂移。
+	workflowAvailable func(policy string) bool
 }
 
 func newRoundtableCreationService(queries *db.Queries, client *rongcloudAPIClient) *roundtableCreationService {
@@ -273,9 +278,10 @@ func (s *roundtableCreationService) create(ctx context.Context, userID string, p
 	if cerr != nil {
 		return nil, cerr
 	}
-	if canonical.RoundPolicy == "user_confirmed" {
-		// v3 策略的运行时（interactive rounds）在 P7 落地；在此之前诚实拒绝，
-		// 不谎报支持 —— 谎报会让前端建出「跑不起来」的讨论。
+	if canonical.RoundPolicy == RoundPolicyUserConfirmed &&
+		(s.workflowAvailable == nil || !s.workflowAvailable(canonical.RoundPolicy)) {
+		// v3 策略的运行时（interactive rounds）尚未装配时诚实拒绝，不谎报支持 ——
+		// 谎报会让前端建出「跑不起来」的讨论。
 		return nil, roundtableErr("DISCUSSION_WORKFLOW_UNAVAILABLE")
 	}
 	payloadJSON, err := json.Marshal(canonical)

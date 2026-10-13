@@ -1639,6 +1639,12 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	r.Get("/api/chatrooms/{chatroomId}/discussions", h.ClawListChatroomDiscussions)
 	r.Get("/api/discussions/{discussionId}", h.ClawGetDiscussion)
 	r.Get("/api/discussions/{discussionId}/events", h.ClawGetDiscussionEvents)
+	// P7：逐轮纪要与产物（对齐旧 Python app.py:3087-3180）。正文只从这几条走，
+	// IM 的 v3 事件只带元数据。
+	r.Get("/api/discussions/{discussionId}/round-documents", h.ClawListDiscussionRoundDocuments)
+	r.Get("/api/round-documents/{documentId}", h.ClawGetRoundDocument)
+	r.Get("/api/round-documents/{documentId}/download", h.ClawDownloadRoundDocument)
+	r.Get("/api/artifacts/{artifactId}", h.ClawGetArtifact)
 	r.Get("/api/user/list", h.ClawUserList)
 	r.Get("/api/user/friends", h.ClawUserFriends)
 	r.Get("/api/user/info", h.ClawUserInfo)

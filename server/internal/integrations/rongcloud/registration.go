@@ -72,6 +72,12 @@ func newRongCloudFactory(deps ChannelDeps) channel.Factory {
 			creation.hostLoader = deps.SystemHostConfig
 			creation.nodeOwner = friendEdgeNodeOwner(deps.Queries, client, logger)
 			discussionRuntime.attachRoundtable(creation, deps.NodeRequests)
+			// P7：v3 交互轮次引擎就绪。interactiveEnabled 是 getWorkflowCapabilities
+			// 翻到 [2,3] 的唯一开关；workflowAvailable 让创建编排用同一个开关判定
+			// user_confirmed 是否可跑 —— 二者必须同源，否则会出现「能力已宣告但
+			// 创建被拒」或反过来「创建放行但前端不敢用」的错位。
+			discussionRuntime.interactiveEnabled = true
+			creation.workflowAvailable = discussionRuntime.roundtablePolicyAvailable
 		}
 		return &rongcloudChannel{
 			cfg:           cfg,

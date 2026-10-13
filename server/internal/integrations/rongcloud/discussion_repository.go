@@ -67,6 +67,10 @@ var (
 	ErrDiscussionVersionConflict = errors.New("rongcloud: discussion version conflict")
 	// ErrArtifactNotFound：artifact_id 不存在。
 	ErrArtifactNotFound = errors.New("rongcloud: artifact not found")
+	// ErrDiscussionEventNotFound：按幂等键查事件时不存在（P7 交互轮次的去重探针）。
+	ErrDiscussionEventNotFound = errors.New("rongcloud: discussion event not found")
+	// ErrRoundDocumentNotFound：document_id 不存在。
+	ErrRoundDocumentNotFound = errors.New("rongcloud: round document not found")
 )
 
 // DiscussionRecord 是一条讨论实例（rongcloud_discussion）。它对应旧后端的
@@ -121,6 +125,20 @@ type ArtifactRecord struct {
 	BaseVersion  int
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
+}
+
+// RoundDocumentRecord 是一条逐轮纪要（rongcloud_discussion_round_document）。
+// (discussion_id, round, revision) 唯一，source_request_id 指回促成它的那次
+// host 派发 —— 重放时靠它读回同一条文档。
+type RoundDocumentRecord struct {
+	DocumentID      string
+	DiscussionID    string
+	Round           int
+	Revision        int
+	SourceRequestID string
+	Title           string
+	Content         string
+	CreatedAt       time.Time
 }
 
 // DiscussionRepository 是圆桌子系统的持久层。它只做「一行进、一行出」的翻译，
@@ -316,6 +334,24 @@ func (r *DiscussionRepository) AppendEvent(ctx context.Context, p AppendDiscussi
 	return discussionEventRecordFromRow(row), nil
 }
 
+// EventByIdempotencyKey 按 (discussion_id, idempotency_key) 查一条事件；不存在时
+// 返回 ErrDiscussionEventNotFound。P7 的交互轮次把每一次推进都挂在一个幂等键上：
+// 融云回调是 at-least-once、设备重连会整段重放离线历史，所以「先查键、命中即
+// 无操作」是引擎唯一的重放保护。
+func (r *DiscussionRepository) EventByIdempotencyKey(ctx context.Context, discussionID, key string) (DiscussionEventRecord, error) {
+	row, err := r.queries.GetRongCloudDiscussionEventByIdempotency(ctx, db.GetRongCloudDiscussionEventByIdempotencyParams{
+		DiscussionID:   textOrNull(discussionID),
+		IdempotencyKey: textOrNull(key),
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return DiscussionEventRecord{}, ErrDiscussionEventNotFound
+	}
+	if err != nil {
+		return DiscussionEventRecord{}, fmt.Errorf("rongcloud: event by idempotency key %s/%s: %w", discussionID, key, err)
+	}
+	return discussionEventRecordFromRow(row), nil
+}
+
 // ListEventsAfter 返回 seq 严格大于 afterSeq 的事件，按 seq 升序 —— 这正是前端
 // 「权威快照 + 缺口补拉」所需要的（afterSeq=0 即全量）。
 func (r *DiscussionRepository) ListEventsAfter(ctx context.Context, discussionID string, afterSeq int64) ([]DiscussionEventRecord, error) {
@@ -384,6 +420,32 @@ func (r *DiscussionRepository) LatestArtifact(ctx context.Context, discussionID 
 	return artifactRecordFromRow(row), nil
 }
 
+// ListRoundDocuments 返回该讨论的逐轮纪要（按 round/revision 升序，与旧后端
+// round_documents.list_for_discussion 的读序一致）。
+func (r *DiscussionRepository) ListRoundDocuments(ctx context.Context, discussionID string) ([]RoundDocumentRecord, error) {
+	rows, err := r.queries.ListRongCloudRoundDocumentsForDiscussion(ctx, discussionID)
+	if err != nil {
+		return nil, fmt.Errorf("rongcloud: list round documents for %s: %w", discussionID, err)
+	}
+	out := make([]RoundDocumentRecord, len(rows))
+	for i, row := range rows {
+		out[i] = roundDocumentRecordFromRow(row)
+	}
+	return out, nil
+}
+
+// GetRoundDocument 按 document_id 取一条逐轮纪要；不存在时 ErrRoundDocumentNotFound。
+func (r *DiscussionRepository) GetRoundDocument(ctx context.Context, documentID string) (RoundDocumentRecord, error) {
+	row, err := r.queries.GetRongCloudRoundDocument(ctx, documentID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return RoundDocumentRecord{}, ErrRoundDocumentNotFound
+	}
+	if err != nil {
+		return RoundDocumentRecord{}, fmt.Errorf("rongcloud: get round document %s: %w", documentID, err)
+	}
+	return roundDocumentRecordFromRow(row), nil
+}
+
 // ---- 行 → 领域对象 --------------------------------------------------------
 
 func discussionRecordFromRow(row db.RongcloudDiscussion) DiscussionRecord {
@@ -436,6 +498,19 @@ func artifactRecordFromRow(row db.RongcloudArtifact) ArtifactRecord {
 		BaseVersion:  int(row.BaseVersion),
 		CreatedAt:    row.CreatedAt.Time,
 		UpdatedAt:    row.UpdatedAt.Time,
+	}
+}
+
+func roundDocumentRecordFromRow(row db.RongcloudDiscussionRoundDocument) RoundDocumentRecord {
+	return RoundDocumentRecord{
+		DocumentID:      row.DocumentID,
+		DiscussionID:    row.DiscussionID,
+		Round:           int(row.Round),
+		Revision:        int(row.Revision),
+		SourceRequestID: row.SourceRequestID,
+		Title:           row.Title,
+		Content:         row.Content,
+		CreatedAt:       row.CreatedAt.Time,
 	}
 }
 

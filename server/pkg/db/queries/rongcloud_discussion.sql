@@ -181,3 +181,82 @@ SELECT * FROM rongcloud_artifact WHERE artifact_id = $1;
 
 -- name: GetRoundtableCreateRequestByChatroom :one
 SELECT * FROM rongcloud_roundtable_create_request WHERE chatroom_id = $1 ORDER BY updated_at DESC LIMIT 1;
+
+-- name: GetRongCloudDiscussionEventByIdempotency :one
+-- P7：交互式轮次的所有推进都按 idempotency_key 做重放保护（融云回调 at-least-once、
+-- 设备重连会整段重放离线历史），落事件前先按幂等键查一次就能把重放变成无操作。
+SELECT * FROM rongcloud_discussion_event
+WHERE discussion_id = $1 AND idempotency_key = $2;
+
+-- name: InsertRongCloudDiscussionCommand :one
+-- P7 outbox：派发（kind=dispatch）/ 取消（kind=cancel）先落库再发送，进程重启不丢。
+-- command_id 就是 v3 信封里的 requestId —— 设备回包按它索引到这条命令。
+INSERT INTO rongcloud_discussion_command (
+    command_id, discussion_id, request_id, kind, payload, available_at
+) VALUES (
+    @command_id, @discussion_id, @request_id, @kind, @payload, @available_at
+)
+ON CONFLICT (command_id) DO NOTHING
+RETURNING *;
+
+-- name: GetRongCloudDiscussionCommand :one
+SELECT * FROM rongcloud_discussion_command WHERE command_id = $1;
+
+-- name: SettleRongCloudDiscussionCommand :execrows
+-- 命令终结：设备回包或判定超时后把命令置为终结态（acknowledged / failed）。
+UPDATE rongcloud_discussion_command
+SET state = @state, lease_until = NULL
+WHERE command_id = @command_id;
+
+-- name: ListRongCloudDiscussionCommandsByDiscussion :many
+-- 取该讨论的全部命令，供「当前活跃派发」判定（引擎按 payload->>'round' 与 state 过滤）。
+SELECT * FROM rongcloud_discussion_command
+WHERE discussion_id = $1
+ORDER BY created_at ASC, command_id ASC;
+
+-- name: ListDueRongCloudDiscussionCommands :many
+-- P7 恢复扫描：到期的未终结派发命令（available_at 在派发时被置为「超时时刻」）。
+SELECT * FROM rongcloud_discussion_command
+WHERE kind = 'dispatch'
+  AND state IN ('pending', 'sent')
+  AND available_at <= now()
+ORDER BY available_at ASC
+LIMIT $1;
+
+-- name: InsertRongCloudRoundDocument :one
+-- P7：主持人的本轮纪要。唯一键 (discussion_id, round, revision) 让重放变无操作。
+INSERT INTO rongcloud_discussion_round_document (
+    document_id, discussion_id, round, revision, source_request_id, title, content
+) VALUES (
+    @document_id, @discussion_id, @round, @revision, @source_request_id, @title, @content
+)
+ON CONFLICT (discussion_id, round, revision) DO NOTHING
+RETURNING *;
+
+-- name: GetRongCloudRoundDocumentByIdentity :one
+-- 幂等查回：同一 source_request_id 或同一 (round, revision) 的既存文档。
+SELECT * FROM rongcloud_discussion_round_document
+WHERE discussion_id = $1
+  AND (source_request_id = $2 OR (round = $3 AND revision = $4))
+ORDER BY created_at ASC
+LIMIT 1;
+
+-- name: InsertRongCloudNodeRequest :one
+-- P7：服务器→节点请求-应答的持久记录（角色推荐经此下发）。
+INSERT INTO rongcloud_node_request (
+    request_id, request_kind, requester_user_id, target_node_id, target_ai_user_id,
+    status, request_payload, expires_at
+) VALUES (
+    @request_id, @request_kind, @requester_user_id, @target_node_id, @target_ai_user_id,
+    @status, @request_payload, @expires_at
+)
+ON CONFLICT (request_id) DO NOTHING
+RETURNING *;
+
+-- name: UpdateRongCloudNodeRequestResult :execrows
+UPDATE rongcloud_node_request
+SET status = @status,
+    response_payload = @response_payload,
+    error_code = @error_code,
+    updated_at = now()
+WHERE request_id = @request_id;
