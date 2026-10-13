@@ -3,6 +3,7 @@ package rongcloud
 import (
 	"context"
 	"encoding/json"
+	"sort"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -66,6 +67,64 @@ func (s *roundtableCreationService) ownedAndEligibleNodes(ctx context.Context, u
 		}
 	}
 	return owned, eligible
+}
+
+// roleCandidateNodes 解析本轮角色推荐的候选设备，对齐 Python
+// _handle_discussion_recommendRoles 的两句话：
+//
+//	devices = eligible(requester) ∩ requested_node_ids
+//	max_roles = min(8, len(devices))
+//
+// 候选集同时也是角色分配的设备池：C 端（RoundtableSetupDialog / uniapp flow.js）
+// 在拿到推荐后硬校验「角色数 ≤ min(8, 所选设备数)」「每个角色的 node_id 互不相同
+// 且都在所选设备内」，所以角色数上限必须由候选数推出，而不是某个固定默认值 ——
+// 固定 3 会让「运营提示词要求 4-6 个角色」的部署必然产出超量角色而整份被否。
+//
+// 与 Python 的一处有意差别：Python 的候选集不过滤在线（只过滤 enabled /
+// system_reserved / 能力位），在线性只在下发模型目录时用到。Go 侧没有服务端模型
+// 目录，于是直接复用创建阶段那套 eligible（在线 + 能力齐备 + 非 host），好处是
+// 推荐出来的角色一定能通过 create 的校验，不会「推荐成功、创建必失败」。
+func roleCandidateNodes(eligible map[string]db.RongcloudNode, requested []string, requestedGiven bool) ([]string, string) {
+	if requestedGiven {
+		out := make([]string, 0, len(requested))
+		seen := make(map[string]bool, len(requested))
+		for _, nodeID := range requested {
+			if seen[nodeID] {
+				continue
+			}
+			seen[nodeID] = true
+			if _, ok := eligible[nodeID]; !ok {
+				continue
+			}
+			out = append(out, nodeID)
+			if len(out) >= RecommendRolesMaxRoles {
+				break
+			}
+		}
+		if len(out) == 0 {
+			return nil, "NO_ELIGIBLE_USER_DEVICES"
+		}
+		return out, ""
+	}
+	ids := make([]string, 0, len(eligible))
+	for nodeID := range eligible {
+		ids = append(ids, nodeID)
+	}
+	if len(ids) == 0 {
+		return nil, "NO_ELIGIBLE_USER_DEVICES"
+	}
+	// 没给 node_ids 时集合来自 map，必须排序：同一份配置两次调用要给出同一份推荐。
+	sort.Strings(ids)
+	if len(ids) > RecommendRolesMaxRoles {
+		ids = ids[:RecommendRolesMaxRoles]
+	}
+	return ids, ""
+}
+
+// roleCandidateNodesFor 取候选设备的运行时封装（查归属 + 在线判定）。
+func (s *roundtableCreationService) roleCandidateNodesFor(ctx context.Context, userID string, host roundtableHostConfig, requested []string, requestedGiven bool) ([]string, string) {
+	_, eligible := s.ownedAndEligibleNodes(ctx, userID, host)
+	return roleCandidateNodes(eligible, requested, requestedGiven)
 }
 
 // ensureChatroom 对齐 _ensure_chatroom：融云侧建房 + DB 行 + owner/host 成员行。
@@ -196,6 +255,11 @@ func (s *roundtableCreationService) ensureDiscussion(ctx context.Context, reques
 			"roleInstructions": role.RolePrompt,
 			"capabilities":     roundtableRequiredRoleCaps,
 			"isHost":           false,
+			// speakingOrder 是 v3 轮次引擎（P7）的派发顺序来源：interactiveRoles
+			// 按它排序依次点名。缺了它所有角色会归到 0 号位，发言顺序退化成
+			// map 遍历顺序（不确定）。legacy_capped 不读它，但两模式共用同一份
+			// 快照，所以这里无条件写入。
+			"speakingOrder": role.SpeakingOrder,
 		}
 	}
 	roles[validated.host.aiUserID] = map[string]interface{}{
@@ -207,6 +271,10 @@ func (s *roundtableCreationService) ensureDiscussion(ctx context.Context, reques
 		"roleInstructions": "",
 		"capabilities":     roundtableRequiredHostCaps,
 		"isHost":           true,
+		// 主持人没有 speakingOrder：他不是排序队列的一员（引擎按 isHost 把他分出来，
+		// 只在全员发言后汇总）。旧后端同样只在 discussion_order 非空时写这个字段，
+		// 而 v3 的线上校验器（protocol_v3._role / 前端 discussion-v3.ts）要求它是
+		// 非负整数 —— 写 -1 会被整段拒掉。
 	}
 	roleJSON, _ := json.Marshal(roles)
 	hostSnapshot, _ := json.Marshal(map[string]interface{}{

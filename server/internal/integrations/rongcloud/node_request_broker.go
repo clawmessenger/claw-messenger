@@ -74,6 +74,9 @@ const (
 	recommendRolesAction    = "recommend_roles"
 	recommendRolesMaxName   = 80
 	recommendRolesMaxPrompt = 8000
+	// recommendRolesMaxNodeID 与设备端（role-recommend.ts 的 segment 校验）以及
+	// 命令参数校验共用同一个 node_id 长度上限。
+	recommendRolesMaxNodeID = 128
 	recommendRolesTTL       = 7 * 24 * time.Hour
 
 	// RecommendRolesMaxRoles bounds how many roles a single recommendation may
@@ -314,15 +317,26 @@ func (b *NodeRequestBroker) settle(requestID, status, errorCode string, roles []
 // recommendationPayload renders the admin response: the stored roles get stable
 // ids (the same request always yields the same ids) and the host's display
 // identity, matching DiscussionHostRecommendation in the admin web.
+//
+// node_id / model 只在角色真的带上它们时才出现。C 端（RoundtableSetupDialog /
+// uniapp flow.js）要求每个角色都落到一台所选设备上，缺了 node_id 它会把整份推荐
+// 判成 ROLE_RECOMMENDATION_INVALID；而管理端预览走的是非严格解析，根本没有设备
+// 分配，多出两个恒为空的字段反而会污染它已有的响应形状。
 func (b *NodeRequestBroker) recommendationPayload(record *pendingNodeRequest, roles []map[string]interface{}) map[string]interface{} {
 	out := make([]map[string]interface{}, 0, len(roles))
 	for index, role := range roles {
-		out = append(out, map[string]interface{}{
+		entry := map[string]interface{}{
 			"role_id":        uuid.NewSHA1(uuid.NameSpaceURL, []byte(fmt.Sprintf("%s:%d", record.requestID, index))).String(),
 			"role_name":      role["role_name"],
 			"role_prompt":    role["role_prompt"],
 			"speaking_order": role["speaking_order"],
-		})
+		}
+		for _, key := range []string{"node_id", "model"} {
+			if value, ok := role[key]; ok {
+				entry[key] = value
+			}
+		}
+		out = append(out, entry)
 	}
 	return map[string]interface{}{
 		"recommendation_id": uuid.NewSHA1(uuid.NameSpaceURL, []byte("recommendation:"+record.requestID)).String(),
@@ -341,6 +355,11 @@ func (b *NodeRequestBroker) recommendationPayload(record *pendingNodeRequest, ro
 // (non-strict branch — the admin preview passes max_roles, never a candidate
 // model list): names non-empty and unique, prompts non-empty, and speaking
 // order an exact permutation of 0..n-1.
+//
+// node_id / model 是 Python 严格模式（candidate_models 非空）才要求的字段。这里
+// 只做类型层透传：语料里出现的合法值原样保留，让下游（持有候选设备清单的
+// roleCandidateNodes 调用方）决定认不认。旧设备端不产这两个字段，解析结果与
+// 以前逐字节一致；管理端预览路径因此完全不受影响。
 func parseRecommendedRoles(raw interface{}, maxRoles int) ([]map[string]interface{}, error) {
 	if raw == nil {
 		return nil, fmt.Errorf("roles missing")
@@ -381,6 +400,19 @@ func parseRecommendedRoles(raw interface{}, maxRoles int) ([]map[string]interfac
 			"role_prompt":    prompt,
 			"speaking_order": order,
 		})
+		// 严格模式的设备端会把「这个角色交给哪台设备、用哪个模型」一起带回来。
+		// 只在值本身可用时透传：坏值留给 assignRoleNodes 丢弃并重新分配，而不是
+		// 把一份本可修复的推荐整份判死。
+		if nodeID, err := roleText(role["node_id"], recommendRolesMaxNodeID); err == nil {
+			normalized[len(normalized)-1]["node_id"] = nodeID
+		}
+		if model, ok := role["model"]; ok && model != nil {
+			if text, ok := model.(string); ok {
+				if trimmed := strings.TrimSpace(text); trimmed != "" {
+					normalized[len(normalized)-1]["model"] = trimmed
+				}
+			}
+		}
 	}
 
 	sortedOrders := append([]int(nil), orders...)

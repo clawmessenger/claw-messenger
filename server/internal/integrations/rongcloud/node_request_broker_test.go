@@ -80,6 +80,102 @@ func TestParseRecommendedRoles(t *testing.T) {
 	}
 }
 
+func TestParseRecommendedRolesDeviceAssignment(t *testing.T) {
+	t.Run("passes through a usable node_id and model", func(t *testing.T) {
+		roles, err := parseRecommendedRoles([]interface{}{
+			map[string]interface{}{
+				"role_name": "主持人", "role_prompt": "引导", "speaking_order": float64(0),
+				"node_id": "node_abc", "model": " openai/gpt-4o ",
+			},
+		}, 3)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if roles[0]["node_id"] != "node_abc" || roles[0]["model"] != "openai/gpt-4o" {
+			t.Fatalf("assignment not carried: %#v", roles[0])
+		}
+	})
+
+	t.Run("drops an unusable node_id instead of failing the whole answer", func(t *testing.T) {
+		// 一台设备名不合法不值得把整份推荐判死：丢给 assignRoleNodes 重新分配。
+		roles, err := parseRecommendedRoles([]interface{}{
+			map[string]interface{}{
+				"role_name": "主持人", "role_prompt": "引导", "speaking_order": float64(0),
+				"node_id": "   ", "model": "",
+			},
+		}, 3)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if _, ok := roles[0]["node_id"]; ok {
+			t.Fatalf("blank node_id must be dropped: %#v", roles[0])
+		}
+		if _, ok := roles[0]["model"]; ok {
+			t.Fatalf("blank model must be dropped: %#v", roles[0])
+		}
+	})
+
+	t.Run("an old device answer stays byte-identical", func(t *testing.T) {
+		roles, err := parseRecommendedRoles([]interface{}{
+			map[string]interface{}{"role_name": "A", "role_prompt": "p", "speaking_order": float64(0)},
+		}, 3)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(roles[0]) != 3 {
+			t.Fatalf("no assignment keys may be invented: %#v", roles[0])
+		}
+	})
+}
+
+// TestNodeRequestBrokerCarriesDeviceAssignment 覆盖 C 端读到的回包形状：设备端给出
+// 的 node_id/model 必须出现在推荐里，否则前端会因「角色没有设备」把整份推荐判无效。
+func TestNodeRequestBrokerCarriesDeviceAssignment(t *testing.T) {
+	broker, _, _ := startBroker(t)
+	host := NodeRequestHost{AIUserID: "rc_node_host", TimeoutSeconds: 30}
+	requestID, code := broker.StartRecommendation(context.Background(), host, "t", "", 2)
+	if code != "" {
+		t.Fatalf("start failed: %s", code)
+	}
+	answer := `{"request_id":"` + requestID + `","msg_type":"command_result","payload":{"roles":[` +
+		`{"role_name":"A","role_prompt":"p","speaking_order":0,"node_id":"node_a","model":"p/m"},` +
+		`{"role_name":"B","role_prompt":"p","speaking_order":1,"node_id":"node_b"}]}}`
+	broker.AcceptResponse("rc_node_host", answer)
+
+	payload, code := broker.AwaitRecommendation(context.Background(), requestID)
+	if code != "" {
+		t.Fatalf("await failed: %s", code)
+	}
+	roles, _ := payload["roles"].([]map[string]interface{})
+	if len(roles) != 2 || roles[0]["node_id"] != "node_a" || roles[0]["model"] != "p/m" {
+		t.Fatalf("role 0: %#v", roles)
+	}
+	if roles[1]["node_id"] != "node_b" {
+		t.Fatalf("role 1: %#v", roles[1])
+	}
+	if _, ok := roles[1]["model"]; ok {
+		t.Fatalf("an absent model must not be invented: %#v", roles[1])
+	}
+}
+
+func TestNodeRequestBrokerOmitsAssignmentForAdminPreview(t *testing.T) {
+	broker, _, _ := startBroker(t)
+	requestID, _ := broker.StartRecommendation(context.Background(), NodeRequestHost{AIUserID: "rc_node_host", TimeoutSeconds: 30}, "t", "", 1)
+
+	broker.AcceptResponse("rc_node_host", `{"request_id":"`+requestID+`","msg_type":"command_result","payload":{"roles":[`+
+		`{"role_name":"A","role_prompt":"p","speaking_order":0}]}}`)
+	payload, code := broker.AwaitRecommendation(context.Background(), requestID)
+	if code != "" {
+		t.Fatalf("await failed: %s", code)
+	}
+	roles, _ := payload["roles"].([]map[string]interface{})
+	for _, key := range []string{"node_id", "model"} {
+		if _, ok := roles[0][key]; ok {
+			t.Fatalf("the admin preview shape must not grow a %q field: %#v", key, roles[0])
+		}
+	}
+}
+
 func TestMapNodeError(t *testing.T) {
 	for _, value := range []interface{}{"timeout", "TIMEOUT", " model_timeout ", "role_recommendation_timeout"} {
 		if got := mapNodeError(value); got != NodeRequestCodeRecommendTimeout {

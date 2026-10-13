@@ -14,14 +14,18 @@ import (
 // handleDiscussionCommand 分发。三个 action 的身份域与 P4 一致：actor.RcID
 //（融云侧 TEXT id）就是 create 状态机的 user_id。
 
-// actionRecommendRoles 对齐 Python 的 recommendRoles：校验 host 配置 → 经
-// broker 发起真实推荐往返 → 落 rongcloud_role_recommendation（request_id 唯一
-// 约束兜底重放）→ 返回 preview。
+// actionRecommendRoles 对齐 Python 的 recommendRoles：校验 host 配置 → 解析候选
+// 设备 → 经 broker 发起真实推荐往返 → 给每个角色绑定一台设备 → 落
+// rongcloud_role_recommendation（request_id 唯一约束兜底重放）→ 返回 preview。
 //
-// 前端契约：RoundtableSetupDialog 固定发 round_policy='user_confirmed'，而 v3
-// 运行时（interactive rounds）在 P7 才落地 —— 这条路径按 round_policies 判定，
-// 未开放时诚实回 503 DISCUSSION_WORKFLOW_UNAVAILABLE，不谎报支持（谎报会让
-// 前端建出跑不起来的讨论）。
+// 角色数上限不是常量：它由候选设备数推出（Python：max_roles = min(8, len(devices))）。
+// 固定默认值会与「一个角色一台设备」这条 C 端硬约束打架 —— 运营提示词要求 4-6 个
+// 角色时，固定 3 会让设备端因超量而拒绝，前端只能看到一句笼统的
+// 「角色推荐结果无效」，与真正的原因（提示词与设备数不匹配）毫无关联。
+//
+// 前端契约：RoundtableSetupDialog 固定发 round_policy='user_confirmed'。这条路径
+// 按 round_policies 判定，v3 运行时（interactive rounds）尚未装配时诚实回 503
+// DISCUSSION_WORKFLOW_UNAVAILABLE，不谎报支持（谎报会让前端建出跑不起来的讨论）。
 func (rt *discussionRuntime) actionRecommendRoles(ctx context.Context, cmd CommandContent, actor discussionActor) commandResult {
 	if rt.roundtable == nil {
 		return errResult(503, "discussion runtime not available")
@@ -31,11 +35,12 @@ func (rt *discussionRuntime) actionRecommendRoles(ctx context.Context, cmd Comma
 	if topic == "" || len(topic) > 4000 || len(goal) > 8000 {
 		return errResult(400, "INVALID_ROUNDTABLE_REQUEST")
 	}
-	maxRoles := 3
-	if v, ok := paramInt(cmd, "maxRoles", "max_roles"); ok {
-		maxRoles = v
+	requested, requestedGiven, listOK := paramStringList(cmd, "node_ids", "nodeIds")
+	if !listOK {
+		return errResult(400, "INVALID_ROUNDTABLE_REQUEST")
 	}
-	if maxRoles < 1 || maxRoles > RecommendRolesMaxRoles {
+	maxRolesParam, maxRolesGiven := paramInt(cmd, "maxRoles", "max_roles")
+	if maxRolesGiven && (maxRolesParam < 1 || maxRolesParam > RecommendRolesMaxRoles) {
 		return errResult(400, "INVALID_ROUNDTABLE_REQUEST")
 	}
 	policy := paramTrim(cmd, "round_policy", "roundPolicy")
@@ -53,6 +58,22 @@ func (rt *discussionRuntime) actionRecommendRoles(ctx context.Context, cmd Comma
 	// 推荐请求带 round_policy 时：v3 未开放就拒绝，别让流程走到 create 才炸。
 	if policy == RoundPolicyUserConfirmed && !rt.roundtablePolicyAvailable(policy) {
 		return errResult(503, "DISCUSSION_WORKFLOW_UNAVAILABLE")
+	}
+
+	// 候选设备 + 角色数上限。两种调用形态：
+	//   · 带 node_ids（C 端）或什么都没带：按候选设备推导上限，并给每个角色分配设备；
+	//   · 只给 max_roles（旧契约，无设备概念）：照旧按给定数量走，不做设备分配。
+	maxRoles := maxRolesParam
+	var candidates []string
+	if !maxRolesGiven || requestedGiven {
+		nodeIDs, candCode := rt.roundtable.roleCandidateNodesFor(ctx, actor.RcID, host, requested, requestedGiven)
+		if candCode != "" {
+			slog.Info("rongcloud: recommend_roles 没有可用候选设备",
+				"user", actor.RcID, "requested", requested, "requested_given", requestedGiven)
+			return errResult(400, candCode)
+		}
+		candidates = nodeIDs
+		maxRoles = len(candidates)
 	}
 
 	// broker 往返（真实调设备端 agent）。等待上限由 host.TimeoutSeconds 决定。
@@ -79,6 +100,10 @@ func (rt *discussionRuntime) actionRecommendRoles(ctx context.Context, cmd Comma
 	if code != "" {
 		return errResult(503, code)
 	}
+
+	// 角色 → 设备。设备端若已自己认领（新版 CLI 读得到 candidates）就尊重它的选择，
+	// 否则服务端确定性补齐。
+	assignRoleNodes(payloadRoles(payload), candidates)
 
 	// 落库：recommendation_id 由 broker 确定性派生；user 域用 actor.RcID
 	//（claw 用户 user_id / 节点 rc 账号），与 create 状态机的推荐校验同键。
@@ -151,6 +176,65 @@ func (rt *discussionRuntime) actionResumeRoundtable(ctx context.Context, cmd Com
 }
 
 // ---- 辅助 ----------------------------------------------------------------
+
+// payloadRoles 取出 broker 回包里的角色列表。返回的是回包里的同一批 map，就地修改
+// 会一起落到 rongcloud_role_recommendation.roles。
+func payloadRoles(payload map[string]interface{}) []map[string]interface{} {
+	roles, _ := payload["roles"].([]map[string]interface{})
+	return roles
+}
+
+// assignRoleNodes 给每个角色绑定一台候选设备，就地写回 role["node_id"]。
+//
+// C 端的校验是「每个角色的 node_id 互不相同，且都在用户所选设备内」，缺一个字段
+// 就整份判无效（ROLE_RECOMMENDATION_INVALID）。Python 里这一步由设备端模型完成
+// （严格模式下设备拿得到 candidates，逐角色回 node_id/model）；Go 侧还没有把这套
+// 候选清单下发到设备，于是服务端按候选顺序确定性补齐 —— 设备端将来若自己回了合法
+// 且未重复的分配，这里会尊重它，只补它没选到的角色。
+func assignRoleNodes(roles []map[string]interface{}, candidates []string) {
+	if len(roles) == 0 || len(candidates) == 0 {
+		return
+	}
+	allowed := make(map[string]bool, len(candidates))
+	for _, nodeID := range candidates {
+		allowed[nodeID] = true
+	}
+	used := make(map[string]bool, len(candidates))
+	pending := make([]int, 0, len(roles))
+	for i, role := range roles {
+		if nodeID, _ := role["node_id"].(string); nodeID != "" {
+			if allowed[nodeID] && !used[nodeID] {
+				used[nodeID] = true
+				continue
+			}
+			// 设备端给的分配不在候选内或与前面的角色撞车：丢弃后重新分配，
+			// 并把原因写进日志 —— 否则「推荐结果无效」又会变成一句没有线索的报错。
+			slog.Warn("rongcloud: 忽略设备端给的角色分配",
+				"node_id", nodeID, "role", role["role_name"],
+				"in_candidates", allowed[nodeID])
+			delete(role, "node_id")
+		}
+		pending = append(pending, i)
+	}
+	next := 0
+	for _, i := range pending {
+		for next < len(candidates) && used[candidates[next]] {
+			next++
+		}
+		if next >= len(candidates) {
+			// 角色数 > 候选设备数。正常路径不可达（max_roles 由候选数推出，设备端
+			// 也会按 max_roles 自我校验），真发生时退化成轮转复用，让上层按
+			// 「同一设备绑定多个角色」显式报错，而不是在这里凭空造一个错误码。
+			slog.Warn("rongcloud: 角色数超过候选设备数，复用设备",
+				"roles", len(roles), "candidates", len(candidates))
+			used = make(map[string]bool, len(candidates))
+			next = 0
+		}
+		roles[i]["node_id"] = candidates[next]
+		used[candidates[next]] = true
+		next++
+	}
+}
 
 // roundtablePolicyAvailable 判定 round_policy 是否已开放（P5 只有 legacy_capped）。
 func (rt *discussionRuntime) roundtablePolicyAvailable(policy string) bool {

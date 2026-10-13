@@ -282,6 +282,42 @@ func paramInt(cmd CommandContent, keys ...string) (int, bool) {
 	return 0, false
 }
 
+// paramStringList 读一个字符串数组参数（node_ids / nodeIds）。
+//
+// 返回值是 (值, 是否给出, 是否合法)：参数缺失（或显式 null）→ (nil,false,true)；
+// 给出但形态不合法 → (nil,true,false)。「给出但是空数组」必须判非法而不是当缺失：
+// C 端把「一台设备都没选」编码成省略 node_ids，一旦有客户端真的发了 []，说明它的
+// 状态和我们的理解不一致，静默按「用户全部设备」去推荐只会推出用户没选的设备。
+func paramStringList(cmd CommandContent, keys ...string) ([]string, bool, bool) {
+	for _, k := range keys {
+		raw, present := cmd.Params[k]
+		if !present {
+			continue
+		}
+		if raw == nil {
+			return nil, false, true
+		}
+		items, ok := raw.([]interface{})
+		if !ok || len(items) == 0 || len(items) > RecommendRolesMaxRoles {
+			return nil, true, false
+		}
+		out := make([]string, 0, len(items))
+		for _, item := range items {
+			text, ok := item.(string)
+			if !ok {
+				return nil, true, false
+			}
+			text = strings.TrimSpace(text)
+			if text == "" || len([]rune(text)) > recommendRolesMaxNodeID {
+				return nil, true, false
+			}
+			out = append(out, text)
+		}
+		return out, true, true
+	}
+	return nil, false, true
+}
+
 // ---- action 实现 ----------------------------------------------------------
 
 // start 对齐 Python start：owner-only，创建 planning 状态的讨论 + 两条初始事件。
