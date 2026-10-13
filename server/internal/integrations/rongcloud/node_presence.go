@@ -15,6 +15,7 @@ package rongcloud
 
 import (
 	"context"
+	"log/slog"
 
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
@@ -30,6 +31,12 @@ func nodeIsOnline(ctx context.Context, client *rongcloudAPIClient, node db.Rongc
 	}
 	online, err := client.checkOnline(ctx, node.RongcloudUserID)
 	if err != nil {
+		// 查询失败按离线处理（fail closed），但必须留痕：静默吞掉会让「节点真的
+		// 掉线」与「融云 API 打不通/凭据不对」看起来完全一样，排查时只能靠猜。
+		slog.Warn("rongcloud: 节点在线查询失败，按离线处理",
+			"node_id", node.NodeID,
+			"rongcloud_user_id", node.RongcloudUserID,
+			"error", err)
 		return false
 	}
 	return online

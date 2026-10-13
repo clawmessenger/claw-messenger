@@ -159,6 +159,8 @@ func (b *NodeRequestBroker) StartRecommendation(ctx context.Context, host NodeRe
 		// The integration is enabled but the channel has not connected yet, so
 		// there is no wire to send on — that is an offline host, not a bad
 		// request.
+		b.logger.Warn("role recommendation: no sender bound, reporting host offline",
+			"ai_user_id", host.AIUserID)
 		return "", NodeRequestCodeHostOffline
 	}
 	send := b.send

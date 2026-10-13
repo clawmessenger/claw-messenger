@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"log/slog"
 	"regexp"
 	"sort"
 	"strings"
@@ -468,9 +469,14 @@ func (s *roundtableCreationService) resolveHost(ctx context.Context) (roundtable
 	}
 	node, err := s.queries.GetRongCloudNodeByID(ctx, pgtype.UUID{Bytes: nodeUUID, Valid: true})
 	if err != nil {
+		slog.Warn("rongcloud: 系统主持节点行不存在",
+			"configured_node_id", cfg.NodeID, "error", err)
 		return roundtableHostConfig{}, "SYSTEM_HOST_OFFLINE"
 	}
 	if missing := missingCapabilities(node.Capabilities, roundtableRequiredHostCaps); len(missing) > 0 {
+		slog.Warn("rongcloud: 系统主持节点缺少能力位",
+			"node_id", node.NodeID, "missing", missing,
+			"capabilities", string(node.Capabilities))
 		return roundtableHostConfig{}, "SYSTEM_HOST_OFFLINE"
 	}
 	// 在线判定走融云 presence（见 node_presence.go），并把观测结果写回
@@ -478,6 +484,14 @@ func (s *roundtableCreationService) resolveHost(ctx context.Context) (roundtable
 	online := nodeIsOnline(ctx, s.client, node)
 	syncNodePresenceCache(ctx, s.queries, node, online)
 	if !online {
+		// 对外只有一个 SYSTEM_HOST_OFFLINE，但内因有四种（节点行缺失 / 能力位缺 /
+		// 融云侧离线 / 未装配融云客户端），排查时必须能区分，否则只能看到前端
+		// 那句「系统主持 AI 当前离线」干瞪眼。
+		slog.Warn("rongcloud: 系统主持节点被判为离线",
+			"node_id", node.NodeID,
+			"rongcloud_user_id", node.RongcloudUserID,
+			"deploy_status_column", node.DeployStatus,
+			"rongcloud_client_wired", s.client != nil)
 		return roundtableHostConfig{}, "SYSTEM_HOST_OFFLINE"
 	}
 	return roundtableHostConfig{

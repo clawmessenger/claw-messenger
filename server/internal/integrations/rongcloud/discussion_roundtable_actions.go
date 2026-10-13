@@ -3,6 +3,7 @@ package rongcloud
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -56,6 +57,9 @@ func (rt *discussionRuntime) actionRecommendRoles(ctx context.Context, cmd Comma
 
 	// broker 往返（真实调设备端 agent）。等待上限由 host.TimeoutSeconds 决定。
 	if rt.nodeRequests == nil {
+		// 与「主持节点离线」共用同一个对外错误码，但内因是装配缺失（融云通道没
+		// 把 broker 挂上来）：必须留日志，否则和真离线无法区分。
+		slog.Warn("rongcloud: recommend_roles 无法下发 —— node request broker 未装配")
 		return errResult(503, "SYSTEM_HOST_OFFLINE")
 	}
 	timeout := host.timeoutSeconds
