@@ -42,6 +42,7 @@ func TestMergeNodeCapabilitiesKeepsReportedValues(t *testing.T) {
 	want := []string{
 		"discussion_host",
 		"discussion_model_routing",
+		"discussion_participant",
 		"discussion_role_recommendation",
 		"discussion_roundtable",
 		"text_reply",
@@ -56,6 +57,7 @@ func TestMergeNodeCapabilitiesIsSortedAndDeduped(t *testing.T) {
 	want := []string{
 		"discussion_host",
 		"discussion_model_routing",
+		"discussion_participant",
 		"discussion_role_recommendation",
 		"discussion_roundtable",
 		"text_reply",
@@ -102,6 +104,7 @@ func TestNodeCapabilitiesJSONFromStoredPreservesReportedValues(t *testing.T) {
 	want := []string{
 		"discussion_host",
 		"discussion_model_routing",
+		"discussion_participant",
 		"discussion_role_recommendation",
 		"discussion_roundtable",
 		"text_reply",

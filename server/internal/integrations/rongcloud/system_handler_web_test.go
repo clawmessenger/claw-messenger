@@ -176,7 +176,7 @@ func TestUnknownDiscussionActionReplies404InTheWebShape(t *testing.T) {
 	msg := NormalizedMessage{
 		ObjectName: objectNameCommand,
 		FromUserID: "web-user",
-		Content:    `{"requestId":"web-2","service":"discussion","action":"createRoundtable","payload":{}}`,
+		Content:    `{"requestId":"web-2","service":"discussion","action":"unknownAction","payload":{}}`,
 	}
 	if err := handler.handleCommand(context.Background(), msg); err != nil {
 		t.Fatalf("handleCommand: %v", err)
@@ -187,8 +187,34 @@ func TestUnknownDiscussionActionReplies404InTheWebShape(t *testing.T) {
 		t.Errorf("expected a 404 error reply, got %#v", result)
 	}
 	message, _ := result["message"].(string)
-	if !strings.Contains(message, "discussion/createRoundtable") || !strings.Contains(message, "未知") {
+	if !strings.Contains(message, "discussion/unknownAction") || !strings.Contains(message, "未知") {
 		t.Errorf("message %q must satisfy the web's legacy-404 predicate", message)
+	}
+}
+
+func TestRegisteredRoundtableActionsReturn503WhenRuntimeUnavailable(t *testing.T) {
+	rec, srv := newWebReplyServer(t)
+	defer srv.Close()
+	handler := testHandler(t, srv, NewDiscussionRegistry())
+
+	for _, action := range []string{"recommendRoles", "createRoundtable", "resumeRoundtable"} {
+		msg := NormalizedMessage{
+			ObjectName: objectNameCommand,
+			FromUserID: "web-user",
+			Content:    fmt.Sprintf(`{"requestId":"web-%s","service":"discussion","action":"%s","payload":{}}`, action, action),
+		}
+		if err := handler.handleCommand(context.Background(), msg); err != nil {
+			t.Fatalf("handleCommand %s: %v", action, err)
+		}
+
+		result := rec.last(t)
+		if result["code"] != float64(503) || result["status"] != "error" {
+			t.Errorf("%s: expected a 503 error reply, got %#v", action, result)
+		}
+		message, _ := result["message"].(string)
+		if message != "discussion runtime not available" {
+			t.Errorf("%s: message %q should indicate runtime unavailable", action, message)
+		}
 	}
 }
 

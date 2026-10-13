@@ -352,12 +352,12 @@ func (h *systemHandler) handleDiscussionCommand(ctx context.Context, msg Normali
 
 	// P4：service=discussion 的生命周期 action。resolveActor 兼容 C 端真人
 	// （claw_im_users）与节点/安装账号（rongcloud_user）两个身份域。
-	// P5 动作（recommendRoles / createRoundtable / resumeRoundtable）尚未注册，
-	// 走 default 的 404 契约 —— 与「runtime 未装配」的语义区分开：
-	// 未装配只影响已注册的动作（503），未注册的动作永远 404 降级。
+	// P4/P5 已注册动作。未注册动作走 default 的 404 契约 —— 与「runtime 未装配」
+	// 的语义区分开：未装配只影响已注册的动作（503），未注册的动作永远 404 降级。
 	known := map[string]bool{
 		"start": true, "getActive": true, "continue": true, "finish": true,
 		"cancel": true, "interject": true, "retry": true, "stop": true,
+		"recommendRoles": true, "createRoundtable": true, "resumeRoundtable": true,
 	}
 	if !known[cmd.Action] {
 		return h.replyErr(ctx, msg, cmd, 404, unknownServiceOrActionMessage(cmd))
@@ -389,6 +389,12 @@ func (h *systemHandler) handleDiscussionCommand(ctx context.Context, msg Normali
 		result = h.discussionRuntime.actionRetry(ctx, cmd, actor)
 	case "stop":
 		result = h.discussionRuntime.actionStop(ctx, cmd, actor)
+	case "recommendRoles":
+		result = h.discussionRuntime.actionRecommendRoles(ctx, cmd, actor)
+	case "createRoundtable":
+		result = h.discussionRuntime.actionCreateRoundtable(ctx, cmd, actor)
+	case "resumeRoundtable":
+		result = h.discussionRuntime.actionResumeRoundtable(ctx, cmd, actor)
 	default:
 		return h.replyErr(ctx, msg, cmd, 404, unknownServiceOrActionMessage(cmd))
 	}

@@ -3,8 +3,11 @@ package rongcloud
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"time"
+
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
 // claimCacheTTL bounds how often the friend-list inversion is repeated. The
@@ -104,4 +107,42 @@ func (s *NodeService) RevokeFriendship(ctx context.Context, userID string, targe
 		return nil
 	}
 	return s.client.RemoveFriends(ctx, userID, targetIDs...)
+}
+
+// friendEdgeNodeOwner lists the nodes a user owns, derived from the user's
+// RongCloud friend edges — the same 融云好友边 truth NodeClaimants inverts.
+// It is the P5 roundtable creation service's nodeOwner: for each friend rc
+// account, GetRongCloudNodeByRongCloudUserID maps it back to its node row.
+// A friend id with no node row (installation accounts, other claw users) is
+// skipped; the per-machine infrastructure node never qualifies as a discussion
+// participant (ai_type empty → no discussion capabilities), so it never enters
+// the eligible set downstream.
+func friendEdgeNodeOwner(queries *db.Queries, client *rongcloudAPIClient, logger *slog.Logger) func(ctx context.Context, userID string) ([]db.RongcloudNode, error) {
+	return func(ctx context.Context, userID string) ([]db.RongcloudNode, error) {
+		if queries == nil {
+			return nil, errors.New("rongcloud: database not available")
+		}
+		if client == nil {
+			return nil, errors.New("rongcloud: API client not configured")
+		}
+		friends, err := client.FriendIDs(ctx, userID)
+		if err != nil {
+			return nil, err
+		}
+		nodes := make([]db.RongcloudNode, 0, len(friends))
+		for _, friend := range friends {
+			friend = strings.TrimSpace(friend)
+			if friend == "" {
+				continue
+			}
+			node, err := queries.GetRongCloudNodeByRongCloudUserID(ctx, friend)
+			if err != nil {
+				// 好友里混着安装账号/真人 claw 用户：查不到节点行属正常，
+				// 单个失败只跳过，不让整个归属列表失败。
+				continue
+			}
+			nodes = append(nodes, node)
+		}
+		return nodes, nil
+	}
 }

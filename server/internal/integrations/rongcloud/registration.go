@@ -64,6 +64,14 @@ func newRongCloudFactory(deps ChannelDeps) channel.Factory {
 		if deps.DiscussionRepository != nil {
 			discussionRuntime = newDiscussionRuntime(deps.Queries, deps.DiscussionRepository, client, creds.SystemNodeID, logger)
 			discussionRuntime.systemHostLoader = deps.SystemHostConfig
+			// P5：创建编排与 recommendRoles 的 broker 都挂在 runtime 上。
+			// nodeOwner 按「融云好友边」列用户归属节点（node_claim 语义的反向）：
+			// 好友列表里的 rc 账号经 GetRongCloudNodeByRongCloudUserID 映射回
+			// 节点行。机器主节点 ai_type 为空 → 无讨论能力位，天然不进 eligible。
+			creation := newRoundtableCreationService(deps.Queries, client)
+			creation.hostLoader = deps.SystemHostConfig
+			creation.nodeOwner = friendEdgeNodeOwner(deps.Queries, client, logger)
+			discussionRuntime.attachRoundtable(creation, deps.NodeRequests)
 		}
 		return &rongcloudChannel{
 			cfg:           cfg,
