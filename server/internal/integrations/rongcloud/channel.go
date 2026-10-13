@@ -19,6 +19,8 @@ type rongcloudChannel struct {
 	logger        *slog.Logger
 	ctx           context.Context
 	cancel        context.CancelFunc
+	// commands 用于丢弃融云重投的命令回调（见 command_dispatch.go）。
+	commands commandDedup
 }
 
 func (c *rongcloudChannel) Type() channel.Type {
@@ -85,15 +87,17 @@ func (c *rongcloudChannel) handleWebhook(w http.ResponseWriter, r *http.Request)
 
 	if isCommandMessage(msg.ObjectName) {
 		if isCommandResult(msg) {
+			// 设备回包只做内存里的一次转交（唤醒 broker / 投给讨论协调器），
+			// 必须同步且立即，别拖慢等待方。
 			c.systemHandler.handleNodeMessage(r.Context(), msg)
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-		if err := c.systemHandler.handleCommand(r.Context(), msg); err != nil {
-			c.logger.Error("rongcloud: handle command", "error", err, "msgUID", msgID)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
+		// 命令一律先 200 再处理：recommendRoles / createRoundtable 要走融云
+		// P2P 下发给设备、等设备端 agent 跑完才回包，同步做会让融云的回调
+		// 客户端先超时断开（r.Context() 被取消，回包发不出去），还会触发重投
+		// 让设备重复执行。详见 command_dispatch.go。
+		c.dispatchCommandAsync(r.Context(), msg)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
