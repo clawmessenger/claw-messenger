@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -1156,6 +1157,17 @@ func DefaultAgentNodeName(agent string) string {
 	return strings.TrimSpace(agent)
 }
 
+// DefaultAgentNodePortrait 返回 AI 节点的默认头像 URL。两端前端（web
+// ChatAvatar.tsx / uniapp conversation-list.vue）早就在用这张 openclaw 图作
+// AI 兜底；把它同时写进融云侧资料，好友列表/会话头部就能直接渲染，不再依赖
+// 各端各自的本地兜底。可用 CLAW_AI_NODE_PORTRAIT_URI 覆盖。
+func DefaultAgentNodePortrait(agent string) string {
+	if v := strings.TrimSpace(os.Getenv("CLAW_AI_NODE_PORTRAIT_URI")); v != "" {
+		return v
+	}
+	return "https://newsradar.dreamdt.cn/newschat/static/imgs/rongyun/openclaw.png"
+}
+
 // machineDisplayName reduces the name a device registered under to the host
 // part alone.
 //
@@ -1262,9 +1274,10 @@ func (s *NodeService) ensureAgentNode(ctx context.Context, machineNode db.Rongcl
 		rcUserID = existing.RongcloudUserID
 	}
 	// Default display name only — a node the owner renamed keeps its name below,
-	// where the stored row wins over this value.
+	// where the stored row wins over this value. 头像同理：默认 openclaw 图，
+	// 用户已设自定义头像时下方 stored-row 路径胜出。
 	name := DefaultAgentNodeName(agent)
-	token, err := s.client.getUserToken(ctx, rcUserID, name, "")
+	token, err := s.client.getUserToken(ctx, rcUserID, name, DefaultAgentNodePortrait(agent))
 	if err != nil {
 		return agentNodeBinding{}, fmt.Errorf("getUserToken: %w", err)
 	}
@@ -1289,9 +1302,14 @@ func (s *NodeService) ensureAgentNode(ctx context.Context, machineNode db.Rongcl
 		// re-sync the authoritative database name on every re-bind. This also
 		// repairs devices renamed through the web before the rename flow
 		// started pushing to RongCloud. Best-effort: a stale RongCloud-side
-		// nickname must not fail the bind itself.
+		// nickname must not fail the bind itself. 头像取「库内已设值，否则默认
+		// openclaw 图」—— 同样走 getToken 不会更新的字段，重绑时补推。
+		portrait := rcUser.PortraitUri.String
+		if portrait == "" {
+			portrait = DefaultAgentNodePortrait(agent)
+		}
 		if rcUser.Name.Valid && rcUser.Name.String != "" {
-			if _, err := s.client.refreshUser(ctx, rcUserID, rcUser.Name.String, rcUser.PortraitUri.String); err != nil {
+			if _, err := s.client.refreshUser(ctx, rcUserID, rcUser.Name.String, portrait); err != nil {
 				s.logger.Warn("rongcloud: refresh agent nickname on rebind failed",
 					"rc_user", rcUserID, "error", err)
 			}
@@ -1301,6 +1319,7 @@ func (s *NodeService) ensureAgentNode(ctx context.Context, machineNode db.Rongcl
 			WorkspaceID:     machineNode.WorkspaceID,
 			RongcloudUserID: rcUserID,
 			Name:            pgText(name),
+			PortraitUri:     pgText(DefaultAgentNodePortrait(agent)),
 			TokenEncrypted:  pgText(encToken),
 			IsAiNode:        true,
 			NodeType:        "ai",

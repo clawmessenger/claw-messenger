@@ -1635,6 +1635,8 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// 供 clawmessenger-web / clawmessenger-uniapp 前端直连。
 	r.Post("/api/register", h.ClawRegister)
 	r.Post("/api/login", h.ClawLogin)
+	// 默认头像：embed 进二进制的公开静态资源（注册/节点绑定时写进融云资料）。
+	handler.ServeClawStaticAssets(r)
 	// P4：C 端圆桌扁平 REST（对齐旧 Python app.py:3042-3084 的路由与鉴权契约）。
 	r.Get("/api/chatrooms/{chatroomId}/discussions", h.ClawListChatroomDiscussions)
 	r.Get("/api/discussions/{discussionId}", h.ClawGetDiscussion)

@@ -22,6 +22,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -112,14 +113,14 @@ type clawRongClient struct {
 	appSecret string
 }
 
-func (c *clawRongClient) getUserToken(ctx context.Context, userID, name, portraitURI string) (string, error) {
-	form := url.Values{}
-	form.Set("userId", userID)
-	form.Set("name", name)
-	if portraitURI != "" {
-		form.Set("portraitUri", portraitURI)
+// post 直接调融云 Server API（REST 签名），返回响应体。getUserToken 与
+// refreshUser 共用，避免签名样板重复。域名可经 CLAW_RONG_API_BASE 覆盖
+// （测试/代理场景），默认官方 api.rong-api.com。
+func (c *clawRongClient) post(ctx context.Context, path string, form url.Values) ([]byte, error) {
+	apiBase := strings.TrimSpace(os.Getenv("CLAW_RONG_API_BASE"))
+	if apiBase == "" {
+		apiBase = "https://api.rong-api.com"
 	}
-
 	nonce := make([]byte, 16)
 	_, _ = rand.Read(nonce)
 	nonceStr := hex.EncodeToString(nonce)
@@ -129,9 +130,9 @@ func (c *clawRongClient) getUserToken(ctx context.Context, userID, name, portrai
 	signature := hex.EncodeToString(sum[:])
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		"https://api.rong-api.com/user/getToken.json", strings.NewReader(form.Encode()))
+		apiBase+path, strings.NewReader(form.Encode()))
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("App-Key", c.appKey)
@@ -141,10 +142,23 @@ func (c *clawRongClient) getUserToken(ctx context.Context, userID, name, portrai
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	return io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+}
+
+func (c *clawRongClient) getUserToken(ctx context.Context, userID, name, portraitURI string) (string, error) {
+	form := url.Values{}
+	form.Set("userId", userID)
+	form.Set("name", name)
+	if portraitURI != "" {
+		form.Set("portraitUri", portraitURI)
+	}
+	body, err := c.post(ctx, "/user/getToken.json", form)
+	if err != nil {
+		return "", err
+	}
 	var out struct {
 		Code  int    `json:"code"`
 		Token string `json:"token"`
@@ -156,6 +170,34 @@ func (c *clawRongClient) getUserToken(ctx context.Context, userID, name, portrai
 		return "", fmt.Errorf("rongcloud code %d", out.Code)
 	}
 	return out.Token, nil
+}
+
+// refreshUser 更新融云侧用户资料（昵称/头像）。getToken 对已存在用户不会
+// 更新资料 —— 改头像后必须走这里推融云，否则融云好友列表/会话渲染的还是
+// 旧头像（或空白）。
+func (c *clawRongClient) refreshUser(ctx context.Context, userID, name, portraitURI string) error {
+	form := url.Values{}
+	form.Set("userId", userID)
+	if name != "" {
+		form.Set("name", name)
+	}
+	if portraitURI != "" {
+		form.Set("portraitUri", portraitURI)
+	}
+	body, err := c.post(ctx, "/user/refresh.json", form)
+	if err != nil {
+		return err
+	}
+	var out struct {
+		Code int `json:"code"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return fmt.Errorf("rongcloud response: %.120s", body)
+	}
+	if out.Code != 200 {
+		return fmt.Errorf("rongcloud code %d", out.Code)
+	}
+	return nil
 }
 
 // ---- 用户行 ----
@@ -290,27 +332,39 @@ func (h *Handler) ClawRegister(w http.ResponseWriter, r *http.Request) {
 		nickname = username
 	}
 
+	// 默认头像：注册时即写库 + 推融云 —— 融云会话/好友列表渲染的是融云侧
+	// portraitUri，客户端本地兜底图在「融云已知资料」场景不生效；不推的话
+	// 新用户在对方客户端长期显示裸 id。
+	portrait := h.clawDefaultPortraitForNewUser()
+
 	_, err = h.DB.Exec(ctx, `
-		INSERT INTO claw_im_users (user_id, username, nickname, password_hash, status, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, 'active', now(), now())`,
-		userID, username, nickname, clawHashPassword(req.Password))
+		INSERT INTO claw_im_users (user_id, username, nickname, portrait_uri, password_hash, status, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, 'active', now(), now())`,
+		userID, username, nickname, portrait, clawHashPassword(req.Password))
 	if err != nil {
 		clawJSON(w, 500, 500, "注册失败", nil)
 		return
 	}
 
-	// 同步注册到融云（best-effort，失败不阻塞注册）
+	// 同步注册到融云（best-effort，失败不阻塞注册）。
 	if rc := h.clawRong(ctx); rc != nil {
-		if token, err := rc.getUserToken(ctx, userID, nickname, ""); err == nil {
+		if token, err := rc.getUserToken(ctx, userID, nickname, portrait); err == nil {
 			_, _ = h.DB.Exec(ctx, "UPDATE claw_im_users SET rongcloud_token=$1 WHERE user_id=$2", token, userID)
 		}
 	}
 
 	clawJSON(w, 200, 200, "注册成功", map[string]interface{}{
-		"username": username,
-		"nickname": nickname,
-		"userId":   userID,
+		"username":    username,
+		"nickname":    nickname,
+		"userId":      userID,
+		"portraitUri": portrait,
 	})
+}
+
+// clawDefaultPortraitForNewUser 返回新注册用户的默认头像 URL（见 claw_static.go
+// 的决议优先级）。
+func (h *Handler) clawDefaultPortraitForNewUser() string {
+	return clawDefaultPortraitURL()
 }
 
 // clawResolveLoginToken 决定登录返回哪个融云 token。
@@ -376,6 +430,25 @@ func (h *Handler) ClawLogin(w http.ResponseWriter, r *http.Request) {
 	var stored string
 	if u.RCStored.Valid {
 		stored = u.RCStored.String
+	}
+	// 存量用户头像兜底：库里没头像的老用户，登录时补默认头像并推融云（mint
+	// 路径顺带写入；token 复用路径单独 refresh，best-effort）。新注册用户
+	// 已在注册时写入，这里对它是 no-op。
+	portrait := u.PortraitURI
+	if portrait == "" {
+		portrait = h.clawDefaultPortraitForNewUser()
+		if _, err := h.DB.Exec(ctx,
+			"UPDATE claw_im_users SET portrait_uri=$1, updated_at=now() WHERE user_id=$2 AND (portrait_uri IS NULL OR portrait_uri='')",
+			portrait, u.UserID); err == nil && stored != "" {
+			// token 复用（不会走 mint）时融云侧资料需要显式刷新。
+			if rc := h.clawRong(ctx); rc != nil {
+				if err := rc.refreshUser(ctx, u.UserID, u.Nickname, portrait); err != nil {
+					slog.Warn("claw: backfill default portrait to rongcloud failed",
+						"user_id", u.UserID, "error", err)
+				}
+			}
+		}
+		u.PortraitURI = portrait
 	}
 	token, minted := clawResolveLoginToken(stored, func() (string, error) {
 		if rc := h.clawRong(ctx); rc != nil {
@@ -498,17 +571,35 @@ func (h *Handler) ClawUserUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 		return v
 	}
+	// 存量用户头像兜底：库里没头像的老用户，改资料时若客户端也没传，用默认
+	// 头像补齐（新注册已在注册时写入，此处只兜老数据）。
+	nextPortrait := set(req.PortraitUri, u.PortraitURI)
+	if nextPortrait == "" {
+		nextPortrait = h.clawDefaultPortraitForNewUser()
+	}
 	_, err = h.DB.Exec(ctx, `
 		UPDATE claw_im_users
 		SET nickname=$1, portrait_uri=$2, phone=$3, email=$4, signature=$5, gender=$6, birthday=$7, updated_at=now()
 		WHERE user_id=$8`,
-		set(req.Nickname, u.Nickname), set(req.PortraitUri, u.PortraitURI),
+		set(req.Nickname, u.Nickname), nextPortrait,
 		set(req.Phone, u.Phone), set(req.Email, u.Email),
 		set(req.Signature, u.Signature), set(req.Gender, u.Gender),
 		set(req.Birthday, u.Birthday), u.UserID)
 	if err != nil {
 		clawJSON(w, 500, 500, err.Error(), nil)
 		return
+	}
+	// 推融云：getToken 不更新已存在用户的资料，改了昵称/头像必须 refresh，
+	// 否则融云侧渲染的仍是旧资料（best-effort，失败不阻塞本地保存）。
+	if rc := h.clawRong(ctx); rc != nil {
+		nextNickname := set(req.Nickname, u.Nickname)
+		if nextPortrait != u.PortraitURI || nextNickname != u.Nickname {
+			if err := rc.refreshUser(ctx, u.UserID, nextNickname, nextPortrait); err != nil {
+				// 不回错误：本地已保存，融云侧旧资料是展示瑕疵不是数据丢失。
+				slog.Warn("claw: refresh rongcloud profile after update failed",
+					"user_id", u.UserID, "error", err)
+			}
+		}
 	}
 	updated, _ := h.clawQueryUser(ctx, "user_id", u.UserID)
 	clawJSON(w, 200, 200, "", clawUserJSON(updated))
@@ -598,6 +689,13 @@ func (h *Handler) ClawImRefreshToken(w http.ResponseWriter, r *http.Request) {
 	if rc == nil {
 		clawJSON(w, 500, 500, "换发 IM Token 失败", nil)
 		return
+	}
+	// 存量用户头像兜底：与登录同策略（库内空头像补默认并写库）。
+	if u.PortraitURI == "" {
+		u.PortraitURI = h.clawDefaultPortraitForNewUser()
+		_, _ = h.DB.Exec(ctx,
+			"UPDATE claw_im_users SET portrait_uri=$1, updated_at=now() WHERE user_id=$2 AND (portrait_uri IS NULL OR portrait_uri='')",
+			u.PortraitURI, u.UserID)
 	}
 	fresh, err := rc.getUserToken(ctx, u.UserID, u.Nickname, u.PortraitURI)
 	if err != nil {
