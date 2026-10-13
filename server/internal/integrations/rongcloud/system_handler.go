@@ -198,6 +198,58 @@ func (h *systemHandler) handleChatroomCommand(ctx context.Context, msg Normalize
 		}
 		return h.commitResult(ctx, msg, cmd, h.actionChatroomSetDiscussionTeam(ctx, cmd, actor))
 
+	// 拉黑 / 禁言 / 白名单（写动作需 owner，三个列表只读不校验 owner）。
+	case "block":
+		actor, err := h.resolveActor(ctx, msg.FromUserID)
+		if err != nil {
+			return h.replyErr(ctx, msg, cmd, 401, "sender not recognized")
+		}
+		return h.commitResult(ctx, msg, cmd, h.actionChatroomBlock(ctx, cmd, actor))
+
+	case "unblock":
+		actor, err := h.resolveActor(ctx, msg.FromUserID)
+		if err != nil {
+			return h.replyErr(ctx, msg, cmd, 401, "sender not recognized")
+		}
+		return h.commitResult(ctx, msg, cmd, h.actionChatroomUnblock(ctx, cmd, actor))
+
+	case "getBlocklist":
+		return h.commitResult(ctx, msg, cmd, h.actionChatroomGetBlocklist(ctx, cmd))
+
+	case "mute":
+		actor, err := h.resolveActor(ctx, msg.FromUserID)
+		if err != nil {
+			return h.replyErr(ctx, msg, cmd, 401, "sender not recognized")
+		}
+		return h.commitResult(ctx, msg, cmd, h.actionChatroomMute(ctx, cmd, actor))
+
+	case "unmute":
+		actor, err := h.resolveActor(ctx, msg.FromUserID)
+		if err != nil {
+			return h.replyErr(ctx, msg, cmd, 401, "sender not recognized")
+		}
+		return h.commitResult(ctx, msg, cmd, h.actionChatroomUnmute(ctx, cmd, actor))
+
+	case "getGaglist":
+		return h.commitResult(ctx, msg, cmd, h.actionChatroomGetGaglist(ctx, cmd))
+
+	case "addWhitelist":
+		actor, err := h.resolveActor(ctx, msg.FromUserID)
+		if err != nil {
+			return h.replyErr(ctx, msg, cmd, 401, "sender not recognized")
+		}
+		return h.commitResult(ctx, msg, cmd, h.actionChatroomAddWhitelist(ctx, cmd, actor))
+
+	case "removeWhitelist":
+		actor, err := h.resolveActor(ctx, msg.FromUserID)
+		if err != nil {
+			return h.replyErr(ctx, msg, cmd, 401, "sender not recognized")
+		}
+		return h.commitResult(ctx, msg, cmd, h.actionChatroomRemoveWhitelist(ctx, cmd, actor))
+
+	case "getWhitelist":
+		return h.commitResult(ctx, msg, cmd, h.actionChatroomGetWhitelist(ctx, cmd))
+
 	default:
 		// The 404 + 「未知的服务或操作」 wording is a contract, not cosmetics:
 		// the web's isLegacyChatroomActionError matches on code===404 AND the
