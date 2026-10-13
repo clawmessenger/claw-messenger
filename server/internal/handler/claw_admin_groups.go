@@ -43,11 +43,19 @@ const (
 // 未启用融云集成（RongCloudNode 为 nil）时返回 nil，命令通道会回 503。
 func (h *Handler) ClawGroupMirror() *rongcloud.GroupMirror {
 	return &rongcloud.GroupMirror{
-		AllocateID:    h.clawGenerateGroupID,
-		SaveGroup:     h.clawSaveGroup,
-		OwnerOf:       h.clawGroupOwner,
-		UpdateMeta:    h.clawUpdateGroupMeta,
-		FallbackAgent: h.clawGroupFallbackAgent,
+		AllocateID:       h.clawGenerateGroupID,
+		SaveGroup:        h.clawSaveGroup,
+		OwnerOf:          h.clawGroupOwner,
+		UpdateMeta:       h.clawUpdateGroupMeta,
+		FallbackAgent:    h.clawGroupFallbackAgent,
+		IsMember:         h.clawGroupIsMember,
+		AddMembers:       h.clawGroupAddMembers,
+		RemoveMember:     h.clawGroupRemoveMember,
+		ListMembers:      h.clawGroupListMembers,
+		ListGroupsByUser: h.clawGroupListByUser,
+		GroupProfiles:    h.clawGroupProfiles,
+		SetOwner:         h.clawGroupSetOwner,
+		DeleteGroup:      h.clawGroupDelete,
 	}
 }
 
@@ -140,6 +148,197 @@ func (h *Handler) clawGroupOwner(ctx context.Context, groupID string) (string, b
 		return "", false, err
 	}
 	return owner, true, nil
+}
+
+// ---- service=group 的成员与资料回调 -------------------------------------------
+//
+// 这一组是 group_members.go 里 addMember/removeMember/getMembers/getMyGroups/
+// getProfiles/getInfo/transfer/quit/dismiss 的数据侧。都只动 rongcloud_group /
+// rongcloud_group_member 两张镜像表；融云调用在集成包里，数据库在这里 —— 与
+// create/update 同一套切分。
+
+// clawGroupIsMember 判定某人是不是群成员。addMember 用它做「只有群成员能邀请」
+// 的门禁，transfer 用它校验新群主已在群里。
+func (h *Handler) clawGroupIsMember(ctx context.Context, groupID, userID string) (bool, error) {
+	var exists bool
+	err := h.DB.QueryRow(ctx, `
+		SELECT EXISTS(SELECT 1 FROM rongcloud_group_member WHERE group_id = $1 AND user_id = $2)`,
+		groupID, userID).Scan(&exists)
+	return exists, err
+}
+
+// clawGroupAddMembers 幂等插入成员并重算 member_count。
+//
+// role 由群主决定（插入的正好是群主时记 owner）：create 之外的路径也得维持
+// 「owner 行的 role 是 owner」这个不变量，否则管理端成员表会显示成普通成员。
+func (h *Handler) clawGroupAddMembers(ctx context.Context, groupID string, userIDs []string) error {
+	if h.TxStarter == nil {
+		return errors.New("事务不可用")
+	}
+	tx, err := h.TxStarter.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	for _, userID := range userIDs {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO rongcloud_group_member (group_id, user_id, role)
+			SELECT $1, $2, CASE WHEN $2 = g.owner_id THEN 'owner' ELSE 'member' END
+			FROM rongcloud_group g WHERE g.group_id = $1
+			ON CONFLICT (group_id, user_id) DO NOTHING`, groupID, userID); err != nil {
+			return err
+		}
+	}
+	if err := clawRecomputeGroupMemberCount(ctx, tx, groupID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// clawGroupRemoveMember 删一个成员并重算 member_count；quit 走的也是它
+// （同一个数据库操作，只是触发者的身份校验不同）。
+func (h *Handler) clawGroupRemoveMember(ctx context.Context, groupID, userID string) error {
+	if h.TxStarter == nil {
+		return errors.New("事务不可用")
+	}
+	tx, err := h.TxStarter.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM rongcloud_group_member WHERE group_id = $1 AND user_id = $2`, groupID, userID); err != nil {
+		return err
+	}
+	if err := clawRecomputeGroupMemberCount(ctx, tx, groupID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// clawRecomputeGroupMemberCount 让 member_count 始终等于成员表的行数。
+// 手工累加迟早会漂移（旧后端同样重算，见 admin_remove_group_member）。
+func clawRecomputeGroupMemberCount(ctx context.Context, tx pgx.Tx, groupID string) error {
+	_, err := tx.Exec(ctx, `
+		UPDATE rongcloud_group
+		SET member_count = (SELECT COUNT(*) FROM rongcloud_group_member WHERE group_id = $1),
+		    updated_at   = now()
+		WHERE group_id = $1`, groupID)
+	return err
+}
+
+// clawGroupListMembers 返回镜像成员，昵称/头像取自 claw_im_users。融云节点成员
+// 没有 IM 账号，两列留空、由调用方回退成 user id。
+func (h *Handler) clawGroupListMembers(ctx context.Context, groupID string) ([]rongcloud.GroupMember, error) {
+	rows, err := h.DB.Query(ctx, `
+		SELECT m.user_id,
+		       COALESCE(NULLIF(m.nickname, ''), u.nickname, ''),
+		       COALESCE(u.portrait_uri, ''),
+		       m.role
+		FROM rongcloud_group_member m
+		LEFT JOIN claw_im_users u ON u.user_id = m.user_id
+		WHERE m.group_id = $1
+		ORDER BY m.created_at ASC`, groupID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	members := []rongcloud.GroupMember{}
+	for rows.Next() {
+		var member rongcloud.GroupMember
+		if err := rows.Scan(&member.UserID, &member.Nickname, &member.PortraitURI, &member.Role); err != nil {
+			return nil, err
+		}
+		members = append(members, member)
+	}
+	return members, rows.Err()
+}
+
+// clawGroupListByUser 反查「我加入了哪些群」（getMyGroups）。
+func (h *Handler) clawGroupListByUser(ctx context.Context, userID string) ([]rongcloud.GroupProfile, error) {
+	rows, err := h.DB.Query(ctx, `
+		SELECT g.group_id, g.group_name, g.owner_id, g.portrait_uri, g.description,
+		       (SELECT COUNT(*) FROM rongcloud_group_member c WHERE c.group_id = g.group_id),
+		       COALESCE(g.openclaw_max_rounds, 0), g.openclaw_stopped
+		FROM rongcloud_group g
+		JOIN rongcloud_group_member m ON m.group_id = g.group_id
+		WHERE m.user_id = $1
+		ORDER BY g.created_at DESC`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return clawScanGroupProfiles(rows)
+}
+
+// clawGroupProfiles 批量取群资料（getProfiles / getInfo）。未镜像的 id 直接跳过，
+// 由调用方决定「一个都没有」是不是 404。
+func (h *Handler) clawGroupProfiles(ctx context.Context, groupIDs []string) ([]rongcloud.GroupProfile, error) {
+	if len(groupIDs) == 0 {
+		return []rongcloud.GroupProfile{}, nil
+	}
+	rows, err := h.DB.Query(ctx, `
+		SELECT g.group_id, g.group_name, g.owner_id, g.portrait_uri, g.description,
+		       (SELECT COUNT(*) FROM rongcloud_group_member c WHERE c.group_id = g.group_id),
+		       COALESCE(g.openclaw_max_rounds, 0), g.openclaw_stopped
+		FROM rongcloud_group g
+		WHERE g.group_id = ANY($1)`, groupIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return clawScanGroupProfiles(rows)
+}
+
+func clawScanGroupProfiles(rows pgx.Rows) ([]rongcloud.GroupProfile, error) {
+	profiles := []rongcloud.GroupProfile{}
+	for rows.Next() {
+		var profile rongcloud.GroupProfile
+		if err := rows.Scan(
+			&profile.GroupID, &profile.GroupName, &profile.OwnerID,
+			&profile.PortraitURI, &profile.Description,
+			&profile.MemberCount, &profile.MaxRounds, &profile.Stopped,
+		); err != nil {
+			return nil, err
+		}
+		profiles = append(profiles, profile)
+	}
+	return profiles, rows.Err()
+}
+
+// clawGroupSetOwner 转让群主：换 owner_id，并把 owner/member 两行 role 一起改。
+// 只改 owner_id 会让管理端的成员表里出现「两个 owner」或「零个 owner」。
+func (h *Handler) clawGroupSetOwner(ctx context.Context, groupID, newOwnerID string) error {
+	if h.TxStarter == nil {
+		return errors.New("事务不可用")
+	}
+	tx, err := h.TxStarter.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE rongcloud_group SET owner_id = $2, updated_at = now() WHERE group_id = $1`,
+		groupID, newOwnerID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE rongcloud_group_member
+		SET role = CASE WHEN user_id = $2 THEN 'owner' ELSE 'member' END, updated_at = now()
+		WHERE group_id = $1`, groupID, newOwnerID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// clawGroupDelete 解散群：成员行靠外键 ON DELETE CASCADE 一起清掉。
+func (h *Handler) clawGroupDelete(ctx context.Context, groupID string) error {
+	_, err := h.DB.Exec(ctx, `DELETE FROM rongcloud_group WHERE group_id = $1`, groupID)
+	return err
 }
 
 // clawUpdateGroupMeta applies a partial settings change; an empty string or nil

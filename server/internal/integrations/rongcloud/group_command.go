@@ -16,9 +16,14 @@ import (
 // Go 的 systemHandler 此前只认 ping/chatroom/device/discussion/ai，group 落进
 // unknown service 分支，所以建群一直是坏的。
 //
-// 这里只补 web 真正会调用的两个动作：create 与 update。其余动作（getMyGroups /
-// getInfo / getMembers / join / quit / dismiss）旧后端有，但当前 C 端并不调用 ——
-// 会话列表由融云 SDK 客户端侧维护，管理端的群组列表则直接读本地镜像。
+// 当前两个客户端真正会调用的动作（逐个 grep 出来的，不是猜的）：
+//   - clawmessenger-web：create / update / addMember / removeMember / getMembers /
+//     getMyGroups / getProfiles
+//   - clawmessenger-uniapp：上面七个 + getInfo / transfer / quit / dismiss
+// 也就是说 11 个动作全部有调用方。早期这里只实现了 create / update，理由是「其余
+// 动作 C 端并不调用」—— 那个判断是错的：群资料页一进来就调 getInfo，成员列表调
+// getMembers，结果是「群聊添加成员报错 unsupported group action: addMember」这一类
+// 问题。本文件与 group_members.go 把剩下的 9 个补齐。
 //
 // 职责切分：融云 API 调用留在本包（group_api.go），数据库归 HTTP 层，两者通过
 // GroupMirror 这组回调对接。
@@ -32,6 +37,31 @@ type GroupRecord struct {
 	Description string
 	MemberIDs   []string
 	MaxRounds   int
+}
+
+// GroupMember is one mirrored membership row, enriched with whatever human
+// profile the local database could supply. Agent nodes have no claw_im_users
+// row, so their nickname/portrait stay empty and the client falls back to the
+// raw user id.
+type GroupMember struct {
+	UserID      string
+	Nickname    string
+	PortraitURI string
+	Role        string
+}
+
+// GroupProfile is the group-level view the C-end reads back (getInfo /
+// getProfiles / getMyGroups). MemberCount is derived from the membership table
+// rather than the stored counter, so it can never drift from the rows.
+type GroupProfile struct {
+	GroupID     string
+	GroupName   string
+	OwnerID     string
+	PortraitURI string
+	Description string
+	MemberCount int
+	MaxRounds   int
+	Stopped     bool
 }
 
 // GroupMirror is the local projection of RongCloud groups. Every callback is
@@ -53,6 +83,25 @@ type GroupMirror struct {
 	// FallbackAgent returns an RongCloud user id of a live agent node, used to
 	// seed a group with an AI member when the creator picked none.
 	FallbackAgent func(ctx context.Context) (string, bool, error)
+	// IsMember reports whether a RongCloud user id is in the mirrored group.
+	// addMember gates on it ("只有群成员可以邀请新成员").
+	IsMember func(ctx context.Context, groupID, userID string) (bool, error)
+	// AddMembers inserts members idempotently and recomputes member_count.
+	AddMembers func(ctx context.Context, groupID string, userIDs []string) error
+	// RemoveMember deletes one member and recomputes member_count.
+	RemoveMember func(ctx context.Context, groupID, userID string) error
+	// ListMembers returns the mirrored member rows (getMembers fallback and the
+	// nickname/portrait source for the RongCloud answer).
+	ListMembers func(ctx context.Context, groupID string) ([]GroupMember, error)
+	// ListGroupsByUser returns the groups a user belongs to (getMyGroups).
+	ListGroupsByUser func(ctx context.Context, userID string) ([]GroupProfile, error)
+	// GroupProfiles returns the mirrored profiles of the requested groups
+	// (getInfo / getProfiles), skipping ids that are not mirrored.
+	GroupProfiles func(ctx context.Context, groupIDs []string) ([]GroupProfile, error)
+	// SetOwner rewrites the group owner and the owner/member roles (transfer).
+	SetOwner func(ctx context.Context, groupID, newOwnerID string) error
+	// DeleteGroup drops the group (members cascade) — the dismiss path.
+	DeleteGroup func(ctx context.Context, groupID string) error
 }
 
 const (
@@ -61,6 +110,9 @@ const (
 	// defaultGroupMaxRounds matches the legacy backend's default and the web's
 	// own fallback (createGroupConversation passes 20).
 	defaultGroupMaxRounds = 20
+	// defaultGroupRounds is what getInfo/getProfiles report when the group has no
+	// stored openclaw_max_rounds — the legacy backend answered 10 in that case.
+	defaultGroupRounds = 10
 )
 
 func (h *systemHandler) handleGroupCommand(ctx context.Context, msg NormalizedMessage, cmd CommandContent) error {
@@ -72,6 +124,24 @@ func (h *systemHandler) handleGroupCommand(ctx context.Context, msg NormalizedMe
 		return h.handleGroupCreate(ctx, msg, cmd)
 	case "update":
 		return h.handleGroupUpdate(ctx, msg, cmd)
+	case "addMember":
+		return h.handleGroupAddMember(ctx, msg, cmd)
+	case "removeMember":
+		return h.handleGroupRemoveMember(ctx, msg, cmd)
+	case "getMembers":
+		return h.handleGroupMembers(ctx, msg, cmd)
+	case "getMyGroups":
+		return h.handleGroupMine(ctx, msg, cmd)
+	case "getProfiles":
+		return h.handleGroupProfiles(ctx, msg, cmd)
+	case "getInfo":
+		return h.handleGroupInfo(ctx, msg, cmd)
+	case "transfer":
+		return h.handleGroupTransfer(ctx, msg, cmd)
+	case "quit":
+		return h.handleGroupQuit(ctx, msg, cmd)
+	case "dismiss":
+		return h.handleGroupDismiss(ctx, msg, cmd)
 	default:
 		return h.sendWebError(ctx, msg, cmd, 400, fmt.Sprintf("unsupported group action: %s", cmd.Action))
 	}

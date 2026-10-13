@@ -829,6 +829,32 @@ func TestClawGroupMirrorWiresEveryCallback(t *testing.T) {
 	if mirror.FallbackAgent == nil {
 		t.Error("FallbackAgent not wired")
 	}
+	// 成员/资料类动作（addMember、removeMember、getMembers、getMyGroups、
+	// getProfiles、getInfo、transfer、quit、dismiss）的数据侧。
+	if mirror.IsMember == nil {
+		t.Error("IsMember not wired")
+	}
+	if mirror.AddMembers == nil {
+		t.Error("AddMembers not wired")
+	}
+	if mirror.RemoveMember == nil {
+		t.Error("RemoveMember not wired")
+	}
+	if mirror.ListMembers == nil {
+		t.Error("ListMembers not wired")
+	}
+	if mirror.ListGroupsByUser == nil {
+		t.Error("ListGroupsByUser not wired")
+	}
+	if mirror.GroupProfiles == nil {
+		t.Error("GroupProfiles not wired")
+	}
+	if mirror.SetOwner == nil {
+		t.Error("SetOwner not wired")
+	}
+	if mirror.DeleteGroup == nil {
+		t.Error("DeleteGroup not wired")
+	}
 }
 
 func TestClawGroupMirrorFallbackAgentNeedsTheRongCloudIntegration(t *testing.T) {
