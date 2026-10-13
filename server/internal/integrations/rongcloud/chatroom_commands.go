@@ -737,7 +737,9 @@ func (h *systemHandler) actionChatroomCreate(ctx context.Context, cmd CommandCon
 	if err != nil {
 		return errResult(422, fmt.Sprintf("AI 节点未注册: %s", hostNodeID))
 	}
-	if hostNode.DeployStatus != "online" {
+	// 在线判定走融云 presence（见 node_presence.go）：deploy_status 列在 Go 侧
+	// 没有任何写入者，读它会把所有节点判成离线。
+	if !nodeIsOnline(ctx, h.client, hostNode) {
 		return errResult(422, "主持人节点必须在线")
 	}
 	if missing := missingCapabilities(hostNode.Capabilities, roundtableHostCaps); len(missing) > 0 {
@@ -763,7 +765,7 @@ func (h *systemHandler) actionChatroomCreate(ctx context.Context, cmd CommandCon
 		if err != nil {
 			return errResult(422, fmt.Sprintf("AI 节点未注册: %s", m.NodeID))
 		}
-		if node.DeployStatus != "online" {
+		if !nodeIsOnline(ctx, h.client, node) {
 			return errResult(422, fmt.Sprintf("AI 节点必须在线: %s", m.NodeID))
 		}
 		if missing := missingCapabilities(node.Capabilities, roundtableMembCaps); len(missing) > 0 {
@@ -897,7 +899,7 @@ func (h *systemHandler) actionChatroomSetHost(ctx context.Context, cmd CommandCo
 	if err != nil {
 		return errResult(422, "AI 节点未注册")
 	}
-	if node.DeployStatus != "online" {
+	if !nodeIsOnline(ctx, h.client, node) {
 		return errResult(422, "主持人节点必须在线")
 	}
 	if missing := missingCapabilities(node.Capabilities, roundtableHostCaps); len(missing) > 0 {
@@ -1036,7 +1038,7 @@ func (h *systemHandler) actionChatroomSetDiscussionTeam(ctx context.Context, cmd
 		if err != nil {
 			return errResult(422, fmt.Sprintf("AI 节点未注册: %s", m.NodeID))
 		}
-		if node.DeployStatus != "online" {
+		if !nodeIsOnline(ctx, h.client, node) {
 			return errResult(422, fmt.Sprintf("AI 节点必须在线: %s", m.NodeID))
 		}
 		if missing := missingCapabilities(node.Capabilities, roundtableMembCaps); len(missing) > 0 {

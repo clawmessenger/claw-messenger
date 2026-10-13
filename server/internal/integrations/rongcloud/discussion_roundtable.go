@@ -470,10 +470,14 @@ func (s *roundtableCreationService) resolveHost(ctx context.Context) (roundtable
 	if err != nil {
 		return roundtableHostConfig{}, "SYSTEM_HOST_OFFLINE"
 	}
-	if node.DeployStatus != "online" {
+	if missing := missingCapabilities(node.Capabilities, roundtableRequiredHostCaps); len(missing) > 0 {
 		return roundtableHostConfig{}, "SYSTEM_HOST_OFFLINE"
 	}
-	if missing := missingCapabilities(node.Capabilities, roundtableRequiredHostCaps); len(missing) > 0 {
+	// 在线判定走融云 presence（见 node_presence.go），并把观测结果写回
+	// deploy_status 缓存，让列恢复成「最近一次观测」而不是永远 offline。
+	online := nodeIsOnline(ctx, s.client, node)
+	syncNodePresenceCache(ctx, s.queries, node, online)
+	if !online {
 		return roundtableHostConfig{}, "SYSTEM_HOST_OFFLINE"
 	}
 	return roundtableHostConfig{

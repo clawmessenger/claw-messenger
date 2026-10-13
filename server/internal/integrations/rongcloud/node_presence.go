@@ -1,0 +1,56 @@
+package rongcloud
+
+// node_presence.go 统一「节点现在是否在线」的判定口径。
+//
+// rongcloud_node.deploy_status 在 Python 原版里并不是权威状态，而是「最近一次
+// 观测到的在线状态」缓存：
+//   - system_host._node_is_available 先查融云 presence，再 _sync_cached_presence
+//     把结果 UPDATE 回 im_nodes.deploy_status；
+//   - /api/claw/node/<id>/online 那一类查询同理，每次都把 presence 写回列。
+//
+// Go 移植时保留了这个列、却没有任何写入者（建节点时写死 offline，之后无人更新），
+// 于是所有读列的判定都变成恒假：圆桌布置弹窗点「推荐角色」必报 SYSTEM_HOST_OFFLINE，
+// 圆桌创建时也挑不出任何可用设备。这里按原版语义把权威信号换回融云 presence ——
+// 服务端下发到设备的命令本身就走的融云 P2P，设备进程掉线就是收不到。
+
+import (
+	"context"
+
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
+)
+
+// nodeIsOnline 报告节点当前是否在线。client/rongcloud id 缺失时（单测或未装配
+// 融云凭据）回落读 deploy_status 列，保持历史行为。
+//
+// presence 查询失败按离线处理（fail closed）：命令发不出去，讨论/房间都驱动不了，
+// 谎报在线只会让流程走到更靠后的地方再失败。这一点与原版 _rongcloud_online 一致。
+func nodeIsOnline(ctx context.Context, client *rongcloudAPIClient, node db.RongcloudNode) bool {
+	if client == nil || node.RongcloudUserID == "" {
+		return node.DeployStatus == "online"
+	}
+	online, err := client.checkOnline(ctx, node.RongcloudUserID)
+	if err != nil {
+		return false
+	}
+	return online
+}
+
+// syncNodePresenceCache 把一次 presence 观测写回 rongcloud_node.deploy_status。
+// 只在观测值与列值不一致时写，避免热点路径上产生无谓的 UPDATE。
+// 写失败不影响判定（列只是缓存，不是权威状态）。
+func syncNodePresenceCache(ctx context.Context, queries *db.Queries, node db.RongcloudNode, online bool) {
+	if queries == nil {
+		return
+	}
+	want := "offline"
+	if online {
+		want = "online"
+	}
+	if node.DeployStatus == want {
+		return
+	}
+	_, _ = queries.UpdateRongCloudNodeDeployStatus(ctx, db.UpdateRongCloudNodeDeployStatusParams{
+		ID:           node.ID,
+		DeployStatus: want,
+	})
+}

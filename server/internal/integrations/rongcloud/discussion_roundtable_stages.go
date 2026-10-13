@@ -57,7 +57,9 @@ func (s *roundtableCreationService) ownedAndEligibleNodes(ctx context.Context, u
 			continue
 		}
 		owned[node.NodeID] = true
-		if node.DeployStatus == "online" &&
+		// 在线判定走融云 presence（见 node_presence.go），不能读 deploy_status：
+		// 那列在 Go 侧无人写入，恒为 offline，会让可选设备永远为空。
+		if nodeIsOnline(ctx, s.client, node) &&
 			len(missingCapabilities(node.Capabilities, roundtableRequiredRoleCaps)) == 0 &&
 			node.NodeID != host.nodeID {
 			eligible[node.NodeID] = node
