@@ -313,6 +313,32 @@ func (h *Handler) ClawRegister(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// clawResolveLoginToken 决定登录返回哪个融云 token。
+//
+// claw_im_users.rongcloud_token 一物两用：既是客户端 IM SDK 的建连凭据，又是
+// /api/claw/* 的 Bearer 会话凭据（服务端按该列做字符串匹配认会话）。因此登录
+// 必须复用库内存量 token —— 每次登录都向融云换发并覆盖库内值，会让其它已登录
+// 端（多标签页 / 小程序 / 设备）手里的旧 token 立即失效：IM 连接被踢、HTTP 鉴权
+// 401，前端表现为「讨论工作流检测失败 / 系统主持状态检测失败」，设备列表也可能
+// 落空。仅在库内没有 token 时才调用 mint 向融云申请，并把新值回写库内（minted=true
+// 表示需要回写）。
+//
+// 确需续期的场景由客户端在 IM 连接失败时显式调用 POST /api/im/refresh-token，
+// 该端点仍然走融云 getUserToken，不受这里「复用」策略的影响。
+func clawResolveLoginToken(stored string, mint func() (string, error)) (token string, minted bool) {
+	if existing := strings.TrimSpace(stored); existing != "" {
+		return existing, false
+	}
+	fresh, err := mint()
+	if err != nil {
+		return "", false
+	}
+	if fresh = strings.TrimSpace(fresh); fresh == "" {
+		return "", false
+	}
+	return fresh, true
+}
+
 // ClawLogin POST /api/login
 func (h *Handler) ClawLogin(w http.ResponseWriter, r *http.Request) {
 	var req struct {
@@ -340,16 +366,25 @@ func (h *Handler) ClawLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 每次登录换发融云 token（避免过期），失败回退库内 token
-	token := ""
-	if rc := h.clawRong(ctx); rc != nil {
-		if t, err := rc.getUserToken(ctx, u.UserID, u.Nickname, u.PortraitURI); err == nil {
-			token = t
-			_, _ = h.DB.Exec(ctx, "UPDATE claw_im_users SET rongcloud_token=$1 WHERE user_id=$2", t, u.UserID)
-		}
+	// 复用库内存量 token：claw_im_users.rongcloud_token 同时充当 /api/claw/*
+	// 的 Bearer 会话凭据，且客户端 IM SDK 用同一 token 建连。若每次登录都向融云
+	// 换发新 token 并覆盖库内值，其它已登录端（多标签页 / 小程序 / 设备）手里的
+	// 旧 token 会立刻失效——IM 连接被踢、HTTP 鉴权 401，表现为圆桌布置弹窗
+	// 「讨论工作流检测失败 / 系统主持状态检测失败」，设备列表也可能落空。
+	// 因此库内已有 token 时直接复用；仅在缺失时才向融云申请。确需续期由客户端
+	// 在 IM 连接失败时显式调用 POST /api/im/refresh-token（它仍走 getUserToken）。
+	var stored string
+	if u.RCStored.Valid {
+		stored = u.RCStored.String
 	}
-	if token == "" && u.RCStored.Valid {
-		token = u.RCStored.String
+	token, minted := clawResolveLoginToken(stored, func() (string, error) {
+		if rc := h.clawRong(ctx); rc != nil {
+			return rc.getUserToken(ctx, u.UserID, u.Nickname, u.PortraitURI)
+		}
+		return "", errors.New("rongcloud 未配置")
+	})
+	if minted {
+		_, _ = h.DB.Exec(ctx, "UPDATE claw_im_users SET rongcloud_token=$1 WHERE user_id=$2", token, u.UserID)
 	}
 	if token == "" {
 		clawJSON(w, 500, 500, "登录成功，但获取IM Token失败", nil)
