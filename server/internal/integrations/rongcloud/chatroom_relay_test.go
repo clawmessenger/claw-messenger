@@ -2,11 +2,13 @@ package rongcloud
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
-	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/jackc/pgx/v5/pgtype"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
 // 测试聚焦 hub 自身状态机：按序推进、回包唤醒、超时跳过、迟到/伪造回包吞掉。
@@ -36,11 +38,11 @@ func TestRelayMembersFor_OrderAndFilter(t *testing.T) {
 	text := pgtype.Text{}
 	rows := []db.ListRongCloudChatroomMembersWithNodeRow{
 		{
-			MemberType:      "user",
-			Enabled:         true,
-			MemberID:        text,
-			NodeRcUserID:    pgtype.Text{String: "rc_user", Valid: true},
-			RoleName:        pgtype.Text{String: "用户", Valid: true},
+			MemberType:   "user",
+			Enabled:      true,
+			MemberID:     text,
+			NodeRcUserID: pgtype.Text{String: "rc_user", Valid: true},
+			RoleName:     pgtype.Text{String: "用户", Valid: true},
 		},
 		{
 			MemberType:      "ai",
@@ -84,10 +86,10 @@ func TestRelayHub_SequentialDispatch(t *testing.T) {
 		{rcID: "rc_b", roleName: "B", order: 1},
 	}
 	ctx := context.Background()
-	if !hub.Start(ctx, "room1", members, "hello", "", "") {
+	if !hub.Start(ctx, "room1", members, "hello", "", "", 0) {
 		t.Fatal("start should succeed")
 	}
-	if hub.Start(ctx, "room1", members, "again", "", "") {
+	if hub.Start(ctx, "room1", members, "again", "", "", 0) {
 		t.Fatal("second start must be rejected while running")
 	}
 	// 首位成员被登记为当前轮。
@@ -166,8 +168,283 @@ func TestRelayRequestIDPrefix(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------- 上下文轮数
+//
+// 「AI 对话轮数」这个设置项的实际语义：每次中继时，每个成员的提示词最多携带
+// 这么多轮历史对话。0/负数表示「没设置」→ 默认值；超过上限按上限截断。
+
+func TestNormalizeContextRounds(t *testing.T) {
+	cases := []struct {
+		in   int
+		want int
+	}{
+		{0, defaultRelayContextRounds},
+		{-7, defaultRelayContextRounds},
+		{1, 1},
+		{20, 20},
+		{maxRelayContextRounds, maxRelayContextRounds},
+		{maxRelayContextRounds + 1, maxRelayContextRounds},
+	}
+	for _, tc := range cases {
+		if got := normalizeContextRounds(tc.in); got != tc.want {
+			t.Errorf("normalizeContextRounds(%d) = %d, want %d", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestRecordRound_TrimsRetainedWindow(t *testing.T) {
+	hub := &chatroomRelayHub{rt: nilRelayRuntime()} // rounds 故意留 nil：验证懒初始化
+	for i := 0; i < maxRetainedRelayRounds+5; i++ {
+		hub.recordRound("room", relayRound{userText: fmt.Sprintf("问题%d", i)})
+	}
+	hub.mu.Lock()
+	got := hub.rounds["room"]
+	hub.mu.Unlock()
+	if len(got) != maxRetainedRelayRounds {
+		t.Fatalf("retained rounds = %d, want %d", len(got), maxRetainedRelayRounds)
+	}
+	// 丢掉的是最旧的，保留的是最新的。
+	if got[0].userText != "问题5" {
+		t.Fatalf("oldest retained round = %q, want 问题5", got[0].userText)
+	}
+	// 空轮不占额度。
+	before := len(got)
+	hub.recordRound("room", relayRound{userText: "   "})
+	hub.mu.Lock()
+	after := len(hub.rounds["room"])
+	hub.mu.Unlock()
+	if after != before {
+		t.Fatalf("blank round must not be recorded: %d -> %d", before, after)
+	}
+}
+
+func TestAttachContext_CapsAtContextRoundsAndDeepCopies(t *testing.T) {
+	hub := &chatroomRelayHub{rt: nilRelayRuntime()}
+	for i := 1; i <= 5; i++ {
+		hub.recordRound("room9", relayRound{
+			userText: fmt.Sprintf("问题%d", i),
+			replies:  []relayReply{{roleName: "A", content: fmt.Sprintf("回答%d", i)}},
+		})
+	}
+	s := &relaySession{
+		chatroomRCID:  "room9",
+		userText:      "新问题",
+		contextRounds: normalizeContextRounds(2),
+	}
+	hub.mu.Lock()
+	hub.attachContextLocked(s)
+	hub.mu.Unlock()
+	if len(s.history) != 2 {
+		t.Fatalf("history = %d rounds, want 2 (cap)", len(s.history))
+	}
+	if s.history[0].userText != "问题4" || s.history[1].userText != "问题5" {
+		t.Fatalf("history must keep the newest rounds: %+v", s.history)
+	}
+	// 快照必须与滚动缓存解耦：改缓存不能污染在途提示词。
+	hub.mu.Lock()
+	hub.rounds["room9"][len(hub.rounds["room9"])-1].replies[0].content = "被改了"
+	hub.mu.Unlock()
+	if s.history[1].replies[0].content != "回答5" {
+		t.Fatalf("history must be a deep copy, got %q", s.history[1].replies[0].content)
+	}
+}
+
+func TestBuildPrompt_CarriesCappedHistory(t *testing.T) {
+	hub := &chatroomRelayHub{rt: nilRelayRuntime()}
+	for i := 1; i <= 5; i++ {
+		hub.recordRound("room9", relayRound{
+			userText: fmt.Sprintf("问题%d", i),
+			replies:  []relayReply{{roleName: "A", content: fmt.Sprintf("回答%d", i)}},
+		})
+	}
+	s := &relaySession{
+		chatroomRCID:  "room9",
+		userText:      "新问题",
+		isGroup:       true,
+		members:       []relayMember{{rcID: "rc_a", roleName: "A"}},
+		contextRounds: normalizeContextRounds(2),
+	}
+	hub.mu.Lock()
+	hub.attachContextLocked(s)
+	hub.mu.Unlock()
+
+	prompt := hub.buildPrompt(s, s.members[0])
+	if !strings.HasPrefix(prompt, "[group chat] ") {
+		t.Fatalf("group prompt prefix must stay intact: %q", prompt)
+	}
+	if !strings.Contains(prompt, "最近的对话记录") {
+		t.Fatalf("prompt must carry the history block: %q", prompt)
+	}
+	if !strings.Contains(prompt, "问题5") || !strings.Contains(prompt, "回答5") {
+		t.Fatalf("prompt must carry the newest round: %q", prompt)
+	}
+	if strings.Contains(prompt, "问题3") {
+		t.Fatalf("prompt must not carry rounds beyond the cap: %q", prompt)
+	}
+}
+
+func TestBuildPrompt_NoHistoryKeepsLegacyShape(t *testing.T) {
+	hub := &chatroomRelayHub{rt: nilRelayRuntime()}
+	s := &relaySession{
+		chatroomRCID: "room1",
+		userText:     "大家好",
+		isGroup:      true,
+		members:      []relayMember{{rcID: "rc_a", roleName: "A"}},
+	}
+	prompt := hub.buildPrompt(s, s.members[0])
+	if strings.Contains(prompt, "最近的对话记录") {
+		t.Fatalf("empty history must not add a block: %q", prompt)
+	}
+	if !strings.Contains(prompt, "大家好") {
+		t.Fatalf("prompt must carry the user message: %q", prompt)
+	}
+}
+
+func TestRelayHistoryBlock_TruncatesLongReply(t *testing.T) {
+	long := strings.Repeat("很", relayHistoryReplyClip+50)
+	block := relayHistoryBlock([]relayRound{{
+		userText: "问",
+		replies:  []relayReply{{roleName: "A", content: long}},
+	}}, relayPromptContextLimit)
+	if !strings.Contains(block, "（已截断）") {
+		t.Fatalf("long reply must be clipped: %q", block)
+	}
+	if len([]rune(block)) > relayPromptContextLimit {
+		t.Fatalf("history block over budget: %d runes", len([]rune(block)))
+	}
+	// 零/负预算不渲染任何东西 —— 提示词预算必须能被上层收紧。
+	if relayHistoryBlock([]relayRound{{userText: "问"}}, 0) != "" {
+		t.Fatal("zero budget must render nothing")
+	}
+}
+
+func TestRelayHistoryBlock_BudgetDropsOldestRounds(t *testing.T) {
+	// 每轮 ~ 200 字符，预算只够两轮多：必须留下最新的，丢掉最旧的。
+	rounds := make([]relayRound, 0, 6)
+	for i := 1; i <= 6; i++ {
+		rounds = append(rounds, relayRound{
+			userText: fmt.Sprintf("第%d轮的问题", i),
+			replies:  []relayReply{{roleName: "A", content: strings.Repeat("答", 180)}},
+		})
+	}
+	block := relayHistoryBlock(rounds, 420)
+	if len([]rune(block)) > 420+8 {
+		t.Fatalf("block must respect the budget: %d runes", len([]rune(block)))
+	}
+	if !strings.Contains(block, "第6轮的问题") {
+		t.Fatalf("newest round must survive the budget: %q", block)
+	}
+	if strings.Contains(block, "第1轮的问题") {
+		t.Fatalf("oldest round must be dropped first: %q", block)
+	}
+}
+
+func TestRelayRepliesBlock_SharesBudgetAcrossMembers(t *testing.T) {
+	replies := []relayReply{
+		{roleName: "A", content: strings.Repeat("甲", 900)},
+		{roleName: "B", content: strings.Repeat("乙", 900)},
+		{roleName: "C", content: strings.Repeat("丙", 900)},
+	}
+	block, used := relayRepliesBlock(replies, 900)
+	if used > 900 {
+		t.Fatalf("replies block over budget: used=%d", used)
+	}
+	// 三位成员都必须出现在段里 —— 预算平分，不能前几位吃光。
+	for _, name := range []string{"- A：", "- B：", "- C："} {
+		if !strings.Contains(block, name) {
+			t.Fatalf("member %s missing from replies block: %q", name, block)
+		}
+	}
+}
+
+func TestBuildPrompt_StaysUnderArgvCap(t *testing.T) {
+	hub := &chatroomRelayHub{rt: nilRelayRuntime()}
+	for i := 1; i <= maxRelayContextRounds; i++ {
+		hub.recordRound("roomX", relayRound{
+			userText: strings.Repeat("问", 500),
+			replies: []relayReply{
+				{roleName: "A", content: strings.Repeat("答", 1500)},
+				{roleName: "B", content: strings.Repeat("答", 1500)},
+			},
+		})
+	}
+	members := []relayMember{{rcID: "rc_a", roleName: "A"}, {rcID: "rc_b", roleName: "B"}}
+	s := &relaySession{
+		chatroomRCID:  "roomX",
+		userText:      "新问题",
+		isGroup:       true,
+		topic:         strings.Repeat("题", 200),
+		members:       members,
+		contextRounds: normalizeContextRounds(maxRelayContextRounds),
+	}
+	hub.mu.Lock()
+	hub.attachContextLocked(s)
+	hub.mu.Unlock()
+	s.replies = []relayReply{
+		{roleName: "A", content: strings.Repeat("新答", 4000)},
+		{roleName: "B", content: strings.Repeat("新答", 4000)},
+	}
+
+	prompt := hub.buildPrompt(s, members[0])
+	if len([]rune(prompt)) >= 8000 {
+		t.Fatalf("prompt must stay under the CLI argv cap (8000), got %d runes", len([]rune(prompt)))
+	}
+	if !strings.Contains(prompt, "新问题") {
+		t.Fatal("user message must never be squeezed out")
+	}
+}
+
+func TestGroupContextRounds_ReadsGroupSetting(t *testing.T) {
+	hub := &chatroomRelayHub{
+		rt: nilRelayRuntime(),
+		groupMirror: &GroupMirror{
+			GroupProfiles: func(_ context.Context, _ []string) ([]GroupProfile, error) {
+				return []GroupProfile{{GroupID: "g1", MaxRounds: 7}}, nil
+			},
+		},
+	}
+	if got := hub.groupContextRounds(context.Background(), "g1"); got != 7 {
+		t.Fatalf("groupContextRounds = %d, want 7 (stored setting)", got)
+	}
+	// 群被镜像但没设过轮数（COALESCE 出来的 0）→ 默认值。
+	hub.groupMirror = &GroupMirror{
+		GroupProfiles: func(_ context.Context, _ []string) ([]GroupProfile, error) {
+			return []GroupProfile{{GroupID: "g2", MaxRounds: 0}}, nil
+		},
+	}
+	if got := hub.groupContextRounds(context.Background(), "g2"); got != defaultRelayContextRounds {
+		t.Fatalf("unset setting must fall back to default, got %d", got)
+	}
+	// 没配镜像回调 → 默认值，不 panic（部署可以不带群功能）。
+	hub.groupMirror = nil
+	if got := hub.groupContextRounds(context.Background(), "g3"); got != defaultRelayContextRounds {
+		t.Fatalf("nil mirror must fall back to default, got %d", got)
+	}
+}
+
+func TestPumpRecordsRoundForNextTurn(t *testing.T) {
+	hub := &chatroomRelayHub{sessions: map[string]*relaySession{}, rounds: map[string][]relayRound{}, rt: nilRelayRuntime()}
+	members := []relayMember{{rcID: "rc_a", roleName: "A", order: 0}}
+	if !hub.Start(context.Background(), "room7", members, "第一句", "", "", 5) {
+		t.Fatal("start should succeed")
+	}
+	// dispatchTurn 在 client==nil 时失败 → pump 直接跳过成员并收尾，本轮仍要记账
+	// （用户消息本身就是上下文的一部分）。
+	waitUntil(t, "round recorded", func() bool {
+		hub.mu.Lock()
+		defer hub.mu.Unlock()
+		return len(hub.rounds["room7"]) == 1
+	})
+	hub.mu.Lock()
+	recorded := hub.rounds["room7"][0]
+	hub.mu.Unlock()
+	if recorded.userText != "第一句" {
+		t.Fatalf("recorded user text = %q, want 第一句", recorded.userText)
+	}
+}
+
 // nilRelayRuntime 构造一个 client 为 nil 的最小 runtime：dispatchTurn 会失败
-//（pump 视同跳过），但 interactiveTurnTimeout / logger 可用。
+// （pump 视同跳过），但 interactiveTurnTimeout / logger 可用。
 func nilRelayRuntime() *discussionRuntime {
 	return newDiscussionRuntime(nil, nil, nil, "", nil)
 }

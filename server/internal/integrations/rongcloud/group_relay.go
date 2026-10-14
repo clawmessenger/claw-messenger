@@ -42,7 +42,7 @@ func (h *chatroomRelayHub) StartGroupRelay(ctx context.Context, groupID, request
 		return errRelayResult(409, "该群没有可发言的 AI 成员")
 	}
 	bgCtx := context.WithoutCancel(ctx)
-	if !h.StartGroup(bgCtx, groupID, speakers, text, requesterRCID) {
+	if !h.StartGroup(bgCtx, groupID, speakers, text, requesterRCID, h.groupContextRounds(ctx, groupID)) {
 		return errRelayResult(409, "上一条消息的回应还在进行中，请稍候")
 	}
 	return commandResult{code: 200, data: map[string]interface{}{
@@ -52,8 +52,31 @@ func (h *chatroomRelayHub) StartGroupRelay(ctx context.Context, groupID, request
 	}}
 }
 
+// groupContextRounds 读群设置里的「AI 对话轮数」（rongcloud_group.
+// openclaw_max_rounds）：每个成员的提示词最多携带这么多轮历史对话。群镜像
+// 没配或查不到时回落默认值 —— 这个设置项是「上下文窗口」，取不到不该让整次
+// 发言失败。
+func (h *chatroomRelayHub) groupContextRounds(ctx context.Context, groupID string) int {
+	if h.groupMirror == nil || h.groupMirror.GroupProfiles == nil {
+		return defaultRelayContextRounds
+	}
+	profiles, err := h.groupMirror.GroupProfiles(ctx, []string{groupID})
+	if err != nil {
+		h.rt.logger.Warn("relay: group context rounds lookup",
+			"group", groupID, "error", err)
+		return defaultRelayContextRounds
+	}
+	for _, profile := range profiles {
+		if profile.GroupID == groupID && profile.MaxRounds > 0 {
+			return profile.MaxRounds
+		}
+	}
+	return defaultRelayContextRounds
+}
+
 // StartGroup 发起一次群中继（复用 hub 的 sessions 表，键即群 id）。
-func (h *chatroomRelayHub) StartGroup(ctx context.Context, groupID string, members []relayMember, userText, requesterRCID string) bool {
+// contextRounds 是该群的「AI 对话轮数」设置。
+func (h *chatroomRelayHub) StartGroup(ctx context.Context, groupID string, members []relayMember, userText, requesterRCID string, contextRounds int) bool {
 	if len(members) == 0 {
 		return false
 	}
@@ -68,7 +91,9 @@ func (h *chatroomRelayHub) StartGroup(ctx context.Context, groupID string, membe
 		userText:      userText,
 		isGroup:       true,
 		requesterRCID: requesterRCID,
+		contextRounds: normalizeContextRounds(contextRounds),
 	}
+	h.attachContextLocked(session)
 	h.sessions[groupID] = session
 	h.mu.Unlock()
 

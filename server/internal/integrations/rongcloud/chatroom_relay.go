@@ -27,6 +27,30 @@ import (
 const (
 	relayTurnKind      = "relay"
 	relayMaxTextLength = 4000
+
+	// defaultRelayContextRounds 是会话没设置（或设成 0）时携带的历史轮数。
+	// 与 Web 端「AI 对话轮数」的默认值、旧后端的默认值保持一致。
+	defaultRelayContextRounds = 20
+	// maxRelayContextRounds 是 Web 端允许设置的上限（ConversationCreationFields
+	// 的 ROUND_MAX），超过就按上限截断。
+	maxRelayContextRounds = 100
+	// maxRetainedRelayRounds 是内存里为单个会话保留的轮数上限。它是
+	// 「上下文窗口」而不是历史存档，多留几轮只是为了让用户临时把上限调大时
+	// 立即有料可用，超出即丢。
+	maxRetainedRelayRounds = 100
+	// relayPromptContextLimit 是注入进提示词的上下文（议题 + 本次已发言成员 +
+	// 历史轮次）的字符总上限，与 v3 讨论那边的 interactivePromptContextLimit
+	// 同源同理由：CLI 的 prompt 走 argv 时有 8000 字符上限（agents.ts 的
+	// ARGV_PROMPT_MAX_CHARS、discussion_bridge.go 的 argvPromptMaxChars），
+	// 超了会退化到 stdin 模式，而 openclaw / opencode / hermes 都不支持 stdin
+	// —— 代价是整轮空转。用户消息和角色人设不能被挤掉，所以只压缩上下文。
+	relayPromptContextLimit = 4000
+	// relayReplyClip 是「本次已发言成员」单条发言的截断长度上限（实际额度还要
+	// 按成员数平分，见 relayRepliesBlock）。
+	relayReplyClip = 1200
+	// relayHistoryReplyClip 是历史记录里单条消息的截断长度：上下文里的旧发言
+	// 只需要「说了什么」，不必是完整长文，否则一两轮就把预算吃光。
+	relayHistoryReplyClip = 300
 )
 
 type relayMember struct {
@@ -63,6 +87,20 @@ type relaySession struct {
 	// requesterRCID 是发起这次闲聊中继的成员（web 用户）；流式帧的
 	// requester_id 字段用它，web 端 validStreamDelivery 据此校验。
 	requesterRCID string
+	// history 是本次中继开始前该会话已发生的最近若干轮对话，供每个成员的
+	// 提示词携带上下文。它由 contextRounds（会话设置里的「AI 对话轮数」）决定
+	// 长度，更早的轮次被截断 —— 这正是那个设置项的实际语义。
+	history []relayRound
+	// contextRounds 是本次中继携带的历史轮数上限（已归一化到
+	// 1..maxRelayContextRounds）。
+	contextRounds int
+}
+
+// relayRound 是一轮已完成的对话：一条用户消息 + 该轮各位 AI 的回应。
+// 只在上下文的粒度上使用，不落库。
+type relayRound struct {
+	userText string
+	replies  []relayReply
 }
 
 type relayReply struct {
@@ -73,13 +111,74 @@ type relayReply struct {
 type chatroomRelayHub struct {
 	mu       sync.Mutex
 	sessions map[string]*relaySession // key: chatroom/group rc id
-	rt       *discussionRuntime
+	// rounds 是每个会话已完成的对话轮次（键与 sessions 相同），喂给下一次中继
+	// 当上下文用。刻意不落库：服务重启后上下文从头开始，与「闲聊不落库」
+	// （见文件头注释）保持一致。
+	rounds map[string][]relayRound
+	rt     *discussionRuntime
 	// groupMirror 提供普通群组的成员镜像读取（relayGroupMessage 用）。
 	groupMirror *GroupMirror
 }
 
 func newChatroomRelayHub(rt *discussionRuntime) *chatroomRelayHub {
-	return &chatroomRelayHub{sessions: map[string]*relaySession{}, rt: rt}
+	return &chatroomRelayHub{sessions: map[string]*relaySession{}, rounds: map[string][]relayRound{}, rt: rt}
+}
+
+// normalizeContextRounds 把会话设置里的轮数收敛到可用区间。0/负数（库里没
+// 存过、或旧数据）按默认值处理 —— 那个设置项从来不是「0 轮上下文」，而是
+// 「没设置」。
+func normalizeContextRounds(value int) int {
+	if value <= 0 {
+		return defaultRelayContextRounds
+	}
+	if value > maxRelayContextRounds {
+		return maxRelayContextRounds
+	}
+	return value
+}
+
+// attachContextLocked 在持有 h.mu 的前提下，把该会话最近 contextRounds 轮
+// 对话快照进 session.history。取值后即与 hub 的滚动缓存解耦（深拷贝），
+// 后续轮次的写入不会影响在途的提示词。
+func (h *chatroomRelayHub) attachContextLocked(s *relaySession) {
+	if s.contextRounds <= 0 {
+		return
+	}
+	all := h.rounds[s.chatroomRCID]
+	if len(all) == 0 {
+		return
+	}
+	if len(all) > s.contextRounds {
+		all = all[len(all)-s.contextRounds:]
+	}
+	history := make([]relayRound, len(all))
+	for i, round := range all {
+		replies := make([]relayReply, len(round.replies))
+		copy(replies, round.replies)
+		history[i] = relayRound{userText: round.userText, replies: replies}
+	}
+	s.history = history
+}
+
+// recordRound 把一轮已完成的对话并入滚动缓存。空轮（没有任何成员回包）不占
+// 上下文额度。h.mu 必须在 h.rounds 初始化之前就存在；map 懒初始化，兼容测试
+// 里直接构造的零值 hub。
+func (h *chatroomRelayHub) recordRound(key string, round relayRound) {
+	if strings.TrimSpace(round.userText) == "" && len(round.replies) == 0 {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.rounds == nil {
+		h.rounds = map[string][]relayRound{}
+	}
+	all := append(h.rounds[key], round)
+	if len(all) > maxRetainedRelayRounds {
+		trimmed := make([]relayRound, maxRetainedRelayRounds)
+		copy(trimmed, all[len(all)-maxRetainedRelayRounds:])
+		all = trimmed
+	}
+	h.rounds[key] = all
 }
 
 // StartRelay 是 web 走 IM 命令（discussion/relayMessage）进来的入口：校验
@@ -137,7 +236,7 @@ func (h *chatroomRelayHub) StartRelay(ctx context.Context, chatroomRCID, request
 	}
 	// HTTP 请求返回后中继要继续跑：换独立 context。
 	bgCtx := context.WithoutCancel(ctx)
-	if !h.Start(bgCtx, chatroomRCID, members, text, topic, requesterRCID) {
+	if !h.Start(bgCtx, chatroomRCID, members, text, topic, requesterRCID, int(room.MaxRounds)) {
 		return errRelayResult(409, "上一条消息的回应还在进行中，请稍候")
 	}
 	return commandResult{code: 200, data: map[string]interface{}{
@@ -152,8 +251,9 @@ func errRelayResult(code int, msg string) commandResult {
 }
 
 // Start 为聊天室发起一次按序中继。返回 false 表示该房间已有会话在跑（前端
-// 可以提示「上一条消息的回应还在进行中」）。
-func (h *chatroomRelayHub) Start(ctx context.Context, chatroomRCID string, members []relayMember, userText, topic, requesterRCID string) bool {
+// 可以提示「上一条消息的回应还在进行中」）。contextRounds 是该房间的
+// 「AI 对话轮数」设置：每个成员的提示词最多携带这么多轮历史对话。
+func (h *chatroomRelayHub) Start(ctx context.Context, chatroomRCID string, members []relayMember, userText, topic, requesterRCID string, contextRounds int) bool {
 	if len(members) == 0 {
 		return false
 	}
@@ -168,7 +268,9 @@ func (h *chatroomRelayHub) Start(ctx context.Context, chatroomRCID string, membe
 		userText:      userText,
 		topic:         topic,
 		requesterRCID: requesterRCID,
+		contextRounds: normalizeContextRounds(contextRounds),
 	}
+	h.attachContextLocked(session)
 	h.sessions[chatroomRCID] = session
 	h.mu.Unlock()
 
@@ -182,10 +284,13 @@ func (h *chatroomRelayHub) pump(ctx context.Context, s *relaySession) {
 	timeout := h.rt.interactiveTurnTimeout()
 	defer func() {
 		h.mu.Lock()
+		replies := append([]relayReply(nil), s.replies...)
 		if cur, ok := h.sessions[s.chatroomRCID]; ok && cur == s {
 			delete(h.sessions, s.chatroomRCID)
 		}
 		h.mu.Unlock()
+		// 本轮结束后并入滚动缓存，供下一条用户消息携带上下文。
+		h.recordRound(s.chatroomRCID, relayRound{userText: s.userText, replies: replies})
 	}()
 	for s.index < len(s.members) {
 		member := s.members[s.index]
@@ -272,16 +377,26 @@ func (h *chatroomRelayHub) buildPrompt(s *relaySession, member relayMember) stri
 	if s.topic != "" {
 		contextBlock = fmt.Sprintf("\n\n本讨论组的议题：%s", s.topic)
 	}
-	// 前序成员发言（本次中继已广播的）：后续成员承接而非凭空重复表态。
-	// 加长度护栏防止长发言把提示词撑爆（截断保留最新内容）。
-	if len(s.replies) > 0 {
-		lines := make([]string, 0, len(s.replies))
-		for _, reply := range s.replies {
-			lines = append(lines, fmt.Sprintf("- %s：%s", reply.roleName, clipRelayText(reply.content, 1200)))
-		}
-		contextBlock += fmt.Sprintf("\n\n本次对话中已发言成员的观点（承接或核验后再发言，不要凭空表态）：\n%s",
-			strings.Join(lines, "\n"))
+	// 注入的上下文（本次已发言成员 + 历史轮次）共享一个字符预算，与 v3 讨论
+	// 那边的 interactivePromptContextLimit 同源：CLI 的 prompt 走 argv 有 8000
+	// 字符上限，超了会退化到 stdin，而 openclaw/opencode/hermes 都不支持 stdin
+	// ——整轮空转。用户消息与角色人设必须留下，所以压缩的只能是上下文。
+	budget := relayPromptContextLimit - len([]rune(contextBlock)) - len([]rune(instr))
+	if budget < 0 {
+		budget = 0
 	}
+	// 前序成员发言（本次中继已广播的）：后续成员承接而非凭空重复表态。优先级
+	// 高于历史轮次，先按成员数平分预算。
+	if len(s.replies) > 0 {
+		block, used := relayRepliesBlock(s.replies, budget)
+		contextBlock += block
+		budget -= used
+	}
+	// 历史上下文：「AI 对话轮数」设置决定最多携带几轮，更早的已截断；装不进
+	// 剩余预算的旧轮次也会被丢掉。设备端的 agent 会话只有 openclaw 跨界保留，
+	// 其余每轮都是新会话 —— 没有这一段，除了第一个发言者以外所有人都不记得
+	// 上一轮聊过什么。
+	contextBlock += relayHistoryBlock(s.history, budget)
 	return fmt.Sprintf(
 		"[group chat] %s：\n\n%s%s\n\n"+
 			"请以「%s」的身份回应用户。回应会被广播回%s，请只输出回应正文，不要输出多余格式。%s",
@@ -291,11 +406,99 @@ func (h *chatroomRelayHub) buildPrompt(s *relaySession, member relayMember) stri
 
 // clipRelayText 截断超长文本，保留开头并注明截断。
 func clipRelayText(text string, limit int) string {
-	if len([]rune(text)) <= limit {
-		return text
+	if limit <= 0 {
+		return ""
 	}
 	runes := []rune(text)
+	if len(runes) <= limit {
+		return text
+	}
 	return string(runes[:limit]) + "…（已截断）"
+}
+
+// clipToBudget 把 text 压进 budget 个字符，返回结果与实际占用的额度。
+func clipToBudget(text string, budget int) (string, int) {
+	if budget <= 0 || text == "" {
+		return "", 0
+	}
+	runes := []rune(text)
+	if len(runes) <= budget {
+		return text, len(runes)
+	}
+	return string(runes[:budget]) + "…（已截断）", budget
+}
+
+// relayRepliesBlock 渲染「本次对话中已发言成员的观点」段。预算按成员数平分，
+// 免得前几位把额度吃光、后面发言的人根本看不到前面说了什么。
+func relayRepliesBlock(replies []relayReply, budget int) (string, int) {
+	if len(replies) == 0 || budget <= 0 {
+		return "", 0
+	}
+	perReply := budget / len(replies)
+	if perReply > relayReplyClip {
+		perReply = relayReplyClip
+	}
+	lines := make([]string, 0, len(replies))
+	for _, reply := range replies {
+		lines = append(lines, fmt.Sprintf("- %s：%s", reply.roleName, clipRelayText(reply.content, perReply)))
+	}
+	return clipToBudget(fmt.Sprintf("\n\n本次对话中已发言成员的观点（承接或核验后再发言，不要凭空表态）：\n%s",
+		strings.Join(lines, "\n")), budget)
+}
+
+// relayHistoryBlock 把最近若干轮已完成对话渲染成提示词里的上下文段。空历史、
+// 零预算返回空串（整段省略，旧报文形态逐字不变）。只渲染装得进 budget 的
+// **最新**轮次：装不下的旧轮次直接丢弃 —— 宁可少给上下文，也不能把提示词撑过
+// CLI 的 argv 上限（见 relayPromptContextLimit）。
+func relayHistoryBlock(history []relayRound, budget int) string {
+	if len(history) == 0 || budget <= 0 {
+		return ""
+	}
+	blocks := make([]string, 0, len(history))
+	used := 0
+	// 从最近一轮往前装，装不下就停。
+	for i := len(history) - 1; i >= 0; i-- {
+		block := renderRelayRound(history[i])
+		length := len([]rune(block))
+		if used+length > budget {
+			if len(blocks) == 0 {
+				// 最新一轮自己就超预算：截断它，至少给一段上下文。
+				clipped, spent := clipToBudget(block, budget)
+				if clipped != "" {
+					blocks = append(blocks, clipped)
+					used += spent
+				}
+			}
+			break
+		}
+		blocks = append(blocks, block)
+		used += length
+	}
+	if len(blocks) == 0 {
+		return ""
+	}
+	// 翻回时间顺序（旧 → 新）。
+	for i, j := 0, len(blocks)-1; i < j; i, j = i+1, j-1 {
+		blocks[i], blocks[j] = blocks[j], blocks[i]
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "\n\n最近的对话记录（只保留最近 %d 轮，更早的已截断；仅作背景，不要复述）：",
+		len(blocks))
+	for _, block := range blocks {
+		b.WriteString(block)
+	}
+	return b.String()
+}
+
+// renderRelayRound 渲染一轮记录：用户的提问 + 该轮各位成员的回应。
+func renderRelayRound(round relayRound) string {
+	var b strings.Builder
+	b.WriteString("\n用户：")
+	b.WriteString(clipRelayText(round.userText, relayHistoryReplyClip))
+	for _, reply := range round.replies {
+		fmt.Fprintf(&b, "\n- %s：%s", reply.roleName, clipRelayText(reply.content, relayHistoryReplyClip))
+	}
+	return b.String()
 }
 
 // AcceptResponse 处理设备对 relay your_turn 的回包。返回 false 表示这条
