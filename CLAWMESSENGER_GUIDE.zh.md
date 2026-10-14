@@ -561,8 +561,10 @@ clawmessenger 是运行在用户设备上的轻量节点 CLI：绑定到工作�
 
 - **A.1** 绑定流程 — 生成配对票并在设备上认领
 - **A.2** 日常使用 — 上线、行为说明、常用命令
-- **A.3** 后台常驻（Windows）— 让设备长期在线、登录自启（`clawmessenger run` 本身只有前台模式）
-- **A.4** 验证与排障
+- **A.3** 后台常驻与开机自启（CLI 原生）— 让设备长期在线（`clawmessenger run` 本身只有前台模式）
+- **A.4** 备选：Windows 守护脚本 — 随 Release 分发的 PowerShell 版（A.3 覆盖不到的老环境用）
+- **A.5** 备选：Linux / macOS 守护脚本 — 随 Release 分发的 bash 版
+- **A.6** 验证与排障
 
 完整冒烟手册见 `packages/xiachat-cli/scripts/smoke.md`。
 
@@ -616,16 +618,20 @@ clawmessenger pair --ticket pt_<64位hex> --server https://<你的服务地址>
 **上线**
 
 ```bash
-# 常规：不带 --agent = supervisor 模式，拉起本设备已绑定的「全部」agent
-clawmessenger.exe run
+# 推荐：后台常驻（v0.2.15+）—— 关掉终端也不掉线，细节见 A.3
+clawmessenger start
+clawmessenger status          # 看 PID、agent 列表、日志位置
+
+# 前台（排障时用，窗口一关就全下线）
+clawmessenger run             # 不带 --agent = supervisor 模式，拉起本设备已绑定的「全部」agent
 # 输出 clawmessenger supervisor: N of M agent(s) online 即已拉起全部 agent 并连上融云
 
-# 调试：只跑单个 agent（--agent 可选，不是必填）
-clawmessenger.exe run --agent opencode   # 可用值见 clawmessenger agents
+# 只跑单个 agent（--agent 可选，不是必填）
+clawmessenger run --agent opencode   # 可用值见 clawmessenger agents
 # 输出 clawmessenger run: connected and dispatching 即已连上融云并开始分发消息
 ```
 
-> **Warning:** `clawmessenger run` 是**前台进程**：它不脱离终端，会一直占着当前窗口，**关掉这个窗口（或 Ctrl+C、注销）会把该设备上所有 agent 一起下线**，设备在管理端随之变离线。日常常驻请用 [A.3 后台常驻（Windows）](#a3-后台常驻windows) 或 [A.4 后台常驻（Linux / macOS）](#a4-后台常驻linux--macos)，不要把它挂在终端窗口里跑。
+> **Warning:** `clawmessenger run` 是**前台进程**：它不脱离终端，会一直占着当前窗口，**关掉这个窗口（或 Ctrl+C、注销）会把该设备上所有 agent 一起下线**，设备在管理端随之变离线。日常常驻请用 [A.3 后台常驻与开机自启](#a3-后台常驻与开机自启cli-原生推荐) 的 `clawmessenger start`，不要把它挂在终端窗口里跑。
 
 上线后即可：
 
@@ -647,12 +653,86 @@ clawmessenger.exe run --agent opencode   # 可用值见 clawmessenger agents
 **常用命令**
 
 ```bash
-clawmessenger agents   # 列出本机可发现的 agent CLI（下文以 clawmessenger 指代 exe 或 node 运行方式）
-clawmessenger status   # 查看当前身份/token/服务器
-clawmessenger login    # 手动刷新 IM token（一般不需要）
+clawmessenger agents            # 列出本机可发现的 agent CLI（下文以 clawmessenger 指代 exe 或 node 运行方式）
+clawmessenger status            # 身份/token/服务器 + 后台运行状态（v0.2.15+）
+clawmessenger login             # 手动刷新 IM token（一般不需要）
+clawmessenger start / stop      # 后台常驻起停（v0.2.15+，见 A.3）
+clawmessenger logs              # 看后台日志尾部（v0.2.15+）
 ```
 
-### A.3 后台常驻（Windows）
+### A.3 后台常驻与开机自启（CLI 原生，推荐）
+
+`clawmessenger run` 只有前台模式，而且 supervisor 只处理 SIGINT / SIGTERM（**不处理 SIGHUP**）：关掉终端、注销都会让这台设备上的全部 agent 一起下线。CLI 自 **v0.2.15** 起自带一组托管命令解决这件事 —— **不需要额外下载任何脚本**：
+
+| 命令 | 作用 |
+|------|------|
+| `clawmessenger start` | 后台启动 supervisor（脱离终端；关窗、注销都不掉线） |
+| `clawmessenger stop` | 停止 supervisor 及它拉起的全部 agent 子进程 |
+| `clawmessenger restart` | 停掉再后台启动（换过二进制版本后用这个） |
+| `clawmessenger status` | 身份 + 后台运行状态（PID、已运行时长、agent 列表、exe 路径、日志位置、自启配置） |
+| `clawmessenger logs` | 看 supervisor 日志尾部（`--lines <n>`，默认 40 行） |
+| `clawmessenger install-service` | 配置开机 / 登录自启（Linux systemd、macOS LaunchAgent、Windows 登录启动） |
+| `clawmessenger uninstall` | 取消自启（不删二进制、不删日志） |
+
+```bash
+clawmessenger start                       # 后台常驻，最常用
+clawmessenger status                      # PID / agent 列表 / 日志位置 / 自启配置
+clawmessenger logs --lines 100            # 看日志
+clawmessenger restart                     # 换过二进制版本后
+clawmessenger stop                        # 停止（含它拉起的全部 agent）
+clawmessenger install-service             # 顺手配上开机自启
+```
+
+`clawmessenger daemon <动作>` 与上表**完全等价**，供偏好命名空间的场景使用。
+
+可选参数（跟在 `start` / `restart` / `install-service` 后面）：
+
+| 参数 | 说明 |
+|------|------|
+| `--model <名称>` | 透传给 `clawmessenger run --model <名称>` |
+| `--workdir <路径>` | supervisor 的工作目录，也是 agent 轮次的 cwd（默认 = 家目录） |
+
+> **Common mistake:** 如果你敲 `clawmessenger start` 得到 `error: unknown command 'start'`，说明手上的二进制**旧于 v0.2.15** —— 这组托管命令是 v0.2.15 才编进 CLI 的（更早的版本只能靠下面 A.4 / A.5 的随包脚本）。CLI 的六个**基础**命令一直是 `register` / `pair` / `login` / `agents` / `run` / `status`。
+
+#### 平台差异
+
+| 平台 | `start` 怎么脱离终端 | `install-service` 写什么 |
+|------|----------------------|--------------------------|
+| Linux | detached + 独立会话（`setsid` 等价语义） | systemd unit：root → `/etc/systemd/system/clawmessenger.service`；普通用户 → `~/.config/systemd/user/clawmessenger.service`（并尝试 `enable-linger`，否则注销即停） |
+| macOS | detached（会话脱离） | `~/Library/LaunchAgents/com.clawmessenger.supervisor.plist`（`RunAtLoad` + `KeepAlive`） |
+| Windows | detached + 隐藏窗口，**不占控制台** | 「启动」文件夹里的 `clawmessenger.vbs`（登录时隐藏窗口拉起，**免管理员**） |
+
+#### 状态文件与日志
+
+| 内容 | 路径 |
+|------|------|
+| supervisor PID | `~/.clawmessenger/supervisor.pid` |
+| 运行详情（PID / 启动时间 / agent 列表 / 工作目录 / 模型） | `~/.clawmessenger/supervisor.json` |
+| 日志 | `~/.clawmessenger/logs/supervisor.log`（超过 5 MB 自动轮转成 `supervisor.log.1`） |
+
+`status` 读的就是这两个文件，**不要手改它们**。进程已经不在、文件却还在时会被判为 stale，`stop` 会顺手清掉。
+
+#### 四条硬约束
+
+1. **必须用 `pair` 时的那个用户运行。** 凭据在 `$HOME/.clawmessenger/`；用 root 跑而 `pair` 用的是普通用户，会**找不到凭据**，或注册出一批**全新的节点**。
+2. **停止一律用 `clawmessenger stop`。** 别 `kill -9`：SIGKILL 跳过 supervisor 的优雅关闭，它拉起的 agent 会变成孤儿（现象：`status` 说没在运行，管理端设备仍在线）。`stop` 先 POSIX SIGTERM（约 15 秒还没退才升级 SIGKILL），Windows 上改用 `taskkill /T /F` 收整棵树。
+3. **`install-service` 写进 systemd unit / plist 的 PATH 取自执行安装时的环境。** systemd 默认 PATH 很简，而 agent CLI（opencode / codex / claude）常装在 nvm 等非标准位置；换过安装位置或新增 agent CLI 之后要**重新执行一次 `install-service`**。若 `status` 列出的 agent 比管理端勾选的少，先查这里。
+4. **用装好的那个 `clawmessenger` 启动。** `start` 拉起的 supervisor 记的是**当时的可执行文件路径**。首次运行会自动把自己复制到 `~/.local/bin/clawmessenger`，所以请用 PATH 里的 `clawmessenger start`，而不是还躺在「下载」目录里的 `./clawmessenger-linux-x64 start` —— 否则以后删掉那个下载文件，supervisor 就再也起不来了。`status` 会打印它实际用的是哪个 exe。
+
+另外，`stop` 之后设备不会立刻在管理端离线：子进程心跳停止后约 **90 秒**才判定离线。
+
+#### 更新可执行文件版本之后
+
+```bash
+clawmessenger restart            # 新进程会用新二进制
+clawmessenger install-service    # 装过自启的还要重跑一次：unit / plist 里写的是绝对路径与旧 PATH
+```
+
+> **Note:** Windows 上如果之前用 `clawmessenger-daemon.cmd install-startup` 配过自启，`clawmessenger install-service` 会**覆盖同一个** `Startup\clawmessenger.vbs` —— 旧版经 `powershell → ps1 → exe` 三层，新版直接拉起 exe，少两层、也不再依赖脚本文件。
+
+### A.4 备选：Windows 守护脚本
+
+> **Note:** 这一节是 v0.2.13 之前的做法（随 Release 分发 PowerShell 脚本）。**新部署请直接用 [A.3](#a3-后台常驻与开机自启cli-原生推荐)**；只有在无法升级到 v0.2.15 及以上二进制、或已有依赖这份脚本的运维流程时才需要它。
 
 `clawmessenger run` 只提供前台模式，CLI 里**没有** `--daemon` 或注册为服务的参数。仓库在 `packages/xiachat-cli/scripts/win/` 下配套了两个脚本，把 supervisor 放到后台常驻：
 
@@ -739,9 +819,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\clawmesse
 
 #### Linux / macOS
 
-Linux / macOS 另有一份**同名同义**的守护脚本，见 [A.4 后台常驻（Linux / macOS）](#a4-后台常驻linux--macos)。
+Linux / macOS 另有一份**同名同义**的守护脚本，见 [A.5](#a5-备选linux--macos-守护脚本)。
 
-### A.4 后台常驻（Linux / macOS）
+### A.5 备选：Linux / macOS 守护脚本
+
+> **Note:** 与 A.4 同理，这是 v0.2.14 之前的做法（随 Release 分发 bash 脚本）。**新部署请直接用 [A.3](#a3-后台常驻与开机自启cli-原生推荐)** —— `clawmessenger start` / `stop` / `install-service` 已经原生覆盖了下面全部动作，不用再下载、`chmod`、也不受 GitHub 连通性影响。
 
 仓库在 `packages/xiachat-cli/scripts/linux/` 下提供 `clawmessenger-daemon.sh`，动作名与 Windows 版**一一对应**：
 
@@ -847,19 +929,22 @@ sudo ./clawmessenger-daemon.sh restart      # 等价：sudo systemctl restart cl
 
 #### macOS
 
-macOS 没有 systemd，`install-service` 不可用；`start` / `stop` / `restart` / `status` / `logs` / `run` 可用（没有 `setsid`，脚本自动退化成 `nohup` + `disown` 脱离终端）。要开机自启请自行写 launchd 的 `~/Library/LaunchAgents/<label>.plist`（`RunAtLoad` + `KeepAlive`），`ProgramArguments` 填 `<可执行文件> run`。
+macOS 没有 systemd，**脚本版的** `install-service` 不可用；`start` / `stop` / `restart` / `status` / `logs` / `run` 可用（没有 `setsid`，脚本自动退化成 `nohup` + `disown` 脱离终端）。要开机自启请自行写 launchd 的 `~/Library/LaunchAgents/<label>.plist`（`RunAtLoad` + `KeepAlive`），`ProgramArguments` 填 `<可执行文件> run` —— 或者直接用 [A.3](#a3-后台常驻与开机自启cli-原生推荐) 的 `clawmessenger install-service`，CLI 会帮你把这份 plist 写好并 `launchctl load`。
 
-### A.5 验证与排障
+### A.6 验证与排障
 
 - 运行日志的 `im in: type=... from=...` 行标记每条入站消息，用于区分"消息未达"与"分发失败"。
 - 单聊不通：先查 `clawmessenger agents` 是否列出了目标 agent；再看日志有无 `im in:`（无 = IM 未连上，检查 token/网络）。
 - 讨论只有 `turn_skipped` 没有 `turn_completed`：回包需经融云 webhook 回服务器，确认融云控制台 webhook 已配置为公网可达地址（见 smoke.md「C1 修复后复验」）。
 - 注册/绑定报 `workspace attribution required`：票据无效或已过期，在「远程设备」页重新点「绑定远程设备」获取新票据。
-- **关掉终端窗口后设备整体离线**：说明当时用的是 A.2 的前台方式（`clawmessenger run` 挂着那个窗口）。改走后台方式：Windows 用 [A.3](#a3-后台常驻windows) 的 `start` / 登录自启，Linux / macOS 用 [A.4](#a4-后台常驻linux--macos) 的 `start` / `install-service`。
-- **`status` 说没在运行，但管理端设备仍显示在线**：典型的孤儿 agent —— 父 supervisor 被强杀（任务管理器结束进程、直接关窗口、`kill -9`），子进程还活着。用 `stop` 清理进程树后重新 `start`。
-- **配了自启但重启后没起来**：`status` 会列出已配置的自启项。Windows 免管理员的看 `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\clawmessenger.vbs` 是否还在，计划任务的用 `Get-ScheduledTask -TaskName 'ClawMessenger Agents'` 查状态；Linux 的用 `systemctl status clawmessenger`（非 root 用户服务加 `--user`）看上次退出码。
-- **子进程数比管理端勾选的 agent 少**：`status` 会列出当前活着的 agent 子进程及各自命令行。绑定了但本机 PATH 里没有对应 CLI 的 agent 会被跳过，日志里有 `agent CLI <name> not found on PATH; skipping`。Linux 上若是 systemd 服务模式，多半是 unit 里的 PATH 过时 —— 重新执行一次 `install-service`（见 [A.4](#a4-后台常驻linux--macos) 第 3 条硬约束）。
-- **Linux 上 `systemd` 服务起不来**：`systemctl status clawmessenger` 看报错。常见两种：`ExecStart` 里那个绝对路径已失效（换了 exe 版本但没 `restart`），或 `HOME` 指向的用户下没有 `~/.clawmessenger/credentials.json`（服务用户和 `pair` 用户不是同一个）。
-- **Linux 上 `start` 成功但 `status` 看不到**：`status` 靠 pid 文件 + 扫 `/proc` 识别进程。若你用的是自定义进程管理器（supervisord 等）而不是本脚本的 `start`，它未必写 pid 文件；用 `ps -ef | grep clawmessenger` 直接确认，管理端在线状态才是最终依据。
+- **关掉终端窗口后设备整体离线**：说明当时用的是 A.2 的前台方式（`clawmessenger run` 挂着那个窗口）。改走 [A.3](#a3-后台常驻与开机自启cli-原生推荐) 的后台方式：`clawmessenger start`，想让它在重启后自动回来再加 `clawmessenger install-service`。
+- **敲 `clawmessenger start` 报 `error: unknown command 'start'`**：手上的二进制旧于 **v0.2.15**。这组托管命令是 v0.2.15 才编进 CLI 的；升级到该版本及以上即可（在那之前只能用 A.4 / A.5 的随包脚本）。
+- **`status` 说没在运行，但管理端设备仍显示在线**：典型的孤儿 agent —— 父 supervisor 被强杀（任务管理器结束进程、直接关窗口、`kill -9`），子进程还活着。`clawmessenger stop` 会清掉残留（POSIX 上还会给残留的 agent 子进程补一次 SIGTERM），然后重新 `start`。
+- **`clawmessenger start` 打印「supervisor exited immediately after start」**：它会顺手把日志尾部贴出来，按那段日志定位即可 —— 最常见的是**这台设备还没绑定**（`no credentials; run clawmessenger register or pair first`）或**没有勾选任何 agent**。失败时 pid / 状态文件会被自动清掉，不会留下假象。
+- **配了自启但重启后没起来**：`clawmessenger status` 会打印已配置的自启项与路径。Windows 免管理员方式是「启动」文件夹里的 `clawmessenger.vbs`；Linux 用 `systemctl status clawmessenger`（非 root 用户的服务加 `--user`）看上次退出码；macOS 用 `launchctl list | grep clawmessenger`。
+- **`status` 列出的 agent 比管理端勾选的少**：`start` 成功后 `status` 会列出 supervisor 报上来的 agent 名字。绑定了但本机 PATH 里没有对应 CLI 的 agent 会被跳过，日志里有 `agent CLI <name> not found on PATH; skipping`。Linux / macOS 上是自启模式时，多半是 unit / plist 里的 PATH 过时 —— 重新执行一次 `clawmessenger install-service`（见 [A.3](#a3-后台常驻与开机自启cli-原生推荐) 第 3 条硬约束）。
+- **`status` 显示 running 但 agents 是 unknown**：supervisor 刚起、还没把状态写出来（要先连 IM、拉绑定列表）。等几秒再 `clawmessenger status`；一直是这样就看 `clawmessenger logs`。
+- **Linux 上 `systemd` 服务起不来**：`systemctl status clawmessenger` 看报错。常见两种：`ExecStart` 里的绝对路径已失效（换过二进制但没重跑 `install-service`），或 `HOME` 指向的用户下没有 `~/.clawmessenger/credentials.json`（服务用户和 `pair` 用户不是同一个）。
+- **用自定义进程管理器（supervisord 等）托管时 `clawmessenger status` 认不出**：`status` 只认 `clawmessenger start` / 前台 `run` 写下的 pid / 状态文件。用别的管理器时它不写这两个文件，请用 `ps -ef | grep clawmessenger` 直接确认，**管理端的在线状态才是最终依据**。
 - **日志里出现 `reg.exe` 被安全策略/黑名单拦截**：无害噪音（exe 每次启动用它自查用户 PATH），不影响运行。
 - 其余已知事项见 smoke.md「已知缺口」一节。
