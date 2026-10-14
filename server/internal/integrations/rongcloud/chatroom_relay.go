@@ -42,6 +42,10 @@ type relaySession struct {
 	members      []relayMember
 	index        int
 	userText     string
+	// isGroup 区分普通群组（融云 group）与聊天室（chatroom）：二者复用同一
+	// 套按序派发状态机，但回包广播端点不同（/message/group/publish.json vs
+	// /message/chatroom/publish.json），提示词语气也不同。
+	isGroup bool
 	// 每个进行中的成员一轮一个 done channel（pump 在派发前换新），避免
 	// 「超时后迟到的回包 close 同一个 chan」把下一轮误推进。
 	currentDone chan struct{}
@@ -54,8 +58,10 @@ type relaySession struct {
 
 type chatroomRelayHub struct {
 	mu       sync.Mutex
-	sessions map[string]*relaySession // key: chatroom rc id
+	sessions map[string]*relaySession // key: chatroom/group rc id
 	rt       *discussionRuntime
+	// groupMirror 提供普通群组的成员镜像读取（relayGroupMessage 用）。
+	groupMirror *GroupMirror
 }
 
 func newChatroomRelayHub(rt *discussionRuntime) *chatroomRelayHub {
@@ -210,10 +216,16 @@ func (h *chatroomRelayHub) buildPrompt(s *relaySession, member relayMember) stri
 	if member.roleInstr != "" {
 		instr = "\n" + member.roleInstr + "\nStay in character."
 	}
+	venue := "聊天室"
+	scope := "这是讨论组的一次自由对话。用户刚在聊天室发言"
+	if s.isGroup {
+		venue = "群聊"
+		scope = "这是普通群聊的一次自由对话。用户刚在群里发言"
+	}
 	return fmt.Sprintf(
-		"[group chat] 这是讨论组的一次自由对话。用户刚在聊天室发言：\n\n%s\n\n"+
-			"请以「%s」的身份回应用户。回应会被广播回聊天室，请只输出回应正文，不要输出多余格式。%s",
-		s.userText, member.roleName, instr,
+		"[group chat] %s：\n\n%s\n\n"+
+			"请以「%s」的身份回应用户。回应会被广播回%s，请只输出回应正文，不要输出多余格式。%s",
+		scope, s.userText, member.roleName, venue, instr,
 	)
 }
 
@@ -276,11 +288,19 @@ func (h *chatroomRelayHub) broadcastMemberSpeech(ctx context.Context, s *relaySe
 		trimmed = trimmed[:relayMaxTextLength]
 	}
 	textPayload, _ := json.Marshal(map[string]interface{}{"content": trimmed})
-	if _, err := h.rt.client.sendChatroomMessage(
-		ctx, member.rcID, s.chatroomRCID, objectNameText, string(textPayload),
-	); err != nil {
+	var sendErr error
+	if s.isGroup {
+		_, sendErr = h.rt.client.sendGroupMessage(
+			ctx, member.rcID, s.chatroomRCID, objectNameText, string(textPayload),
+		)
+	} else {
+		_, sendErr = h.rt.client.sendChatroomMessage(
+			ctx, member.rcID, s.chatroomRCID, objectNameText, string(textPayload),
+		)
+	}
+	if sendErr != nil {
 		h.rt.logger.Warn("relay: chatroom broadcast failed",
-			"chatroom", s.chatroomRCID, "from", member.rcID, "error", err)
+			"chatroom", s.chatroomRCID, "from", member.rcID, "error", sendErr)
 	}
 }
 

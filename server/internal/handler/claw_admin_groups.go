@@ -52,6 +52,7 @@ func (h *Handler) ClawGroupMirror() *rongcloud.GroupMirror {
 		AddMembers:       h.clawGroupAddMembers,
 		RemoveMember:     h.clawGroupRemoveMember,
 		ListMembers:      h.clawGroupListMembers,
+		ListAiMembers:    h.clawGroupListAiMembers,
 		ListGroupsByUser: h.clawGroupListByUser,
 		GroupProfiles:    h.clawGroupProfiles,
 		SetOwner:         h.clawGroupSetOwner,
@@ -240,6 +241,37 @@ func (h *Handler) clawGroupListMembers(ctx context.Context, groupID string) ([]r
 		FROM rongcloud_group_member m
 		LEFT JOIN claw_im_users u ON u.user_id = m.user_id
 		WHERE m.group_id = $1
+		ORDER BY m.created_at ASC`, groupID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	members := []rongcloud.GroupMember{}
+	for rows.Next() {
+		var member rongcloud.GroupMember
+		if err := rows.Scan(&member.UserID, &member.Nickname, &member.PortraitURI, &member.Role); err != nil {
+			return nil, err
+		}
+		members = append(members, member)
+	}
+	return members, rows.Err()
+}
+
+// clawGroupListAiMembers 返回群的 AI 发言者列表（按成员加入顺序）。AI 身份
+// 经 rongcloud_node 反查：ai_type 非空才算智能体节点；机器主节点 ai_type 为
+// 空被天然排除（红线 #6：按 rc id 反查时绝不能把机器主节点当 agent）。
+func (h *Handler) clawGroupListAiMembers(ctx context.Context, groupID string) ([]rongcloud.GroupMember, error) {
+	rows, err := h.DB.Query(ctx, `
+		SELECT m.user_id,
+		       COALESCE(NULLIF(m.nickname, ''), u.nickname, ''),
+		       COALESCE(u.portrait_uri, ''),
+		       m.role
+		FROM rongcloud_group_member m
+		LEFT JOIN claw_im_users u ON u.user_id = m.user_id
+		WHERE m.group_id = $1
+		  AND EXISTS(SELECT 1 FROM rongcloud_node x
+		             WHERE x.rongcloud_user_id = m.user_id AND NULLIF(x.ai_type, '') IS NOT NULL)
 		ORDER BY m.created_at ASC`, groupID)
 	if err != nil {
 		return nil, err

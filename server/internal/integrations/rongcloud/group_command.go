@@ -93,6 +93,10 @@ type GroupMirror struct {
 	// ListMembers returns the mirrored member rows (getMembers fallback and the
 	// nickname/portrait source for the RongCloud answer).
 	ListMembers func(ctx context.Context, groupID string) ([]GroupMember, error)
+	// ListAiMembers returns the group's AI speaker list in speaking order,
+	// resolved against the node table (machine-host nodes with empty ai_type
+	// are excluded). The group relay uses it; nil disables relayGroupMessage.
+	ListAiMembers func(ctx context.Context, groupID string) ([]GroupMember, error)
 	// ListGroupsByUser returns the groups a user belongs to (getMyGroups).
 	ListGroupsByUser func(ctx context.Context, userID string) ([]GroupProfile, error)
 	// GroupProfiles returns the mirrored profiles of the requested groups

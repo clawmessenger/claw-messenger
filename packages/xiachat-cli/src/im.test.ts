@@ -13,6 +13,39 @@ function makeDeps() {
 }
 
 describe("MessageDispatcher single chat", () => {
+  it("observes group/chatroom broadcast RC:TxtMsg without replying (relay arbitrates)", async () => {
+    for (const conversationType of [3, 4]) {
+      const deps = makeDeps();
+      const dispatcher = new MessageDispatcher({ send: deps.send });
+      await dispatcher.handle({
+        objectName: "RC:TxtMsg",
+        fromUserId: "user-1",
+        toUserId: "node-a",
+        targetId: "room-1",
+        conversationType,
+        content: JSON.stringify({ content: "大家好" }),
+      }, { runTurn: async () => {
+        throw new Error("group broadcast must not run the agent");
+      } });
+      expect(deps.sent.length).toBe(0);
+    }
+  });
+
+  it("replies to private RC:TxtMsg with conversationType=1", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    await dispatcher.handle({
+      objectName: "RC:TxtMsg",
+      fromUserId: "user-1",
+      toUserId: "node-a",
+      targetId: "node-a",
+      conversationType: 1,
+      content: JSON.stringify({ content: "你好" }),
+    }, { runTurn: async (prompt) => `echo:${prompt}` });
+    expect(deps.sent.length).toBe(1);
+    expect(deps.sent[0].objectName).toBe("RC:TxtMsg");
+  });
+
   it("replies to RC:TxtMsg with agent output as RC:TxtMsg", async () => {
     const deps = makeDeps();
     const dispatcher = new MessageDispatcher({ send: deps.send });

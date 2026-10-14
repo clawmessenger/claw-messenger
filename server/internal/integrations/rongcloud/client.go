@@ -197,6 +197,28 @@ func (c *rongcloudAPIClient) sendChatroomMessage(ctx context.Context, fromUserID
 	return "", nil
 }
 
+// sendGroupMessage publishes a message into a RongCloud group (融云普通群组，
+// conversationType=3) as a specific member. Used by the group relay to speak AI
+// members' answers back into the group as normal group bubbles. The legacy
+// Python transport used the same endpoint with isPersisted=0/isCounted=0;
+// groups here are durable conversations, so we persist and count.
+func (c *rongcloudAPIClient) sendGroupMessage(ctx context.Context, fromUserID, groupID, objectName, content string) (string, error) {
+	form := url.Values{
+		"fromUserId": {fromUserID},
+		"toGroupId":  {groupID},
+		"objectName": {objectName},
+		"content":    {content},
+	}
+	result, err := c.postForm(ctx, "/message/group/publish.json", form)
+	if err != nil {
+		return "", err
+	}
+	if msgUID, ok := result["msgUID"].(string); ok {
+		return msgUID, nil
+	}
+	return "", nil
+}
+
 // sendCommandResult sends a command_result message back to the requesting user.
 func (c *rongcloudAPIClient) sendCommandResult(ctx context.Context, fromUserID, toUserID, requestID string, payload map[string]interface{}) error {
 	resultContent := CommandResultContent{

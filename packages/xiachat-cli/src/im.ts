@@ -108,6 +108,15 @@ export class MessageDispatcher {
       return;
     }
     if (msg.objectName === "RC:TxtMsg") {
+      // 融云会话类型（@rongcloud/engine ConversationType）：1 私聊、3 普通群组、
+      // 4 聊天室。只有私聊的 RC:TxtMsg 才是「对着我说话」；群组/聊天室广播是
+      // 「对着房间里所有人说话」——多节点场景下每个成员都会收到，若各跑一轮
+      // agent 就是全员抢答。群聊发言权改由服务端按序中继派发（your_turn
+      // command），这里只观察不抢答。
+      if (msg.conversationType === 3 || msg.conversationType === 4) {
+        console.log(`im in: observing ${msg.conversationType === 3 ? "group" : "chatroom"} broadcast (relay arbitrates turns)`);
+        return;
+      }
       let text = "";
       try {
         const parsed = JSON.parse(msg.content) as { content?: unknown };

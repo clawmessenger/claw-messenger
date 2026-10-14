@@ -79,10 +79,12 @@ func newRongCloudFactory(deps ChannelDeps) channel.Factory {
 		discussionRuntime.interactiveEnabled = true
 		creation.workflowAvailable = discussionRuntime.roundtablePolicyAvailable
 	}
-	// 讨论组闲聊的「按序发言」中继（服务端仲裁，替代客户端扇出）。
+	// 讨论组闲聊与普通群组的「按序发言」中继（服务端仲裁，替代客户端扇出）。
+	// groupMirror 由 HTTP 层注入，群中继用它读成员镜像。
 	var relayHub *chatroomRelayHub
 	if discussionRuntime != nil {
 		relayHub = newChatroomRelayHub(discussionRuntime)
+		relayHub.groupMirror = deps.GroupMirror
 	}
 	return &rongcloudChannel{
 		cfg:           cfg,

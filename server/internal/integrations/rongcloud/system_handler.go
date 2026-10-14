@@ -435,7 +435,7 @@ func (h *systemHandler) handleDiscussionCommand(ctx context.Context, msg Normali
 		"start": true, "getActive": true, "continue": true, "finish": true,
 		"cancel": true, "interject": true, "retry": true, "stop": true,
 		"recommendRoles": true, "createRoundtable": true, "resumeRoundtable": true,
-		"relayMessage": true,
+		"relayMessage": true, "relayGroupMessage": true,
 	}
 	if !known[cmd.Action] {
 		return h.replyErr(ctx, msg, cmd, 404, unknownServiceOrActionMessage(cmd))
@@ -456,6 +456,33 @@ func (h *systemHandler) handleDiscussionCommand(ctx context.Context, msg Normali
 			return h.replyErr(ctx, msg, cmd, 400, "参数不完整")
 		}
 		return h.replyCommandResult(ctx, msg, cmd, h.relayHub.StartRelay(ctx, chatroomID, msg.FromUserID, text))
+	}
+
+	// relayGroupMessage 仲裁普通群组（融云 group）闲聊的按序发言：与
+	// relayMessage 同构，但成员来自群镜像 + 节点表（排除机器主节点），
+	// 回包经 /message/group/publish.json 广播回群。
+	if cmd.Action == "relayGroupMessage" {
+		if h.relayHub == nil {
+			return h.replyErr(ctx, msg, cmd, 503, "discussion runtime not available")
+		}
+		groupID := getStringAny(cmd.Params, "group_id", "groupId")
+		text := getString(cmd.Params, "content")
+		if groupID == "" || text == "" {
+			return h.replyErr(ctx, msg, cmd, 400, "参数不完整")
+		}
+		if h.groupMirror == nil || h.groupMirror.ListAiMembers == nil {
+			return h.replyErr(ctx, msg, cmd, 503, "群成员镜像不可用")
+		}
+		aiMembers, err := h.groupMirror.ListAiMembers(ctx, groupID)
+		if err != nil {
+			return h.replyErr(ctx, msg, cmd, 500, "查询群成员失败")
+		}
+		allMembers, err := h.groupMirror.ListMembers(ctx, groupID)
+		if err != nil {
+			return h.replyErr(ctx, msg, cmd, 500, "查询群成员失败")
+		}
+		// 发起者校验用全量成员（真人发起），发言列表用 AI 过滤结果。
+		return h.replyCommandResult(ctx, msg, cmd, h.relayHub.StartGroupRelay(ctx, groupID, msg.FromUserID, text, allMembers, aiMembers))
 	}
 
 	actor, err := h.discussionRuntime.resolveActor(ctx, msg.FromUserID)
