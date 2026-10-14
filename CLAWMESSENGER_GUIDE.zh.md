@@ -661,7 +661,7 @@ clawmessenger login    # 手动刷新 IM token（一般不需要）
 | `clawmessenger-daemon.ps1` | 主体（启动/停止/状态/日志/自启） |
 | `clawmessenger-daemon.cmd` | 薄包装，方便在 cmd 里直接调用 |
 
-> **Note:** 这两个文件**目前不随 Release 产物发布**（Release 只上传单文件 exe）。开发者在本仓库内直接使用上述路径；外部用户请从 GitHub 仓库同一路径下载这两个文件，并保持它们在同一目录。执行过一次 `install-startup` 或 `install` 后，脚本会自动复制一份到 `%LOCALAPPDATA%\clawmessenger\`（连同 `.cmd`），之后用安装目录里的副本即可，不再依赖仓库位置。
+> **Note:** 发布流水线会额外把这两个文件打包成 `clawmessenger-windows-x64-daemon-scripts.zip` 附在 Release 资产里（见 `.github/workflows/clawmessenger-release.yml`），下载后解压到 exe 同目录即可；若你手上的 Release 里还没有这个 zip，直接从本仓库 `packages/xiachat-cli/scripts/win/` 取同样两个文件，并保持它们在同一目录。执行过一次 `install-startup` 或 `install` 后，脚本会自动复制一份到 `%LOCALAPPDATA%\clawmessenger\`（连同 `.cmd`），之后用安装目录里的副本即可，不再依赖仓库位置。
 
 #### 命令
 
