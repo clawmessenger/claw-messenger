@@ -62,7 +62,16 @@ func TestClawAdminNodeRowProjectsTheFrontendShape(t *testing.T) {
 	h := &Handler{}
 	rec := testNodeRecord("node_abc", "opencode_3300776275", "opencode", "3300776275")
 
-	row := h.clawAdminNodeRowFor(rec, "小久 opencode", "说明", "850509", "小酒", true)
+	row := h.clawAdminNodeRowFor(rec, "小久 opencode", "说明", "850509", "小酒", true,
+		clawAdminNodeControl{DesiredState: "running", DesiredVersion: 3})
+
+	if row.DesiredState != "running" || row.DesiredVersion != 3 {
+		t.Fatalf("desired state = %q / %d", row.DesiredState, row.DesiredVersion)
+	}
+	// 展示节点（普通 AI 节点）必须可启停。
+	if !row.Controllable {
+		t.Fatal("display node must be controllable")
+	}
 
 	if row.NodeID != "node_abc" {
 		t.Fatalf("node_id = %q", row.NodeID)
@@ -95,7 +104,7 @@ func TestClawAdminNodeRowFallsBackToAgentTypeForTheName(t *testing.T) {
 	h := &Handler{}
 	rec := testNodeRecord("node_abc", "opencode_3300776275", "opencode", "3300776275")
 
-	row := h.clawAdminNodeRowFor(rec, "", "", "", "", false)
+	row := h.clawAdminNodeRowFor(rec, "", "", "", "", false, clawAdminNodeControl{})
 
 	// rongcloud_user.name 为空时显示 ai_type，而不是空串或内部 id。
 	if row.Name != "opencode" {

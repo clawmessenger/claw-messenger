@@ -255,6 +255,47 @@ type clawAdminNodeRow struct {
 	CreatedAt        string `json:"created_at,omitempty"`
 	UpdatedAt        string `json:"updated_at,omitempty"`
 	IsSystemReserved bool   `json:"is_system_reserved"`
+	// Controllable 表示该节点可被启停（与启停接口的 IsDisplayNode 门槛同源）。
+	// DesiredState/DesiredVersion 是最近一次下发、等待设备收敛的指令：设备离线
+	// 时指令会一直挂着，页面靠它区分「没点成功」与「设备还没执行」。
+	Controllable   bool   `json:"controllable"`
+	DesiredState   string `json:"desired_state,omitempty"`
+	DesiredVersion int64  `json:"desired_version,omitempty"`
+}
+
+// clawAdminNodeControl 是 rongcloud_node_control 的一行（运维期望状态）。
+type clawAdminNodeControl struct {
+	DesiredState   string
+	DesiredVersion int64
+}
+
+// clawAdminNodeControls 取全部已下发的期望状态指令，键是 rongcloud_node.id 的
+// 文本形式。表量级 = 被操作过的节点数，全量取比在页面循环里逐条查便宜。
+func (h *Handler) clawAdminNodeControls(ctx context.Context) map[string]clawAdminNodeControl {
+	out := make(map[string]clawAdminNodeControl, 4)
+	rows, err := h.DB.Query(ctx, `SELECT node_id, desired_state, desired_version FROM rongcloud_node_control`)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var nodeUUID pgtype.UUID
+		var ctl clawAdminNodeControl
+		if err := rows.Scan(&nodeUUID, &ctl.DesiredState, &ctl.DesiredVersion); err != nil {
+			continue
+		}
+		out[uuidToText(nodeUUID)] = ctl
+	}
+	return out
+}
+
+func uuidToText(u pgtype.UUID) string {
+	if !u.Valid {
+		return ""
+	}
+	buf, _ := u.MarshalJSON()
+	// pgtype.UUID.MarshalJSON 返回带引号的字符串形式。
+	return strings.Trim(string(buf), `"`)
 }
 
 // clawAdminNodeStatus reports the derived liveness of a node. `detail` explains
@@ -270,7 +311,7 @@ func (h *Handler) clawAdminNodeStatus(rec clawAdminNodeRecord) (string, string) 
 	return "offline", "90 秒内无心跳"
 }
 
-func (h *Handler) clawAdminNodeRowFor(rec clawAdminNodeRecord, name, description, claimant, claimantName string, reserved bool) clawAdminNodeRow {
+func (h *Handler) clawAdminNodeRowFor(rec clawAdminNodeRecord, name, description, claimant, claimantName string, reserved bool, ctl clawAdminNodeControl) clawAdminNodeRow {
 	status, _ := h.clawAdminNodeStatus(rec)
 	row := clawAdminNodeRow{
 		NodeID:           rec.NodeID,
@@ -281,6 +322,9 @@ func (h *Handler) clawAdminNodeRowFor(rec clawAdminNodeRecord, name, description
 		CreatedAt:        rec.CreatedAt.UTC().Format(time.RFC3339),
 		UpdatedAt:        rec.UpdatedAt.UTC().Format(time.RFC3339),
 		IsSystemReserved: reserved,
+		Controllable:     rongcloud.IsDisplayNode(rec.dbNode()),
+		DesiredState:     ctl.DesiredState,
+		DesiredVersion:   ctl.DesiredVersion,
 	}
 	if claimant != "" {
 		row.UserID = claimant
@@ -362,6 +406,7 @@ func (h *Handler) ClawAdminListNodes(w http.ResponseWriter, r *http.Request) {
 	}
 	claimants := h.clawAdminNodeClaimants(ctx, rcIDs)
 	accountNames, _ := h.clawAdminIMAccounts(ctx)
+	controls := h.clawAdminNodeControls(ctx)
 
 	items := make([]clawAdminNodeRow, 0, len(pageRecords))
 	for _, rec := range pageRecords {
@@ -373,6 +418,7 @@ func (h *Handler) ClawAdminListNodes(w http.ResponseWriter, r *http.Request) {
 			claimant,
 			accountNames[claimant],
 			reserved[rec.RongcloudUserID] || hostNodes[rec.NodeID],
+			controls[uuidToText(rec.ID)],
 		))
 	}
 	clawAdminOK(w, map[string]interface{}{
@@ -425,6 +471,7 @@ func (h *Handler) ClawAdminGetNode(w http.ResponseWriter, r *http.Request) {
 	row := h.clawAdminNodeRowFor(
 		rec, names[rec.RongcloudUserID], descriptions[rec.NodeID], claimant,
 		accountNames[claimant], reserved[rec.RongcloudUserID] || hostNodes[rec.NodeID],
+		h.clawAdminNodeControls(ctx)[uuidToText(rec.ID)],
 	)
 	clawAdminOK(w, row)
 }
@@ -548,6 +595,7 @@ func (h *Handler) ClawAdminUpdateNode(w http.ResponseWriter, r *http.Request) {
 	clawAdminOK(w, h.clawAdminNodeRowFor(
 		rec, names[rec.RongcloudUserID], descriptions[rec.NodeID], claimant,
 		accountNames[claimant], reserved[rec.RongcloudUserID] || hostNodes[rec.NodeID],
+		h.clawAdminNodeControls(ctx)[uuidToText(rec.ID)],
 	))
 }
 
@@ -649,10 +697,15 @@ func (h *Handler) clawAdminSetNodeDesiredState(w http.ResponseWriter, r *http.Re
 		"desired_state": state,
 		"version":       version,
 	})
+	// 设备不在线时指令只会挂在 rongcloud_node_control 里等 supervisor 上线轮询，
+	// 页面必须把这个区别告诉运维，否则「指令已发送」读起来像没生效。
+	_, statusDetail := h.clawAdminNodeStatus(rec)
 	clawAdminOK(w, map[string]interface{}{
-		"node_id":       rec.NodeID,
-		"desired_state": state,
-		"version":       version,
+		"node_id":         rec.NodeID,
+		"desired_state":   state,
+		"version":         version,
+		"device_online":   h.RongCloudNode != nil && h.RongCloudNode.IsOnline(rec.ID),
+		"delivery_detail": statusDetail,
 	})
 }
 
@@ -783,5 +836,6 @@ func (h *Handler) ClawAdminTransferNodeOwner(w http.ResponseWriter, r *http.Requ
 	clawAdminOK(w, h.clawAdminNodeRowFor(
 		rec, names[rec.RongcloudUserID], descriptions[rec.NodeID], claimant,
 		accountNames[claimant], isReserved,
+		h.clawAdminNodeControls(ctx)[uuidToText(rec.ID)],
 	))
 }
