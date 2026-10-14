@@ -396,8 +396,8 @@ describe("daemon install-service (Linux)", () => {
     expect(existsSync(unitPath)).toBe(true);
     const unit = readFileSync(unitPath, "utf8");
     expect(unit).toContain("WantedBy=multi-user.target");
-    expect(unit).toContain(`ExecStart="${EXE}" run --model gpt-5`);
-    expect(unit).toContain(`WorkingDirectory="${h.home}"`);
+    expect(unit).toContain(`ExecStart=${EXE} run --model gpt-5`);
+    expect(unit).toContain(`WorkingDirectory=${h.home}`);
     expect(unit).toContain("Restart=always");
     expect(h.commands.some((c) => c.file === "systemctl" && c.args.join(" ") === "daemon-reload")).toBe(true);
     expect(h.commands.some((c) => c.file === "systemctl" && c.args.join(" ") === "enable clawmessenger")).toBe(true);
@@ -414,11 +414,90 @@ describe("daemon install-service (Linux)", () => {
     expect(existsSync(unitPath)).toBe(true);
     const unit = readFileSync(unitPath, "utf8");
     expect(unit).toContain("WantedBy=default.target");
-    expect(unit).toContain(`ExecStart="${EXE}" run`);
-    expect(unit).toContain(`WorkingDirectory="${h.home}"`);
-    expect(unit).toContain('Environment="PATH=/usr/bin:/bin"');
+    expect(unit).toContain(`ExecStart=${EXE} run`);
+    expect(unit).toContain(`WorkingDirectory=${h.home}`);
+    expect(unit).toContain("Environment=PATH=/usr/bin:/bin");
+    // 回归护栏：systemd 的 WorkingDirectory= 不去引号，带引号的值会被判成「非绝对路径」，
+    // 整个 unit 变成 bad unit file setting（0.2.15 线上就是这么炸的）。
+    expect(unit).not.toContain('WorkingDirectory="');
+    expect(unit).not.toContain('ExecStart="');
+    expect(unit).not.toContain('Environment="');
     expect(h.commands.some((c) => c.file === "systemctl" && c.args[0] === "--user")).toBe(true);
     expect(h.commands.some((c) => c.file === "loginctl" && c.args[0] === "enable-linger")).toBe(true);
+  });
+
+  it("quotes an env value only when it really contains whitespace", async () => {
+    const h = harness({ uid: 0, home: "/opt/my home", env: { PATH: "/opt/my agents/bin:/usr/bin" } });
+    // 显式给 workdir：否则默认值会取带空格的 home，而它并不存在。
+    await h.daemon.installService({ workdir: h.home });
+
+    const unitPath = join(h.paths.stateDir, "etc", "systemd", "system", "clawmessenger.service");
+    const unit = readFileSync(unitPath, "utf8");
+    // 有空白必须加引号，否则 systemd 会按空白拆成多个赋值，PATH 直接丢。
+    expect(unit).toContain('Environment="HOME=/opt/my home"');
+    expect(unit).toContain('Environment="PATH=/opt/my agents/bin:/usr/bin"');
+    // WorkingDirectory= 永远不加引号（systemd 不去引号，加了就是致命错误）。
+    expect(unit).not.toContain('WorkingDirectory="');
+  });
+
+  it("aborts before touching the running supervisor when systemd-analyze rejects the unit", async () => {
+    const calls: Array<{ file: string; args: string[] }> = [];
+    const h = harness(
+      {
+        uid: 0,
+        runCommand: (file, args) => {
+          calls.push({ file, args });
+          if (file === "systemd-analyze") {
+            return {
+              status: 1,
+              stdout: "",
+              stderr: 'clawmessenger.service: Working directory is not absolute, ignoring: "/root"',
+            };
+          }
+          return { status: 0, stdout: "", stderr: "" };
+        },
+      },
+      { spawnPid: 808 },
+    );
+    state(h.paths, 4242, ["claude", "codex"]);
+    h.alive.add(4242);
+
+    await h.daemon.installService();
+
+    // 手工 supervisor 一根汗毛都没动：没有信号、没有新进程，pid 文件照旧。
+    expect(h.signals).toEqual([]);
+    expect(h.spawns).toHaveLength(0);
+    expect(readFileSync(h.paths.pidFile, "utf8").trim()).toBe("4242");
+    // 也没 enable / start —— 否则每次开机都会再撞一次同样的失败。
+    expect(calls.some((c) => c.file === "systemctl" && c.args.join(" ") === "enable clawmessenger")).toBe(false);
+    expect(calls.some((c) => c.file === "systemctl" && c.args.join(" ") === "start clawmessenger")).toBe(false);
+    // systemd 的原话 + unit 正文都要带出来。
+    const errs = h.errors.join("");
+    expect(errs).toContain("Working directory is not absolute");
+    expect(errs).toContain("unit file ");
+    expect(errs).toContain("the device stays online");
+  });
+
+  it("does not treat a missing systemd-analyze as a broken unit", async () => {
+    const calls: Array<{ file: string; args: string[] }> = [];
+    const h = harness(
+      {
+        uid: 0,
+        runCommand: (file, args) => {
+          calls.push({ file, args });
+          // spawnSync 跑不起来时 status 是 null（宿主机没装 systemd-analyze）。
+          if (file === "systemd-analyze") return { status: null, stdout: "", stderr: "" };
+          return { status: 0, stdout: "", stderr: "" };
+        },
+      },
+      { spawnPid: 808 },
+    );
+
+    await h.daemon.installService();
+
+    // 真的走下去了：enable + start 都发了，也没有把「校验不通过」当成结论。
+    expect(calls.some((c) => c.file === "systemctl" && c.args.join(" ") === "start clawmessenger")).toBe(true);
+    expect(h.errors.join("")).not.toContain("rejected the unit");
   });
 
   it("keeps the device online when systemd refuses the unit", async () => {

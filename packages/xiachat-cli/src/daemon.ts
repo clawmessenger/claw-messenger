@@ -533,10 +533,18 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
     const scope = uid === 0 ? "system" : "user";
     const path = scope === "system" ? SYSTEM_UNIT : USER_UNIT;
     const wantedBy = scope === "system" ? "multi-user.target" : "default.target";
-    // systemd 只把「带空格或引号的参数」用引号包起来就够；给每个参数都加引号虽然
-    // 也能跑，但会让人以为参数里真含引号。
+    // 引号策略（踩过坑，别改回去）—— systemd 对各个指令的引号处理**不一致**：
+    //   · Environment= / ExecStart= 的解析器会自己去引号（EXTRACT_UNQUOTE），加引号安全；
+    //   · WorkingDirectory= **完全不去引号**，值被当成字面量路径。于是
+    //     WorkingDirectory="/root" 里的 `"/root"` 不是绝对路径，走到
+    //     path_simplify_and_warn(..., PATH_CHECK_ABSOLUTE|PATH_CHECK_FATAL) 就返回 -ENOEXEC
+    //     （src/core/load-fragment.c，v240 与 v257 逐字相同），unit 被记成 UNIT_BAD_SETTING，
+    //     `systemctl start` 只报一句 "Unit ... has a bad unit file setting."。
+    // 所以：值里没有空白就一律裸写（任何版本都最稳），有空白才加引号；
+    // WorkingDirectory= 永远裸写（它本来也不支持引号，路径里有空格直接写空格即可）。
     const quote = (a: string): string => (/[\s"]/.test(a) ? `"${a.replace(/"/g, '\\"')}"` : a);
-    const execStart = [`"${exec.replace(/"/g, '\\"')}"`, ...rest.map(quote)].join(" ");
+    const execStart = [quote(exec), ...rest.map(quote)].join(" ");
+    const envLine = (name: string, value: string): string => `Environment=${quote(`${name}=${value}`)}`;
     // PATH 必须写死：systemd 的默认 PATH 很简，而 agent CLI（opencode / codex /
     // claude）常装在 nvm 之类不在默认 PATH 里的位置，漏掉就会被跳过。
     const content = [
@@ -547,9 +555,9 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
       "",
       "[Service]",
       "Type=simple",
-      `Environment="HOME=${home}"`,
-      `Environment="PATH=${env.PATH ?? "/usr/local/bin:/usr/bin:/bin"}"`,
-      `WorkingDirectory="${workdir}"`,
+      envLine("HOME", home),
+      envLine("PATH", env.PATH ?? "/usr/local/bin:/usr/bin:/bin"),
+      `WorkingDirectory=${workdir}`,
       `ExecStart=${execStart}`,
       "Restart=always",
       "RestartSec=5",
@@ -630,6 +638,14 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
       if (text) err(`${label}\n${tailLines(text, 25).replace(/^/gm, "  ")}\n`);
     };
     show(sctl[0], [...sctl.slice(1), "status", DAEMON_SERVICE_NAME, "--no-pager", "-l"], `$ ${sctl.join(" ")} status ${DAEMON_SERVICE_NAME}`);
+    // LoadState 能看出是不是 unit 文件本身被判坏了（bad-setting）；LoadError 才是被 systemd
+    // 藏起来的那句真话（例如 "Invalid argument"）。LoadError 属性 systemd v240 起才有，老版本这里
+    // 会多一行「Unknown property」，出现在失败转储里可以接受。
+    show(
+      sctl[0],
+      [...sctl.slice(1), "show", DAEMON_SERVICE_NAME, "-p", "LoadState", "-p", "LoadError", "--no-pager"],
+      `$ ${sctl.join(" ")} show ${DAEMON_SERVICE_NAME} -p LoadState -p LoadError`,
+    );
     show(
       "journalctl",
       [...(sctl.includes("--user") ? ["--user"] : []), "-u", DAEMON_SERVICE_NAME, "--no-pager", "-n", "25"],
@@ -656,6 +672,23 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
     }
   }
 
+  /**
+   * 用 systemd 自己的解析器（`systemd-analyze verify`）先把 unit 过一遍。
+   * 这一步**零副作用**：能在「还没把手上的 supervisor 停掉」之前，就把
+   * 「Unit ... has a bad unit file setting.」这类 unit 自身的问题拦下来，设备不掉线。
+   *
+   * 返回 null = 通过（或者这台机器上没有 systemd-analyze，此时不拦，交给真正的 start 去判）；
+   * 返回字符串 = 被拒，内容是 systemd 的原文。
+   */
+  function verifySystemdUnit(unitPath: string): string | null {
+    const r = runCommand("systemd-analyze", ["verify", unitPath]);
+    // status === null 是 spawnSync 的「命令没跑起来」（没装 / 找不到二进制），
+    // 不能据此判定 unit 有问题，否则会在精简的容器镜像里误伤。
+    if (r.status === null || r.status === 0) return null;
+    const detail = `${r.stdout ?? ""}${r.stderr ?? ""}`.trim();
+    return detail || `systemd-analyze verify exited ${r.status}`;
+  }
+
   async function installService(o: DaemonStartOptions = {}): Promise<void> {
     if (platform === "linux") {
       const unit = systemdUnit(o);
@@ -666,6 +699,18 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
       if (reload.status !== 0) {
         err(`systemctl daemon-reload failed: ${reload.stderr.trim() || `exit ${reload.status}`}\n`);
       }
+
+      // 先校验再动手：unit 本身不合法时直接返回，既不停 supervisor、也不 enable，
+      // 免得装个开机自启反而把在线设备搞下线（0.2.15 的 WorkingDirectory="…" 就是这个坑）。
+      const rejected = verifySystemdUnit(unit.path);
+      if (rejected !== null) {
+        err(`systemd-analyze verify rejected the unit:\n${tailLines(rejected, 25).replace(/^/gm, "  ")}\n`);
+        err(`unit file ${unit.path}:\n${unit.content.replace(/^/gm, "  ")}\n`);
+        err("nothing was stopped and the autostart entry was NOT enabled — the device stays online.\n");
+        err("fix the line reported above, or drop the entry with `clawmessenger uninstall`.\n");
+        return;
+      }
+
       const enable = runCommand(sctl[0], [...sctl.slice(1), "enable", DAEMON_SERVICE_NAME]);
       if (enable.status !== 0) {
         err(`systemctl enable failed: ${enable.stderr.trim() || `exit ${enable.status}`}\n`);

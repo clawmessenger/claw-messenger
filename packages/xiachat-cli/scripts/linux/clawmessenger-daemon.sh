@@ -433,6 +433,15 @@ do_install_service() {
 
   # 把「当前这个 shell 的 PATH」写进 unit：agent CLI（opencode / codex / claude 等）
   # 往往装在 nvm 之类不在 systemd 默认 PATH 里的位置，不写死它们会找不到 -> 子进程被跳过。
+  #
+  # 引号策略（踩过坑，别改回去）：systemd 对各个指令的去引号处理**不一致** ——
+  # Environment= / ExecStart= 会去引号，而 WorkingDirectory= **不去**，值被当成字面量路径。
+  # 所以 `WorkingDirectory="${wd}"` 里的 `"/root"` 不是绝对路径，会走到
+  # path_simplify_and_warn(PATH_CHECK_ABSOLUTE|PATH_CHECK_FATAL) 返回 -ENOEXEC
+  # （src/core/load-fragment.c，systemd v240 与 v257 逐字相同），unit 被记成 UNIT_BAD_SETTING，
+  # `systemctl start` 只报一句 "Unit ... has a bad unit file setting."。
+  # 结论：没有空白就一律裸写，有空白才加引号；WorkingDirectory= 永远裸写。
+  q_ws() { case "$1" in *[[:space:]]*) printf '"%s"' "$1" ;; *) printf '%s' "$1" ;; esac; }
   cat > "$unit_path" <<EOF
 [Unit]
 Description=clawmessenger agent supervisor (RongCloud IM)
@@ -441,10 +450,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-Environment="HOME=${HOME}"
-Environment="PATH=${PATH}"
-WorkingDirectory="${wd}"
-ExecStart="${exe}" run${MODEL_ARG:+ ${MODEL_ARG}}
+Environment=HOME=$(q_ws "$HOME")
+Environment=PATH=$(q_ws "$PATH")
+WorkingDirectory=${wd}
+ExecStart=$(q_ws "$exe") run${MODEL_ARG:+ ${MODEL_ARG}}
 Restart=always
 RestartSec=5
 KillMode=control-group
@@ -455,6 +464,19 @@ StandardError=journal
 [Install]
 WantedBy=${wanted}
 EOF
+
+  # 先让 systemd 自己校验一遍（零副作用）：unit 不合法就到此为止，
+  # 既不停已跑着的 supervisor、也不 enable，免得装自启反而把在线设备搞下线。
+  if command -v systemd-analyze >/dev/null 2>&1; then
+    if ! verify_out="$(systemd-analyze verify "$unit_path" 2>&1)"; then
+      warn 'systemd 拒绝了这个 unit（systemd-analyze verify）：'
+      printf '%s\n' "$verify_out" | sed 's/^/  /'
+      warn "unit 正文：${unit_path}"
+      sed 's/^/  /' "$unit_path"
+      warn '没有停掉任何东西、也没有 enable —— 设备仍然在线。改掉上面那行错误再试，或 ./clawmessenger-daemon.sh uninstall 摘掉。'
+      return 1
+    fi
+  fi
 
   if [ "$scope" = 'system' ]; then
     systemctl daemon-reload
