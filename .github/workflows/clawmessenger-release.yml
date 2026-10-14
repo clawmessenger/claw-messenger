@@ -95,11 +95,25 @@ jobs:
     if: github.repository == 'clawmessenger/claw-messenger'
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
+
+      # Windows users get the background-daemon wrapper next to the exe, so the
+      # agents can stay online without a foreground console window.
+      - name: Bundle Windows daemon scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          zip -9 -j artifacts/clawmessenger-windows-x64-daemon-scripts.zip \
+            packages/xiachat-cli/scripts/win/clawmessenger-daemon.ps1 \
+            packages/xiachat-cli/scripts/win/clawmessenger-daemon.cmd
+          unzip -l artifacts/clawmessenger-windows-x64-daemon-scripts.zip
 
       - name: Generate checksums
         run: |
@@ -111,7 +125,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${GITHUB_REF_NAME}"
-          NOTES="$(printf 'Standalone clawmessenger CLI builds (Node SEA executables).\n\nDownload the binary for your platform from the assets below; see SHA256SUMS for checksums. Windows: clawmessenger-windows-x64.exe (rename to clawmessenger.exe if you like). macOS/Linux: chmod +x before first run.\n\n'; cat artifacts/SHA256SUMS)"
+          NOTES="$(printf 'Standalone clawmessenger CLI builds (Node SEA executables).\n\nDownload the binary for your platform from the assets below; see SHA256SUMS for checksums. Windows: clawmessenger-windows-x64.exe (rename to clawmessenger.exe if you like). macOS/Linux: chmod +x before first run.\n\nWindows only: clawmessenger-windows-x64-daemon-scripts.zip keeps the agents running in the background, so closing the console no longer takes them offline. Unzip next to the exe and run `clawmessenger-daemon.cmd start` (also: stop / restart / status / logs / install-startup / install / uninstall).\n\n'; cat artifacts/SHA256SUMS)"
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --title "clawmessenger ${TAG#clawmessenger-v}" \

@@ -2,5 +2,10 @@
 *.sh text eol=lf
 docker/entrypoint.sh text eol=lf
 
+# Windows daemon scripts ship as a user-facing release asset and are executed by
+# cmd.exe / Windows PowerShell, so keep native CRLF endings in the working tree.
+packages/xiachat-cli/scripts/win/*.ps1 text eol=crlf
+packages/xiachat-cli/scripts/win/*.cmd text eol=crlf
+
 # Default behavior
 * text=auto
