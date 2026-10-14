@@ -557,7 +557,14 @@ function multica { & "quukk-clawmessenger" @args }
 
 ## 附录 A：用户设备 CLI（clawmessenger）— 绑定与使用
 
-clawmessenger 是运行在用户设备上的轻量节点 CLI：绑定到工作区后，经融云 IM 接收单聊消息与讨论指令，在本机调用真实 agent CLI（codex / opencode 等）完成回合。完整冒烟手册见 `packages/xiachat-cli/scripts/smoke.md`。
+clawmessenger 是运行在用户设备上的轻量节点 CLI：绑定到工作区后，经融云 IM 接收单聊消息与讨论指令，在本机调用真实 agent CLI（codex / opencode 等）完成回合。
+
+- **A.1** 绑定流程 — 生成配对票并在设备上认领
+- **A.2** 日常使用 — 上线、行为说明、常用命令
+- **A.3** 后台常驻（Windows）— 让设备长期在线、登录自启（`clawmessenger run` 本身只有前台模式）
+- **A.4** 验证与排障
+
+完整冒烟手册见 `packages/xiachat-cli/scripts/smoke.md`。
 
 ### A.1 绑定流程（Web 端发起）
 
@@ -592,7 +599,7 @@ clawmessenger pair --ticket pt_<64位hex> --server https://<你的服务地址>
 
  # 认领配对票（复制 Web 弹窗里的命令，在设备上执行）
  clawmessenger pair --ticket pt_<64位hex> --server https://<你的服务地址>
- ```
+```
 
 > 也可用 `build:bin` 产出 `dist/clawmessenger.bundle.js`（需本机装有 Node ≥ 20，用 `node clawmessenger.bundle.js <cmd>` 运行）。
 
@@ -602,16 +609,23 @@ clawmessenger pair --ticket pt_<64位hex> --server https://<你的服务地址>
 - 设备上 `clawmessenger.exe status` 可看到节点凭据
 
 > **Note:** 认领失败提示 "ticket already claimed" 表示票据已被其他设备使用；「票据已过期」则重新点「绑定远程设备」生成。
-> 绑定只需做一次；凭据保存在 `~/.clawmessenger/credentials.json`（权限 0600）。同一设备重复 pair 是安全的（幂等：复用已有节点，不会重复创建）。
+> 绑定只需做一次；凭据保存在 `~/.clawmessenger/credentials.json`（Windows 为 `%USERPROFILE%\.clawmessenger\credentials.json`，权限 0600）。同一设备重复 pair 是安全的（幂等：复用已有节点，不会重复创建）。
 
 ### A.2 日常使用
 
-**上线（每次使用前启动）**
+**上线**
 
 ```bash
-clawmessenger.exe run --agent opencode   # --agent 必填；可用值见 clawmessenger agents（exe 与 node 运行方式通用）
+# 常规：不带 --agent = supervisor 模式，拉起本设备已绑定的「全部」agent
+clawmessenger.exe run
+# 输出 clawmessenger supervisor: N of M agent(s) online 即已拉起全部 agent 并连上融云
+
+# 调试：只跑单个 agent（--agent 可选，不是必填）
+clawmessenger.exe run --agent opencode   # 可用值见 clawmessenger agents
 # 输出 clawmessenger run: connected and dispatching 即已连上融云并开始分发消息
 ```
+
+> **Warning:** `clawmessenger run` 是**前台进程**：它不脱离终端，会一直占着当前窗口，**关掉这个窗口（或 Ctrl+C、注销）会把该设备上所有 agent 一起下线**，设备在管理端随之变离线。日常常驻请用 [A.3 后台常驻](#a3-后台常驻windows)，不要把它挂在 cmd 窗口里跑。
 
 上线后即可：
 
@@ -626,6 +640,9 @@ clawmessenger.exe run --agent opencode   # --agent 必填；可用值见 clawmes
 - agent 调用：claude 用 `-p`、codex 用 `exec`、opencode 用 `run` 子命令（argv 模式）；超长 prompt（>8000 字符）自动回退 STDIN
 - 讨论回合超时 120s 自动跳过（事件日志记 `turn_skipped`），不影响其他节点
 - token 过期自动刷新重连，无需人工干预
+- **supervisor 模式（不带 `--agent`）**：一个父进程托管本设备**全部**已绑定 agent，每个 agent 起一个子进程（融云 SDK 是进程级单例，一个 IM 用户必须独占一个进程）。子进程异常退出会按 1s → 2s → 4s → 8s → 16s 退避重启，连续 5 次后转入「5 分钟一次」的慢车道；存活满 60s 视为健康、退避归零
+- 管理端可以**单独停/起某个 agent**（服务端存期望状态，supervisor 每 10s 轮询收敛）。被人工停掉的 agent 不会被上面的自愈逻辑重新拉起，这是刻意设计
+- 启动时会为本设备自动绑定内置的 `ops`（运维）agent，因此子进程数通常比你在管理端手工勾选的 agent 多一个
 
 **常用命令**
 
@@ -635,10 +652,114 @@ clawmessenger status   # 查看当前身份/token/服务器
 clawmessenger login    # 手动刷新 IM token（一般不需要）
 ```
 
-### A.3 验证与排障
+### A.3 后台常驻（Windows）
+
+`clawmessenger run` 只提供前台模式，CLI 里**没有** `--daemon` 或注册为服务的参数。仓库在 `packages/xiachat-cli/scripts/win/` 下配套了两个脚本，把 supervisor 放到后台常驻：
+
+| 文件 | 用途 |
+|------|------|
+| `clawmessenger-daemon.ps1` | 主体（启动/停止/状态/日志/自启） |
+| `clawmessenger-daemon.cmd` | 薄包装，方便在 cmd 里直接调用 |
+
+> **Note:** 这两个文件**目前不随 Release 产物发布**（Release 只上传单文件 exe）。开发者在本仓库内直接使用上述路径；外部用户请从 GitHub 仓库同一路径下载这两个文件，并保持它们在同一目录。执行过一次 `install-startup` 或 `install` 后，脚本会自动复制一份到 `%LOCALAPPDATA%\clawmessenger\`（连同 `.cmd`），之后用安装目录里的副本即可，不再依赖仓库位置。
+
+#### 命令
+
+| 动作 | 作用 |
+|------|------|
+| `start` | 后台启动 supervisor（隐藏窗口、**独立隐藏控制台**，关掉父窗口不受影响） |
+| `stop` | 停止 supervisor 及其全部 agent 子进程 |
+| `restart` | 停掉再后台启动 |
+| `status` | 看 exe 路径、自启配置、PID、已运行时长、agent 子进程列表 |
+| `logs` | 打印最新一份日志的末尾 |
+| `run` | 前台阻塞运行（**供计划任务 / 启动文件夹内部调用**，不建议手动用） |
+| `install-startup` | 配置登录静默自启（写 .vbs 到「启动」文件夹，**不需要管理员**） |
+| `install` | 配置计划任务自启（登录常驻 + 异常退出每分钟自动重试，**需要管理员**） |
+| `uninstall` | 取消自启配置（不删 exe、不删日志） |
+
+```bat
+# 后台启动（最常用；关掉这个窗口也不掉线）
+%LOCALAPPDATA%\clawmessenger\clawmessenger-daemon.cmd start
+
+# 查看状态 / 停止 / 看日志
+%LOCALAPPDATA%\clawmessenger\clawmessenger-daemon.cmd status
+%LOCALAPPDATA%\clawmessenger\clawmessenger-daemon.cmd stop
+%LOCALAPPDATA%\clawmessenger\clawmessenger-daemon.cmd logs
+
+# 配置登录自启（二选一）
+%LOCALAPPDATA%\clawmessenger\clawmessenger-daemon.cmd install-startup   # 免管理员
+%LOCALAPPDATA%\clawmessenger\clawmessenger-daemon.cmd install           # 需管理员 PowerShell
+```
+
+> 上面是 cmd 写法；在 PowerShell 里把 `%LOCALAPPDATA%` 换成 `$env:LOCALAPPDATA`。
+
+不用 `.cmd` 也可以直接调 `.ps1`（`.cmd` 内部就是这么做的）：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\clawmessenger\clawmessenger-daemon.ps1" -Action start
+```
+
+可选参数（追加在动作后面即可，例如 `... start -Model gpt-5`）：
+
+| 参数 | 说明 |
+|------|------|
+| `-Model <名称>` | 透传给 `clawmessenger run --model <名称>` |
+| `-Exe <路径>` | 显式指定 exe（默认从 PATH / `%LOCALAPPDATA%\clawmessenger` 找） |
+| `-WorkDir <路径>` | supervisor 工作目录，同时是 agent 轮次的 cwd（默认 = exe 所在目录） |
+| `-TaskName <名称>` | 计划任务名，默认 `ClawMessenger Agents` |
+
+#### 状态文件与日志
+
+| 内容 | 路径 |
+|------|------|
+| supervisor PID | `%USERPROFILE%\.clawmessenger\supervisor.pid` |
+| 运行日志 | `%USERPROFILE%\.clawmessenger\logs\supervisor-<yyyyMMdd-HHmmss>.out.log` / `.err.log` |
+| 自启项（免管理员） | `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\clawmessenger.vbs` |
+| 自启项（计划任务） | 任务计划程序中的 `ClawMessenger Agents` |
+
+每次启动都用带时间戳的新日志文件，不会覆盖历史（IM SDK 会把重连、心跳、每条入站消息都写进去，排查「消息没到」还是「分发失败」靠它）。
+
+#### 三条硬约束
+
+1. **必须在同一个 Windows 用户下运行。** 凭据和机器 ID 在 `%USERPROFILE%\.clawmessenger\`，换成别的账号（尤其把 exe 以 SYSTEM 身份注册成服务）会**找不到凭据**，或注册出一批**全新的节点**。计划任务因此固定配置为「当前用户登录时」触发。
+2. **停止一律用 `-Action stop`。** 它走 `taskkill /PID <pid> /T /F`。Windows 上没有 POSIX 信号：`Stop-Process` 走 TerminateProcess，Node 收不到 SIGTERM，supervisor 的优雅关闭和子进程清理**都不会执行**，会留下孤儿 agent 进程（现象：`status` 显示没在运行，但管理端设备仍在线）。
+3. **不要同时起两个 supervisor。** 两个会重复拉起同一批 agent（IM 侧一个用户只能一个连接）。`start` 会先检测已有实例并直接拒绝（它连「手动 bat 启的前台 supervisor」也能按命令行特征认出来）；切换方式请先 `stop` 再 `start`。`run` 是自启入口，出于「登录时必须能拉起来」的考虑不做这个检查，所以别手动重复调用它。
+
+另外，`stop` 后设备不会立刻在管理端离线：子进程心跳停止后约 **90 秒**才判定离线。
+
+#### 更新 exe 版本之后
+
+自启项的指向是 `%LOCALAPPDATA%\clawmessenger\clawmessenger.exe` 的**绝对路径**（不是仓库里的构建产物），所以按既有静默升级流程替换掉那个 exe 之后，执行一次：
+
+```bat
+%LOCALAPPDATA%\clawmessenger\clawmessenger-daemon.cmd restart
+```
+
+（或直接下次登录，自启会用新 exe 拉起）即可生效，不需要重新配置自启。
+
+#### 非 Windows 平台
+
+脚本只覆盖 Windows。Linux / macOS 上没有对应工具，等价做法是让它脱离会话：
+
+```bash
+# Linux / macOS：脱离会话后台常驻
+mkdir -p ~/.clawmessenger/logs
+setsid nohup clawmessenger run >> ~/.clawmessenger/logs/supervisor.log 2>&1 &
+
+# 更稳妥：systemd user unit（崩溃自动重启 + 开机自启）
+#   ~/.config/systemd/user/clawmessenger.service  →  systemctl --user enable --now clawmessenger
+# macOS 可用 launchd：~/Library/LaunchAgents/<label>.plist（KeepAlive + RunAtLoad）
+```
+
+### A.4 验证与排障
 
 - 运行日志的 `im in: type=... from=...` 行标记每条入站消息，用于区分"消息未达"与"分发失败"。
 - 单聊不通：先查 `clawmessenger agents` 是否列出了目标 agent；再看日志有无 `im in:`（无 = IM 未连上，检查 token/网络）。
 - 讨论只有 `turn_skipped` 没有 `turn_completed`：回包需经融云 webhook 回服务器，确认融云控制台 webhook 已配置为公网可达地址（见 smoke.md「C1 修复后复验」）。
 - 注册/绑定报 `workspace attribution required`：票据无效或已过期，在「远程设备」页重新点「绑定远程设备」获取新票据。
+- **关掉 cmd 窗口后设备整体离线**：说明当时用的是 A.2 的前台方式（`clawmessenger run` 挂着那个窗口）。改走 [A.3 后台常驻](#a3-后台常驻windows)，用 `-Action start` 或配置登录自启。
+- **`status` 说没在运行，但管理端设备仍显示在线**：典型的孤儿 agent —— 父 supervisor 被强杀（任务管理器结束进程、直接关窗口），子进程还活着。用 `-Action stop` 清理进程树后重新 `start`。
+- **配了自启但重启后没起来**：`-Action status` 会列出已配置的自启项。免管理员的看 `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\clawmessenger.vbs` 是否还在；计划任务的用 `Get-ScheduledTask -TaskName 'ClawMessenger Agents'` 查状态。
+- **子进程数比管理端勾选的 agent 少**：`-Action status` 会列出当前活着的 agent 子进程及各自命令行。绑定了但本机 PATH 里没有对应 CLI 的 agent 会被跳过，日志里有 `agent CLI <name> not found on PATH; skipping`。
+- **日志里出现 `reg.exe` 被安全策略/黑名单拦截**：无害噪音（exe 每次启动用它自查用户 PATH），不影响运行。
 - 其余已知事项见 smoke.md「已知缺口」一节。
