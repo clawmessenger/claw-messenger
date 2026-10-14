@@ -7,6 +7,16 @@ import { XiachatApi } from "./api.js";
 import { discoverAgents } from "./agents.js";
 import { DEFAULT_SERVER_URL, machineId, defaultProcessedUidsPath } from "./config.js";
 import { ensureOpencodeInstalled, OPS_AGENT_NAME, OPS_TURN_TIMEOUT_MS, setupOpsWorkdir } from "./ops.js";
+import {
+  clearSupervisorState,
+  createDaemon,
+  defaultDaemonPaths,
+  formatDaemonStatus,
+  supervisorSpawnArgv,
+  writeSupervisorState,
+  type Daemon,
+  type DaemonPaths,
+} from "./daemon.js";
 
 // Deterministic per (ticket, machine): a retried claim after a lost
 // response reuses the same key, so the server deduplicates instead of
@@ -35,6 +45,11 @@ export interface BuildProgramOpts {
   // it short because the interval is registered before they install fake
   // timers, so advancing the fake clock would never fire it.
   supervisorControlPollMs?: number;
+  // Injectable for tests; defaults to a real cross-platform supervisor daemon.
+  daemon?: Daemon;
+  // Injectable for tests; the state/pid files the supervisor writes about itself
+  // (default: ~/.clawmessenger). Must agree with whatever `daemon` above uses.
+  daemonPaths?: DaemonPaths;
 }
 
 export function buildProgram(opts: BuildProgramOpts): Command {
@@ -46,6 +61,9 @@ export function buildProgram(opts: BuildProgramOpts): Command {
     // Tests parse this program in-process; commander would otherwise
     // process.exit on missing options and kill the vitest runner.
     .exitOverride();
+
+  const daemon = opts.daemon ?? createDaemon();
+  const daemonPaths = opts.daemonPaths ?? defaultDaemonPaths();
 
   program
     .command("register")
@@ -195,6 +213,23 @@ export function buildProgram(opts: BuildProgramOpts): Command {
           ...(opts.supervisorControlPollMs !== undefined
             ? { controlPollIntervalMs: opts.supervisorControlPollMs }
             : {}),
+          // 不管是 `clawmessenger start` 拉起的，还是用户在终端里直接 `run`，
+          // supervisor 都把自己的运行状态写下来 —— 于是 status / stop 都能看到它，
+          // 顺带实现「前台跑着时 start 会拒绝，避免两份 supervisor 抢同一批 agent」。
+          onStarted: (agents) => {
+            writeSupervisorState(
+              {
+                pid: process.pid,
+                startedAt: Date.now(),
+                execPath: process.execPath,
+                cwd: process.cwd(),
+                ...(cmdOpts.model ? { model: cmdOpts.model } : {}),
+                agents,
+              },
+              daemonPaths,
+            );
+          },
+          onStopped: () => clearSupervisorState(daemonPaths),
         });
         return;
       }
@@ -254,14 +289,108 @@ export function buildProgram(opts: BuildProgramOpts): Command {
 
   program
     .command("status")
-    .description("Show stored identity")
+    .description("Show stored identity and whether the supervisor is running in the background")
     .action(async () => {
       const creds = opts.keystore.load();
       if (!creds) {
         opts.stdout.write("not registered\n");
-        return;
+      } else {
+        opts.stdout.write(`node: ${creds.nodeId}\nserver: ${creds.serverUrl}\ntoken: ${creds.token ? "present" : "missing"}\n`);
       }
-      opts.stdout.write(`node: ${creds.nodeId}\nserver: ${creds.serverUrl}\ntoken: ${creds.token ? "present" : "missing"}\n`);
+      opts.stdout.write(formatDaemonStatus(daemon.status(), daemonPaths));
+    });
+
+  // --- 后台常驻 -------------------------------------------------------------
+  // `clawmessenger run` 只有前台模式，关掉终端整台设备的智能体就全下线。这几个
+  // 动作把 supervisor 托管起来，命令名与随 Release 分发的守护脚本一一对应，但
+  // 直接编进 exe —— 不用再去下载 / chmod 任何脚本。
+  const daemonOpts = (cmd: Command): Command =>
+    cmd
+      .option("--model <model>", "model override passed through to the agent CLI")
+      .option("--workdir <dir>", "working directory for agent turns (default: your home directory)");
+
+  daemonOpts(
+    program
+      .command("start")
+      .description("Start the supervisor in the background — every bound agent stays online after the terminal closes"),
+  ).action(async (cmdOpts: { model?: string; workdir?: string }) => {
+    await daemon.start(cmdOpts);
+  });
+
+  program
+    .command("stop")
+    .description("Stop the background supervisor and the agent processes it started")
+    .action(async () => {
+      await daemon.stop();
+    });
+
+  daemonOpts(
+    program.command("restart").description("Stop the background supervisor, then start it again"),
+  ).action(async (cmdOpts: { model?: string; workdir?: string }) => {
+    await daemon.restart(cmdOpts);
+  });
+
+  program
+    .command("logs")
+    .description("Show the tail of the background supervisor's log")
+    .option("--lines <n>", "how many lines to show", "40")
+    .action((cmdOpts: { lines: string }) => {
+      const n = Number.parseInt(cmdOpts.lines, 10);
+      daemon.logs({ lines: Number.isFinite(n) && n > 0 ? n : 40 });
+    });
+
+  daemonOpts(
+    program
+      .command("install-service")
+      .description("Install autostart so the supervisor comes back after a reboot (systemd / launchd / Windows logon)"),
+  ).action(async (cmdOpts: { model?: string; workdir?: string }) => {
+    await daemon.installService(cmdOpts);
+  });
+
+  program
+    .command("uninstall")
+    .description("Remove the autostart entry (leaves the binary and the logs alone)")
+    .action(async () => {
+      await daemon.uninstall();
+    });
+
+  // 显式命名空间，等价于上面那些顶层命令，给「不想让 6 个动词混在命令列表里」的人用。
+  program
+    .command("daemon <action>")
+    .description("Background-supervisor actions: start | stop | restart | status | logs | install-service | uninstall")
+    .option("--model <model>", "model override passed through to the agent CLI")
+    .option("--workdir <dir>", "working directory for agent turns (default: your home directory)")
+    .option("--lines <n>", "lines to show for `daemon logs`", "40")
+    .action(async (action: string, cmdOpts: { model?: string; workdir?: string; lines: string }) => {
+      // --lines 只在 logs 有意义，别把它混进 start / restart / install-service 的选项里。
+      const passthrough = { model: cmdOpts.model, workdir: cmdOpts.workdir };
+      switch (action) {
+        case "start":
+          await daemon.start(passthrough);
+          return;
+        case "stop":
+          await daemon.stop();
+          return;
+        case "restart":
+          await daemon.restart(passthrough);
+          return;
+        case "status":
+          opts.stdout.write(formatDaemonStatus(daemon.status(), daemonPaths));
+          return;
+        case "logs": {
+          const n = Number.parseInt(cmdOpts.lines, 10);
+          daemon.logs({ lines: Number.isFinite(n) && n > 0 ? n : 40 });
+          return;
+        }
+        case "install-service":
+          await daemon.installService(passthrough);
+          return;
+        case "uninstall":
+          await daemon.uninstall();
+          return;
+        default:
+          throw new Error(`unknown daemon action '${action}'; try: start | stop | restart | status | logs | install-service | uninstall`);
+      }
     });
 
   return program;
@@ -279,6 +408,12 @@ interface RunSupervisorOpts {
   model?: string;
   /** Poll cadence override, for tests. */
   controlPollIntervalMs?: number;
+  /** Called once the agent set is known, so the caller can publish the
+   * supervisor's runtime state for `clawmessenger status`. Best-effort. */
+  onStarted?: (agents: string[]) => void;
+  /** Called when the supervisor is shutting down, so the caller can clear that
+   * state. Must fire exactly once. */
+  onStopped?: () => void;
 }
 
 // --- supervised child restarts --------------------------------------------
@@ -353,8 +488,7 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
   const found = await discoverAgents({});
   // SEA single-file exe: re-invoke the exe itself. Node script mode: re-run
   // the bundle entry so argv keeps the [execPath, script, ...] shape.
-  const script = process.argv[1];
-  const isSea = !script || !script.endsWith(".js");
+  const spawnArgvPrefix = supervisorSpawnArgv();
   const spawnChild = opts.spawnChild ?? spawn;
   const managed = new Map<string, SupervisedAgent>();
   // Set by shutdown so a SIGTERM'd child is never resurrected by its own exit
@@ -368,7 +502,7 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
     if (stopping) return;
     const child = spawnChild(
       process.execPath,
-      isSea ? entry.runArgs : [script as string, ...entry.runArgs],
+      [...spawnArgvPrefix, ...entry.runArgs],
       { env: { ...process.env, CLAWMESSENGER_AGENT_CREDS: JSON.stringify(entry.childCreds) } },
     );
     entry.child = child;
@@ -504,6 +638,14 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
   }
   const runningCount = [...managed.values()].filter((entry) => entry.desired === "running").length;
   opts.stdout.write(`clawmessenger supervisor: ${runningCount} of ${managed.size} agent(s) online\n`);
+  // Publish the runtime state now that the agent set is final: this is what
+  // `clawmessenger status` reads back, so it must happen after the map is built
+  // (and not before, or it would report zero agents).
+  try {
+    supervisor.onStarted?.([...managed.values()].map((entry) => entry.agent));
+  } catch (err) {
+    console.error("supervisor: could not record runtime state:", err instanceof Error ? err.message : String(err));
+  }
 
   const controlPollMs = supervisor.controlPollIntervalMs ?? SUPERVISOR_CONTROL_POLL_MS;
   const controlTimer = setInterval(() => {
@@ -514,6 +656,7 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
   if (typeof controlTimer.unref === "function") controlTimer.unref();
 
   const shutdown = (): void => {
+    const first = !stopping;
     stopping = true;
     clearInterval(controlTimer);
     for (const entry of managed.values()) {
@@ -523,6 +666,14 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
       }
       entry.state = "stopped";
       entry.child?.kill("SIGTERM");
+    }
+    // 只通知一次：SIGINT 之后往往还会来一个 SIGTERM。
+    if (first) {
+      try {
+        supervisor.onStopped?.();
+      } catch {
+        // 清不掉状态文件不影响退出。
+      }
     }
     // Returning instead of looping forever lets the process exit once the
     // children are gone; `process.on` below replaces Node's default SIGTERM

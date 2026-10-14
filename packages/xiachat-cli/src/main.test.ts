@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { buildProgram } from "./main.js";
 import { Keystore } from "./keystore.js";
 import type { XiachatApi } from "./api.js";
+import { defaultDaemonPaths, type Daemon } from "./daemon.js";
 
 const dirs: string[] = [];
 function tempKeystore(): Keystore {
@@ -194,6 +195,23 @@ describe("clawmessenger pair", () => {
   });
 });
 
+// 后台常驻命令面：这些动作以前只能靠随 Release 分发的守护脚本提供
+// （clawmessenger-daemon.sh / .cmd），现在直接编进 CLI。
+function fakeDaemon(overrides: Partial<Daemon> = {}): { daemon: Daemon; calls: string[] } {
+  const calls: string[] = [];
+  const daemon: Daemon = {
+    start: async (o) => { calls.push(`start:${JSON.stringify(o ?? {})}`); },
+    stop: async () => { calls.push("stop"); },
+    restart: async (o) => { calls.push(`restart:${JSON.stringify(o ?? {})}`); },
+    status: () => ({ platform: "linux", running: false, stale: false, agents: [], logs: [], serviceName: "clawmessenger" }),
+    logs: (o) => { calls.push(`logs:${o?.lines ?? 40}`); },
+    installService: async (o) => { calls.push(`install-service:${JSON.stringify(o ?? {})}`); },
+    uninstall: async () => { calls.push("uninstall"); },
+    ...overrides,
+  };
+  return { daemon, calls };
+}
+
 describe("clawmessenger status", () => {
   it("prints stored identity", async () => {
     const keystore = tempKeystore();
@@ -203,8 +221,126 @@ describe("clawmessenger status", () => {
       keystore,
       apiFactory: () => { throw new Error("should not be called"); },
       stdout: { write: (s: string) => { lines.push(s); return true; } } as unknown as NodeJS.WriteStream,
+      daemon: fakeDaemon().daemon,
+      daemonPaths: defaultDaemonPaths(join(tmpdir(), "clawmessenger-daemon-unused")),
     });
     await program.parseAsync(["node", "clawmessenger", "status"]);
     expect(lines.join("")).toContain("node_9");
+  });
+
+  it("appends whether the supervisor is running in the background", async () => {
+    const keystore = tempKeystore();
+    keystore.save({ nodeId: "node_9", token: "t", serverUrl: "http://srv" });
+    const lines: string[] = [];
+    const program = buildProgram({
+      keystore,
+      apiFactory: () => { throw new Error("should not be called"); },
+      stdout: { write: (s: string) => { lines.push(s); return true; } } as unknown as NodeJS.WriteStream,
+      daemon: fakeDaemon({
+        status: () => ({
+          platform: "linux",
+          running: true,
+          stale: false,
+          pid: 4242,
+          uptimeMs: 65_000,
+          agents: ["claude", "codex"],
+          logs: ["/home/u/.clawmessenger/logs/supervisor.log"],
+          serviceName: "clawmessenger",
+        }),
+      }).daemon,
+      daemonPaths: defaultDaemonPaths(join(tmpdir(), "clawmessenger-daemon-unused")),
+    });
+    await program.parseAsync(["node", "clawmessenger", "status"]);
+    const text = lines.join("");
+    expect(text).toContain("node_9");
+    expect(text).toContain("daemon : running in the background (PID 4242, up 1m05s)");
+    expect(text).toContain("2 (claude, codex)");
+    expect(text).toContain("supervisor.log");
+  });
+});
+
+describe("clawmessenger background commands", () => {
+  it("start passes --model and --workdir through", async () => {
+    const { daemon, calls } = fakeDaemon();
+    const program = buildProgram({
+      keystore: tempKeystore(),
+      apiFactory: () => { throw new Error("should not be called"); },
+      stdout: process.stdout,
+      daemon,
+    });
+    await program.parseAsync(["node", "clawmessenger", "start", "--model", "gpt-5", "--workdir", "/srv/work"]);
+    expect(calls).toEqual(['start:{"model":"gpt-5","workdir":"/srv/work"}']);
+  });
+
+  it("stop and restart reach the daemon", async () => {
+    const { daemon, calls } = fakeDaemon();
+    const program = buildProgram({
+      keystore: tempKeystore(),
+      apiFactory: () => { throw new Error("should not be called"); },
+      stdout: process.stdout,
+      daemon,
+    });
+    await program.parseAsync(["node", "clawmessenger", "stop"]);
+    await program.parseAsync(["node", "clawmessenger", "restart"]);
+    expect(calls).toEqual(["stop", "restart:{}"]);
+  });
+
+  it("logs honours --lines and defaults to 40", async () => {
+    const { daemon, calls } = fakeDaemon();
+    const program = buildProgram({
+      keystore: tempKeystore(),
+      apiFactory: () => { throw new Error("should not be called"); },
+      stdout: process.stdout,
+      daemon,
+    });
+    await program.parseAsync(["node", "clawmessenger", "logs", "--lines", "5"]);
+    await program.parseAsync(["node", "clawmessenger", "logs"]);
+    await program.parseAsync(["node", "clawmessenger", "logs", "--lines", "not-a-number"]);
+    expect(calls).toEqual(["logs:5", "logs:40", "logs:40"]);
+  });
+
+  it("install-service and uninstall reach the daemon", async () => {
+    const { daemon, calls } = fakeDaemon();
+    const program = buildProgram({
+      keystore: tempKeystore(),
+      apiFactory: () => { throw new Error("should not be called"); },
+      stdout: process.stdout,
+      daemon,
+    });
+    await program.parseAsync(["node", "clawmessenger", "install-service"]);
+    await program.parseAsync(["node", "clawmessenger", "uninstall"]);
+    expect(calls).toEqual(["install-service:{}", "uninstall"]);
+  });
+
+  it("the `daemon` namespace dispatches every action", async () => {
+    const { daemon, calls } = fakeDaemon();
+    const lines: string[] = [];
+    const program = buildProgram({
+      keystore: tempKeystore(),
+      apiFactory: () => { throw new Error("should not be called"); },
+      stdout: { write: (s: string) => { lines.push(s); return true; } } as unknown as NodeJS.WriteStream,
+      daemon,
+      daemonPaths: defaultDaemonPaths(join(tmpdir(), "clawmessenger-daemon-unused")),
+    });
+    for (const action of ["start", "stop", "restart", "logs", "install-service", "uninstall"]) {
+      await program.parseAsync(["node", "clawmessenger", "daemon", action]);
+    }
+    await program.parseAsync(["node", "clawmessenger", "daemon", "status"]);
+    expect(calls).toEqual(["start:{}", "stop", "restart:{}", "logs:40", "install-service:{}", "uninstall"]);
+    expect(lines.join("")).toContain("not running in the background");
+  });
+
+  it("rejects an unknown daemon action instead of silently doing nothing", async () => {
+    const { daemon, calls } = fakeDaemon();
+    const program = buildProgram({
+      keystore: tempKeystore(),
+      apiFactory: () => { throw new Error("should not be called"); },
+      stdout: process.stdout,
+      daemon,
+    });
+    await expect(program.parseAsync(["node", "clawmessenger", "daemon", "explode"])).rejects.toThrow(
+      /unknown daemon action 'explode'/,
+    );
+    expect(calls).toEqual([]);
   });
 });
