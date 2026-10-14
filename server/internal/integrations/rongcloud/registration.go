@@ -76,17 +76,22 @@ func newRongCloudFactory(deps ChannelDeps) channel.Factory {
 			// 翻到 [2,3] 的唯一开关；workflowAvailable 让创建编排用同一个开关判定
 			// user_confirmed 是否可跑 —— 二者必须同源，否则会出现「能力已宣告但
 			// 创建被拒」或反过来「创建放行但前端不敢用」的错位。
-			discussionRuntime.interactiveEnabled = true
-			creation.workflowAvailable = discussionRuntime.roundtablePolicyAvailable
-		}
-		return &rongcloudChannel{
-			cfg:           cfg,
-			creds:         creds,
-			client:        client,
-			systemHandler: newSystemHandler(client, creds.SystemNodeID, logger, deps.Queries, deps.Registry, deps.NodeRequests, deps.GroupMirror, discussionRuntime),
-			registrar:     deps.Registrar,
-			handler:       cfg.Handler,
-			logger:        logger,
-		}, nil
+		discussionRuntime.interactiveEnabled = true
+		creation.workflowAvailable = discussionRuntime.roundtablePolicyAvailable
 	}
+	// 讨论组闲聊的「按序发言」中继（服务端仲裁，替代客户端扇出）。
+	var relayHub *chatroomRelayHub
+	if discussionRuntime != nil {
+		relayHub = newChatroomRelayHub(discussionRuntime)
+	}
+	return &rongcloudChannel{
+		cfg:           cfg,
+		creds:         creds,
+		client:        client,
+		systemHandler: newSystemHandler(client, creds.SystemNodeID, logger, deps.Queries, deps.Registry, deps.NodeRequests, deps.GroupMirror, discussionRuntime, relayHub),
+		registrar:     deps.Registrar,
+		handler:       cfg.Handler,
+		logger:        logger,
+	}, nil
+}
 }

@@ -20,9 +20,11 @@ type systemHandler struct {
 	groupMirror  *GroupMirror
 	// discussionRuntime 承载 service=discussion 的生命周期 action（P4）。
 	discussionRuntime *discussionRuntime
+	// relayHub 仲裁讨论组闲聊的按序发言（chatroom_relay.go）。
+	relayHub *chatroomRelayHub
 }
 
-func newSystemHandler(client *rongcloudAPIClient, nodeID string, logger *slog.Logger, queries *db.Queries, registry *DiscussionRegistry, nodeRequests *NodeRequestBroker, groupMirror *GroupMirror, discussionRuntime *discussionRuntime) *systemHandler {
+func newSystemHandler(client *rongcloudAPIClient, nodeID string, logger *slog.Logger, queries *db.Queries, registry *DiscussionRegistry, nodeRequests *NodeRequestBroker, groupMirror *GroupMirror, discussionRuntime *discussionRuntime, relayHub *chatroomRelayHub) *systemHandler {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -35,6 +37,7 @@ func newSystemHandler(client *rongcloudAPIClient, nodeID string, logger *slog.Lo
 		nodeRequests:      nodeRequests,
 		groupMirror:       groupMirror,
 		discussionRuntime: discussionRuntime,
+		relayHub:          relayHub,
 	}
 }
 
@@ -432,12 +435,27 @@ func (h *systemHandler) handleDiscussionCommand(ctx context.Context, msg Normali
 		"start": true, "getActive": true, "continue": true, "finish": true,
 		"cancel": true, "interject": true, "retry": true, "stop": true,
 		"recommendRoles": true, "createRoundtable": true, "resumeRoundtable": true,
+		"relayMessage": true,
 	}
 	if !known[cmd.Action] {
 		return h.replyErr(ctx, msg, cmd, 404, unknownServiceOrActionMessage(cmd))
 	}
 	if h.discussionRuntime == nil {
 		return h.replyErr(ctx, msg, cmd, 503, "discussion runtime not available")
+	}
+
+	// relayMessage 不属于任何一种讨论状态机：它仲裁讨论组闲聊的按序发言，
+	// 直接走 relayHub，不碰 v3 引擎也不碰 legacy 协调器。
+	if cmd.Action == "relayMessage" {
+		if h.relayHub == nil {
+			return h.replyErr(ctx, msg, cmd, 503, "discussion runtime not available")
+		}
+		chatroomID := getStringAny(cmd.Params, "chatroom_id", "chatroomId")
+		text := getString(cmd.Params, "content")
+		if chatroomID == "" || text == "" {
+			return h.replyErr(ctx, msg, cmd, 400, "参数不完整")
+		}
+		return h.replyCommandResult(ctx, msg, cmd, h.relayHub.StartRelay(ctx, chatroomID, msg.FromUserID, text))
 	}
 
 	actor, err := h.discussionRuntime.resolveActor(ctx, msg.FromUserID)

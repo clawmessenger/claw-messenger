@@ -57,6 +57,11 @@ func (h *systemHandler) handleCommandResult(ctx context.Context, msg NormalizedM
 			content, kind == "error", errMsg) {
 			return
 		}
+		// 讨论组闲聊中继：relay_ 前缀的 your_turn 回包在这里消化，不进旧协调器。
+		if h.relayHub != nil && h.relayHub.AcceptResponse(ctx, msg.FromUserID, result.RequestID,
+			content, kind == "error", errMsg) {
+			return
+		}
 	}
 
 	resp := NodeResponse{
