@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
+	"github.com/google/uuid"
 )
 
 // 圆桌创建/推荐 action（P5）。挂在 discussionRuntime 上，由 system_handler 的
@@ -312,4 +314,119 @@ func configVersionInt(v string) int {
 		n = n*10 + int(c-'0')
 	}
 	return n
+}
+
+// actionRestartRoundtable 在原讨论组直接重开新讨论：不换房、不重新跑 LLM 角色推荐，
+// 以聊天室成员表为权威重建角色板。前端语义：讨论终态（completed/cancelled/failed）
+// 或死讨论（legacy_capped 停在 planning，红线：Go 侧无执行引擎）后，用户直接发言
+// 即以发言内容为新 topic 重开。
+func (rt *discussionRuntime) actionRestartRoundtable(ctx context.Context, cmd CommandContent, actor discussionActor) commandResult {
+	if rt.roundtable == nil {
+		return errResult(503, "discussion runtime not available")
+	}
+	chatroomID := paramTrim(cmd, "chatroom_id", "chatroomId")
+	topic := strings.TrimSpace(getString(cmd.Params, "topic"))
+	if chatroomID == "" || topic == "" {
+		return errResult(400, "INVALID_ROUNDTABLE_REQUEST")
+	}
+	s := rt.roundtable
+	room, err := s.queries.GetRongCloudChatroomViewByRongCloudID(ctx, chatroomID)
+	if err != nil {
+		return errResult(404, "ROUNDTABLE_CREATE_REQUEST_NOT_FOUND")
+	}
+	// 只有房主/讨论创建者可重开。
+	if !room.OwnerRcUserID.Valid || room.OwnerRcUserID.String != actor.RcID {
+		return errResult(403, "ROUNDTABLE_CREATE_REQUEST_NOT_FOUND")
+	}
+	// 并发保护：v3（user_confirmed）讨论真在跑时不许覆盖。但 legacy_capped 的
+	// "活跃"行是死讨论（红线：Go 侧没有执行引擎，建出来就永远停在 planning），
+	// 恰恰是重开的目标场景，必须放行。
+	if active, err := s.queries.GetActiveRongCloudDiscussionByChatroom(ctx, chatroomID); err == nil && active.RoundPolicy == RoundPolicyUserConfirmed {
+		return errResult(409, "DISCUSSION_ALREADY_ACTIVE")
+	}
+
+	// 以成员表为权威重建角色板（用户可能编辑过角色，比旧 snapshot 更可信）。
+	rows, err := s.queries.ListRongCloudChatroomMembersWithNode(ctx, room.ID)
+	if err != nil {
+		return errResult(500, "CREATE_ROUNDTABLE_RECOVERABLE")
+	}
+	host, hostErr := s.resolveHost(ctx)
+	if hostErr != "" {
+		return errResult(503, hostErr)
+	}
+	roles := map[string]interface{}{}
+	order := 0
+	for _, row := range rows {
+		if row.MemberType != "ai" || !row.Enabled || !row.NodeRcUserID.Valid {
+			continue
+		}
+		if row.BusinessNodeID.Valid && row.BusinessNodeID.String == host.nodeID {
+			continue // 主持节点不是角色
+		}
+		roleName := row.Nickname
+		if row.RoleName.Valid && row.RoleName.String != "" {
+			roleName = row.RoleName.String
+		}
+		instructions := ""
+		if row.RoleInstructions.Valid {
+			instructions = row.RoleInstructions.String
+		}
+		roles[row.NodeRcUserID.String] = map[string]interface{}{
+			"memberId":         row.NodeRcUserID.String,
+			"nodeId":           row.BusinessNodeID.String,
+			"nickname":         roleName,
+			"portraitUri":      "",
+			"roleName":         roleName,
+			"roleInstructions": instructions,
+			"capabilities":     roundtableRequiredRoleCaps,
+			"isHost":           false,
+			"speakingOrder":    order,
+		}
+		order++
+	}
+	if len(roles) == 0 {
+		return errResult(400, "ROLE_RECOMMENDATION_INVALID")
+	}
+	roles[host.aiUserID] = map[string]interface{}{
+		"memberId":         host.aiUserID,
+		"nodeId":           host.nodeID,
+		"nickname":         host.displayName,
+		"portraitUri":      host.avatar,
+		"roleName":         roundtableHostRoleName,
+		"roleInstructions": "",
+		"capabilities":     roundtableRequiredHostCaps,
+		"isHost":           true,
+	}
+	roleJSON, _ := json.Marshal(roles)
+	hostSnapshot, _ := json.Marshal(map[string]interface{}{
+		"node_id":                host.nodeID,
+		"ai_user_id":             host.aiUserID,
+		"display_name":           host.displayName,
+		"avatar":                 host.avatar,
+		"discussion_host_prompt": host.hostPrompt,
+		"config_version":         host.configVersion,
+	})
+	// 新讨论 ID：不能复用确定性派生（同房间会撞旧讨论的 ID），用随机 UUID。
+	discussionID := uuid.NewString()
+	_, err = s.queries.CreateRongCloudDiscussion(ctx, db.CreateRongCloudDiscussionParams{
+		DiscussionID:       discussionID,
+		ChatroomID:         chatroomID,
+		WorkspaceID:        room.WorkspaceID,
+		CreatedBy:          actor.RcID,
+		Topic:              topic,
+		Mode:               "roundtable",
+		Status:             "planning",
+		RoleSnapshot:       roleJSON,
+		HostConfigSnapshot: hostSnapshot,
+		RoundPolicy:        RoundPolicyUserConfirmed,
+	})
+	if err != nil {
+		return errResult(500, "CREATE_ROUNDTABLE_RECOVERABLE")
+	}
+	rt.beginInteractiveSafe(ctx, map[string]interface{}{"discussion_id": discussionID})
+	return okResult(map[string]interface{}{
+		"chatroom_id":   chatroomID,
+		"discussion_id": discussionID,
+		"status":        "planning",
+	})
 }

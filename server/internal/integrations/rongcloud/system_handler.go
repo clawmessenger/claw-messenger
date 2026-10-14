@@ -434,7 +434,7 @@ func (h *systemHandler) handleDiscussionCommand(ctx context.Context, msg Normali
 	known := map[string]bool{
 		"start": true, "getActive": true, "continue": true, "finish": true,
 		"cancel": true, "interject": true, "retry": true, "stop": true,
-		"recommendRoles": true, "createRoundtable": true, "resumeRoundtable": true,
+		"recommendRoles": true, "createRoundtable": true, "resumeRoundtable": true, "restartRoundtable": true,
 		"relayMessage": true, "relayGroupMessage": true,
 	}
 	if !known[cmd.Action] {
@@ -520,6 +520,8 @@ func (h *systemHandler) handleDiscussionCommand(ctx context.Context, msg Normali
 		result = h.discussionRuntime.actionCreateRoundtable(ctx, cmd, actor)
 	case "resumeRoundtable":
 		result = h.discussionRuntime.actionResumeRoundtable(ctx, cmd, actor)
+	case "restartRoundtable":
+		result = h.discussionRuntime.actionRestartRoundtable(ctx, cmd, actor)
 	default:
 		return h.replyErr(ctx, msg, cmd, 404, unknownServiceOrActionMessage(cmd))
 	}
