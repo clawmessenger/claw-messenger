@@ -31,6 +31,24 @@ describe("MessageDispatcher single chat", () => {
     }
   });
 
+  it("observes RC:TxtMsg with unknown/missing conversationType (fail-closed: never answer privately)", async () => {
+    for (const conversationType of [0, undefined, "3"] as Array<number | undefined | string>) {
+      const deps = makeDeps();
+      const dispatcher = new MessageDispatcher({ send: deps.send });
+      await dispatcher.handle({
+        objectName: "RC:TxtMsg",
+        fromUserId: "user-1",
+        toUserId: "node-a",
+        targetId: "room-1",
+        conversationType: conversationType as number,
+        content: JSON.stringify({ content: "大家好" }),
+      }, { runTurn: async () => {
+        throw new Error("unknown conversation type must not run the agent");
+      } });
+      expect(deps.sent.length).toBe(0);
+    }
+  });
+
   it("replies to private RC:TxtMsg with conversationType=1", async () => {
     const deps = makeDeps();
     const dispatcher = new MessageDispatcher({ send: deps.send });
@@ -906,3 +924,158 @@ describe("MessageDispatcher discussion recommend_roles", () => {
     expect(deps.sent).toHaveLength(0);
   });
 });
+
+// ---- chat_stream 流式输出（所有会话形态共用 runStreamedTurn）----
+
+describe("MessageDispatcher chat_stream streaming", () => {
+  interface SentItem { to: string; type: string; content: string }
+
+  function buildDeps() {
+    const sent: SentItem[] = []
+    const streams: Array<{ conversationType: number; conversationId: string; content: string }> = []
+    const deps = {
+      sent,
+      streams,
+      send: async (to: string, type: string, content: string) => { sent.push({ to, type, content }) },
+      sendStream: async (conversationType: 1 | 3 | 4, conversationId: string, _objectName: string, content: string) => {
+        streams.push({ conversationType, conversationId, content })
+      },
+      selfUserId: "node_self",
+    }
+    return { deps, sent, streams }
+  }
+
+  function parseFrame(raw: string) {
+    return JSON.parse(raw) as Record<string, unknown>
+  }
+
+  it("single chat streams processing -> streaming -> completed then card fallback", async () => {
+    const { deps, streams, sent } = buildDeps()
+    const dispatcher = new MessageDispatcher(deps)
+    const turns = {
+      runTurn: async () => { throw new Error("should use streamed variant") },
+      runTurnStreamed: async (_p: string, _m: undefined, onDelta: (d: string) => void) => {
+        onDelta("你好")
+        onDelta("，世界")
+        return "你好，世界"
+      },
+    }
+    await dispatcher.handle({
+      objectName: "RC:TxtMsg", fromUserId: "user_a", toUserId: "", targetId: "node_self",
+      conversationType: 1, content: JSON.stringify({ content: "hi" }),
+    }, turns)
+
+    // 帧序列：processing(0) → streaming ≥1 → completed 终帧
+    const frames = streams.map((s) => parseFrame(s.content))
+    expect(frames[0].status).toBe("processing")
+    expect(frames[0].seq).toBe(0)
+    expect(frames[0].text).toBe("")
+    expect(frames[0].node_id).toBe("node_self")
+    expect(frames[0].conversation_type).toBe(1)
+    expect(frames[0].conversation_id).toBe("user_a")
+    expect(frames.at(-1)!.status).toBe("completed")
+    expect(frames.at(-1)!.text).toContain("你好，世界")
+    // seq 单调不减
+    for (let i = 1; i < frames.length; i += 1) {
+      expect(Number(frames[i].seq)).toBeGreaterThanOrEqual(Number(frames[i - 1].seq))
+    }
+    // 会话路由正确（私聊帧发给对端）
+    expect(streams.every((s) => s.conversationType === 1 && s.conversationId === "user_a")).toBe(true)
+    // 完成后仍有兜底回复（deliverAgentReply 的文本/卡片路径）
+    expect(sent.length).toBeGreaterThanOrEqual(1)
+  })
+
+  it("relay your_turn streams into the chatroom conversation", async () => {
+    const { deps, streams, sent } = buildDeps()
+    const dispatcher = new MessageDispatcher(deps)
+    const turns = {
+      runTurn: async () => { throw new Error("should use streamed variant") },
+      runTurnStreamed: async () => "正式回答",
+    }
+    await dispatcher.handle({
+      objectName: "command", fromUserId: "host_node", toUserId: "", targetId: "node_self",
+      conversationType: 1,
+      content: JSON.stringify({
+        request_id: "turn_1_1_x", service: "discussion", action: "your_turn",
+        params: {
+          round: 1, speaking_order: 1, role_name: "顾问",
+          chatroom_id: "room_rc", conversation_type: 4, requester_id: "user_b",
+        },
+      }),
+    }, turns)
+
+    const frames = streams.map((s) => parseFrame(s.content))
+    expect(frames.length).toBeGreaterThanOrEqual(2)
+    expect(frames[0].status).toBe("processing")
+    expect(frames.at(-1)!.status).toBe("completed")
+    // 帧进聊天室会话（type 4, id room_rc），requester_id 来自 params
+    expect(streams.every((s) => s.conversationType === 4 && s.conversationId === "room_rc")).toBe(true)
+    expect(frames[0].requester_id).toBe("user_b")
+    expect(frames[0].role_name ?? true).toBeTruthy()
+    // 中继推进依赖的 command_result 兜底仍在
+    const result = sent.find((s) => s.type === "command")
+    expect(result).toBeDefined()
+    expect(JSON.parse(result!.content).payload.kind).toBe("text")
+  })
+
+  it("chat_stop cancels the active stream and acks accepted", async () => {
+    const { deps, streams, sent } = buildDeps()
+    const dispatcher = new MessageDispatcher(deps)
+    let rejectTurn!: (e: Error) => void
+    const turnDone = new Promise<string>((_resolve, reject) => { rejectTurn = reject })
+    const handleDone = dispatcher.handle({
+      objectName: "RC:TxtMsg", fromUserId: "user_a", toUserId: "", targetId: "node_self",
+      conversationType: 1, content: JSON.stringify({ content: "hi" }),
+    }, {
+      runTurn: async () => { throw new Error("unused") },
+      // 模拟 runAgentTurn(signal) 的真实行为：abort 时 reject。
+      runTurnStreamed: async (_p: string, _m: undefined, onDelta: (d: string) => void, signal?: AbortSignal) => {
+        onDelta("部分内容")
+        return new Promise<string>((_resolve, reject) => {
+          signal?.addEventListener("abort", () => reject(new Error("agent turn aborted")), { once: true })
+          rejectTurn = reject
+        })
+      },
+    })
+    // 等首帧落地（activeStreams 已注册）
+    await new Promise((r) => setTimeout(r, 30))
+    const streamId = (JSON.parse(streams[0].content) as { stream_id: string }).stream_id
+    await dispatcher.handle({
+      objectName: "chat_stop", fromUserId: "user_a", toUserId: "", targetId: "node_self",
+      conversationType: 1,
+      content: JSON.stringify({
+        msg_type: "chat_stop", protocol_version: 1, request_id: "stop-1",
+        stream_id: streamId, node_id: "node_self",
+        conversation_type: 1, conversation_id: "user_a",
+      }),
+    }, { runTurn: async () => "" })
+    rejectTurn(new Error("agent turn aborted"))
+    await handleDone
+
+    const stopResult = sent.find((s) => s.type === "chat_stop_result")
+    expect(stopResult).toBeDefined()
+    const parsed = JSON.parse(stopResult!.content) as Record<string, unknown>
+    expect(parsed.status).toBe("accepted")
+    expect(parsed.code).toBe("stop_requested")
+    // 取消后不再发 completed 终帧
+    const frames = streams.map((s) => parseFrame(s.content))
+    expect(frames.at(-1)!.status).toBe("cancelled")
+  })
+
+  it("chat_stop for an unknown stream is rejected with no_active_task", async () => {
+    const { deps, sent } = buildDeps()
+    const dispatcher = new MessageDispatcher(deps)
+    await dispatcher.handle({
+      objectName: "chat_stop", fromUserId: "user_a", toUserId: "", targetId: "node_self",
+      conversationType: 1,
+      content: JSON.stringify({
+        msg_type: "chat_stop", protocol_version: 1, request_id: "stop-2",
+        stream_id: "stream-none", node_id: "node_self",
+        conversation_type: 1, conversation_id: "user_a",
+      }),
+    }, { runTurn: async () => "" })
+    const parsed = JSON.parse(sent[0].content) as Record<string, unknown>
+    expect(parsed.status).toBe("rejected")
+    expect(parsed.code).toBe("no_active_task")
+  })
+})

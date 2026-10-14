@@ -137,7 +137,7 @@ func (h *chatroomRelayHub) StartRelay(ctx context.Context, chatroomRCID, request
 	}
 	// HTTP 请求返回后中继要继续跑：换独立 context。
 	bgCtx := context.WithoutCancel(ctx)
-	if !h.Start(bgCtx, chatroomRCID, members, text, topic) {
+	if !h.Start(bgCtx, chatroomRCID, members, text, topic, requesterRCID) {
 		return errRelayResult(409, "上一条消息的回应还在进行中，请稍候")
 	}
 	return commandResult{code: 200, data: map[string]interface{}{
@@ -153,7 +153,7 @@ func errRelayResult(code int, msg string) commandResult {
 
 // Start 为聊天室发起一次按序中继。返回 false 表示该房间已有会话在跑（前端
 // 可以提示「上一条消息的回应还在进行中」）。
-func (h *chatroomRelayHub) Start(ctx context.Context, chatroomRCID string, members []relayMember, userText, topic string) bool {
+func (h *chatroomRelayHub) Start(ctx context.Context, chatroomRCID string, members []relayMember, userText, topic, requesterRCID string) bool {
 	if len(members) == 0 {
 		return false
 	}
@@ -163,10 +163,11 @@ func (h *chatroomRelayHub) Start(ctx context.Context, chatroomRCID string, membe
 		return false
 	}
 	session := &relaySession{
-		chatroomRCID: chatroomRCID,
-		members:      members,
-		userText:     userText,
-		topic:        topic,
+		chatroomRCID:  chatroomRCID,
+		members:       members,
+		userText:      userText,
+		topic:         topic,
+		requesterRCID: requesterRCID,
 	}
 	h.sessions[chatroomRCID] = session
 	h.mu.Unlock()

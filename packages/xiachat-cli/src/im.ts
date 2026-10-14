@@ -1,4 +1,5 @@
 import { decodeCommandContent, encodeCommandResult } from "./protocol.js";
+import { buildChatStreamFrame, parseChatStopRequest, sliceSnapshot, type ChatStreamStatus } from "./chat-stream.js";
 import { buildHtmlCard, extractHtmlFence, htmlRevisePrompt } from "./cards.js";
 import {
   buildModelCatalogResponse,
@@ -44,6 +45,15 @@ export interface InboundIMMessage {
 export interface IMTransport {
   connect(appKey: string, token: string): Promise<void>;
   sendMessage(toUserId: string, objectName: string, content: string): Promise<void>;
+  // Sends into an arbitrary conversation (1 private / 3 group / 4 chatroom).
+  // chat_stream frames for group/chatroom relay turns ride this; private
+  // streams keep using sendMessage (conversationId === peer user id).
+  sendMessageTo?: (
+    conversationType: 1 | 3 | 4,
+    targetId: string,
+    objectName: string,
+    content: string,
+  ) => Promise<void>;
   onMessage(cb: (msg: InboundIMMessage) => void): void;
   disconnect(): Promise<void>;
   // The IM user this transport is connected as, once connected. Needed to
@@ -69,10 +79,31 @@ export interface DispatcherDeps {
   // Echoed back in the response's data.agent so the web can show which runtime
   // it was talking to. Purely informational.
   agentName?: string;
+  // Streams a chat_stream frame into a conversation (1 private / 3 group /
+  // 4 chatroom). The web renders these incrementally (chat-stream.ts there);
+  // when omitted the dispatcher degrades to the old single-shot reply.
+  sendStream?: (
+    conversationType: 1 | 3 | 4,
+    conversationId: string,
+    objectName: string,
+    content: string,
+  ) => Promise<void>;
+  // The RongCloud user id of THIS node (stream frames carry node_id = self).
+  // Falls back to selfUserId when omitted.
+  nodeId?: string;
 }
 
 export interface TurnRunner {
   runTurn: (prompt: string, model?: string) => Promise<string>;
+  // Streaming variant: same contract as runTurn plus per-chunk deltas of the
+  // answer as the agent produces them. Optional: dispatchers fall back to
+  // runTurn when absent (tests / agents without stdout streaming).
+  runTurnStreamed?: (
+    prompt: string,
+    model: string | undefined,
+    onDelta: (delta: string) => void,
+    signal?: AbortSignal,
+  ) => Promise<string>;
 }
 
 // The web's 默认模型 panel aborts after 8s (15s while the node looks offline),
@@ -84,6 +115,11 @@ const STALE_MODEL_CATALOG_REQUEST_MS = 30_000;
 // this can no longer be delivered to anyone waiting — skip it instead of
 // spending an install + a 20s agent spawn on it.
 const STALE_RUNTIME_RECOVERY_REQUEST_MS = 60_000;
+
+// chat_stream 帧的最小发送间隔：融云自定义消息有每秒条数限频（20604
+// SEND_FREQUENCY_TOO_FAST），逐 token 发帧必然触发；快照帧按此间隔节流，
+// 攒下的内容由下一帧或终帧补全（快照语义使丢帧无害）。
+const STREAM_FRAME_INTERVAL_MS = 500;
 
 export class MessageDispatcher {
   // cardId -> latest html for cards this bridge produced, so card_action
@@ -98,6 +134,9 @@ export class MessageDispatcher {
   // Same guard for the admin role-recommendation preview: a replayed request
   // must not spend a whole agent turn again. Bounded: evicts oldest.
   private readonly answeredRoleRecommendRequests = new Set<string>();
+  // streamId -> AbortController for turns in flight, so chat_stop can cancel
+  // the active one. Entries live exactly for the duration of a streamed turn.
+  private readonly activeStreams = new Map<string, AbortController>();
 
   constructor(private readonly deps: DispatcherDeps) {}
 
@@ -113,8 +152,17 @@ export class MessageDispatcher {
       // 「对着房间里所有人说话」——多节点场景下每个成员都会收到，若各跑一轮
       // agent 就是全员抢答。群聊发言权改由服务端按序中继派发（your_turn
       // command），这里只观察不抢答。
-      if (msg.conversationType === 3 || msg.conversationType === 4) {
-        console.log(`im in: observing ${msg.conversationType === 3 ? "group" : "chatroom"} broadcast (relay arbitrates turns)`);
+      //
+      // fail-closed：判定条件是「不是私聊就观察」，而不是「是群/聊天室才观察」。
+      // 0.2.5 及更早的二进制不看 conversationType，任何 RC:TxtMsg 都当私聊提问
+      // 并私发回答，于是群聊/讨论组里的广播被当成私聊问题，回答被私发给提问者
+      // ——房间里的话串进私聊（消息串联）。未知/缺失/异常类型（0、undefined、
+      // 字符串）同样一律按广播处理，宁可漏答也不串会话。
+      if (msg.conversationType !== 1) {
+        const kind = msg.conversationType === 3 ? "group"
+          : msg.conversationType === 4 ? "chatroom"
+          : `unknown(${String(msg.conversationType)})`;
+        console.log(`im in: observing ${kind} broadcast (only private messages are prompts)`);
         return;
       }
       let text = "";
@@ -125,13 +173,26 @@ export class MessageDispatcher {
         return;
       }
       if (!text) return;
-      try {
-        const out = await turns.runTurn(text);
-        await this.deliverAgentReply(msg.fromUserId, out);
-      } catch (err) {
-        // Single-chat failure: do not reply; the user can retry.
-        console.error("agent turn failed:", err instanceof Error ? err.message : err);
-      }
+      // 私聊也走流式：web 端 chat_stream 帧先逐帧渲染，完成后 command_result
+      // / 卡片兜底。sendStream 缺失（测试）时退回整包回复。
+      await this.runStreamedTurn({
+        conversationType: 1,
+        conversationId: msg.fromUserId,
+        requestMessageId: msg.messageUId || `req-${Date.now()}`,
+        requesterId: msg.fromUserId,
+        prompt: text,
+        model: undefined,
+        turns,
+        fallback: (out) => this.deliverAgentReply(msg.fromUserId, out),
+      });
+      return;
+    }
+
+    // chat_stop：web 的「停止生成」。取消本轮活动流（runStreamedTurn 的
+    // AbortController），并按协议回 chat_stop_result。
+    if (msg.objectName === "chat_stop") {
+      const stop = parseChatStopRequest(msg.content);
+      if (stop) await this.handleChatStop(msg, stop.requestId, stop.streamId);
       return;
     }
 
@@ -169,6 +230,7 @@ export class MessageDispatcher {
       const params = (cmd.params ?? {}) as {
         round?: number; speaking_order?: number; role_name?: string; model?: string;
         chatroom_id?: string; role_prompt?: string;
+        conversation_type?: number; requester_id?: string;
       };
       // Address the reply to the discussion chatroom: the server's webhook
       // sets targetId to the private-message receiver, and the coordinator
@@ -187,23 +249,191 @@ export class MessageDispatcher {
         persona ? `\n${persona}` : "",
         persona ? "Stay in character. Do not repeat or summarise these instructions." : "",
       ].filter(Boolean).join("\n");
-      try {
-        const out = await turns.runTurn(prompt, params.model);
-        await this.deps.send(
-          replyTo,
-          "command",
-          encodeCommandResult(cmd.request_id, "text", { content: out }),
-        );
-      } catch (err) {
-        await this.deps.send(
-          replyTo,
-          "command",
-          encodeCommandResult(cmd.request_id, "error", {
-            error: err instanceof Error ? err.message : "agent turn failed",
-          }),
-        );
-      }
+      // 群/聊天室闲聊中继轮次：回答同时以 chat_stream 流帧广播进房间，
+      // 完成帧之后仍回 command_result（中继据此推进下一位发言人）。
+      const hasConvType = params.conversation_type === 3 || params.conversation_type === 4
+        || params.conversation_type === 1;
+      const convType: 1 | 3 | 4 = !hasConvType ? 1
+        : params.conversation_type === 3 ? 3
+        : params.conversation_type === 4 ? 4 : 1;
+      await this.runStreamedTurn({
+        conversationType: convType,
+        conversationId: replyTo,
+        requestMessageId: cmd.request_id,
+        requesterId: typeof params.requester_id === "string" ? params.requester_id : msg.fromUserId,
+        prompt,
+        model: params.model,
+        turns,
+        fallback: async (out) => {
+          await this.deps.send(
+            replyTo,
+            "command",
+            encodeCommandResult(cmd.request_id, "text", { content: out }),
+          );
+        },
+        onError: async (errMsg) => {
+          await this.deps.send(
+            replyTo,
+            "command",
+            encodeCommandResult(cmd.request_id, "error", {
+              error: errMsg,
+            }),
+          );
+        },
+      });
     }
+  }
+
+  // runStreamedTurn 是所有会话形态共用的流式回合执行器：
+  //  1. 先发 status=processing 的 0 号帧（web 立刻出现打字气泡）；
+  //  2. runTurnStreamed 可用时逐 chunk 发 status=streaming 全量快照帧；
+  //  3. 结束发 completed 终帧；异常发 failed 帧；被停止发 cancelled 帧；
+  //  4. 终帧之后仍回调 fallback（command_result / 卡片），保持中继推进与
+  //     旧消费方兼容——旧 web 不解析 chat_stream 也照常工作。
+  // 帧节流：融云自定义消息限频，帧间隔至少 STREAM_FRAME_INTERVAL_MS；
+  // 快照分片单帧上限由 sliceSnapshot 决定。
+  private async runStreamedTurn(opts: {
+    conversationType: 1 | 3 | 4;
+    conversationId: string;
+    requestMessageId: string;
+    requesterId: string;
+    prompt: string;
+    model: string | undefined;
+    turns: TurnRunner;
+    fallback: (out: string) => Promise<void>;
+    onError?: (errMsg: string) => Promise<void>;
+  }): Promise<void> {
+    const ctx = {
+      streamId: `stream-${opts.requestMessageId}-${Math.random().toString(36).slice(2, 8)}`,
+      requestMessageId: opts.requestMessageId,
+      requesterId: opts.requesterId,
+      conversationType: opts.conversationType,
+      conversationId: opts.conversationId,
+    };
+    const frame = (seq: number, status: ChatStreamStatus, text: string, errorCode?: string) =>
+      buildChatStreamFrame({
+        streamId: ctx.streamId,
+        requestMessageId: ctx.requestMessageId,
+        requesterId: ctx.requesterId,
+        nodeId: this.deps.nodeId || this.deps.selfUserId || "",
+        conversationType: ctx.conversationType,
+        conversationId: ctx.conversationId,
+        seq,
+        status,
+        text,
+        ...(errorCode ? { errorCode } : {}),
+      });
+    const emit = async (seq: number, status: ChatStreamStatus, text: string, errorCode?: string) => {
+      const sendStream = this.deps.sendStream;
+      if (!sendStream) return;
+      try {
+        await sendStream(ctx.conversationType, ctx.conversationId, "chat_stream", frame(seq, status, text, errorCode));
+      } catch (err) {
+        // 单帧失败不打断回答：流帧只是 UI 加速，权威内容走 fallback。
+        console.error("stream frame send failed:", err instanceof Error ? err.message : err);
+      }
+    };
+    const canStream = Boolean(this.deps.sendStream) && Boolean(opts.turns.runTurnStreamed);
+    // Active-stream registry keyed by streamId for chat_stop cancellation.
+    const controller = new AbortController();
+    this.activeStreams.set(ctx.streamId, controller);
+    try {
+      if (!canStream) {
+        // Degraded path (tests, or an agent without streamed stdout): the
+        // old single-shot reply is the whole turn — including the old error
+        // semantics (single chat: log only; your_turn: error command_result).
+        try {
+          const out = await opts.turns.runTurn(opts.prompt, opts.model);
+          await opts.fallback(out);
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          if (opts.onError) {
+            await opts.onError(errMsg);
+            return;
+          }
+          // Single-chat failure: do not reply; the user can retry.
+          console.error("agent turn failed:", errMsg);
+        }
+        return;
+      }
+      await emit(0, "processing", "");
+      let seq = 1;
+      let snapshot = "";
+      let lastSent = 0;
+      const sendDelta = async (delta: string) => {
+        if (controller.signal.aborted) return;
+        snapshot += delta;
+        const now = Date.now();
+        // 节流：距上一帧不足间隔时只攒不动，由下个 chunk 或终帧冲刷。
+        if (now - lastSent < STREAM_FRAME_INTERVAL_MS) return;
+        lastSent = now;
+        for (const slice of sliceSnapshot(snapshot)) {
+          await emit(seq, "streaming", slice);
+          seq += 1;
+        }
+      };
+      let finalText = "";
+      try {
+        finalText = await opts.turns.runTurnStreamed!(opts.prompt, opts.model, sendDelta, controller.signal);
+      } catch (err) {
+        if (controller.signal.aborted) {
+          await emit(seq, "cancelled", snapshot);
+          return;
+        }
+        const errMsg = err instanceof Error ? err.message : String(err);
+        await emit(seq, "failed", snapshot, errMsg.slice(0, 120));
+        if (opts.onError) {
+          await opts.onError(errMsg);
+          return;
+        }
+        throw err;
+      }
+      // 已被 chat_stop 中止：不再发任何终帧（cancelled 帧只在 agent 轮
+      // 因 abort 抛错时由 catch 分支发出；这里 turn 已正常返回，沉默即止）。
+      if (controller.signal.aborted) {
+        return;
+      }
+      // 终帧用完整全文（agent 的最终 stdout 可能比 chunk 累积更权威）。
+      const finalSnapshot = finalText || snapshot;
+      for (const slice of sliceSnapshot(finalSnapshot)) {
+        await emit(seq, "completed", slice);
+        seq += 1;
+      }
+      await opts.fallback(finalSnapshot);
+    } finally {
+      this.activeStreams.delete(ctx.streamId);
+    }
+  }
+
+  // chat_stop 处理：取消活动流并回执。
+  private async handleChatStop(msg: InboundIMMessage, requestId: string, streamId: string): Promise<void> {
+    const controller = this.activeStreams.get(streamId);
+    if (!controller) {
+      await this.sendStopResult(msg, requestId, streamId, "rejected", "no_active_task");
+      return;
+    }
+    controller.abort();
+    this.activeStreams.delete(streamId);
+    await this.sendStopResult(msg, requestId, streamId, "accepted", "stop_requested");
+  }
+
+  private async sendStopResult(
+    msg: InboundIMMessage,
+    requestId: string,
+    streamId: string,
+    status: "accepted" | "rejected",
+    code: string,
+  ): Promise<void> {
+    const frame = JSON.stringify({
+      msg_type: "chat_stop_result",
+      protocol_version: 1,
+      request_id: requestId,
+      stream_id: streamId,
+      node_id: this.deps.nodeId || this.deps.selfUserId || "",
+      status,
+      code,
+    });
+    await this.deps.send(msg.fromUserId, "chat_stop_result", frame).catch(() => {});
   }
 
   // A node must never treat its own message as a user prompt. 融云 echoes a

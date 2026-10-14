@@ -207,6 +207,10 @@ func (c *DiscussionCoordinator) sendYourTurn(ctx context.Context, speaker Speake
 		"model":           speaker.Model,
 		"chatroom_id":     chatroomKey(c.chatroomID),
 		"discussion_kind": c.state.Status,
+		// 流式帧路由参数：CLI 据此把 chat_stream 帧直接广播进聊天室会话。
+		// requester_id 留空（正式轮次由服务端编排而非某用户发起，web 端
+		// validStreamDelivery 对群/聊天室只校验 conversation_id）。
+		"conversation_type": 4,
 	}
 	// Omitted rather than sent empty, so a reader that predates the field sees
 	// the same payload shape it always did.

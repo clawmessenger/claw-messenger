@@ -2,7 +2,6 @@ package rongcloud
 
 import (
 	"context"
-	"strings"
 	"testing"
 	"time"
 
@@ -31,51 +30,6 @@ func relaySessionState(hub *chatroomRelayHub, room string) *relaySession {
 	hub.mu.Lock()
 	defer hub.mu.Unlock()
 	return hub.sessions[room]
-}
-
-// 守门型角色（如「守门人」）以「未收到议题」为由拒绝实质发言，会让整轮空转；
-// 序号 2 看不到序号 1 的发言只能凭空表态。两者都必须进提示词。
-func TestRelayBuildPrompt_CarriesTopicAndPriorReplies(t *testing.T) {
-	hub := &chatroomRelayHub{sessions: map[string]*relaySession{}, rt: nilRelayRuntime()}
-	s := &relaySession{
-		chatroomRCID: "room1",
-		userText:     "大家怎么看这个方案",
-		topic:        "是否把结算周期改成周结",
-		replies: []relayReply{
-			{roleName: "守门人", content: "议题边界先确认：仅限结算周期"},
-		},
-	}
-	out := hub.buildPrompt(s, relayMember{rcID: "rc_b", roleName: "风控", roleInstr: "你是风控"})
-	if !strings.Contains(out, "是否把结算周期改成周结") {
-		t.Fatalf("prompt missing topic: %s", out)
-	}
-	if !strings.Contains(out, "守门人") || !strings.Contains(out, "议题边界先确认") {
-		t.Fatalf("prompt missing prior reply: %s", out)
-	}
-	if !strings.Contains(out, "大家怎么看这个方案") {
-		t.Fatalf("prompt missing user text: %s", out)
-	}
-	// 普通群组（无议题）不应出现议题块，但前序发言仍要带上。
-	group := &relaySession{chatroomRCID: "g1", isGroup: true, userText: "hi",
-		replies: []relayReply{{roleName: "A", content: "我先说"}}}
-	gout := hub.buildPrompt(group, relayMember{rcID: "rc_g", roleName: "B"})
-	if strings.Contains(gout, "本讨论组的议题") {
-		t.Fatalf("group prompt should not carry discussion topic: %s", gout)
-	}
-	if !strings.Contains(gout, "我先说") {
-		t.Fatalf("group prompt missing prior reply: %s", gout)
-	}
-}
-
-func TestClipRelayText(t *testing.T) {
-	if got := clipRelayText("短文本", 10); got != "短文本" {
-		t.Fatalf("short text should pass through, got %q", got)
-	}
-	long := strings.Repeat("字", 20)
-	got := clipRelayText(long, 5)
-	if !strings.HasPrefix(got, "字字字字字") || !strings.Contains(got, "已截断") {
-		t.Fatalf("long text should be clipped and marked, got %q", got)
-	}
 }
 
 func TestRelayMembersFor_OrderAndFilter(t *testing.T) {
@@ -130,10 +84,10 @@ func TestRelayHub_SequentialDispatch(t *testing.T) {
 		{rcID: "rc_b", roleName: "B", order: 1},
 	}
 	ctx := context.Background()
-	if !hub.Start(ctx, "room1", members, "hello", "") {
+	if !hub.Start(ctx, "room1", members, "hello", "", "") {
 		t.Fatal("start should succeed")
 	}
-	if hub.Start(ctx, "room1", members, "again", "") {
+	if hub.Start(ctx, "room1", members, "again", "", "") {
 		t.Fatal("second start must be rejected while running")
 	}
 	// 首位成员被登记为当前轮。

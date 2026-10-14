@@ -42,7 +42,7 @@ func (h *chatroomRelayHub) StartGroupRelay(ctx context.Context, groupID, request
 		return errRelayResult(409, "该群没有可发言的 AI 成员")
 	}
 	bgCtx := context.WithoutCancel(ctx)
-	if !h.StartGroup(bgCtx, groupID, speakers, text) {
+	if !h.StartGroup(bgCtx, groupID, speakers, text, requesterRCID) {
 		return errRelayResult(409, "上一条消息的回应还在进行中，请稍候")
 	}
 	return commandResult{code: 200, data: map[string]interface{}{
@@ -53,7 +53,7 @@ func (h *chatroomRelayHub) StartGroupRelay(ctx context.Context, groupID, request
 }
 
 // StartGroup 发起一次群中继（复用 hub 的 sessions 表，键即群 id）。
-func (h *chatroomRelayHub) StartGroup(ctx context.Context, groupID string, members []relayMember, userText string) bool {
+func (h *chatroomRelayHub) StartGroup(ctx context.Context, groupID string, members []relayMember, userText, requesterRCID string) bool {
 	if len(members) == 0 {
 		return false
 	}
@@ -63,10 +63,11 @@ func (h *chatroomRelayHub) StartGroup(ctx context.Context, groupID string, membe
 		return false
 	}
 	session := &relaySession{
-		chatroomRCID: groupID,
-		members:      members,
-		userText:     userText,
-		isGroup:      true,
+		chatroomRCID:  groupID,
+		members:       members,
+		userText:      userText,
+		isGroup:       true,
+		requesterRCID: requesterRCID,
 	}
 	h.sessions[groupID] = session
 	h.mu.Unlock()

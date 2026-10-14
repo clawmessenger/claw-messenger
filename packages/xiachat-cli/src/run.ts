@@ -300,6 +300,13 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
     probeRuntime,
     agentName: opts.agentName,
     selfUserId: opts.transport.getSelfUserId?.(),
+    nodeId: opts.transport.getSelfUserId?.(),
+    // chat_stream 帧按会话类型路由：私聊走 PRIVATE 会话，群组/聊天室走
+    // 对应会话号（由 runStreamedTurn 的 ctx.conversationType 决定）。
+    sendStream: (conversationType, conversationId, objectName, content) =>
+      opts.transport.sendMessageTo
+        ? opts.transport.sendMessageTo(conversationType, conversationId, objectName, content)
+        : Promise.reject(new Error("transport lacks sendMessageTo")),
   });
   const turns: TurnRunner = {
     runTurn: (prompt, model) =>
@@ -310,6 +317,21 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
         model: opts.model ?? model,
         timeoutMs: opts.turnTimeoutMs ?? 120_000,
         cwd: opts.cwd,
+      }),
+    // Streaming variant: the agent's stdout is decoded chunk by chunk
+    // (agents.ts onChunk, UTF-8 boundary safe); the dispatcher turns those
+    // deltas into chat_stream snapshot frames. signal lets chat_stop kill
+    // the agent process instead of just muting the frames.
+    runTurnStreamed: (prompt, model, onDelta, signal) =>
+      runAgentTurn({
+        execPath: opts.agentExecPath,
+        agentName: opts.agentName,
+        prompt,
+        model: opts.model ?? model,
+        timeoutMs: opts.turnTimeoutMs ?? 120_000,
+        cwd: opts.cwd,
+        onChunk: onDelta,
+        signal,
       }),
   };
   // onBusy only receives the conversation key; remember the latest peer per
@@ -479,6 +501,11 @@ export async function createImlibTransport(): Promise<IMTransport> {
         ["card_message", true, true],
         ["card_update", true, true],
         ["card_action", false, false],
+        // chat_stream: persisted but uncounted — same registration the web
+        // uses, so the frames store as history yet never badge unread.
+        ["chat_stream", true, false],
+        ["chat_stop", false, false],
+        ["chat_stop_result", false, false],
       ] as const) {
         customMessages.set(name, imlib.registerMessageType<Record<string, unknown>>(name, persisted, counted));
       }
@@ -515,6 +542,26 @@ export async function createImlibTransport(): Promise<IMTransport> {
           throw new Error(`imlib sendMessage failed: ${res.code} ${res.msg}`);
         }
         // Back off and try again: 250ms, 500ms, 1s.
+        await sleep(SEND_RETRY_BASE_MS * 2 ** (attempt - 1));
+      }
+    },
+    // Sends into private (1) / group (3) / chatroom (4) conversations.
+    // chat_stream frames for relay turns address the room itself.
+    async sendMessageTo(conversationType: 1 | 3 | 4, targetId: string, objectName: string, content: string): Promise<void> {
+      const conversation = {
+        conversationType:
+          conversationType === 3 ? imlib.ConversationType.GROUP
+          : conversationType === 4 ? imlib.ConversationType.CHATROOM
+          : imlib.ConversationType.PRIVATE,
+        targetId,
+      };
+      const message = toBaseMessage(objectName, content);
+      for (let attempt = 1; ; attempt += 1) {
+        const res = await imlib.sendMessage(conversation, message);
+        if (res.isOk) return;
+        if (res.code !== SEND_FREQUENCY_TOO_FAST || attempt >= SEND_RETRY_ATTEMPTS) {
+          throw new Error(`imlib sendMessage failed: ${res.code} ${res.msg}`);
+        }
         await sleep(SEND_RETRY_BASE_MS * 2 ** (attempt - 1));
       }
     },
