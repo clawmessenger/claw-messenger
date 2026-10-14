@@ -349,3 +349,31 @@ func TestActiveInteractiveDiscussionGate(t *testing.T) {
 		t.Error("engine not ready must not claim lifecycle actions")
 	}
 }
+
+// TestInteractiveInterjectionRoundFor 锁住插话归属轮次：轮末与未开局的插话必须
+// 顺延到「真正会被派发、因而会被读到」的轮次，否则气泡显示「已接受」而无人消费。
+func TestInteractiveInterjectionRoundFor(t *testing.T) {
+	ptr := func(n int) *int { return &n }
+	cases := []struct {
+		name         string
+		status       string
+		currentRound int
+		allDone      bool
+		maxRounds    *int
+		want         int
+	}{
+		{"planning 未开局 → 首轮", DiscussionStatusPlanning, 0, false, nil, 1},
+		{"轮次异常为 0 的 running → 首轮", DiscussionStatusRunning, 0, false, nil, 1},
+		{"running 本轮仍有成员待发言 → 当前轮", DiscussionStatusRunning, 3, false, nil, 3},
+		{"running 但本轮全员已说完（推进间隙）→ 下一轮", DiscussionStatusRunning, 3, true, nil, 4},
+		{"summarizing 正在汇总 → 下一轮", DiscussionStatusSummarizing, 3, false, nil, 4},
+		{"awaiting_user 等人确认 → 下一轮", DiscussionStatusAwaitingUser, 3, false, nil, 4},
+		{"legacy_capped 已达上限 → 0（无可承载轮次）", DiscussionStatusRunning, 2, true, ptr(2), 0},
+		{"legacy_capped 未达上限 → 当前轮", DiscussionStatusRunning, 1, false, ptr(2), 1},
+	}
+	for _, tc := range cases {
+		if got := interactiveInterjectionRoundFor(tc.status, tc.currentRound, tc.allDone, tc.maxRounds); got != tc.want {
+			t.Errorf("%s: got %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}

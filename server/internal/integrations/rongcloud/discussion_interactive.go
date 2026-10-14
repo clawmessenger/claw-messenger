@@ -247,17 +247,17 @@ func (rt *discussionRuntime) interactiveBroadcast(ctx context.Context, d Discuss
 	}
 	view := discussionEventView(rec)
 	payload := map[string]interface{}{
-		"msg_type":     "discussion_event",
+		"msg_type":        "discussion_event",
 		"protocolVersion": 3,
-		"discussionId": d.DiscussionID,
-		"chatroomId":   d.ChatroomID,
-		"seq":          rec.Seq,
-		"eventType":    view["eventType"],
-		"actorId":      view["actorId"],
-		"targetId":     view["targetId"],
-		"data":         view["payload"],
-		"stateVersion": d.Version,
-		"timestamp":    time.Now().UnixMilli(),
+		"discussionId":    d.DiscussionID,
+		"chatroomId":      d.ChatroomID,
+		"seq":             rec.Seq,
+		"eventType":       view["eventType"],
+		"actorId":         view["actorId"],
+		"targetId":        view["targetId"],
+		"data":            view["payload"],
+		"stateVersion":    d.Version,
+		"timestamp":       time.Now().UnixMilli(),
 	}
 	// v3 信封里的身份字段（requestId/round/roundRevision）必须原样带上：前端会对
 	// round_summary_completed 这类事件做跨字段一致性校验。
@@ -409,11 +409,11 @@ func (rt *discussionRuntime) interactiveBegin(ctx context.Context, discussionID 
 
 	roundStarted, _, err := rt.interactiveEmit(ctx, advanced, interactiveEvent{
 		EventType: "round_started", ActorID: "system",
-		Payload:        map[string]interface{}{"round": 1, "roundFocus": ""},
-		Key:            fmt.Sprintf("round-start:%s:1", discussionID),
-		StateVer:       advanced.Version,
-		Round:          1,
-		Revision:       0,
+		Payload:  map[string]interface{}{"round": 1, "roundFocus": ""},
+		Key:      fmt.Sprintf("round-start:%s:1", discussionID),
+		StateVer: advanced.Version,
+		Round:    1,
+		Revision: 0,
 	})
 	if err != nil {
 		return err
@@ -452,11 +452,11 @@ func (rt *discussionRuntime) interactiveNext(ctx context.Context, d DiscussionRe
 				EventType: "member_skipped", ActorID: "system", TargetID: role.MemberID,
 				Payload: map[string]interface{}{"round": d.CurrentRound, "memberId": role.MemberID,
 					"reason": "Member is disabled or no longer available"},
-				Key:        fmt.Sprintf("skip:%d:%s", d.Version, role.MemberID),
-				RequestID:  uuid.NewString(),
-				StateVer:   d.Version,
-				Round:      d.CurrentRound,
-				Revision:   d.RoundRevision,
+				Key:       fmt.Sprintf("skip:%d:%s", d.Version, role.MemberID),
+				RequestID: uuid.NewString(),
+				StateVer:  d.Version,
+				Round:     d.CurrentRound,
+				Revision:  d.RoundRevision,
 			})
 			if emitErr != nil {
 				return emitErr
@@ -531,7 +531,7 @@ func (rt *discussionRuntime) interactiveMemberEnabled(ctx context.Context, d Dis
 // interactiveBuildPrompt 拼出私发给设备的你的角色提示词：人设 + 本轮上下文
 // （话题/目标 + 本轮用户插话）。设备端（CLI）把 role_prompt 原样塞进 agent 提示词，
 // 所以插话就是从这里进入后续 agent 的上下文 —— 轮次指针不受影响。
-func (rt *discussionRuntime) interactiveBuildPrompt(d DiscussionRecord, role interactiveRole, extra string) string {
+func (rt *discussionRuntime) interactiveBuildPrompt(d DiscussionRecord, role interactiveRole, extra string, opinions []interactiveOpinion) string {
 	parts := make([]string, 0, 4)
 	if role.RoleInstructions != "" {
 		parts = append(parts, role.RoleInstructions)
@@ -548,10 +548,10 @@ func (rt *discussionRuntime) interactiveBuildPrompt(d DiscussionRecord, role int
 	if d.Goal != "" {
 		context = append(context, "讨论目标："+d.Goal)
 	}
-	if opinions := rt.interactiveInterjections(d); len(opinions) > 0 {
+	if len(opinions) > 0 {
 		lines := []string{"本轮用户插话（必须纳入你的发言）："}
 		for _, opinion := range opinions {
-			lines = append(lines, "- "+opinion)
+			lines = append(lines, "- "+opinion.content)
 		}
 		context = append(context, strings.Join(lines, "\n"))
 	}
@@ -568,14 +568,21 @@ func (rt *discussionRuntime) interactiveBuildPrompt(d DiscussionRecord, role int
 	return strings.Join(parts, "\n\n")
 }
 
-// interactiveInterjections 返回「本轮消费」的用户插话内容（consumedFromRound == 当前轮）。
+// interactiveOpinion 是一条被本轮消费的用户插话：messageUID 用于回执（interjection_applied）
+// 与前端气泡对账，content 用于拼进提示词。
+type interactiveOpinion struct {
+	messageUID string
+	content    string
+}
+
+// interactiveConsumedOpinions 返回「本轮消费」的用户插话（consumedFromRound == 当前轮）。
 // 与旧后端 _context 的取值一致：插话只在被投递的那一轮生效，不跨轮重复注入。
-func (rt *discussionRuntime) interactiveInterjections(d DiscussionRecord) []string {
+func (rt *discussionRuntime) interactiveConsumedOpinions(d DiscussionRecord) []interactiveOpinion {
 	events, err := rt.repo.ListEventsAfter(context.Background(), d.DiscussionID, 0)
 	if err != nil {
 		return nil
 	}
-	out := []string{}
+	out := []interactiveOpinion{}
 	for _, e := range events {
 		if e.EventType != "user_interjection" {
 			continue
@@ -588,11 +595,76 @@ func (rt *discussionRuntime) interactiveInterjections(d DiscussionRecord) []stri
 		if int(round) != d.CurrentRound {
 			continue
 		}
-		if content, ok := payload["content"].(string); ok && content != "" {
-			out = append(out, content)
+		content, _ := payload["content"].(string)
+		if content == "" {
+			continue
 		}
+		uid, _ := payload["messageUid"].(string)
+		out = append(out, interactiveOpinion{messageUID: uid, content: content})
 	}
 	return out
+}
+
+// interactiveRoundAllDone 判断本轮所有普通成员是否都已「完成或跳过」。
+// 用于插话归属判定：全员已说完时本轮不会再派发，插话必须顺延到下一轮。
+func (rt *discussionRuntime) interactiveRoundAllDone(ctx context.Context, d DiscussionRecord) bool {
+	ordinary, _, ok := interactiveRoles(d)
+	if !ok || len(ordinary) == 0 {
+		return false
+	}
+	done, err := rt.interactiveRoundDone(ctx, d)
+	if err != nil {
+		return false
+	}
+	for _, role := range ordinary {
+		if !done[role.MemberID] {
+			return false
+		}
+	}
+	return true
+}
+
+// interactiveInterjectionRound 返回这条插话应该由哪一轮消费。
+// 不能一律记成当前轮：轮末（本轮全员已说完 / 正在汇总 / 已进入
+// 等人确认）与未开局（planning，轮次还是 0）时，当前轮不会再派发给
+// 任何成员，consumedFromRound 永不匹配 → 插话被静默丢弃。
+//
+// 返回 0 表示已无后续轮次可承载（仅 legacy_capped 有上限时可能发生；
+// user_confirmed 的 MaxRounds 为 nil，下一轮总是存在）。
+func (rt *discussionRuntime) interactiveInterjectionRound(ctx context.Context, d DiscussionRecord) int {
+	allDone := false
+	if d.Status != DiscussionStatusPlanning && d.CurrentRound > 0 &&
+		d.Status != DiscussionStatusSummarizing && d.Status != DiscussionStatusAwaitingUser {
+		allDone = rt.interactiveRoundAllDone(ctx, d)
+	}
+	return interactiveInterjectionRoundFor(d.Status, d.CurrentRound, allDone, d.MaxRounds)
+}
+
+// interactiveInterjectionRoundFor 是纯函数版的归属判定（便于回归测试）。
+func interactiveInterjectionRoundFor(status string, currentRound int, roundAllDone bool, maxRounds *int) int {
+	var round int
+	switch {
+	case status == DiscussionStatusPlanning || currentRound <= 0:
+		// 尚未开局（创建后引擎还没 CAS 到 running）：插话归首轮。
+		round = 1
+	case status == DiscussionStatusSummarizing || status == DiscussionStatusAwaitingUser:
+		// 本轮已进入汇总/等人确认，普通成员不会再被派发 → 下一轮。
+		round = currentRound + 1
+	default:
+		if roundAllDone {
+			// running 但本轮全员已说完（推进间隙）→ 下一轮。
+			round = currentRound + 1
+		} else {
+			round = currentRound
+		}
+	}
+	if round < 1 {
+		round = 1
+	}
+	if maxRounds != nil && round > *maxRounds {
+		return 0
+	}
+	return round
 }
 
 // interactiveDispatch 落 outbox + 事件，并把 your_turn 私发给目标节点。
@@ -610,25 +682,56 @@ func (rt *discussionRuntime) interactiveDispatch(ctx context.Context, d Discussi
 		extra = fmt.Sprintf("本轮（第 %d 轮）所有成员已发言完毕，请输出本轮纪要："+
 			"成员立场、已达成的共识、仍存在的分歧、以及下一轮建议聚焦的问题。", d.CurrentRound)
 	}
-	prompt := rt.interactiveBuildPrompt(d, role, extra)
+	// 本轮被消费的用户插话：同一份快照同时用于提示词拼接与回执落库，
+	// 避免重复全量拉事件，也避免两处看到不同快照。
+	opinions := rt.interactiveConsumedOpinions(d)
+	prompt := rt.interactiveBuildPrompt(d, role, extra, opinions)
+
+	// 插话消费回执：本轮真正注入该成员提示词的插话落 interjection_applied，
+	// 前端据此把气泡从「已接受」升级为「已纳入发言参考」。
+	//
+	// payload 必须严格对齐 v3 契约：前端 shape 校验不允许多余字段，且要求
+	// 信封 requestId == payload.replacementRequestId，否则整条事件被判无效丢弃。
+	// key 不含成员：同一条插话只需一条「已纳入」回执，否则时间线会重复堆叠。
+	for _, opinion := range opinions {
+		if opinion.messageUID == "" {
+			continue
+		}
+		applied, created, emitErr := rt.interactiveEmit(ctx, d, interactiveEvent{
+			EventType: "interjection_applied", ActorID: role.MemberID, TargetID: role.MemberID,
+			Payload: map[string]interface{}{
+				"messageUid":           opinion.messageUID,
+				"targetRequestId":      nil,
+				"replacementRequestId": requestID,
+			},
+			Key:       "interjection-applied:" + opinion.messageUID,
+			RequestID: requestID, StateVer: d.Version, Round: d.CurrentRound, Revision: d.RoundRevision,
+		})
+		if emitErr != nil {
+			break
+		}
+		if created {
+			rt.interactiveBroadcast(ctx, d, applied)
+		}
+	}
 
 	timestamp := time.Now().UnixMilli()
 	payload := map[string]interface{}{
-		"msg_type":      "discussion_assignment",
+		"msg_type":        "discussion_assignment",
 		"protocolVersion": 3,
-		"discussionId":  d.DiscussionID,
-		"chatroomId":    d.ChatroomID,
-		"requestId":     requestID,
-		"stateVersion":  d.Version,
-		"round":         d.CurrentRound,
-		"roundRevision": d.RoundRevision,
-		"timestamp":     timestamp,
-		"assignmentId":  requestID,
-		"action":        action,
-		"targetId":      role.MemberID,
-		"topic":         d.Topic,
-		"goal":          d.Goal,
-		"model":         nullableString(role.Model),
+		"discussionId":    d.DiscussionID,
+		"chatroomId":      d.ChatroomID,
+		"requestId":       requestID,
+		"stateVersion":    d.Version,
+		"round":           d.CurrentRound,
+		"roundRevision":   d.RoundRevision,
+		"timestamp":       timestamp,
+		"assignmentId":    requestID,
+		"action":          action,
+		"targetId":        role.MemberID,
+		"topic":           d.Topic,
+		"goal":            d.Goal,
+		"model":           nullableString(role.Model),
 		"role": map[string]interface{}{
 			"roleName":         role.RoleName,
 			"roleInstructions": role.RoleInstructions,
@@ -865,7 +968,7 @@ func (rt *discussionRuntime) interactiveCompleteSummary(ctx context.Context, d D
 			"sourceRequestId": task.RequestID, "documentId": doc.DocumentID,
 			"title": doc.Title, "content": doc.Content,
 		},
-		Key: "round-summary-completed:" + task.RequestID,
+		Key:       "round-summary-completed:" + task.RequestID,
 		RequestID: task.RequestID, StateVer: advanced.Version, Round: task.Round,
 		Revision: task.RoundRevision,
 	})
@@ -1166,12 +1269,12 @@ func (rt *discussionRuntime) interactiveControl(ctx context.Context, cmd Command
 
 	roundStarted, _, err := rt.interactiveEmit(ctx, advanced, interactiveEvent{
 		EventType: "round_started", ActorID: actorRCID,
-		Payload:        map[string]interface{}{"round": nextRound, "roundFocus": ""},
-		Key:            key + ":round",
-		RequestID:      requestID,
-		StateVer:       advanced.Version,
-		Round:          nextRound,
-		Revision:       0,
+		Payload:   map[string]interface{}{"round": nextRound, "roundFocus": ""},
+		Key:       key + ":round",
+		RequestID: requestID,
+		StateVer:  advanced.Version,
+		Round:     nextRound,
+		Revision:  0,
 	})
 	if err != nil {
 		return errResult(500, "写入讨论事件失败")
@@ -1184,10 +1287,10 @@ func (rt *discussionRuntime) interactiveControl(ctx context.Context, cmd Command
 			EventType: "user_interjection", ActorID: actorRCID,
 			Payload: map[string]interface{}{
 				"messageUid": messageUID, "memberId": actorRCID, "content": opinion,
-				"createdAt": time.Now().UTC().Format(time.RFC3339Nano),
+				"createdAt":         time.Now().UTC().Format(time.RFC3339Nano),
 				"consumedFromRound": nextRound,
 			},
-			Key: "interactive-opinion:" + messageUID,
+			Key:       "interactive-opinion:" + messageUID,
 			RequestID: messageUID, StateVer: advanced.Version, Round: nextRound, Revision: 0,
 		})
 		if err != nil {
@@ -1230,15 +1333,21 @@ func (rt *discussionRuntime) interactiveInterject(ctx context.Context, cmd Comma
 	if version, ok := paramInt(cmd, "stateVersion", "state_version", "version"); !ok || version != d.Version {
 		return rt.versionConflictResult(ctx, d.DiscussionID)
 	}
+	// 插话归属轮次：轮末与未开局时当前轮不会再派发，必须顺延到真正会被消费的轮次，
+	// 否则气泡显示「已接受」但永远无人读到。
+	consumedRound := rt.interactiveInterjectionRound(ctx, d)
+	if consumedRound == 0 {
+		return errResult(409, "当前讨论已无后续轮次可承载这条意见")
+	}
 	event, _, err := rt.interactiveEmit(ctx, d, interactiveEvent{
 		EventType: "user_interjection", ActorID: actorRCID,
 		Payload: map[string]interface{}{
 			"messageUid": messageUID, "memberId": actorRCID, "content": content,
-			"createdAt": time.Now().UTC().Format(time.RFC3339Nano),
-			"consumedFromRound": d.CurrentRound,
+			"createdAt":         time.Now().UTC().Format(time.RFC3339Nano),
+			"consumedFromRound": consumedRound,
 		},
-		Key: key, RequestID: messageUID, StateVer: d.Version, Round: d.CurrentRound,
-		Revision: d.RoundRevision,
+		Key: key, RequestID: messageUID, StateVer: d.Version, Round: consumedRound,
+		Revision: 0,
 	})
 	if err != nil {
 		return errResult(500, "写入插话事件失败")
