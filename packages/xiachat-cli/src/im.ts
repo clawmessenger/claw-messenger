@@ -336,20 +336,19 @@ export class MessageDispatcher {
       // coordinators omit it, so an absent/blank value keeps the old prompt.
       const persona = typeof params.role_prompt === "string" ? params.role_prompt.trim() : "";
       const venue = resolveTurnVenue(params.conversation_type, persona);
-      // 闲聊中继（群聊/聊天室）的服务端提示词本身就是完整指令（「这是普通
-      // 群聊的一次自由对话。用户刚在群里发言：<原话>…请以「X」的身份回应
-      // 用户」），这里只补一行场景抬头；不要再沿用圆桌讨论那套
-      // 「Answer as this node in the discussion.」—— 那会让 agent 以为自己在
-      // 等主持人发题，把群聊问题答成「等待主题发布」。
-      const head = `[${venue === "group" ? "group chat" : venue === "chatroom" ? "chatroom" : "discussion"}] round=${params.round ?? "?"} speaking_order=${params.speaking_order ?? "?"}`;
-      const roleLine = params.role_name ? `role: ${params.role_name}` : "";
       const isRelayChat = venue === "group" || venue === "chatroom";
+      // 闲聊中继（群聊/聊天室）：服务端的提示词本身就是完整指令（「[group chat]
+      // 这是普通群聊的一次自由对话。用户刚在群里发言：<原话>…请以「X」的身份
+      // 回应用户」），原样喂给 agent 即可。**不要**再补 round / speaking_order /
+      // 「Answer as this node in the discussion.」这类圆桌词汇 —— 旧版对群聊也
+      // 盖这层抬头，agent 于是当自己是圆桌成员等主持人发题，把群聊问题答成
+      // 「等待主题发布」。普通群聊就是闲聊，没有轮次、没有主题、没有主持。
       const prompt = isRelayChat
-        ? [head, roleLine, persona, "只输出回应正文，不要输出多余格式。"]
-          .filter(Boolean).join("\n")
+        ? (persona
+          || `[${venue === "group" ? "group chat" : "chatroom"}] 用户刚在${venue === "group" ? "群里" : "聊天室"}发言，请直接回应用户。`)
         : [
-          head,
-          roleLine,
+          `[discussion] round=${params.round ?? "?"} speaking_order=${params.speaking_order ?? "?"}`,
+          params.role_name ? `role: ${params.role_name}` : "",
           "Answer as this node in the discussion.",
           persona ? `\n${persona}` : "",
           persona ? "Stay in character. Do not repeat or summarise these instructions." : "",

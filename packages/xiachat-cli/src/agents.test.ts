@@ -2,12 +2,14 @@
 import { describe, expect, it } from "vitest";
 import {
   buildAgentArgs,
+  buildSpawnInvocation,
   buildModelArgs,
   discoverAgents,
   extractOpenclawReply,
   KNOWN_AGENT_CLIS,
   normalizeOpenclawOutput,
   parseOpenclawJsonOutput,
+  resolveWindowsShim,
   runAgentTurn,
   splitModelRoute,
   stripAnsiCodes,
@@ -508,3 +510,82 @@ describe("runAgentTurn", () => {
     }
   });
 });
+
+describe("Windows .cmd shim 穿透（cmd.exe 会截断多行提示词）", () => {
+  it("能认出 npm shim 的真实目标：真 exe 直接跑，脚本交给同目录 node.exe", async () => {
+    const { mkdtemp, mkdir, writeFile } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { existsSync } = await import("node:fs");
+    const dir = await mkdtemp(join(tmpdir(), "cm-shim-"));
+
+    // opencode 形态：目标本身就是 exe
+    const binDir = join(dir, "node_modules", "pkg", "bin");
+    await mkdir(binDir, { recursive: true });
+    const exeTarget = join(binDir, "cli.exe");
+    await writeFile(exeTarget, "");
+    const exeShim = join(dir, "opencode.cmd");
+    await writeFile(
+      exeShim,
+      ['@ECHO off', 'GOTO start', ':start', 'SETLOCAL', `"%dp0%\\node_modules\\pkg\\bin\\cli.exe"   %*`].join("\r\n"),
+    );
+    expect(resolveWindowsShim(exeShim)).toEqual({ file: exeTarget, prefixArgs: [] });
+
+    // openclaw 形态：目标是 .mjs，且 shim 同目录有 node.exe
+    const nodeExe = join(dir, "node.exe");
+    await writeFile(nodeExe, "");
+    const mjsTarget = join(dir, "node_modules", "oc", "openclaw.mjs");
+    await mkdir(join(dir, "node_modules", "oc"), { recursive: true });
+    await writeFile(mjsTarget, "");
+    const mjsShim = join(dir, "openclaw.cmd");
+    await writeFile(
+      mjsShim,
+      [
+        '@ECHO off',
+        'IF EXIST "%dp0%\\node.exe" (',
+        '  SET "_prog=%dp0%\\node.exe"',
+        ') ELSE (',
+        '  SET "_prog=node"',
+        ')',
+        `endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\node_modules\\oc\\openclaw.mjs" %*`,
+      ].join("\r\n"),
+    );
+    const resolved = resolveWindowsShim(mjsShim);
+    expect(resolved?.file).toBe(nodeExe);
+    expect(resolved?.prefixArgs).toEqual([mjsTarget]);
+    expect(existsSync(resolved!.prefixArgs[0])).toBe(true);
+
+    // 目标不存在 → 不硬来，返回 null（调用方退回 cmd.exe）
+    const broken = join(dir, "broken.cmd");
+    await writeFile(broken, '"%dp0%\\node_modules\\nope\\gone.exe" %*');
+    expect(resolveWindowsShim(broken)).toBeNull();
+
+    // 非 npm shim（认不出目标）→ null
+    const weird = join(dir, "weird.cmd");
+    await writeFile(weird, "@ECHO off\r\necho hello\r\n");
+    expect(resolveWindowsShim(weird)).toBeNull();
+  });
+
+  it("buildSpawnInvocation：解析成功就不再经 cmd.exe；失败则退回 cmd.exe 并抹掉换行", async () => {
+    const { mkdtemp, mkdir, writeFile } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const dir = await mkdtemp(join(tmpdir(), "cm-spawn-"));
+    const binDir = join(dir, "node_modules", "pkg", "bin");
+    await mkdir(binDir, { recursive: true });
+    const target = join(binDir, "cli.exe");
+    await writeFile(target, "");
+    const shim = join(dir, "pkg.cmd");
+    await writeFile(shim, `"%dp0%\\node_modules\\pkg\\bin\\cli.exe"   %*`);
+
+    const viaReal = buildSpawnInvocation(shim, ["run", "line1\nline2"]);
+    expect(viaReal.file).toBe(target);
+    expect(viaReal.args).toEqual(["run", "line1\nline2"]);
+
+    const unresolvable = join(dir, "plain.cmd");
+    await writeFile(unresolvable, "@ECHO off\r\necho hi\r\n");
+    const viaCmd = buildSpawnInvocation(unresolvable, ["run", "line1\nline2"]);
+    expect(viaCmd.file).toBe("cmd.exe");
+    expect(viaCmd.args.every((a) => !a.includes("\n"))).toBe(true);
+  });
+})

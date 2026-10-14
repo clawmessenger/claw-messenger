@@ -1203,13 +1203,33 @@ describe("会话形态判定与隔离（群聊不得被当成讨论组）", () =
       },
     })
 
-    expect(seenPrompt.startsWith("[group chat] round=1 speaking_order=0")).toBe(true)
-    expect(seenPrompt).toContain("role: openclaw")
+    // 闲聊中继：服务端提示词原样下传（不加轮次/角色头，普通群聊就是闲聊）
+    expect(seenPrompt).toBe(RELAY_PROMPT)
     expect(seenPrompt).toContain("今天的天气怎么样")
     // 关键回归：不得再说自己在 discussion 里等主持人
     expect(seenPrompt).not.toContain("[discussion]")
     expect(seenPrompt).not.toContain("Answer as this node in the discussion")
+    expect(seenPrompt).not.toContain("speaking_order")
     expect(seenKey).toBe("cm-group-group_rc")
+  })
+
+  it("中继提示词缺失时（老协调器）也要给出可回答的闲聊提示，而不是空提示", async () => {
+    const { deps } = relayDeps()
+    const dispatcher = new MessageDispatcher(deps)
+    let seenPrompt = ""
+    await dispatcher.handle({
+      objectName: "command", fromUserId: "claw-system", toUserId: "", targetId: "node_self",
+      conversationType: 1,
+      content: JSON.stringify({
+        request_id: "relay_1_0", service: "discussion", action: "your_turn",
+        params: { round: 1, speaking_order: 0, chatroom_id: "group_rc", conversation_type: 3 },
+      }),
+    }, {
+      runTurn: async () => { throw new Error("should use streamed variant") },
+      runTurnStreamed: async (prompt: string) => { seenPrompt = prompt; return "ok" },
+    })
+    expect(seenPrompt).toContain("[group chat]")
+    expect(seenPrompt).not.toContain("[discussion]")
   })
 
   it("v3 讨论轮次仍走讨论抬头与人设，键按房间分桶", async () => {

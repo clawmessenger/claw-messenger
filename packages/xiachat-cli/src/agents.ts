@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
 import { access, constants } from "node:fs/promises";
-import { delimiter, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 
 // Mirrors knownAgentCLIs in server/internal/integrations/rongcloud/
@@ -122,12 +123,71 @@ function isWindowsScript(execPath: string): boolean {
   return process.platform === "win32" && /\.(cmd|bat)$/i.test(execPath);
 }
 
+// npm 生成的 .cmd/.bat shim 只是个转发器：openclaw.cmd → node openclaw.mjs，
+// opencode.cmd → node_modules/opencode-ai/bin/opencode.exe。
+//
+// 为什么要穿透它：Node ≥18.20/20.12 拒绝直接 spawn .cmd（CVE-2024-27980），
+// 于是命令行必须经 cmd.exe，而 cmd.exe 把命令里的**换行当命令分隔符**，还会
+// 解释 & | ^ % 等元字符。2026-10-14 实测（openclaw 的 transcript_events 里存的
+// 提示词只剩第一行）后果是：
+//   · 多行提示词只到第一行就断 —— 群聊/讨论的 your_turn 因此只带着
+//     `[discussion] round=1 speaking_order=1` 这一行进了 agent，用户的问题、
+//     角色人设全部丢失，agent 只能回「等待主题发布」；
+//   · 断点之后的参数一起丢 —— 包括 --session-key、--model，于是会话隔离失效；
+//   · 用户正文里的 & 会被 cmd 当成命令分隔符。
+// 所以能解析出真实目标时直接 spawn 它，shell 完全不经手。
+export function resolveWindowsShim(
+  execPath: string,
+): { file: string; prefixArgs: string[] } | null {
+  const cached = shimTargetCache.get(execPath);
+  if (cached !== undefined) return cached;
+  const resolved = parseWindowsShim(execPath);
+  shimTargetCache.set(execPath, resolved);
+  return resolved;
+}
+
+const shimTargetCache = new Map<string, { file: string; prefixArgs: string[] } | null>();
+
+function parseWindowsShim(execPath: string): { file: string; prefixArgs: string[] } | null {
+  let text: string;
+  try {
+    text = readFileSync(execPath, "utf8");
+  } catch {
+    return null;
+  }
+  const dir = dirname(execPath);
+  // shim 末行一定是 `"<目标>" %*`。取**最后一个**带可执行扩展名的引号路径，
+  // 前面探测用的 "%dp0%\node.exe" 与 "%_prog%" 因此不会被误取。
+  const matches = [...text.matchAll(/"([^"\r\n]+\.(?:exe|mjs|cjs|js))"/gi)];
+  const raw = matches.at(-1)?.[1];
+  if (!raw) return null;
+  const target = raw.replace(/%~?dp0%?\\?/gi, dir.endsWith("\\") ? dir : `${dir}\\`);
+  if (!existsSync(target)) return null;
+  if (/\.exe$/i.test(target)) return { file: target, prefixArgs: [] };
+  // 脚本目标要用 node 跑：优先 shim 同目录的 node.exe（nvm 的布局），否则交给
+  // PATH 上的 node。**不能用 process.execPath** —— 那是本 CLI 自己的 SEA 二进制。
+  const nodeExe = join(dir, "node.exe");
+  return { file: existsSync(nodeExe) ? nodeExe : "node", prefixArgs: [target] };
+}
+
+// 兜底（shim 解析不出来时仍走 cmd.exe）：把参数里的换行抹掉 —— cmd 会把换行
+// 当命令分隔符，一条多行提示词只到第一行就断。
+function sanitizeForCmdArgs(args: string[]): string[] {
+  return args.map((arg) => arg.replace(/\r?\n/g, "⏎"));
+}
+
 // Node >= 18.20/20.12 refuses to spawn .cmd/.bat directly (CVE-2024-27980),
-// so those go through cmd.exe like a shell would. Everything else spawns
-// directly, POSIX included.
-function buildSpawnInvocation(execPath: string, args: string[]): { file: string; args: string[] } {
+// so those go through cmd.exe like a shell would — unless the shim's real
+// target can be resolved, which we prefer for the reasons above. Everything
+// else spawns directly, POSIX included.
+export function buildSpawnInvocation(
+  execPath: string,
+  args: string[],
+): { file: string; args: string[] } {
   if (isWindowsScript(execPath)) {
-    return { file: "cmd.exe", args: ["/d", "/s", "/c", execPath, ...args] };
+    const real = resolveWindowsShim(execPath);
+    if (real) return { file: real.file, args: [...real.prefixArgs, ...args] };
+    return { file: "cmd.exe", args: ["/d", "/s", "/c", execPath, ...sanitizeForCmdArgs(args)] };
   }
   return { file: execPath, args };
 }
