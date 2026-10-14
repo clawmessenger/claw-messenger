@@ -338,11 +338,17 @@ func (rt *discussionRuntime) actionRestartRoundtable(ctx context.Context, cmd Co
 	if !room.OwnerRcUserID.Valid || room.OwnerRcUserID.String != actor.RcID {
 		return errResult(403, "ROUNDTABLE_CREATE_REQUEST_NOT_FOUND")
 	}
-	// 并发保护：v3（user_confirmed）讨论真在跑时不许覆盖。但 legacy_capped 的
-	// "活跃"行是死讨论（红线：Go 侧没有执行引擎，建出来就永远停在 planning），
-	// 恰恰是重开的目标场景，必须放行。
-	if active, err := s.queries.GetActiveRongCloudDiscussionByChatroom(ctx, chatroomID); err == nil && active.RoundPolicy == RoundPolicyUserConfirmed {
-		return errResult(409, "DISCUSSION_ALREADY_ACTIVE")
+	// 并发保护：讨论真在跑（planning/running/summarizing/synthesizing）不许覆盖。
+	// 两类"活跃"行放行并先收尾，正是重开的目标场景：
+	//  - awaiting_user：轮次已完、等房主决定，用户直接发言=放弃旧讨论重开新局；
+	//  - legacy_capped：Go 侧无执行引擎的死讨论（建出即停 planning）。
+	if active, err := s.queries.GetActiveRongCloudDiscussionByChatroom(ctx, chatroomID); err == nil {
+		if active.RoundPolicy == RoundPolicyUserConfirmed && active.Status != DiscussionStatusAwaitingUser {
+			return errResult(409, "DISCUSSION_ALREADY_ACTIVE")
+		}
+		if cerr := rt.closeDiscussionForRestart(ctx, active); cerr != nil {
+			return errResult(500, "CREATE_ROUNDTABLE_RECOVERABLE")
+		}
 	}
 
 	// 以成员表为权威重建角色板（用户可能编辑过角色，比旧 snapshot 更可信）。
@@ -429,4 +435,38 @@ func (rt *discussionRuntime) actionRestartRoundtable(ctx context.Context, cmd Co
 		"discussion_id": discussionID,
 		"status":        "planning",
 	})
+}
+
+
+// closeDiscussionForRestart 把等待重开的旧讨论收尾为 completed（幂等：已终态直接过）。
+// awaiting_user 是用户主动放弃旧局，语义上等同于「就此结束并保留纪要」。
+func (rt *discussionRuntime) closeDiscussionForRestart(ctx context.Context, active db.RongcloudDiscussion) *RoundtableError {
+	if !IsLiveDiscussionStatus(active.Status) {
+		return nil
+	}
+	d, err := rt.repo.Get(ctx, active.DiscussionID)
+	if err != nil {
+		return roundtableErr("CREATE_ROUNDTABLE_RECOVERABLE")
+	}
+	// UpdateRongCloudDiscussionState 无条件写 current_round/round_revision，
+	// 必须带上原值，否则终态行的轮次会被清零。
+	advanced, err := rt.repo.AdvanceState(ctx, AdvanceDiscussionParams{
+		DiscussionID: d.DiscussionID, ExpectedVersion: d.Version,
+		Status:        DiscussionStatusCompleted,
+		CurrentRound:  d.CurrentRound,
+		RoundRevision: d.RoundRevision,
+	})
+	if err != nil {
+		return roundtableErr("CREATE_ROUNDTABLE_RECOVERABLE")
+	}
+	done, _, err := rt.interactiveEmit(ctx, advanced, interactiveEvent{
+		EventType: "discussion_completed", ActorID: active.CreatedBy,
+		Payload: map[string]interface{}{"reason": "restarted"},
+		Key:     "restart-close:" + active.DiscussionID, StateVer: advanced.Version,
+	})
+	if err != nil {
+		return roundtableErr("CREATE_ROUNDTABLE_RECOVERABLE")
+	}
+	rt.interactiveBroadcast(ctx, advanced, done)
+	return nil
 }
