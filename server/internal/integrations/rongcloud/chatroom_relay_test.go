@@ -84,10 +84,10 @@ func TestRelayHub_SequentialDispatch(t *testing.T) {
 		{rcID: "rc_b", roleName: "B", order: 1},
 	}
 	ctx := context.Background()
-	if !hub.Start(ctx, "room1", members, "hello") {
+	if !hub.Start(ctx, "room1", members, "hello", "") {
 		t.Fatal("start should succeed")
 	}
-	if hub.Start(ctx, "room1", members, "again") {
+	if hub.Start(ctx, "room1", members, "again", "") {
 		t.Fatal("second start must be rejected while running")
 	}
 	// 首位成员被登记为当前轮。

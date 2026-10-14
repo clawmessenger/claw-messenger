@@ -54,6 +54,20 @@ type relaySession struct {
 	requestID string
 	// senderRCID 是 currentDone 轮的预期回包者。
 	senderRCID string
+	// topic 是本讨论组的常驻议题（取最近一次讨论的议题；无历史讨论时为空）。
+	// 守门型角色强依赖它判定「本轮缺少必要输入」，缺失会让整轮空转。
+	topic string
+	// replies 是已发言成员的 (roleName, content) 列表：后续成员的提示词带上
+	// 前序发言，否则序号 2 看不到序号 1 说了什么，只能凭空表态。
+	replies []relayReply
+	// requesterRCID 是发起这次闲聊中继的成员（web 用户）；流式帧的
+	// requester_id 字段用它，web 端 validStreamDelivery 据此校验。
+	requesterRCID string
+}
+
+type relayReply struct {
+	roleName string
+	content  string
 }
 
 type chatroomRelayHub struct {
@@ -103,9 +117,21 @@ func (h *chatroomRelayHub) StartRelay(ctx context.Context, chatroomRCID, request
 	if len(members) == 0 {
 		return errRelayResult(409, "该聊天室没有可发言的 AI 成员")
 	}
+	// 讨论组的议题对闲聊同样有效：后续成员「知道这个组在聊什么」是基本上下文。
+	// 取最近一次 v3 讨论的 topic；新组还没有讨论行时退回房间名。
+	topic := ""
+	if discussions, err := h.rt.repo.ListByChatroom(ctx, room.ID.String()); err == nil && len(discussions) > 0 {
+		latest := discussions[0]
+		if latest.RoundPolicy == RoundPolicyUserConfirmed && latest.Topic != "" {
+			topic = latest.Topic
+		}
+	}
+	if topic == "" {
+		topic = strings.TrimSpace(room.Name)
+	}
 	// HTTP 请求返回后中继要继续跑：换独立 context。
 	bgCtx := context.WithoutCancel(ctx)
-	if !h.Start(bgCtx, chatroomRCID, members, text) {
+	if !h.Start(bgCtx, chatroomRCID, members, text, topic) {
 		return errRelayResult(409, "上一条消息的回应还在进行中，请稍候")
 	}
 	return commandResult{code: 200, data: map[string]interface{}{
@@ -121,7 +147,7 @@ func errRelayResult(code int, msg string) commandResult {
 
 // Start 为聊天室发起一次按序中继。返回 false 表示该房间已有会话在跑（前端
 // 可以提示「上一条消息的回应还在进行中」）。
-func (h *chatroomRelayHub) Start(ctx context.Context, chatroomRCID string, members []relayMember, userText string) bool {
+func (h *chatroomRelayHub) Start(ctx context.Context, chatroomRCID string, members []relayMember, userText, topic string) bool {
 	if len(members) == 0 {
 		return false
 	}
@@ -134,6 +160,7 @@ func (h *chatroomRelayHub) Start(ctx context.Context, chatroomRCID string, membe
 		chatroomRCID: chatroomRCID,
 		members:      members,
 		userText:     userText,
+		topic:        topic,
 	}
 	h.sessions[chatroomRCID] = session
 	h.mu.Unlock()
@@ -191,12 +218,20 @@ func (h *chatroomRelayHub) pump(ctx context.Context, s *relaySession) {
 // dispatchTurn 私发 your_turn 给成员（CLI 零改动的既有协议）。
 func (h *chatroomRelayHub) dispatchTurn(ctx context.Context, s *relaySession, member relayMember, requestID string) error {
 	prompt := h.buildPrompt(s, member)
+	convType := 4
+	if s.isGroup {
+		convType = 3
+	}
 	params := map[string]interface{}{
 		"round":          1,
 		"speaking_order": member.order,
 		"role_name":      member.roleName,
 		"chatroom_id":    s.chatroomRCID,
 		"role_prompt":    prompt,
+		// 流式帧路由参数：CLI 据此把 chat_stream 帧直接广播进群/聊天室
+		// 会话（web 端 validStreamDelivery 校验 conversation 一致性）。
+		"conversation_type": convType,
+		"requester_id":      s.requesterRCID,
 	}
 	if member.model != "" {
 		params["model"] = member.model
@@ -210,7 +245,9 @@ func (h *chatroomRelayHub) dispatchTurn(ctx context.Context, s *relaySession, me
 	return h.rt.sendPrivateJSON(ctx, member.rcID, content)
 }
 
-// buildPrompt 组装闲聊提示词：群聊上下文 + 用户消息 + 角色人设。
+// buildPrompt 组装闲聊提示词：群聊上下文 + 用户消息 + 角色人设 + 本组议题 +
+// 前序成员发言。守门型/承接型角色（如「守门人」）没有议题与前序发言会直接
+// 拒绝实质回应，整轮空转。
 func (h *chatroomRelayHub) buildPrompt(s *relaySession, member relayMember) string {
 	instr := ""
 	if member.roleInstr != "" {
@@ -222,11 +259,36 @@ func (h *chatroomRelayHub) buildPrompt(s *relaySession, member relayMember) stri
 		venue = "群聊"
 		scope = "这是普通群聊的一次自由对话。用户刚在群里发言"
 	}
+	// 本组议题（来自最近一次讨论）：讨论组的闲聊不是无根之水，成员应知道
+	// 这个组围绕什么展开。无历史讨论时整段省略。
+	contextBlock := ""
+	if s.topic != "" {
+		contextBlock = fmt.Sprintf("\n\n本讨论组的议题：%s", s.topic)
+	}
+	// 前序成员发言（本次中继已广播的）：后续成员承接而非凭空重复表态。
+	// 加长度护栏防止长发言把提示词撑爆（截断保留最新内容）。
+	if len(s.replies) > 0 {
+		lines := make([]string, 0, len(s.replies))
+		for _, reply := range s.replies {
+			lines = append(lines, fmt.Sprintf("- %s：%s", reply.roleName, clipRelayText(reply.content, 1200)))
+		}
+		contextBlock += fmt.Sprintf("\n\n本次对话中已发言成员的观点（承接或核验后再发言，不要凭空表态）：\n%s",
+			strings.Join(lines, "\n"))
+	}
 	return fmt.Sprintf(
-		"[group chat] %s：\n\n%s\n\n"+
+		"[group chat] %s：\n\n%s%s\n\n"+
 			"请以「%s」的身份回应用户。回应会被广播回%s，请只输出回应正文，不要输出多余格式。%s",
-		scope, s.userText, member.roleName, venue, instr,
+		scope, s.userText, contextBlock, member.roleName, venue, instr,
 	)
+}
+
+// clipRelayText 截断超长文本，保留开头并注明截断。
+func clipRelayText(text string, limit int) string {
+	if len([]rune(text)) <= limit {
+		return text
+	}
+	runes := []rune(text)
+	return string(runes[:limit]) + "…（已截断）"
 }
 
 // AcceptResponse 处理设备对 relay your_turn 的回包。返回 false 表示这条
@@ -266,6 +328,12 @@ func (h *chatroomRelayHub) AcceptResponse(ctx context.Context, senderID, request
 			"chatroom", session.chatroomRCID, "target", senderID, "error", errMsg)
 	} else if content != "" {
 		h.broadcastMemberSpeech(ctx, session, &member, content)
+		// 积累进会话上下文：后续成员的提示词会带上这条发言。
+		h.mu.Lock()
+		if s := session; s.requestID == requestID {
+			s.replies = append(s.replies, relayReply{roleName: member.roleName, content: content})
+		}
+		h.mu.Unlock()
 	}
 	// 作废当前轮的 requestID（防重复回包重复推进），再唤醒 pump。
 	h.mu.Lock()
