@@ -618,6 +618,44 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
     ].join("\r\n");
   }
 
+  /**
+   * 服务管理器拒收 unit 时，把「它自己那句话」原样带出来。
+   * `systemctl start` 只会说一句 "has a bad unit file setting"，真正哪一行不合法只在
+   * status / journal 里；与其让用户自己去翻，不如我们连着 unit 正文一起打出来。
+   */
+  function dumpSystemdDiagnostics(sctl: string[], unitPath: string, unitBody: string): void {
+    const show = (file: string, args: string[], label: string): void => {
+      const r = runCommand(file, args);
+      const text = `${r.stdout ?? ""}${r.stderr ?? ""}`.trim();
+      if (text) err(`${label}\n${tailLines(text, 25).replace(/^/gm, "  ")}\n`);
+    };
+    show(sctl[0], [...sctl.slice(1), "status", DAEMON_SERVICE_NAME, "--no-pager", "-l"], `$ ${sctl.join(" ")} status ${DAEMON_SERVICE_NAME}`);
+    show(
+      "journalctl",
+      [...(sctl.includes("--user") ? ["--user"] : []), "-u", DAEMON_SERVICE_NAME, "--no-pager", "-n", "25"],
+      `$ journalctl -u ${DAEMON_SERVICE_NAME}`,
+    );
+    show("systemd-analyze", ["verify", unitPath], `$ systemd-analyze verify ${unitPath}`);
+    err(`unit file ${unitPath}:\n${unitBody.replace(/^/gm, "  ")}`);
+  }
+
+  /**
+   * 自启服务没能起来时，把「刚才被我们停掉的」后台 supervisor 拉回来。
+   * 反面教材：先把 supervisor 停掉、再 `systemctl start`，一旦 start 失败，
+   * 装个自启反而把在线设备搞下线了。
+   */
+  async function restoreAfterFailedService(o: DaemonStartOptions, message: string): Promise<void> {
+    err(`${message}\n`);
+    out("restoring the background supervisor so the device stays online...\n");
+    try {
+      await start(o);
+    } catch (e) {
+      const detail = e instanceof Error ? e.message : String(e);
+      err(`could not restart the background supervisor either: ${detail}\n`);
+      err("this device is offline now — after fixing the autostart entry, run `clawmessenger start`.\n");
+    }
+  }
+
   async function installService(o: DaemonStartOptions = {}): Promise<void> {
     if (platform === "linux") {
       const unit = systemdUnit(o);
@@ -638,6 +676,12 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
       const startRes = runCommand(sctl[0], [...sctl.slice(1), "start", DAEMON_SERVICE_NAME]);
       if (startRes.status !== 0) {
         err(`systemctl start failed: ${startRes.stderr.trim() || `exit ${startRes.status}`}\n`);
+        dumpSystemdDiagnostics(sctl, unit.path, unit.content);
+        await restoreAfterFailedService(
+          o,
+          `the unit is at ${unit.path}, but systemd refused it (details above). It is left in place so the output can be inspected; \`clawmessenger uninstall\` removes it.`,
+        );
+        return;
       }
       if (unit.scope === "user") {
         const user = safeUsername();
@@ -661,6 +705,15 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
       const loadRes = runCommand("launchctl", ["load", "-w", LAUNCH_AGENT]);
       if (loadRes.status !== 0) {
         err(`launchctl load failed: ${loadRes.stderr.trim() || `exit ${loadRes.status}`}\n`);
+        const list = runCommand("launchctl", ["list"]);
+        const hit = `${list.stdout ?? ""}${list.stderr ?? ""}`
+          .split(/\r?\n/)
+          .filter((l) => l.includes("clawmessenger"))
+          .join("\n");
+        if (hit.trim()) err(`$ launchctl list (clawmessenger entries)\n${hit.replace(/^/gm, "  ")}\n`);
+        err(`plist ${LAUNCH_AGENT}:\n${launchAgentPlist(o).replace(/^/gm, "  ")}\n`);
+        await restoreAfterFailedService(o, "the LaunchAgent is written, but launchctl refused to load it (details above).");
+        return;
       }
       out(`installed LaunchAgent: ${LAUNCH_AGENT}\n`);
       out("  manage : launchctl list | grep clawmessenger ; launchctl unload/load -w <plist>\n");

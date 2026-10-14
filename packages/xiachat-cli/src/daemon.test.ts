@@ -420,6 +420,54 @@ describe("daemon install-service (Linux)", () => {
     expect(h.commands.some((c) => c.file === "systemctl" && c.args[0] === "--user")).toBe(true);
     expect(h.commands.some((c) => c.file === "loginctl" && c.args[0] === "enable-linger")).toBe(true);
   });
+
+  it("keeps the device online when systemd refuses the unit", async () => {
+    const h = harness(
+      {
+        uid: 0,
+        runCommand: (file, args) => {
+          if (file === "systemctl" && args.join(" ") === "start clawmessenger") {
+            return {
+              status: 1,
+              stdout: "",
+              stderr: "Failed to start clawmessenger.service: Unit clawmessenger.service has a bad unit file setting.",
+            };
+          }
+          if (file === "journalctl") {
+            return {
+              status: 0,
+              stdout: 'clawmessenger.service: Invalid syntax in ExecStart=, ignoring: "/opt/x" run',
+              stderr: "",
+            };
+          }
+          return { status: 0, stdout: "", stderr: "" };
+        },
+      },
+      { spawnPid: 808 },
+    );
+    state(h.paths, 4242, ["claude", "codex"]);
+    h.alive.add(4242);
+    h.alive.add(808);
+
+    await h.daemon.installService();
+
+    // 手工起的 supervisor 确实被收掉了……
+    expect(h.signals).toEqual([{ pid: 4242, signal: "SIGTERM" }]);
+    // ……但服务起不来也不能让设备就这么下线：自动把后台 supervisor 拉回来。
+    expect(h.spawns).toHaveLength(1);
+    expect(h.spawns[0].argv).toEqual(["run"]);
+    expect(readFileSync(h.paths.pidFile, "utf8").trim()).toBe("808");
+    expect(h.lines.join("")).toContain("restoring the background supervisor");
+    expect(h.lines.join("")).toContain("supervisor PID 808");
+    // systemd 的原话、unit 正文都要带出来，省得用户自己去翻 journal。
+    const errs = h.errors.join("");
+    expect(errs).toContain("Unit clawmessenger.service has a bad unit file setting");
+    expect(errs).toContain("Invalid syntax in ExecStart=");
+    expect(errs).toContain("unit file ");
+    expect(errs).toContain("WantedBy=multi-user.target");
+    // 失败后不再打「怎么管理服务」那一套，避免误导。
+    expect(h.lines.join("")).not.toContain("the PATH baked into the unit");
+  });
 });
 
 describe("daemon install-service (macOS / Windows)", () => {
@@ -434,6 +482,35 @@ describe("daemon install-service (macOS / Windows)", () => {
     expect(plist).toContain(`<string>${EXE}</string>`);
     expect(plist).toContain("<string>run</string>");
     expect(h.commands.some((c) => c.file === "launchctl" && c.args[0] === "load")).toBe(true);
+  });
+
+  it("restores the supervisor when launchctl refuses to load the plist", async () => {
+    const h = harness(
+      {
+        platform: "darwin",
+        runCommand: (file, args) => {
+          if (file === "launchctl" && args[0] === "load") {
+            return { status: 1, stdout: "", stderr: "Load failed: 5: Input/output error" };
+          }
+          if (file === "launchctl" && args[0] === "list") {
+            return { status: 0, stdout: "PID\tStatus\tLabel\n-\t0\tcom.clawmessenger.supervisor\n", stderr: "" };
+          }
+          return { status: 0, stdout: "", stderr: "" };
+        },
+      },
+      { spawnPid: 909 },
+    );
+    state(h.paths, 4242);
+    h.alive.add(4242);
+    h.alive.add(909);
+
+    await h.daemon.installService();
+
+    expect(h.spawns).toHaveLength(1);
+    expect(readFileSync(h.paths.pidFile, "utf8").trim()).toBe("909");
+    expect(h.lines.join("")).toContain("restoring the background supervisor");
+    expect(h.errors.join("")).toContain("Load failed: 5: Input/output error");
+    expect(h.errors.join("")).toContain("com.clawmessenger.supervisor");
   });
 
   it("writes a hidden logon launcher into the Startup folder on Windows", async () => {
