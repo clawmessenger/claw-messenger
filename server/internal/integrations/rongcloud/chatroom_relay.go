@@ -118,12 +118,18 @@ func (h *chatroomRelayHub) StartRelay(ctx context.Context, chatroomRCID, request
 		return errRelayResult(409, "该聊天室没有可发言的 AI 成员")
 	}
 	// 讨论组的议题对闲聊同样有效：后续成员「知道这个组在聊什么」是基本上下文。
-	// 取最近一次 v3 讨论的 topic；新组还没有讨论行时退回房间名。
+	// 必须用融云 chatroom id（chatroomRCID）查：rongcloud_discussion.chatroom_id
+	// 列存的是融云 id（创建时写入的 d.ChatroomID），不是 chatroom 表的 UUID
+	// 主键 —— 传主键会永远查不到讨论、议题静默丢失。
+	// 取最近一条带议题的讨论（不限 policy，legacy 议题同样有效）；新组还没有
+	// 讨论行时退回房间名。
 	topic := ""
-	if discussions, err := h.rt.repo.ListByChatroom(ctx, room.ID.String()); err == nil && len(discussions) > 0 {
-		latest := discussions[0]
-		if latest.RoundPolicy == RoundPolicyUserConfirmed && latest.Topic != "" {
-			topic = latest.Topic
+	if discussions, err := h.rt.repo.ListByChatroom(ctx, chatroomRCID); err == nil {
+		for _, d := range discussions {
+			if d.Topic != "" {
+				topic = d.Topic
+				break
+			}
 		}
 	}
 	if topic == "" {
