@@ -7,5 +7,10 @@ docker/entrypoint.sh text eol=lf
 packages/xiachat-cli/scripts/win/*.ps1 text eol=crlf
 packages/xiachat-cli/scripts/win/*.cmd text eol=crlf
 
+# The Linux/macOS daemon script ships as a release asset and is executed by bash:
+# a CRLF shebang would break it. Covered by the global "*.sh text eol=lf" rule
+# above -- stated explicitly here so nobody "fixes" it to CRLF later.
+packages/xiachat-cli/scripts/linux/*.sh text eol=lf
+
 # Default behavior
 * text=auto

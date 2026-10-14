@@ -115,6 +115,17 @@ jobs:
             packages/xiachat-cli/scripts/win/clawmessenger-daemon.cmd
           unzip -l artifacts/clawmessenger-windows-x64-daemon-scripts.zip
 
+      # Linux/macOS users get the same capability: a daemon wrapper that detaches
+      # from the shell (nohup/setsid) and can register a systemd service.
+      - name: Bundle Linux/macOS daemon scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x packages/xiachat-cli/scripts/linux/clawmessenger-daemon.sh
+          tar -czf artifacts/clawmessenger-linux-daemon-scripts.tar.gz \
+            -C packages/xiachat-cli/scripts/linux clawmessenger-daemon.sh
+          tar -tzvf artifacts/clawmessenger-linux-daemon-scripts.tar.gz
+
       - name: Generate checksums
         run: |
           cd artifacts
@@ -125,7 +136,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${GITHUB_REF_NAME}"
-          NOTES="$(printf 'Standalone clawmessenger CLI builds (Node SEA executables).\n\nDownload the binary for your platform from the assets below; see SHA256SUMS for checksums. Windows: clawmessenger-windows-x64.exe (rename to clawmessenger.exe if you like). macOS/Linux: chmod +x before first run.\n\nWindows only: clawmessenger-windows-x64-daemon-scripts.zip keeps the agents running in the background, so closing the console no longer takes them offline. Unzip next to the exe and run `clawmessenger-daemon.cmd start` (also: stop / restart / status / logs / install-startup / install / uninstall).\n\n'; cat artifacts/SHA256SUMS)"
+          NOTES="$(printf 'Standalone clawmessenger CLI builds (Node SEA executables).\n\nDownload the binary for your platform from the assets below; see SHA256SUMS for checksums. Windows: clawmessenger-windows-x64.exe (rename to clawmessenger.exe if you like). macOS/Linux: chmod +x before first run.\n\nWindows only: clawmessenger-windows-x64-daemon-scripts.zip keeps the agents running in the background, so closing the console no longer takes them offline. Unzip next to the exe and run `clawmessenger-daemon.cmd start` (also: stop / restart / status / logs / install-startup / install / uninstall).\n\nLinux/macOS: clawmessenger-linux-daemon-scripts.tar.gz does the same -- the agents stay online after you close the shell. Untar and run `./clawmessenger-daemon.sh start`; `install-service` registers a systemd unit (boot start + crash restart). Also: stop / restart / status / logs / uninstall.\n\n'; cat artifacts/SHA256SUMS)"
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --title "clawmessenger ${TAG#clawmessenger-v}" \
