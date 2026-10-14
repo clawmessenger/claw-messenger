@@ -40,6 +40,61 @@ export interface InboundIMMessage {
   messageUId?: string;
 }
 
+// 已读回执的「该不该回、回给谁、走哪条通道」判定。
+//
+// 融云不替客户端回执：web 端发单聊/群聊消息时带 needReceipt，人类气泡要等
+// 收件端回调回执接口才会从「未读」翻成「已读」。一个只收不回的 AI 节点，会让
+// 每次提问都永远停在「未读」——这正是本次要修的问题。
+//
+// 抽成纯函数是为了能脱离 imlib 单测（imlib 只在浏览器/Node 运行时可用）。
+// 返回 null 表示不回执。
+export type ReadReceiptPlan =
+  | { channel: "private"; targetId: string; messageUId: string; sentTime: number }
+  | { channel: "group"; conversationType: 3; targetId: string; messageUId: string };
+
+export interface ReadReceiptCandidate {
+  messageUId?: string;
+  /** 发送方是否要求回执（web 端单聊/群聊发送时置 true）。 */
+  needReceipt?: boolean;
+  /** 融云 MessageDirection：1=己方发送，2=接收。 */
+  messageDirection?: number;
+  senderUserId?: string;
+  targetId?: string;
+  conversationType?: number;
+  sentTime?: number;
+}
+
+export function planReadReceipt(
+  msg: ReadReceiptCandidate,
+  selfUserId?: string,
+): ReadReceiptPlan | null {
+  // 没有 needReceipt 就不回。融云只在单聊/群聊允许该标记（聊天室本就没有
+  // 已读能力），而 AI 节点之间的 relay / chat_stream 帧也不带它——顺势把
+  // 群内「每个节点对彼此的每一帧都回一次回执」的 N² 回执风暴挡在门外。
+  if (!msg.messageUId || msg.needReceipt !== true) return null;
+  // 多端同步会把本端发出的消息回推；给自己的消息回执没有意义。
+  if (msg.messageDirection === 1) return null;
+  if (selfUserId && msg.senderUserId === selfUserId) return null;
+  if (!msg.senderUserId || !msg.targetId) return null;
+  if (msg.conversationType === 1) {
+    return {
+      channel: "private",
+      targetId: msg.senderUserId,
+      messageUId: msg.messageUId,
+      sentTime: Number(msg.sentTime || 0),
+    };
+  }
+  if (msg.conversationType === 3) {
+    return {
+      channel: "group",
+      conversationType: 3,
+      targetId: msg.targetId,
+      messageUId: msg.messageUId,
+    };
+  }
+  return null;
+}
+
 // Thin transport over @rongcloud/imlib-next so the dispatcher stays testable.
 // The production adapter is wired in run.ts (Task 8); tests use an in-memory fake.
 export interface IMTransport {

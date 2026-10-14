@@ -2,7 +2,7 @@ import type { BaseMessage, IAReceivedMessage } from "@rongcloud/imlib-next";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import type { IMTransport, InboundIMMessage, TurnRunner } from "./im.js";
-import { MessageDispatcher } from "./im.js";
+import { MessageDispatcher, planReadReceipt } from "./im.js";
 import { runAgentTurn, runAgentCommand } from "./agents.js";
 import { createModelCatalogLoader, parseModelCatalogRequest } from "./model-catalog.js";
 import {
@@ -477,6 +477,29 @@ export async function createImlibTransport(): Promise<IMTransport> {
   // the run loop can drop RongCloud's echoes of our own sent messages.
   let selfUserId: string | undefined;
 
+  // 已读回执：判定见 im.ts planReadReceipt，这里只负责把它翻成 imlib 调用。
+  // 单聊用 sendReadReceiptMessage（发送方收 READ_RECEIPT_RECEIVED 推送），
+  // 群聊用 sendReadReceiptResponseV5（发送方靠查询已读数看到）。
+  // 尽力而为：回执失败绝不能影响消息处理本身。
+  const acknowledgeReceipt = async (m: IAReceivedMessage): Promise<void> => {
+    const plan = planReadReceipt(m, selfUserId);
+    if (!plan) return;
+    try {
+      if (plan.channel === "private") {
+        const res = await imlib.sendReadReceiptMessage(plan.targetId, plan.messageUId, plan.sentTime);
+        if (!res.isOk) console.warn(`read receipt (private) failed: ${res.code} ${res.msg}`);
+        return;
+      }
+      const res = await imlib.sendReadReceiptResponseV5(
+        { conversationType: plan.conversationType, targetId: plan.targetId },
+        [plan.messageUId],
+      );
+      if (!res.isOk) console.warn(`read receipt (group) failed: ${res.code} ${res.msg}`);
+    } catch (err) {
+      console.warn("read receipt failed:", err instanceof Error ? err.message : err);
+    }
+  };
+
   const toBaseMessage = (objectName: string, content: string): BaseMessage<never> => {
     if (objectName === "RC:TxtMsg") {
       // Dispatcher hands us the full text-message content JSON.
@@ -516,6 +539,8 @@ export async function createImlibTransport(): Promise<IMTransport> {
       selfUserId = res.data?.userId || imlib.getCurrentUserId() || undefined;
       imlib.addEventListener(imlib.Events.MESSAGES, (evt: { messages: IAReceivedMessage[] }) => {
         for (const m of evt.messages) {
+          // 收到即回执（不阻塞分发）：人类气泡的「已读」靠这一步。
+          void acknowledgeReceipt(m);
           const raw = m.content as unknown;
           const content = typeof raw === "string" ? raw : JSON.stringify(raw ?? {});
           for (const cb of listeners) {

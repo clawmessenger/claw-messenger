@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
-import { MessageDispatcher } from "./im.js";
+import { MessageDispatcher, planReadReceipt } from "./im.js";
 
 function makeDeps() {
   const sent: Array<{ to: string; objectName: string; content: string }> = [];
@@ -954,7 +954,7 @@ describe("MessageDispatcher chat_stream streaming", () => {
     const dispatcher = new MessageDispatcher(deps)
     const turns = {
       runTurn: async () => { throw new Error("should use streamed variant") },
-      runTurnStreamed: async (_p: string, _m: undefined, onDelta: (d: string) => void) => {
+      runTurnStreamed: async (_p: string, _m: string | undefined, onDelta: (d: string) => void) => {
         onDelta("你好")
         onDelta("，世界")
         return "你好，世界"
@@ -1029,7 +1029,7 @@ describe("MessageDispatcher chat_stream streaming", () => {
     }, {
       runTurn: async () => { throw new Error("unused") },
       // 模拟 runAgentTurn(signal) 的真实行为：abort 时 reject。
-      runTurnStreamed: async (_p: string, _m: undefined, onDelta: (d: string) => void, signal?: AbortSignal) => {
+      runTurnStreamed: async (_p: string, _m: string | undefined, onDelta: (d: string) => void, signal?: AbortSignal) => {
         onDelta("部分内容")
         return new Promise<string>((_resolve, reject) => {
           signal?.addEventListener("abort", () => reject(new Error("agent turn aborted")), { once: true })
@@ -1077,5 +1077,65 @@ describe("MessageDispatcher chat_stream streaming", () => {
     const parsed = JSON.parse(sent[0].content) as Record<string, unknown>
     expect(parsed.status).toBe("rejected")
     expect(parsed.code).toBe("no_active_task")
+  })
+})
+
+describe("planReadReceipt (已读回执判定)", () => {
+  it("单聊：收到带 needReceipt 的消息 → 回给发送方", () => {
+    expect(planReadReceipt({
+      messageUId: "u1", needReceipt: true, messageDirection: 2,
+      senderUserId: "human-1", targetId: "node-a", conversationType: 1, sentTime: 1700,
+    }, "node-a")).toEqual({
+      channel: "private", targetId: "human-1", messageUId: "u1", sentTime: 1700,
+    })
+  })
+
+  it("群聊：回执打到群会话上（V5 通道）", () => {
+    expect(planReadReceipt({
+      messageUId: "u2", needReceipt: true, messageDirection: 2,
+      senderUserId: "human-1", targetId: "group-9", conversationType: 3, sentTime: 1700,
+    }, "node-a")).toEqual({
+      channel: "group", conversationType: 3, targetId: "group-9", messageUId: "u2",
+    })
+  })
+
+  it("聊天室不回执（融云聊天室没有已读能力）", () => {
+    expect(planReadReceipt({
+      messageUId: "u3", needReceipt: true, messageDirection: 2,
+      senderUserId: "human-1", targetId: "room-1", conversationType: 4, sentTime: 1700,
+    }, "node-a")).toBeNull()
+  })
+
+  it("没有 needReceipt 就不回（挡住 AI 的 relay/chat_stream 帧，避免 N² 回执风暴）", () => {
+    expect(planReadReceipt({
+      messageUId: "u4", messageDirection: 2,
+      senderUserId: "node-b", targetId: "group-9", conversationType: 3, sentTime: 1700,
+    }, "node-a")).toBeNull()
+    expect(planReadReceipt({
+      messageUId: "u5", needReceipt: false, messageDirection: 2,
+      senderUserId: "node-b", targetId: "group-9", conversationType: 3, sentTime: 1700,
+    }, "node-a")).toBeNull()
+  })
+
+  it("自己的消息（多端同步回推）不回执", () => {
+    expect(planReadReceipt({
+      messageUId: "u6", needReceipt: true, messageDirection: 1,
+      senderUserId: "node-a", targetId: "human-1", conversationType: 1, sentTime: 1700,
+    }, "node-a")).toBeNull()
+    expect(planReadReceipt({
+      messageUId: "u7", needReceipt: true, messageDirection: 2,
+      senderUserId: "node-a", targetId: "group-9", conversationType: 3, sentTime: 1700,
+    }, "node-a")).toBeNull()
+  })
+
+  it("缺 messageUId / 发送方时安全跳过", () => {
+    expect(planReadReceipt({
+      needReceipt: true, messageDirection: 2,
+      senderUserId: "human-1", targetId: "node-a", conversationType: 1,
+    }, "node-a")).toBeNull()
+    expect(planReadReceipt({
+      messageUId: "u8", needReceipt: true, messageDirection: 2,
+      targetId: "node-a", conversationType: 1, sentTime: 1700,
+    }, "node-a")).toBeNull()
   })
 })
