@@ -77,7 +77,10 @@ const (
 	// recommendRolesMaxNodeID 与设备端（role-recommend.ts 的 segment 校验）以及
 	// 命令参数校验共用同一个 node_id 长度上限。
 	recommendRolesMaxNodeID = 128
-	recommendRolesTTL       = 7 * 24 * time.Hour
+	// recommendRolesMaxStyle 是讨论风格 id 的长度上限，与设备端
+	// role-recommend.ts 的解析保持一致：更长的一律当没选。
+	recommendRolesMaxStyle = 64
+	recommendRolesTTL      = 7 * 24 * time.Hour
 
 	// RecommendRolesMaxRoles bounds how many roles a single recommendation may
 	// return. Shared with the admin handler so the request and the validation
@@ -125,7 +128,11 @@ func (b *NodeRequestBroker) BindSender(send NodeRequestSender) {
 
 // StartRecommendation records a pending request and sends it. Returns the
 // request id, or a public error code when it could not be sent.
-func (b *NodeRequestBroker) StartRecommendation(ctx context.Context, host NodeRequestHost, topic, goal string, maxRoles int) (string, string) {
+//
+// style 是 C 端选的讨论风格 id（free / brainstorm / debate / review /
+// consensus）。它为空时**不下发**这个键，旧设备端与旧行为都不受影响；设备端
+// 认不出来时也会退回 goal 里的风格短语自行识别。
+func (b *NodeRequestBroker) StartRecommendation(ctx context.Context, host NodeRequestHost, topic, goal string, maxRoles int, style string) (string, string) {
 	if host.AIUserID == "" {
 		return "", NodeRequestCodeHostNotConfigured
 	}
@@ -136,21 +143,26 @@ func (b *NodeRequestBroker) StartRecommendation(ctx context.Context, host NodeRe
 		timeout = 60 * time.Second
 	}
 
+	params := map[string]interface{}{
+		"topic":                 topic,
+		"goal":                  goal,
+		"max_roles":             maxRoles,
+		"recommendation_prompt": host.RecommendationPrompt,
+		"config_version":        host.ConfigVersion,
+		"protocol_version":      "v1",
+		// 融云在客户端每次重连时会把离线历史整段重放；设备端用它丢弃
+		// 早已无人等待的旧请求，避免为一次重放白跑一遍 agent。
+		"timestamp": b.now().UnixMilli(),
+	}
+	if style != "" {
+		params["style"] = style
+	}
+
 	content, err := json.Marshal(map[string]interface{}{
 		"request_id": requestID,
 		"service":    recommendRolesService,
 		"action":     recommendRolesAction,
-		"params": map[string]interface{}{
-			"topic":                 topic,
-			"goal":                  goal,
-			"max_roles":             maxRoles,
-			"recommendation_prompt": host.RecommendationPrompt,
-			"config_version":        host.ConfigVersion,
-			"protocol_version":      "v1",
-			// 融云在客户端每次重连时会把离线历史整段重放；设备端用它丢弃
-			// 早已无人等待的旧请求，避免为一次重放白跑一遍 agent。
-			"timestamp": b.now().UnixMilli(),
-		},
+		"params":     params,
 	})
 	if err != nil {
 		return "", NodeRequestCodeRecommendInvalid
@@ -230,8 +242,8 @@ func (b *NodeRequestBroker) AwaitRecommendation(ctx context.Context, requestID s
 }
 
 // RecommendRoles runs a full start + await round trip.
-func (b *NodeRequestBroker) RecommendRoles(ctx context.Context, host NodeRequestHost, topic, goal string, maxRoles int) (map[string]interface{}, string) {
-	requestID, code := b.StartRecommendation(ctx, host, topic, goal, maxRoles)
+func (b *NodeRequestBroker) RecommendRoles(ctx context.Context, host NodeRequestHost, topic, goal string, maxRoles int, style string) (map[string]interface{}, string) {
+	requestID, code := b.StartRecommendation(ctx, host, topic, goal, maxRoles, style)
 	if code != "" {
 		return nil, code
 	}

@@ -53,6 +53,13 @@ func (rt *discussionRuntime) actionRecommendRoles(ctx context.Context, cmd Comma
 	if policy != RoundPolicyLegacyCapped && policy != RoundPolicyUserConfirmed {
 		return errResult(400, "INVALID_ROUNDTABLE_REQUEST")
 	}
+	// 讨论风格（C 端选的 free / brainstorm / debate / review / consensus）。
+	// 空值或超长一律当没选：设备端会退回 goal 里的风格短语自行识别，所以这里
+	// 不做 400 —— 风格只影响角色推荐的取向，不该让整次推荐失败。
+	style := paramTrim(cmd, "style", "discussion_style")
+	if len(style) > recommendRolesMaxStyle {
+		style = ""
+	}
 
 	host, hostErr := rt.roundtable.resolveHost(ctx)
 	if hostErr != "" {
@@ -99,7 +106,7 @@ func (rt *discussionRuntime) actionRecommendRoles(ctx context.Context, cmd Comma
 		RecommendationPrompt: rt.roundtable.recommendationPrompt(ctx),
 		TimeoutSeconds:       timeout,
 		ConfigVersion:        configVersionInt(host.configVersion),
-	}, topic, goal, maxRoles)
+	}, topic, goal, maxRoles, style)
 	if code != "" {
 		return errResult(503, code)
 	}

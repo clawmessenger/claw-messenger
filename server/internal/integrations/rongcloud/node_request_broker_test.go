@@ -133,7 +133,7 @@ func TestParseRecommendedRolesDeviceAssignment(t *testing.T) {
 func TestNodeRequestBrokerCarriesDeviceAssignment(t *testing.T) {
 	broker, _, _ := startBroker(t)
 	host := NodeRequestHost{AIUserID: "rc_node_host", TimeoutSeconds: 30}
-	requestID, code := broker.StartRecommendation(context.Background(), host, "t", "", 2)
+	requestID, code := broker.StartRecommendation(context.Background(), host, "t", "", 2, "")
 	if code != "" {
 		t.Fatalf("start failed: %s", code)
 	}
@@ -160,7 +160,7 @@ func TestNodeRequestBrokerCarriesDeviceAssignment(t *testing.T) {
 
 func TestNodeRequestBrokerOmitsAssignmentForAdminPreview(t *testing.T) {
 	broker, _, _ := startBroker(t)
-	requestID, _ := broker.StartRecommendation(context.Background(), NodeRequestHost{AIUserID: "rc_node_host", TimeoutSeconds: 30}, "t", "", 1)
+	requestID, _ := broker.StartRecommendation(context.Background(), NodeRequestHost{AIUserID: "rc_node_host", TimeoutSeconds: 30}, "t", "", 1, "")
 
 	broker.AcceptResponse("rc_node_host", `{"request_id":"`+requestID+`","msg_type":"command_result","payload":{"roles":[`+
 		`{"role_name":"A","role_prompt":"p","speaking_order":0}]}}`)
@@ -218,7 +218,7 @@ func TestNodeRequestBrokerRoundTrip(t *testing.T) {
 		ConfigVersion:        7,
 	}
 
-	requestID, code := broker.StartRecommendation(context.Background(), host, "AI 与就业", "找平衡", 3)
+	requestID, code := broker.StartRecommendation(context.Background(), host, "AI 与就业", "找平衡", 3, "debate")
 	if code != "" {
 		t.Fatalf("StartRecommendation failed: %s", code)
 	}
@@ -249,6 +249,10 @@ func TestNodeRequestBrokerRoundTrip(t *testing.T) {
 	}
 	if envelope.Params["recommendation_prompt"] != "用中文" {
 		t.Fatalf("operator prompt not carried: %#v", envelope.Params)
+	}
+	// 讨论风格必须原样送设备端：它决定这次推荐用哪套角色骨架和口吻。
+	if envelope.Params["style"] != "debate" {
+		t.Fatalf("discussion style not carried: %#v", envelope.Params)
 	}
 	if _, ok := envelope.Params["timestamp"]; !ok {
 		t.Fatalf("timestamp missing; the device needs it to drop replayed requests")
@@ -290,7 +294,7 @@ func TestNodeRequestBrokerRejectsBeforeSending(t *testing.T) {
 	broker, _, _ := startBroker(t)
 
 	t.Run("unconfigured host", func(t *testing.T) {
-		if _, code := broker.StartRecommendation(context.Background(), NodeRequestHost{}, "t", "", 3); code != NodeRequestCodeHostNotConfigured {
+		if _, code := broker.StartRecommendation(context.Background(), NodeRequestHost{}, "t", "", 3, ""); code != NodeRequestCodeHostNotConfigured {
 			t.Fatalf("got %q, want %q", code, NodeRequestCodeHostNotConfigured)
 		}
 	})
@@ -298,7 +302,7 @@ func TestNodeRequestBrokerRejectsBeforeSending(t *testing.T) {
 	t.Run("no sender bound", func(t *testing.T) {
 		unbound := NewNodeRequestBroker(nil)
 		host := NodeRequestHost{AIUserID: "rc_node_host", TimeoutSeconds: 30}
-		if _, code := unbound.StartRecommendation(context.Background(), host, "t", "", 3); code != NodeRequestCodeHostOffline {
+		if _, code := unbound.StartRecommendation(context.Background(), host, "t", "", 3, ""); code != NodeRequestCodeHostOffline {
 			t.Fatalf("got %q, want %q", code, NodeRequestCodeHostOffline)
 		}
 	})
@@ -307,7 +311,7 @@ func TestNodeRequestBrokerRejectsBeforeSending(t *testing.T) {
 func TestNodeRequestBrokerInvalidAnswer(t *testing.T) {
 	broker, _, _ := startBroker(t)
 	host := NodeRequestHost{AIUserID: "rc_node_host", TimeoutSeconds: 30}
-	requestID, code := broker.StartRecommendation(context.Background(), host, "t", "", 3)
+	requestID, code := broker.StartRecommendation(context.Background(), host, "t", "", 3, "")
 	if code != "" {
 		t.Fatalf("start failed: %s", code)
 	}
@@ -326,7 +330,7 @@ func TestNodeRequestBrokerInvalidAnswer(t *testing.T) {
 
 func TestNodeRequestBrokerErrorAnswer(t *testing.T) {
 	broker, _, _ := startBroker(t)
-	requestID, _ := broker.StartRecommendation(context.Background(), NodeRequestHost{AIUserID: "rc_node_host", TimeoutSeconds: 30}, "t", "", 3)
+	requestID, _ := broker.StartRecommendation(context.Background(), NodeRequestHost{AIUserID: "rc_node_host", TimeoutSeconds: 30}, "t", "", 3, "")
 
 	broker.AcceptResponse("rc_node_host", `{"request_id":"`+requestID+`","msg_type":"command_result","payload":{"kind":"error","error":"timeout"}}`)
 	if _, code := broker.AwaitRecommendation(context.Background(), requestID); code != NodeRequestCodeRecommendTimeout {
@@ -352,7 +356,7 @@ func TestNodeRequestBrokerIgnoresForeignMessages(t *testing.T) {
 
 func TestNodeRequestBrokerIgnoresWrongSender(t *testing.T) {
 	broker, _, _ := startBroker(t)
-	requestID, _ := broker.StartRecommendation(context.Background(), NodeRequestHost{AIUserID: "rc_node_host", TimeoutSeconds: 30}, "t", "", 3)
+	requestID, _ := broker.StartRecommendation(context.Background(), NodeRequestHost{AIUserID: "rc_node_host", TimeoutSeconds: 30}, "t", "", 3, "")
 
 	answer := `{"request_id":"` + requestID + `","msg_type":"command_result","payload":{"roles":[` +
 		`{"role_name":"A","role_prompt":"p","speaking_order":0}]}}`
@@ -370,7 +374,7 @@ func TestNodeRequestBrokerIgnoresWrongSender(t *testing.T) {
 
 func TestNodeRequestBrokerTimeout(t *testing.T) {
 	broker, _, _ := startBroker(t)
-	requestID, code := broker.StartRecommendation(context.Background(), NodeRequestHost{AIUserID: "rc_node_host", TimeoutSeconds: 1}, "t", "", 3)
+	requestID, code := broker.StartRecommendation(context.Background(), NodeRequestHost{AIUserID: "rc_node_host", TimeoutSeconds: 1}, "t", "", 3, "")
 	if code != "" {
 		t.Fatalf("start failed: %s", code)
 	}
@@ -389,7 +393,7 @@ func TestNodeRequestBrokerTimeout(t *testing.T) {
 
 func TestNodeRequestBrokerFirstSettleWins(t *testing.T) {
 	broker, _, _ := startBroker(t)
-	requestID, _ := broker.StartRecommendation(context.Background(), NodeRequestHost{AIUserID: "rc_node_host", TimeoutSeconds: 30}, "t", "", 3)
+	requestID, _ := broker.StartRecommendation(context.Background(), NodeRequestHost{AIUserID: "rc_node_host", TimeoutSeconds: 30}, "t", "", 3, "")
 
 	// Expire it first, then deliver a (late) good answer: the timeout stands.
 	broker.settle(requestID, "", NodeRequestCodeRecommendTimeout, nil)
@@ -404,7 +408,7 @@ func TestNodeRequestBrokerFirstSettleWins(t *testing.T) {
 
 func TestNodeRequestBrokerCancelledContext(t *testing.T) {
 	broker, _, _ := startBroker(t)
-	requestID, _ := broker.StartRecommendation(context.Background(), NodeRequestHost{AIUserID: "rc_node_host", TimeoutSeconds: 30}, "t", "", 3)
+	requestID, _ := broker.StartRecommendation(context.Background(), NodeRequestHost{AIUserID: "rc_node_host", TimeoutSeconds: 30}, "t", "", 3, "")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -417,5 +421,32 @@ func TestNodeRequestBrokerUnknownRequest(t *testing.T) {
 	broker := NewNodeRequestBroker(nil)
 	if _, code := broker.AwaitRecommendation(context.Background(), "roles_missing"); code != NodeRequestCodeRecommendInvalid {
 		t.Fatalf("got %q, want %q", code, NodeRequestCodeRecommendInvalid)
+	}
+}
+
+// 没选风格时信封里不该出现 style 键：旧设备端（认不出这个键也不该被打扰）与
+// 改造前的报文保持逐字一致；风格只影响角色推荐的取向，不该成为硬依赖。
+func TestNodeRequestBrokerOmitsEmptyStyle(t *testing.T) {
+	broker, sent, mu := startBroker(t)
+	host := NodeRequestHost{AIUserID: "rc_node_host", TimeoutSeconds: 30}
+
+	if _, code := broker.StartRecommendation(context.Background(), host, "t", "", 2, ""); code != "" {
+		t.Fatalf("StartRecommendation failed: %s", code)
+	}
+
+	mu.Lock()
+	wire := *sent
+	mu.Unlock()
+	var envelope struct {
+		Params map[string]interface{} `json:"params"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(wire, "rc_node_host|")), &envelope); err != nil {
+		t.Fatalf("unmarshal wire payload: %v", err)
+	}
+	if _, ok := envelope.Params["style"]; ok {
+		t.Fatalf("an unset style must not ride the envelope: %#v", envelope.Params)
+	}
+	if envelope.Params["topic"] != "t" {
+		t.Fatalf("the rest of the envelope must be unchanged: %#v", envelope.Params)
 	}
 }

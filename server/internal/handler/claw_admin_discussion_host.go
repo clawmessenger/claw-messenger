@@ -707,7 +707,7 @@ func (h *Handler) ClawAdminDiscussionHostTestRecommendation(w http.ResponseWrite
 	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(cfg.TimeoutSeconds+5)*time.Second)
 	defer cancel()
 
-	payload, code := h.RongCloudNodeRequests.RecommendRoles(ctx, host, topic, goal, maxRoles)
+	payload, code := h.RongCloudNodeRequests.RecommendRoles(ctx, host, topic, goal, maxRoles, "")
 	if code != "" {
 		h.clawAdminRecommendFail(w, r, ident, code, maxRoles)
 		return

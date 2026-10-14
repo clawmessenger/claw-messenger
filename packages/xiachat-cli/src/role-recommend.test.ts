@@ -3,9 +3,11 @@ import {
   buildRoleRecommendPrompt,
   buildRoleRecommendationError,
   buildRoleRecommendationResponse,
+  detectDiscussionStyle,
   parseRoleRecommendRequest,
   parseRoleRecommendationOutput,
   STALE_ROLE_RECOMMEND_REQUEST_MS,
+  type RoleRecommendRequest,
 } from "./role-recommend.js";
 
 describe("parseRoleRecommendRequest", () => {
@@ -49,6 +51,22 @@ describe("parseRoleRecommendRequest", () => {
     expect(parseRoleRecommendRequest({ ...base, params: { topic: "t", max_roles: 9 } })).toBeNull();
     expect(parseRoleRecommendRequest({ ...base, params: { topic: "t", max_roles: 2.5 } })).toBeNull();
     expect(parseRoleRecommendRequest({ ...base, params: { topic: "t", max_roles: "3" } })).toBeNull();
+  });
+
+  it("carries an explicit discussion style through, defaulting to undefined", () => {
+    // 旧请求（没有 style）必须保持 undefined —— 提示词才会退回旧形态。
+    expect(parseRoleRecommendRequest(base)?.style).toBeUndefined();
+
+    const camel = parseRoleRecommendRequest({ ...base, params: { ...base.params, style: "debate" } });
+    expect(camel?.style).toBe("debate");
+
+    // 服务端用 snake_case 下发时同样认。
+    const snake = parseRoleRecommendRequest({ ...base, params: { ...base.params, discussion_style: "review" } });
+    expect(snake?.style).toBe("review");
+
+    // 空白或过长的取值不当作风格。
+    expect(parseRoleRecommendRequest({ ...base, params: { ...base.params, style: "   " } })?.style).toBeUndefined();
+    expect(parseRoleRecommendRequest({ ...base, params: { ...base.params, style: "x".repeat(65) } })?.style).toBeUndefined();
   });
 });
 
@@ -162,5 +180,91 @@ describe("reply builders", () => {
 
   it("keeps the staleness window at least the max host timeout (600s)", () => {
     expect(STALE_ROLE_RECOMMEND_REQUEST_MS).toBeGreaterThanOrEqual(600_000);
+  });
+});
+
+// 讨论风格必须真的改变推荐结果：换风格就换一批角色名，也换一种说话方式。
+describe("discussion style steering", () => {
+  const styleIds = ["free", "brainstorm", "debate", "review", "consensus"] as const;
+
+  const promptFor = (style: string | undefined, overrides: Partial<RoleRecommendRequest> = {}) =>
+    buildRoleRecommendPrompt({
+      requestId: "r",
+      topic: "AI 与就业",
+      goal: "",
+      maxRoles: 4,
+      recommendationPrompt: "",
+      style,
+      ...overrides,
+    });
+
+  it("resolves the style from an explicit id first, then from the goal phrase", () => {
+    expect(detectDiscussionStyle("debate", "")).toBe("debate");
+    // 旧链路（服务端/前端都没带 style）只能靠 C 端拼进 goal 的原话。
+    expect(detectDiscussionStyle(undefined, "围绕“X”，以专家多角度评审的方式展开讨论，形成可执行的共识。")).toBe("review");
+    // 不认识的显式取值要让位给 goal，而不是直接把风格丢掉。
+    expect(detectDiscussionStyle("nonsense", "围绕“X”，以聚焦决策凝聚共识的方式展开讨论。")).toBe("consensus");
+    expect(detectDiscussionStyle(undefined, "没有风格短语的 goal")).toBeNull();
+    expect(detectDiscussionStyle("nonsense", "")).toBeNull();
+  });
+
+  it("gives every style its own cast — no role name is shared across styles", () => {
+    const owner = new Map<string, string>();
+    for (const id of styleIds) {
+      const names = [...promptFor(id, { maxRoles: 8 }).matchAll(/^\d+\. (.+)$/gm)].map((m) => m[1]);
+      expect(names.length, `${id} 至少要给出一个角色`).toBeGreaterThan(0);
+      for (const name of names) {
+        expect(owner.has(name), `角色「${name}」在 ${id} 与 ${owner.get(name)} 之间重复`).toBe(false);
+        owner.set(name, id);
+      }
+    }
+    expect(owner.size).toBe(20);
+  });
+
+  it("writes each style's own speaking voice into the prompt", () => {
+    const marker: Record<(typeof styleIds)[number], string> = {
+      free: "像熟人聊天",
+      brainstorm: "异想天开",
+      debate: "我反对",
+      review: "风险等级",
+      consensus: "代价是",
+    };
+    for (const id of styleIds) {
+      const prompt = promptFor(id);
+      expect(prompt, `${id} 缺少风格段落`).toContain(`Discussion style: `);
+      expect(prompt, `${id} 缺少口吻要求`).toContain(marker[id]);
+      // 口吻必须落在 role_prompt 上（role_prompt 才是每轮注入的人设）。
+      expect(prompt).toContain("role_prompt");
+    }
+  });
+
+  it("caps the cast at max_roles and asks for the shortfall", () => {
+    const tight = promptFor("debate", { maxRoles: 2 });
+    expect(tight).toContain("1. 正方主辩");
+    expect(tight).toContain("2. 反方主辩");
+    expect(tight).not.toContain("3. 证据审查员");
+    expect(tight).not.toContain("add up to");
+
+    const roomy = promptFor("debate", { maxRoles: 8 });
+    expect(roomy).toContain("3. 证据审查员");
+    expect(roomy).toContain("4. 裁判");
+    expect(roomy).toContain("add up to 4 role(s)");
+  });
+
+  it("matches the explicit style with the goal-only fallback", () => {
+    const goal = "围绕“AI 与就业”，以正反两方交锋辩论的方式展开讨论，形成可执行的共识、分歧清单和后续行动。";
+    expect(promptFor(undefined, { goal })).toBe(promptFor("debate", { goal }));
+  });
+
+  it("leaves the prompt exactly as before when no style is recognisable", () => {
+    const prompt = buildRoleRecommendPrompt({
+      requestId: "r",
+      topic: "t",
+      goal: "找平衡",
+      maxRoles: 3,
+      recommendationPrompt: "",
+    });
+    expect(prompt).not.toContain("Discussion style:");
+    expect(prompt).toContain("Return between 1 and 3 roles.");
   });
 });
