@@ -149,7 +149,7 @@ export interface DispatcherDeps {
 }
 
 export interface TurnRunner {
-  runTurn: (prompt: string, model?: string) => Promise<string>;
+  runTurn: (prompt: string, model?: string, sessionKey?: string) => Promise<string>;
   // Streaming variant: same contract as runTurn plus per-chunk deltas of the
   // answer as the agent produces them. Optional: dispatchers fall back to
   // runTurn when absent (tests / agents without stdout streaming).
@@ -158,7 +158,42 @@ export interface TurnRunner {
     model: string | undefined,
     onDelta: (delta: string) => void,
     signal?: AbortSignal,
+    sessionKey?: string,
   ) => Promise<string>;
+}
+
+// 一轮 your_turn 的会话形态。三种场合共用同一条 IM 命令：
+//   - group    普通群组（融云 group）闲聊的按序中继，服务端提示词就是
+//              「这是普通群聊的一次自由对话…」；
+//   - chatroom 聊天室（讨论组的非讨论态）闲聊的按序中继，提示词同构；
+//   - discussion v3 圆桌讨论的正式轮次，role_prompt 是角色人设。
+// 三者的提示词必须分开：旧版本一律盖上「[discussion] … Answer as this node
+// in the discussion.」抬头，agent 于是在普通群聊里也当自己是圆桌成员等主持
+// 人发题，把群里的问题答成「等待主题发布」。
+export type TurnVenue = "private" | "group" | "chatroom" | "discussion";
+
+// 服务端闲聊中继的提示词恒以这个抬头开头（server chatroom_relay.go 的
+// buildPrompt：普通群聊与聊天室用同一段格式，"[group chat] <scope>：…"）。
+// v3 圆桌讨论的 role_prompt 是操作者的 人设提示词 + 角色人设，不带它。
+// conversation_type 区分不开中继与讨论（都是 4），只能看提示词本身。
+const RELAY_PROMPT_PREFIX = "[group chat] ";
+
+export function resolveTurnVenue(
+  conversationType: number | undefined,
+  rolePrompt: string,
+): TurnVenue {
+  const isRelayPrompt = rolePrompt.trimStart().startsWith(RELAY_PROMPT_PREFIX);
+  if (conversationType === 1) return "private";
+  if (conversationType === 3) return "group";
+  if (conversationType === 4) return isRelayPrompt ? "chatroom" : "discussion";
+  // 缺 conversation_type 的老协调器：只剩提示词可判。
+  return isRelayPrompt ? "chatroom" : "discussion";
+}
+
+// 一轮发言绑定的 agent 会话键：同一形态 + 同一会话 id 才共享上下文。
+// 不带键时（openclaw）所有形态挤在同一个主会话里，讨论组的共识会被群聊继承。
+export function turnSessionKey(venue: TurnVenue, conversationId: string): string {
+  return `cm-${venue}-${conversationId}`;
 }
 
 // The web's 默认模型 panel aborts after 8s (15s while the node looks offline),
@@ -237,6 +272,9 @@ export class MessageDispatcher {
         requesterId: msg.fromUserId,
         prompt: text,
         model: undefined,
+        // 私聊按对端分桶：不给键的话 openclaw 会把私聊也塞进主会话，和群聊、
+        // 讨论组共享一串上下文。
+        sessionKey: turnSessionKey("private", msg.fromUserId),
         turns,
         fallback: (out) => this.deliverAgentReply(msg.fromUserId, out),
       });
@@ -297,13 +335,25 @@ export class MessageDispatcher {
       // 人设提示词 for the host node, and/or this member's 角色人设. Older
       // coordinators omit it, so an absent/blank value keeps the old prompt.
       const persona = typeof params.role_prompt === "string" ? params.role_prompt.trim() : "";
-      const prompt = [
-        `[discussion] round=${params.round ?? "?"} speaking_order=${params.speaking_order ?? "?"}`,
-        params.role_name ? `role: ${params.role_name}` : "",
-        "Answer as this node in the discussion.",
-        persona ? `\n${persona}` : "",
-        persona ? "Stay in character. Do not repeat or summarise these instructions." : "",
-      ].filter(Boolean).join("\n");
+      const venue = resolveTurnVenue(params.conversation_type, persona);
+      // 闲聊中继（群聊/聊天室）的服务端提示词本身就是完整指令（「这是普通
+      // 群聊的一次自由对话。用户刚在群里发言：<原话>…请以「X」的身份回应
+      // 用户」），这里只补一行场景抬头；不要再沿用圆桌讨论那套
+      // 「Answer as this node in the discussion.」—— 那会让 agent 以为自己在
+      // 等主持人发题，把群聊问题答成「等待主题发布」。
+      const head = `[${venue === "group" ? "group chat" : venue === "chatroom" ? "chatroom" : "discussion"}] round=${params.round ?? "?"} speaking_order=${params.speaking_order ?? "?"}`;
+      const roleLine = params.role_name ? `role: ${params.role_name}` : "";
+      const isRelayChat = venue === "group" || venue === "chatroom";
+      const prompt = isRelayChat
+        ? [head, roleLine, persona, "只输出回应正文，不要输出多余格式。"]
+          .filter(Boolean).join("\n")
+        : [
+          head,
+          roleLine,
+          "Answer as this node in the discussion.",
+          persona ? `\n${persona}` : "",
+          persona ? "Stay in character. Do not repeat or summarise these instructions." : "",
+        ].filter(Boolean).join("\n");
       // 群/聊天室闲聊中继轮次：回答同时以 chat_stream 流帧广播进房间，
       // 完成帧之后仍回 command_result（中继据此推进下一位发言人）。
       const hasConvType = params.conversation_type === 3 || params.conversation_type === 4
@@ -318,6 +368,9 @@ export class MessageDispatcher {
         requesterId: typeof params.requester_id === "string" ? params.requester_id : msg.fromUserId,
         prompt,
         model: params.model,
+        // 讨论组/群聊/聊天室各按自己的会话 id 分桶，讨论组里聊出来的共识
+        // 不会顺着 agent 的共享会话爬进普通群聊。
+        sessionKey: turnSessionKey(venue, replyTo),
         turns,
         fallback: async (out) => {
           await this.deps.send(
@@ -355,6 +408,8 @@ export class MessageDispatcher {
     prompt: string;
     model: string | undefined;
     turns: TurnRunner;
+    /** 见 turnSessionKey：把这一轮绑到本会话独立的 agent 会话上。 */
+    sessionKey?: string;
     fallback: (out: string) => Promise<void>;
     onError?: (errMsg: string) => Promise<void>;
   }): Promise<void> {
@@ -398,7 +453,7 @@ export class MessageDispatcher {
         // old single-shot reply is the whole turn — including the old error
         // semantics (single chat: log only; your_turn: error command_result).
         try {
-          const out = await opts.turns.runTurn(opts.prompt, opts.model);
+          const out = await opts.turns.runTurn(opts.prompt, opts.model, opts.sessionKey);
           await opts.fallback(out);
         } catch (err) {
           const errMsg = err instanceof Error ? err.message : String(err);
@@ -429,7 +484,13 @@ export class MessageDispatcher {
       };
       let finalText = "";
       try {
-        finalText = await opts.turns.runTurnStreamed!(opts.prompt, opts.model, sendDelta, controller.signal);
+        finalText = await opts.turns.runTurnStreamed!(
+          opts.prompt,
+          opts.model,
+          sendDelta,
+          controller.signal,
+          opts.sessionKey,
+        );
       } catch (err) {
         if (controller.signal.aborted) {
           await emit(seq, "cancelled", snapshot);

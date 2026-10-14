@@ -43,6 +43,19 @@ describe("buildAgentArgs", () => {
     expect(buildAgentArgs("openclaw", "hi", "m1")).toEqual(["agent", "--local", "--json", "-m", "hi", "--model", "m1"]);
   });
 
+  it("openclaw 带会话键时用 --session-key 隔离会话（群聊不得读讨论组的上下文）", () => {
+    expect(buildAgentArgs("openclaw", "hi", "m1", "cm-group-g1")).toEqual([
+      "agent", "--local", "--json", "-m", "hi", "--session-key", "cm-group-g1", "--model", "m1",
+    ]);
+    // 不带键时参数形状不变（老行为、老测试）
+    expect(buildAgentArgs("openclaw", "hi", "m1")).not.toContain("--session-key");
+  });
+
+  it("不支持会话键的 agent 忽略它（opencode/hermes 每轮本就是新会话）", () => {
+    expect(buildAgentArgs("opencode", "hi", undefined, "cm-group-g1")).toEqual(["run", "hi"]);
+    expect(buildAgentArgs("hermes", "hi", undefined, "cm-group-g1")).toEqual(["-z", "hi"]);
+  });
+
   it("hermes uses -z with -m", () => {
     expect(buildAgentArgs("hermes", "hi", "m1")).toEqual(["-z", "hi", "-m", "m1"]);
   });

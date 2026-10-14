@@ -31,6 +31,13 @@ export interface RunAgentTurnOpts {
   cwd?: string;
   onChunk?: (chunk: string) => void;
   signal?: AbortSignal;
+  // 会话隔离键（可选）。多个会话形态共用同一个 agent 二进制，而 agent CLI
+  // 默认把它们全塞进自己的「主会话」：openclaw 的默认键就是 agent:main:main，
+  // 于是讨论组、普通群聊、私聊共享一串上下文。讨论组里达成过的共识（例如
+  // 「没有主题就回『等待主题发布』占位」）会被后续群聊继承，群聊于是答非
+  // 所问。支持显式会话键的 agent（当前只有 openclaw 的 --session-key）按
+  // 「会话形态 + 会话 id」分桶；不支持的 agent 忽略此参数。
+  sessionKey?: string;
 }
 
 // Agents known to reject or hang on stdin-mode invocation get an argv
@@ -43,7 +50,7 @@ export interface RunAgentTurnOpts {
 //             log lines with the answer — see parseOpenclawJsonOutput)
 //   hermes:   `-z` one-shot prompt (stdin-mode unsupported)
 // Keep in sync with agentArgvArgs in server discussion_bridge.go.
-type AgentArgvStrategy = (prompt: string, model?: string) => string[];
+type AgentArgvStrategy = (prompt: string, model?: string, sessionKey?: string) => string[];
 
 // The web stores a model as a `provider/model` route. Most agent CLIs take
 // that verbatim, but two split it:
@@ -78,7 +85,14 @@ const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
   claude: (prompt, model) => ["-p", prompt, ...buildModelArgs("claude", model)],
   codex: (prompt, model) => ["exec", prompt, ...buildModelArgs("codex", model)],
   opencode: (prompt, model) => ["run", prompt, ...buildModelArgs("opencode", model)],
-  openclaw: (prompt, model) => ["agent", "--local", "--json", "-m", prompt, ...buildModelArgs("openclaw", model)],
+  // --session-key 把这一轮绑到「会话形态 + 会话 id」的独立会话上。不带它时
+  // openclaw 一律走默认主会话（agent:main:main），群聊会被讨论组的上下文
+  // 带跑（见 RunAgentTurnOpts.sessionKey）。
+  openclaw: (prompt, model, sessionKey) => [
+    "agent", "--local", "--json", "-m", prompt,
+    ...(sessionKey ? ["--session-key", sessionKey] : []),
+    ...buildModelArgs("openclaw", model),
+  ],
   hermes: (prompt, model) => ["-z", prompt, ...buildModelArgs("hermes", model)],
 };
 
@@ -90,10 +104,15 @@ const ARGV_PROMPT_MAX_CHARS = 8000;
 
 // Returns the argv for an agent turn; an empty array means stdin mode
 // (unknown agent, or a prompt too long for argv).
-export function buildAgentArgs(name: string, prompt: string, model?: string): string[] {
+export function buildAgentArgs(
+  name: string,
+  prompt: string,
+  model?: string,
+  sessionKey?: string,
+): string[] {
   const strategy = agentArgvStrategies[name];
   if (!strategy || prompt.length > ARGV_PROMPT_MAX_CHARS) return [];
-  return strategy(prompt, model);
+  return strategy(prompt, model, sessionKey);
 }
 
 const DEFAULT_TIMEOUT_MS = 120_000;
@@ -338,7 +357,7 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
     // agent, or a prompt past the argv length cap) keeps the legacy stdin
     // invocation with the model flag as the only argument.
     const strategyArgs = opts.agentName
-      ? buildAgentArgs(opts.agentName, opts.prompt, opts.model)
+      ? buildAgentArgs(opts.agentName, opts.prompt, opts.model, opts.sessionKey)
       : [];
     const argvMode = strategyArgs.length > 0;
     const agentArgs = argvMode

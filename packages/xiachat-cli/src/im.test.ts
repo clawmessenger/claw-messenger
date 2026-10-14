@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
-import { MessageDispatcher, planReadReceipt } from "./im.js";
+import { MessageDispatcher, planReadReceipt, resolveTurnVenue, turnSessionKey } from "./im.js";
 
 function makeDeps() {
   const sent: Array<{ to: string; objectName: string; content: string }> = [];
@@ -1137,5 +1137,126 @@ describe("planReadReceipt (已读回执判定)", () => {
       messageUId: "u8", needReceipt: true, messageDirection: 2,
       targetId: "node-a", conversationType: 1, sentTime: 1700,
     }, "node-a")).toBeNull()
+  })
+})
+
+describe("会话形态判定与隔离（群聊不得被当成讨论组）", () => {
+  const RELAY_PROMPT =
+    "[group chat] 这是普通群聊的一次自由对话。用户刚在群里发言：\n\n今天的天气怎么样\n\n" +
+    "请以「openclaw」的身份回应用户。回应会被广播回群聊，请只输出回应正文，不要输出多余格式。"
+
+  it("conversation_type=3 → 群聊；=4 且提示词是中继文案 → 聊天室；=4 且是人设 → 讨论", () => {
+    expect(resolveTurnVenue(3, RELAY_PROMPT)).toBe("group")
+    expect(resolveTurnVenue(4, RELAY_PROMPT)).toBe("chatroom")
+    expect(resolveTurnVenue(4, "你是主持人，负责收敛分歧。")).toBe("discussion")
+    expect(resolveTurnVenue(1, "")).toBe("private")
+    // 老协调器不带 conversation_type：只能靠提示词认中继
+    expect(resolveTurnVenue(undefined, RELAY_PROMPT)).toBe("chatroom")
+    expect(resolveTurnVenue(undefined, "你是架构师")).toBe("discussion")
+  })
+
+  it("会话键按形态 + 会话 id 分桶", () => {
+    expect(turnSessionKey("group", "group_rc")).toBe("cm-group-group_rc")
+    expect(turnSessionKey("discussion", "room_rc")).toBe("cm-discussion-room_rc")
+    expect(turnSessionKey("private", "user_a")).toBe("cm-private-user_a")
+    // 群聊与讨论组永远不共享键 —— 这正是「群聊答成等待主题发布」的病灶
+    expect(turnSessionKey("group", "room_rc")).not.toBe(turnSessionKey("discussion", "room_rc"))
+  })
+
+  function relayDeps() {
+    const streams: Array<{ conversationType: number; conversationId: string; content: string }> = []
+    const sent: Array<{ to: string; type: string; content: string }> = []
+    const deps = {
+      sent,
+      streams,
+      send: async (to: string, type: string, content: string) => { sent.push({ to, type, content }) },
+      sendStream: async (conversationType: 1 | 3 | 4, conversationId: string, _o: string, content: string) => {
+        streams.push({ conversationType, conversationId, content })
+      },
+      selfUserId: "node_self",
+    }
+    return { deps, sent, streams }
+  }
+
+  it("群聊中继的提示词不再盖圆桌讨论抬头，且绑到群会话键上", async () => {
+    const { deps } = relayDeps()
+    const dispatcher = new MessageDispatcher(deps)
+    let seenPrompt = ""
+    let seenKey: string | undefined
+    await dispatcher.handle({
+      objectName: "command", fromUserId: "claw-system", toUserId: "", targetId: "node_self",
+      conversationType: 1,
+      content: JSON.stringify({
+        request_id: "relay_1_0", service: "discussion", action: "your_turn",
+        params: {
+          round: 1, speaking_order: 0, role_name: "openclaw",
+          chatroom_id: "group_rc", conversation_type: 3, requester_id: "user_b",
+          role_prompt: RELAY_PROMPT,
+        },
+      }),
+    }, {
+      runTurn: async () => { throw new Error("should use streamed variant") },
+      runTurnStreamed: async (prompt: string, _m, _d, _s, sessionKey?: string) => {
+        seenPrompt = prompt
+        seenKey = sessionKey
+        return "今天多云"
+      },
+    })
+
+    expect(seenPrompt.startsWith("[group chat] round=1 speaking_order=0")).toBe(true)
+    expect(seenPrompt).toContain("role: openclaw")
+    expect(seenPrompt).toContain("今天的天气怎么样")
+    // 关键回归：不得再说自己在 discussion 里等主持人
+    expect(seenPrompt).not.toContain("[discussion]")
+    expect(seenPrompt).not.toContain("Answer as this node in the discussion")
+    expect(seenKey).toBe("cm-group-group_rc")
+  })
+
+  it("v3 讨论轮次仍走讨论抬头与人设，键按房间分桶", async () => {
+    const { deps } = relayDeps()
+    const dispatcher = new MessageDispatcher(deps)
+    let seenPrompt = ""
+    let seenKey: string | undefined
+    await dispatcher.handle({
+      objectName: "command", fromUserId: "host_node", toUserId: "", targetId: "node_self",
+      conversationType: 1,
+      content: JSON.stringify({
+        request_id: "turn_1_1_x", service: "discussion", action: "your_turn",
+        params: {
+          round: 1, speaking_order: 1, role_name: "架构师",
+          chatroom_id: "room_rc", conversation_type: 4,
+          role_prompt: "你是主持人，负责收敛分歧。",
+        },
+      }),
+    }, {
+      runTurn: async () => { throw new Error("should use streamed variant") },
+      runTurnStreamed: async (prompt: string, _m, _d, _s, sessionKey?: string) => {
+        seenPrompt = prompt
+        seenKey = sessionKey
+        return "ok"
+      },
+    })
+
+    expect(seenPrompt).toContain("[discussion] round=1 speaking_order=1")
+    expect(seenPrompt).toContain("你是主持人，负责收敛分歧。")
+    expect(seenPrompt).toContain("Stay in character")
+    expect(seenKey).toBe("cm-discussion-room_rc")
+  })
+
+  it("私聊按对端分桶", async () => {
+    const { deps } = relayDeps()
+    const dispatcher = new MessageDispatcher(deps)
+    let seenKey: string | undefined
+    await dispatcher.handle({
+      objectName: "RC:TxtMsg", fromUserId: "user_a", toUserId: "", targetId: "node_self",
+      conversationType: 1, content: JSON.stringify({ content: "hi" }),
+    }, {
+      runTurn: async () => { throw new Error("should use streamed variant") },
+      runTurnStreamed: async (_p: string, _m, _d, _s, sessionKey?: string) => {
+        seenKey = sessionKey
+        return "你好"
+      },
+    })
+    expect(seenKey).toBe("cm-private-user_a")
   })
 })

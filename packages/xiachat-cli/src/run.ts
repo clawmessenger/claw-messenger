@@ -309,7 +309,7 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
         : Promise.reject(new Error("transport lacks sendMessageTo")),
   });
   const turns: TurnRunner = {
-    runTurn: (prompt, model) =>
+    runTurn: (prompt, model, sessionKey) =>
       runAgentTurn({
         execPath: opts.agentExecPath,
         agentName: opts.agentName,
@@ -317,12 +317,13 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
         model: opts.model ?? model,
         timeoutMs: opts.turnTimeoutMs ?? 120_000,
         cwd: opts.cwd,
+        sessionKey,
       }),
     // Streaming variant: the agent's stdout is decoded chunk by chunk
     // (agents.ts onChunk, UTF-8 boundary safe); the dispatcher turns those
     // deltas into chat_stream snapshot frames. signal lets chat_stop kill
     // the agent process instead of just muting the frames.
-    runTurnStreamed: (prompt, model, onDelta, signal) =>
+    runTurnStreamed: (prompt, model, onDelta, signal, sessionKey) =>
       runAgentTurn({
         execPath: opts.agentExecPath,
         agentName: opts.agentName,
@@ -332,6 +333,7 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
         cwd: opts.cwd,
         onChunk: onDelta,
         signal,
+        sessionKey,
       }),
   };
   // onBusy only receives the conversation key; remember the latest peer per
