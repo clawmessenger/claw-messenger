@@ -756,6 +756,34 @@ Linux / macOS 另有一份**同名同义**的守护脚本，见 [A.4 后台常�
 > chmod +x clawmessenger-daemon.sh
 > ```
 
+> **Common mistake:** `start` / `stop` / `restart` / `logs` / `install-service` **不是 `clawmessenger` 的子命令**。CLI 一共只有 `register` / `pair` / `login` / `agents` / `run` / `status` 六个命令，直接敲 `clawmessenger start` 只会得到 `error: unknown command 'start'`。下面这些动作全部由**这个脚本**（一个独立的 bash 文件，不依赖 node）提供 —— 所以脚本必须先落到磁盘上，敲的也是 `./clawmessenger-daemon.sh start` 而不是 `clawmessenger start`。
+
+#### GitHub 下载不通时（国内网络）
+
+GitHub Release 直链在国内经常连不上（典型报错 `curl: (28) Failed to connect to github.com port 443: Connection timed out`）。三条退路，按推荐顺序：
+
+1. **走加速镜像**（把原链整段拼在镜像域名后面）：
+
+   ```bash
+   curl -fLO https://ghfast.top/https://github.com/clawmessenger/claw-messenger/releases/latest/download/clawmessenger-linux-daemon-scripts.tar.gz \
+     || curl -fLO https://gh-proxy.com/https://github.com/clawmessenger/claw-messenger/releases/latest/download/clawmessenger-linux-daemon-scripts.tar.gz \
+     || curl -fLO https://ghproxy.net/https://github.com/clawmessenger/claw-messenger/releases/latest/download/clawmessenger-linux-daemon-scripts.tar.gz
+   ```
+
+   这些镜像可用性会变，失败就换下一个域名；也可以在**有外网的机器**上下载好，再 `scp` 到目标服务器。
+
+2. **不装脚本，先手工放后台**（`setsid` + `nohup` 让进程脱离终端，关窗、`exit`、注销都不掉线）：
+
+   ```bash
+   mkdir -p ~/.clawmessenger/logs
+   cd ~ && setsid nohup clawmessenger run >>~/.clawmessenger/logs/supervisor.out.log 2>&1 </dev/null &
+   ```
+
+   停止：`pkill -f 'clawmessenger run'`（一并停掉它拉起的 agent 子进程）。看日志：`tail -f ~/.clawmessenger/logs/supervisor.out.log`。
+   代价是没有 `status` / `logs` / 开机自启，且**必须用 `setsid`**——少了它，`nohup ... &` 在部分 shell 里仍会随终端退出被 HUP 掉（supervisor 只处理 SIGINT / SIGTERM，不处理 SIGHUP）。
+
+3. **从仓库复制**：脚本源码在 `packages/xiachat-cli/scripts/linux/clawmessenger-daemon.sh`（约 530 行，纯 bash）。在能访问仓库的机器上取出内容、原样存成同名文件再 `chmod +x` 即可。**注意保持 LF 行尾**（别经过会把行尾改成 CRLF 的编辑器/传输方式），否则会报 `bad interpreter: /usr/bin/env bash^M`。
+
 #### 命令
 
 | 动作 | 作用 |
