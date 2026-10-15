@@ -588,3 +588,187 @@ func TestInteractivePromptInputsFromRealEvents(t *testing.T) {
 		}
 	}
 }
+
+// ---- 空轮守卫（2026-10-15 线上：「明明都发言完了，主持人却说没收到发言」）------
+
+// newFixtureDiscussion 在 fixture 的聊天室里建一条 user_confirmed 讨论：
+// 一名普通成员（fixture 里那个 AI 节点）+ 一名主持人。
+func newFixtureDiscussion(t *testing.T, f *discussionFixture) DiscussionRecord {
+	t.Helper()
+	memberRC := f.memberNode.RongcloudUserID
+	roleSnapshot := mustJSON(map[string]interface{}{
+		memberRC: map[string]interface{}{
+			"memberId": memberRC, "nodeId": f.memberNode.NodeID,
+			"nickname": "观看着", "roleName": "观看着", "speakingOrder": float64(0),
+		},
+		"host-rc": map[string]interface{}{
+			"memberId": "host-rc", "nodeId": "host-node",
+			"nickname": "中立主持人", "roleName": "中立主持人", "isHost": true,
+		},
+	})
+	ctx := context.Background()
+	// 真实链路是 createRoundtable 先建 planning 再 CAS 推进到 running 第 1 轮；
+	// CreateDiscussionParams 没有轮次字段，直接建成 running 会留下 CurrentRound=0，
+	// 于是事件流里 round=1 的记录全被按「不是本轮」过滤掉，守卫与推进都会看错。夹具必须
+	// 复刻「先 planning、再推进」这两步。
+	created, err := f.rt.repo.Create(ctx, CreateDiscussionParams{
+		DiscussionID: uniqueID("disc"), ChatroomID: f.roomRCID, WorkspaceID: f.wsID,
+		CreatedBy: f.ownerRCID, Topic: "AI 能发展到什么程度", Goal: "形成共识清单",
+		Mode: DiscussionModeRoundtable, Status: DiscussionStatusPlanning,
+		RoundPolicy: RoundPolicyUserConfirmed, RoleSnapshot: roleSnapshot,
+		HostConfigSnapshot: mustJSON(map[string]interface{}{}),
+	})
+	if err != nil {
+		t.Fatalf("create discussion: %v", err)
+	}
+	running, err := f.rt.repo.AdvanceState(ctx, AdvanceDiscussionParams{
+		DiscussionID: created.DiscussionID, ExpectedVersion: created.Version,
+		Status: DiscussionStatusRunning, CurrentRound: 1, RoundRevision: 0,
+	})
+	if err != nil {
+		t.Fatalf("advance to running: %v", err)
+	}
+	return running
+}
+
+// TestInteractiveNext_FailsRoundWithNoContribution 钉住「全员被跳光仍请主持人写纪要」的
+// 回归：成员节点全部超时/失败时主持人手上没有任何素材，只会回「尚未收到任何成员的
+// 发言记录」，把一次真实的全员失败伪装成主持人不会写纪要。这时必须判讨论失败。
+func TestInteractiveNext_FailsRoundWithNoContribution(t *testing.T) {
+	f := setupDiscussionFixture(t)
+	ctx := context.Background()
+	created := newFixtureDiscussion(t, f)
+	memberRC := f.memberNode.RongcloudUserID
+	// 本轮唯一的成员两次尝试都失败 → member_skipped，一条发言都没落地。
+	if _, err := f.rt.repo.AppendEvent(ctx, AppendDiscussionEventParams{
+		DiscussionID: created.DiscussionID, Seq: 1, EventType: "member_skipped",
+		ActorID: "system", TargetID: memberRC,
+		Payload:        mustJSON(map[string]interface{}{"round": 1, "memberId": memberRC, "category": "timeout"}),
+		IdempotencyKey: "member-skipped:1",
+	}); err != nil {
+		t.Fatalf("append member_skipped: %v", err)
+	}
+	d, err := f.rt.repo.Get(ctx, created.DiscussionID)
+	if err != nil {
+		t.Fatalf("get discussion: %v", err)
+	}
+	if err := f.rt.interactiveNext(ctx, d); err != nil {
+		t.Fatalf("interactiveNext: %v", err)
+	}
+	after, err := f.rt.repo.Get(ctx, created.DiscussionID)
+	if err != nil {
+		t.Fatalf("get after: %v", err)
+	}
+	if after.Status != DiscussionStatusFailed {
+		t.Fatalf("status = %q, want %q（空轮必须失败，不能进汇总）", after.Status, DiscussionStatusFailed)
+	}
+	events, err := f.rt.repo.ListEventsAfter(ctx, created.DiscussionID, 0)
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	failed, hostAsked := false, false
+	for _, e := range events {
+		switch e.EventType {
+		case "discussion_failed":
+			failed = true
+			// reason 必须在 web 的严格枚举里，否则前端会把整段讨论历史判为无效。
+			var payload map[string]interface{}
+			_ = json.Unmarshal(e.Payload, &payload)
+			if payload["reason"] != "dispatch_failed" {
+				t.Errorf("failure reason = %v, want dispatch_failed", payload["reason"])
+			}
+		case "host_turn_requested", "round_summary_started":
+			hostAsked = true
+		}
+	}
+	if !failed {
+		t.Error("空轮必须落一条 discussion_failed")
+	}
+	if hostAsked {
+		t.Error("空轮不能派发主持人汇总")
+	}
+}
+
+// TestInteractiveNext_SummarizesWhenRoundHasContribution 反向回归：有产出时照常进入
+// 汇总并派发主持人 —— 空轮守卫不能把正常路径也挡掉。
+func TestInteractiveNext_SummarizesWhenRoundHasContribution(t *testing.T) {
+	f := setupDiscussionFixture(t)
+	ctx := context.Background()
+	created := newFixtureDiscussion(t, f)
+	memberRC := f.memberNode.RongcloudUserID
+	if _, err := f.rt.repo.AppendEvent(ctx, AppendDiscussionEventParams{
+		DiscussionID: created.DiscussionID, Seq: 1, EventType: "contribution_completed",
+		ActorID: memberRC, TargetID: memberRC,
+		Payload:        mustJSON(map[string]interface{}{"round": 1, "content": "我的判断是……"}),
+		IdempotencyKey: "complete:1",
+	}); err != nil {
+		t.Fatalf("append contribution: %v", err)
+	}
+	d, err := f.rt.repo.Get(ctx, created.DiscussionID)
+	if err != nil {
+		t.Fatalf("get discussion: %v", err)
+	}
+	if err := f.rt.interactiveNext(ctx, d); err != nil {
+		t.Fatalf("interactiveNext: %v", err)
+	}
+	after, err := f.rt.repo.Get(ctx, created.DiscussionID)
+	if err != nil {
+		t.Fatalf("get after: %v", err)
+	}
+	if after.Status != DiscussionStatusSummarizing {
+		t.Fatalf("status = %q, want %q", after.Status, DiscussionStatusSummarizing)
+	}
+	events, err := f.rt.repo.ListEventsAfter(ctx, created.DiscussionID, 0)
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	hostAsked := false
+	for _, e := range events {
+		if e.EventType == "host_turn_requested" || e.EventType == "round_summary_started" {
+			hostAsked = true
+		}
+	}
+	if !hostAsked {
+		t.Error("有产出时必须派发主持人汇总")
+	}
+}
+
+// TestInteractiveDispatch_EmptyRoundTellsHostTheTruth 手动重试主持任务的兜底路径：
+// 本轮确实没有任何成员产出时，提示词要直说「没有可依据的发言」，而不是留空让主持人
+// 去猜、去向用户索要材料。
+func TestInteractiveDispatch_EmptyRoundTellsHostTheTruth(t *testing.T) {
+	f := setupDiscussionFixture(t)
+	ctx := context.Background()
+	created := newFixtureDiscussion(t, f)
+	d, err := f.rt.repo.Get(ctx, created.DiscussionID)
+	if err != nil {
+		t.Fatalf("get discussion: %v", err)
+	}
+	host := interactiveRole{MemberID: "host-rc", RoleName: "中立主持人", IsHost: true}
+	if err := f.rt.interactiveDispatch(ctx, d, host, 1); err != nil {
+		t.Fatalf("interactiveDispatch: %v", err)
+	}
+	commands, err := f.queries.ListRongCloudDiscussionCommandsByDiscussion(ctx, d.DiscussionID)
+	if err != nil {
+		t.Fatalf("list commands: %v", err)
+	}
+	prompted := ""
+	for _, cmd := range commands {
+		var task interactiveTask
+		if err := json.Unmarshal(cmd.Payload, &task); err != nil {
+			continue
+		}
+		if task.IsHost {
+			prompted = task.Prompt
+		}
+	}
+	if prompted == "" {
+		t.Fatal("主持人派发没有落进 outbox")
+	}
+	if !strings.Contains(prompted, "没有任何成员产出") {
+		t.Errorf("空轮的主持人提示词必须直说没有素材：%q", prompted)
+	}
+	if strings.Contains(prompted, "不要向我索要材料") {
+		t.Errorf("空轮提示词不该复用「据现有发言撰写」那一版：%q", prompted)
+	}
+}

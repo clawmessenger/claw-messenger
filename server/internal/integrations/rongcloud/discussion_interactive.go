@@ -482,7 +482,17 @@ func (rt *discussionRuntime) interactiveNext(ctx context.Context, d DiscussionRe
 		}
 		return rt.interactiveDispatch(ctx, d, role, 1)
 	}
-	// 本轮全员完成 → 主持人汇总。
+	// 本轮全员完成 → 主持人汇总。但「全员完成」有两种含义：真说完了，和**全被跳光了**
+	// （成员节点超时/异常，两次尝试都失败）。后者绝不能请主持人写纪要 —— 它手里一条
+	// 发言都没有，只能回「尚未收到任何成员的发言记录…请第一位角色先行发言」，把一次
+	// 真实的全员失败伪装成「主持人不会写纪要」（线上 2026-10-15 的观感）。
+	contributions, countErr := rt.interactiveRoundContributions(ctx, d)
+	if countErr != nil {
+		return countErr
+	}
+	if contributions == 0 {
+		return rt.interactiveFailEmptyRound(ctx, d)
+	}
 	summarizing, err := rt.interactiveAdvance(ctx, d.DiscussionID, func(cur DiscussionRecord) (AdvanceDiscussionParams, bool, error) {
 		if !IsLiveDiscussionStatus(cur.Status) || cur.Status == DiscussionStatusSummarizing {
 			return AdvanceDiscussionParams{}, false, nil
@@ -497,6 +507,72 @@ func (rt *discussionRuntime) interactiveNext(ctx context.Context, d DiscussionRe
 		return err
 	}
 	return rt.interactiveDispatch(ctx, summarizing, host, 1)
+}
+
+// interactiveRoundContributions 统计本轮真正落地的成员发言（按成员去重）。
+// 与 interactiveRoundDone 的区别：后者把「跳过」也算完成，这里只认有产出的。
+func (rt *discussionRuntime) interactiveRoundContributions(ctx context.Context, d DiscussionRecord) (int, error) {
+	events, err := rt.repo.ListEventsAfter(ctx, d.DiscussionID, 0)
+	if err != nil {
+		return 0, err
+	}
+	speakers := map[string]bool{}
+	for _, e := range events {
+		if e.EventType != "contribution_completed" {
+			continue
+		}
+		var payload map[string]interface{}
+		if err := json.Unmarshal(e.Payload, &payload); err != nil {
+			continue
+		}
+		round, ok := payload["round"].(float64)
+		if !ok || int(round) != d.CurrentRound {
+			continue
+		}
+		if e.ActorID != "" {
+			speakers[e.ActorID] = true
+		}
+	}
+	return len(speakers), nil
+}
+
+// interactiveFailEmptyRound 把「本轮没有任何成员产出」的讨论判为失败。
+//
+// 为什么不继续推进：主持人没素材（只能编造或索要）、进 awaiting_user 又会把一次真实
+// 的全员失败说成「本轮已汇总」。失败态是唯一诚实的出口 —— 用户看到「讨论失败」，
+// 检查节点后重开讨论；成员节点修好后也还能点重试。
+//
+// reason 必须落在前端 v3 校验器已有的枚举里（discussion-v3.ts 的 discussion_failed
+// 是严格 choice('summary_failed','cancel_failed','cancel_unconfirmed','dispatch_failed')）：
+// 加新值会让前端把**整段**讨论历史判为无效，除非前后端同时发版。
+func (rt *discussionRuntime) interactiveFailEmptyRound(ctx context.Context, d DiscussionRecord) error {
+	advanced, err := rt.interactiveAdvance(ctx, d.DiscussionID, func(cur DiscussionRecord) (AdvanceDiscussionParams, bool, error) {
+		if !IsLiveDiscussionStatus(cur.Status) || cur.Status == DiscussionStatusSummarizing {
+			return AdvanceDiscussionParams{}, false, nil
+		}
+		return AdvanceDiscussionParams{
+			DiscussionID: cur.DiscussionID, ExpectedVersion: cur.Version,
+			Status: DiscussionStatusFailed, CurrentRound: cur.CurrentRound,
+			RoundRevision: cur.RoundRevision,
+		}, true, nil
+	})
+	if err != nil {
+		return err
+	}
+	event, _, emitErr := rt.interactiveEmit(ctx, advanced, interactiveEvent{
+		EventType: "discussion_failed", ActorID: "system",
+		Payload:   map[string]interface{}{"reason": "dispatch_failed", "retryable": true},
+		Key:       fmt.Sprintf("no-contribution:%d", advanced.CurrentRound),
+		RequestID: uuid.NewString(), StateVer: advanced.Version,
+		Round: advanced.CurrentRound, Revision: advanced.RoundRevision,
+	})
+	if emitErr != nil {
+		return emitErr
+	}
+	rt.interactiveBroadcast(ctx, advanced, event)
+	rt.logger.Warn("discussion: round finished with no contribution",
+		"discussionId", advanced.DiscussionID, "round", advanced.CurrentRound)
+	return nil
 }
 
 // interactiveRoundDone 返回本轮已「完成或跳过」的成员集合。
@@ -918,6 +994,9 @@ func (rt *discussionRuntime) interactiveDispatch(ctx context.Context, d Discussi
 		return nil
 	}
 	requestID := uuid.NewString()
+	// 本轮被消费的用户插话 + 前序发言：同一份快照同时用于提示词拼接与回执落库，
+	// 避免重复全量拉事件，也避免两处看到不同快照。
+	opinions, history := rt.interactivePromptInputs(d)
 	action := "assignment"
 	eventType := "assignment_created"
 	extra := "请针对当前轮次给出你的分析。"
@@ -934,10 +1013,15 @@ func (rt *discussionRuntime) interactiveDispatch(ctx context.Context, d Discussi
 			"成员立场、已达成的共识、仍存在的分歧、以及下一轮建议聚焦的问题。\n"+
 			"成员发言已在上文[前序发言]中逐条给出，请直接据此撰写；即便信息不完整，也请基于现有"+
 			"发言给出纪要与待确认项，不要向我索要材料。", d.CurrentRound)
+		if len(history.roundStatements(d.CurrentRound)) == 0 {
+			// 兜底：正常路径下空轮不会再派发主持人（见 interactiveNext 的空轮守卫），
+			// 只有用户在失败态手动「重试主持任务」才会走到这里。别让它编造纪要。
+			extra = fmt.Sprintf("本轮（第 %d 轮）没有任何成员产出：成员节点超时或执行失败，"+
+				"你手上没有可依据的发言。请只输出一段简短说明 —— 本轮无成员发言记录、"+
+				"无法复述立场与分歧，建议检查成员节点后重开讨论。不要索要材料，也不要编造成员观点。",
+				d.CurrentRound)
+		}
 	}
-	// 本轮被消费的用户插话 + 前序发言：同一份快照同时用于提示词拼接与回执落库，
-	// 避免重复全量拉事件，也避免两处看到不同快照。
-	opinions, history := rt.interactivePromptInputs(d)
 	prompt := rt.interactiveBuildPrompt(d, role, extra, opinions, history)
 
 	// 插话消费回执：本轮真正注入该成员提示词的插话落 interjection_applied，
