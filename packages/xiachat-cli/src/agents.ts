@@ -31,6 +31,10 @@ export interface RunAgentTurnOpts {
   // its workdir so `opencode run` picks up the ops AGENTS.md system prompt.
   cwd?: string;
   onChunk?: (chunk: string) => void;
+  // 思考流增量（可选）：claude/codex 的 stream-json 模式下，agent 的
+  // thinking/reasoning 过程文本与正文分道回调。不支持思考流的 agent
+  // 不调用它，调用方天然降级为纯正文流。
+  onReasoningChunk?: (chunk: string) => void;
   signal?: AbortSignal;
   // 会话隔离键（可选）。多个会话形态共用同一个 agent 二进制，而 agent CLI
   // 默认把它们全塞进自己的「主会话」：openclaw 的默认键就是 agent:main:main，
@@ -82,9 +86,31 @@ export function buildModelArgs(name: string, model: string | undefined): string[
   return ["--model", model];
 }
 
+// 思考流可用性：这两个 agent 以 stream-json 模式运行，thinking/reasoning
+// 事件可被解析（见 parseStreamJsonLine）。其余 agent（stdin 模式或无结构化
+// 输出）不吐思考流。
+const STREAM_JSON_AGENTS = new Set(["claude", "codex"]);
+
+export function agentSupportsReasoning(name: string | undefined): boolean {
+  return name !== undefined && STREAM_JSON_AGENTS.has(name);
+}
+
 const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
-  claude: (prompt, model) => ["-p", prompt, ...buildModelArgs("claude", model)],
-  codex: (prompt, model) => ["exec", prompt, ...buildModelArgs("codex", model)],
+  claude: (prompt, model) => [
+    "-p", prompt,
+    // stream-json：逐行 JSON 事件流（thinking_delta / text_delta 可解析，
+    // 同时是思考流数据源）。--verbose 是 stream-json 的前置要求。
+    "--output-format", "stream-json", "--verbose",
+    ...buildModelArgs("claude", model),
+  ],
+  codex: (prompt, model) => [
+    "exec", prompt,
+    // --json：JSONL 事件流（reasoning.item_start/delta 等可解析）。实测
+    // codex 0.144：未信任目录需 --skip-git-repo-check；stdin 模式会挂起
+    // 等输入，必须保持 argv 模式（runAgentTurn argvMode 下 stdin 已 end）。
+    "--json", "--skip-git-repo-check",
+    ...buildModelArgs("codex", model),
+  ],
   opencode: (prompt, model) => ["run", prompt, ...buildModelArgs("opencode", model)],
   // --session-key 把这一轮绑到「会话形态 + 会话 id」的独立会话上。不带它时
   // openclaw 一律走默认主会话（agent:main:main），群聊会被讨论组的上下文
@@ -118,6 +144,9 @@ export function buildAgentArgs(
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 65_536;
+// stream-json（claude/codex）的事件流含元数据行与思考流，同回答体积约为
+// 纯文本 2-3 倍；上限放到 512KB 与 runAgentCommand 的默认一致量级。
+const STREAM_JSON_MAX_OUTPUT_BYTES = 512 * 1024;
 
 function isWindowsScript(execPath: string): boolean {
   return process.platform === "win32" && /\.(cmd|bat)$/i.test(execPath);
@@ -403,9 +432,117 @@ export function runAgentCommand(opts: RunAgentCommandOpts): Promise<string> {
   });
 }
 
+// --- stream-json / JSONL 解析（claude & codex 思考流数据源）----------------
+// 两个 agent 都以「每行一个 JSON 事件」输出，思考流与正文分道。解析器是
+// 纯函数：一行进，{reasoning?, text?, result?} 出。非 JSON 行（codex 的
+// WARNING: / rmcp ERROR 行）返回 null 丢弃。
+//
+// claude stream-json（--output-format stream-json --verbose）：
+//   {"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"…"}}}
+//   {"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"…"}}}
+//   {"type":"assistant","message":{"content":[{"type":"text","text":"全文"}]}}
+//   {"type":"result","result":"全文"}
+//
+// codex exec --json（0.144 实测）：
+//   {"type":"item.completed","item":{"type":"reasoning","text":"…"}}
+//   {"type":"item.completed","item":{"type":"agent_message","text":"…"}}
+//   {"type":"item.started","item":{"type":"agent_message"}}
+//   {"type":"turn.completed","usage":{…}}
+export interface StreamJsonDelta {
+  reasoning?: string;
+  text?: string;
+}
+
+export function parseStreamJsonLine(line: string): StreamJsonDelta | null {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith("{")) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const event = parsed as Record<string, unknown>;
+
+  // --- claude ---
+  if (event.type === "stream_event") {
+    const inner = event.event as Record<string, unknown> | undefined;
+    const delta = inner?.delta as Record<string, unknown> | undefined;
+    if (!delta) return null;
+    if (delta.type === "thinking_delta" && typeof delta.thinking === "string") {
+      return { reasoning: delta.thinking };
+    }
+    if (delta.type === "text_delta" && typeof delta.text === "string") {
+      return { text: delta.text };
+    }
+    return null;
+  }
+
+  // --- codex ---
+  if (event.type === "item.completed") {
+    const item = event.item as Record<string, unknown> | undefined;
+    if (!item) return null;
+    if (item.type === "reasoning" && typeof item.text === "string") {
+      return { reasoning: item.text };
+    }
+    if (item.type === "agent_message" && typeof item.text === "string") {
+      return { text: item.text };
+    }
+    return null;
+  }
+  return null;
+}
+
+// 从 stream-json 全量 stdout 提取最终正文（claude 优先 result.result / 最长
+// assistant 文本；codex 聚合 agent_message）。空时返回 undefined 走兜底。
+export function extractStreamJsonFinalText(raw: string): string | undefined {
+  const texts: string[] = [];
+  let claudeResult: string | undefined;
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{")) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (typeof parsed !== "object" || parsed === null) continue;
+    const event = parsed as Record<string, unknown>;
+    if (event.type === "result" && typeof event.result === "string") {
+      claudeResult = event.result;
+    }
+    if (event.type === "assistant") {
+      const message = event.message as Record<string, unknown> | undefined;
+      const content = message?.content;
+      if (Array.isArray(content)) {
+        const parts = content
+          .map((block) => (typeof block === "object" && block !== null
+            ? (block as Record<string, unknown>) : undefined))
+          .filter((block): block is Record<string, unknown> =>
+            block?.type === "text" && typeof block.text === "string")
+          .map((block) => block.text as string);
+        if (parts.length > 0) texts.push(parts.join(""));
+      }
+    }
+    if (event.type === "item.completed") {
+      const item = event.item as Record<string, unknown> | undefined;
+      if (item?.type === "agent_message" && typeof item.text === "string") {
+        texts.push(item.text);
+      }
+    }
+  }
+  if (claudeResult !== undefined && claudeResult.length > 0) return claudeResult;
+  const joined = texts.join("\n").trim();
+  return joined.length > 0 ? joined : undefined;
+}
+
 export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const maxBytes = opts.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
+  // stream-json 的 JSONL 冗余大（事件元数据 + 思考流），64KB 会截断长回答。
+  const streamJsonTurn = opts.onReasoningChunk !== undefined || agentSupportsReasoning(opts.agentName);
+  const maxBytes = opts.maxOutputBytes ?? (streamJsonTurn ? STREAM_JSON_MAX_OUTPUT_BYTES : DEFAULT_MAX_OUTPUT_BYTES);
 
   return new Promise<string>((resolve, reject) => {
     if (opts.signal?.aborted) {
@@ -463,6 +600,17 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
     };
     opts.signal?.addEventListener("abort", onAbort, { once: true });
 
+    // stream-json 模式（claude/codex）：stdout 是逐行 JSON 事件流。行缓冲
+    // 切分（\n 边界），thinking/text 增量分道回调；原始字节照常入 chunks，
+    // 结束时用 extractStreamJsonFinalText 提取权威正文。
+    const streamJsonMode = agentSupportsReasoning(opts.agentName) && argvMode;
+    let lineBuf = "";
+    const emitStreamJson = (flushed: string) => {
+      const delta = parseStreamJsonLine(flushed);
+      if (!delta) return;
+      if (delta.reasoning !== undefined) opts.onReasoningChunk?.(delta.reasoning);
+      if (delta.text !== undefined) opts.onChunk?.(delta.text);
+    };
     child.stdout.on("data", (buf: Buffer) => {
       if (truncated) return;
       if (totalBytes + buf.length > maxBytes) {
@@ -472,7 +620,7 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
           chunks.push(tail);
           totalBytes += tail.length;
           const delta = decoder.write(tail);
-          if (delta) opts.onChunk?.(delta);
+          if (!streamJsonMode && delta) opts.onChunk?.(delta);
         }
         decoder = new StringDecoder("utf8"); // drop any held partial sequence
         truncated = true;
@@ -481,7 +629,19 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
       chunks.push(buf);
       totalBytes += buf.length;
       const delta = decoder.write(buf);
-      if (delta) opts.onChunk?.(delta);
+      if (streamJsonMode) {
+        // 按行切分：完整行立即解析，残行留在 lineBuf 等下一个 chunk。
+        lineBuf += delta;
+        for (;;) {
+          const nl = lineBuf.indexOf("\n");
+          if (nl < 0) break;
+          const line = lineBuf.slice(0, nl);
+          lineBuf = lineBuf.slice(nl + 1);
+          emitStreamJson(line);
+        }
+      } else if (delta) {
+        opts.onChunk?.(delta);
+      }
     });
     child.stderr.on("data", (buf: Buffer) => {
       stderr = (stderr + buf.toString("utf8")).slice(-2000);
@@ -493,7 +653,13 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
       settle(() => {
         const stdout = Buffer.concat(chunks).toString("utf8");
         if (code === 0) {
-          resolve(opts.agentName === "openclaw" ? extractOpenclawReply(stdout) : stdout);
+          if (streamJsonMode) {
+            // 冲刷残行后提取权威正文；提取失败（非标准输出）兜底原文。
+            emitStreamJson(lineBuf);
+            resolve(extractStreamJsonFinalText(stdout) ?? stdout);
+          } else {
+            resolve(opts.agentName === "openclaw" ? extractOpenclawReply(stdout) : stdout);
+          }
         } else {
           reject(new Error(`agent exited with code ${code}: ${stderr}`));
         }

@@ -332,6 +332,9 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
         timeoutMs: opts.turnTimeoutMs ?? 120_000,
         cwd: opts.cwd,
         onChunk: onDelta,
+        // 思考流增量直接并入 onDelta 第二参：runStreamedTurn 维护
+        // reasoningSnapshot 并与正文同帧发出。
+        onReasoningChunk: (reasoning) => onDelta("", reasoning),
         signal,
         sessionKey,
       }),

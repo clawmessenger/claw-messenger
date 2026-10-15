@@ -1,5 +1,5 @@
 import { decodeCommandContent, encodeCommandResult } from "./protocol.js";
-import { buildChatStreamFrame, parseChatStopRequest, sliceSnapshot, type ChatStreamStatus } from "./chat-stream.js";
+import { buildChatStreamFrame, encodeChatStreamWireFrames, parseChatStopRequest, type ChatStreamStatus } from "./chat-stream.js";
 import { buildHtmlCard, extractHtmlFence, htmlRevisePrompt } from "./cards.js";
 import {
   buildModelCatalogResponse,
@@ -156,7 +156,7 @@ export interface TurnRunner {
   runTurnStreamed?: (
     prompt: string,
     model: string | undefined,
-    onDelta: (delta: string) => void,
+    onDelta: (delta: string, reasoningDelta?: string) => void,
     signal?: AbortSignal,
     sessionKey?: string,
   ) => Promise<string>;
@@ -398,7 +398,7 @@ export class MessageDispatcher {
   //  4. 终帧之后仍回调 fallback（command_result / 卡片），保持中继推进与
   //     旧消费方兼容——旧 web 不解析 chat_stream 也照常工作。
   // 帧节流：融云自定义消息限频，帧间隔至少 STREAM_FRAME_INTERVAL_MS；
-  // 快照分片单帧上限由 sliceSnapshot 决定。
+  // 帧超限时由 encodeChatStreamWireFrames 自动切 wire 分块。
   private async runStreamedTurn(opts: {
     conversationType: 1 | 3 | 4;
     conversationId: string;
@@ -419,8 +419,8 @@ export class MessageDispatcher {
       conversationType: opts.conversationType,
       conversationId: opts.conversationId,
     };
-    const frame = (seq: number, status: ChatStreamStatus, text: string, errorCode?: string) =>
-      buildChatStreamFrame({
+    const frame = (seq: number, status: ChatStreamStatus, text: string, reasoning?: string, errorCode?: string) => {
+      const serialized = buildChatStreamFrame({
         streamId: ctx.streamId,
         requestMessageId: ctx.requestMessageId,
         requesterId: ctx.requesterId,
@@ -430,13 +430,21 @@ export class MessageDispatcher {
         seq,
         status,
         text,
+        ...(reasoning ? { reasoning } : {}),
         ...(errorCode ? { errorCode } : {}),
       });
-    const emit = async (seq: number, status: ChatStreamStatus, text: string, errorCode?: string) => {
+      // 融云单条消息 ~9KB 上限：超限帧切 wire 分块（web 端重组器还原）。
+      // 帧是全量快照（text+reasoning 同帧），不再按 1800 字符切片多帧。
+      const payload = JSON.parse(serialized) as Record<string, unknown>;
+      return encodeChatStreamWireFrames(payload);
+    };
+    const emit = async (seq: number, status: ChatStreamStatus, text: string, reasoning?: string, errorCode?: string) => {
       const sendStream = this.deps.sendStream;
       if (!sendStream) return;
       try {
-        await sendStream(ctx.conversationType, ctx.conversationId, "chat_stream", frame(seq, status, text, errorCode));
+        for (const wire of frame(seq, status, text, reasoning, errorCode)) {
+          await sendStream(ctx.conversationType, ctx.conversationId, wire.objectName, wire.content);
+        }
       } catch (err) {
         // 单帧失败不打断回答：流帧只是 UI 加速，权威内容走 fallback。
         console.error("stream frame send failed:", err instanceof Error ? err.message : err);
@@ -468,18 +476,19 @@ export class MessageDispatcher {
       await emit(0, "processing", "");
       let seq = 1;
       let snapshot = "";
+      // 思考流快照：与正文快照同帧携带（reasoning 字段），同 seq 递增。
+      let reasoningSnapshot = "";
       let lastSent = 0;
-      const sendDelta = async (delta: string) => {
+      const sendDelta = async (delta: string, reasoningDelta?: string) => {
         if (controller.signal.aborted) return;
         snapshot += delta;
+        if (reasoningDelta) reasoningSnapshot += reasoningDelta;
         const now = Date.now();
         // 节流：距上一帧不足间隔时只攒不动，由下个 chunk 或终帧冲刷。
         if (now - lastSent < STREAM_FRAME_INTERVAL_MS) return;
         lastSent = now;
-        for (const slice of sliceSnapshot(snapshot)) {
-          await emit(seq, "streaming", slice);
-          seq += 1;
-        }
+        await emit(seq, "streaming", snapshot, reasoningSnapshot || undefined);
+        seq += 1;
       };
       let finalText = "";
       try {
@@ -492,11 +501,11 @@ export class MessageDispatcher {
         );
       } catch (err) {
         if (controller.signal.aborted) {
-          await emit(seq, "cancelled", snapshot);
+          await emit(seq, "cancelled", snapshot, reasoningSnapshot || undefined);
           return;
         }
         const errMsg = err instanceof Error ? err.message : String(err);
-        await emit(seq, "failed", snapshot, errMsg.slice(0, 120));
+        await emit(seq, "failed", snapshot, reasoningSnapshot || undefined, errMsg.slice(0, 120));
         if (opts.onError) {
           await opts.onError(errMsg);
           return;
@@ -510,10 +519,7 @@ export class MessageDispatcher {
       }
       // 终帧用完整全文（agent 的最终 stdout 可能比 chunk 累积更权威）。
       const finalSnapshot = finalText || snapshot;
-      for (const slice of sliceSnapshot(finalSnapshot)) {
-        await emit(seq, "completed", slice);
-        seq += 1;
-      }
+      await emit(seq, "completed", finalSnapshot, reasoningSnapshot || undefined);
       await opts.fallback(finalSnapshot);
     } finally {
       this.activeStreams.delete(ctx.streamId);

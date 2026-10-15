@@ -29,12 +29,16 @@ describe("KNOWN_AGENT_CLIS", () => {
 });
 
 describe("buildAgentArgs", () => {
-  it("claude uses print mode with --model", () => {
-    expect(buildAgentArgs("claude", "hi", "sonnet-4")).toEqual(["-p", "hi", "--model", "sonnet-4"]);
+  it("claude uses print mode with stream-json and --model", () => {
+    expect(buildAgentArgs("claude", "hi", "sonnet-4")).toEqual([
+      "-p", "hi", "--output-format", "stream-json", "--verbose", "--model", "sonnet-4",
+    ]);
   });
 
-  it("codex uses exec subcommand with -m", () => {
-    expect(buildAgentArgs("codex", "hi", "gpt-5")).toEqual(["exec", "hi", "-m", "gpt-5"]);
+  it("codex uses exec subcommand with --json and -m", () => {
+    expect(buildAgentArgs("codex", "hi", "gpt-5")).toEqual([
+      "exec", "hi", "--json", "--skip-git-repo-check", "-m", "gpt-5",
+    ]);
   });
 
   it("opencode uses run subcommand with --model", () => {
@@ -67,7 +71,8 @@ describe("buildAgentArgs", () => {
   // against the real CLIs: `codex -m quukk_direct/glm-5.2` is model_not_found.
   it("codex splits a route into -c model_provider + a bare -m", () => {
     expect(buildAgentArgs("codex", "hi", "quukk_direct/glm-5.2")).toEqual([
-      "exec", "hi", "-c", "model_provider=quukk_direct", "-m", "glm-5.2",
+      "exec", "hi", "--json", "--skip-git-repo-check",
+      "-c", "model_provider=quukk_direct", "-m", "glm-5.2",
     ]);
   });
 
@@ -84,8 +89,8 @@ describe("buildAgentArgs", () => {
   });
 
   it("omits model flags when no model is given", () => {
-    expect(buildAgentArgs("claude", "hi")).toEqual(["-p", "hi"]);
-    expect(buildAgentArgs("codex", "hi")).toEqual(["exec", "hi"]);
+    expect(buildAgentArgs("claude", "hi")).toEqual(["-p", "hi", "--output-format", "stream-json", "--verbose"]);
+    expect(buildAgentArgs("codex", "hi")).toEqual(["exec", "hi", "--json", "--skip-git-repo-check"]);
     expect(buildAgentArgs("opencode", "hi")).toEqual(["run", "hi"]);
     expect(buildAgentArgs("openclaw", "hi")).toEqual(["agent", "--local", "--json", "-m", "hi"]);
     expect(buildAgentArgs("hermes", "hi")).toEqual(["-z", "hi"]);
@@ -99,7 +104,9 @@ describe("buildAgentArgs", () => {
   it("returns [] past the argv length cap (falls back to stdin)", () => {
     expect(buildAgentArgs("claude", "a".repeat(8001))).toEqual([]);
     expect(buildAgentArgs("codex", "a".repeat(8001), "gpt-5")).toEqual([]);
-    expect(buildAgentArgs("claude", "a".repeat(8000))).toEqual(["-p", "a".repeat(8000)]);
+    expect(buildAgentArgs("claude", "a".repeat(8000))).toEqual([
+      "-p", "a".repeat(8000), "--output-format", "stream-json", "--verbose",
+    ]);
   });
 });
 
