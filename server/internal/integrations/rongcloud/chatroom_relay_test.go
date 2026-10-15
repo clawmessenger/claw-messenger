@@ -363,7 +363,7 @@ func TestBuildPrompt_CarriesCappedHistory(t *testing.T) {
 	if !strings.HasPrefix(prompt, "[group chat] ") {
 		t.Fatalf("group prompt prefix must stay intact: %q", prompt)
 	}
-	if !strings.Contains(prompt, "最近的对话记录") {
+	if !strings.Contains(prompt, "更早的对话") {
 		t.Fatalf("prompt must carry the history block: %q", prompt)
 	}
 	if !strings.Contains(prompt, "问题5") || !strings.Contains(prompt, "回答5") {
@@ -383,7 +383,7 @@ func TestBuildPrompt_NoHistoryKeepsLegacyShape(t *testing.T) {
 		members:      []relayMember{{rcID: "rc_a", roleName: "A"}},
 	}
 	prompt := hub.buildPrompt(s, s.members[0])
-	if strings.Contains(prompt, "最近的对话记录") {
+	if strings.Contains(prompt, "更早的对话") {
 		t.Fatalf("empty history must not add a block: %q", prompt)
 	}
 	if !strings.Contains(prompt, "大家好") {
@@ -430,21 +430,45 @@ func TestRelayHistoryBlock_BudgetDropsOldestRounds(t *testing.T) {
 	}
 }
 
-func TestRelayRepliesBlock_SharesBudgetAcrossMembers(t *testing.T) {
+// 预算远小于内容时，取舍规则是「保住要接的那位」：接龙接不上紧邻的上一位，
+// 比看不到更早的人严重得多 —— 所以最后一条必须完整（或至少）留下。
+func TestRelayRepliesBlock_PrioritisesLastSpeaker(t *testing.T) {
 	replies := []relayReply{
 		{roleName: "A", content: strings.Repeat("甲", 900)},
 		{roleName: "B", content: strings.Repeat("乙", 900)},
 		{roleName: "C", content: strings.Repeat("丙", 900)},
 	}
 	block, used := relayRepliesBlock(replies, 900)
+	if used > 900 || len([]rune(block)) > 900 {
+		t.Fatalf("replies block over budget: used=%d runes=%d", used, len([]rune(block)))
+	}
+	// C 是要接的话头，必须活下来。
+	if !strings.Contains(block, "- C：") {
+		t.Fatalf("the speaker to follow must survive the budget: %q", block)
+	}
+}
+
+// 预算够时所有人都要在段里 —— 不能因为「最后一位优先」就把前面的人整段丢掉，
+// 而且顺序必须是先来后到、要接的那位在最后（它是接力锚点）。
+func TestRelayRepliesBlock_KeepsEveryoneWhenBudgetAllows(t *testing.T) {
+	replies := []relayReply{
+		{roleName: "A", content: "甲甲甲"},
+		{roleName: "B", content: "乙乙乙"},
+		{roleName: "C", content: "丙丙丙"},
+	}
+	block, used := relayRepliesBlock(replies, 900)
 	if used > 900 {
 		t.Fatalf("replies block over budget: used=%d", used)
 	}
-	// 三位成员都必须出现在段里 —— 预算平分，不能前几位吃光。
 	for _, name := range []string{"- A：", "- B：", "- C："} {
 		if !strings.Contains(block, name) {
 			t.Fatalf("member %s missing from replies block: %q", name, block)
 		}
+	}
+	// 顺序：A → B → C，接力锚点在末尾。
+	if !(strings.Index(block, "- A：") < strings.Index(block, "- B：") &&
+		strings.Index(block, "- B：") < strings.Index(block, "- C：")) {
+		t.Fatalf("replies must stay in speaking order, last one at the tail: %q", block)
 	}
 }
 
@@ -620,7 +644,7 @@ func TestGroupRelay_TwoRoundsAcrossMembers(t *testing.T) {
 			t.Fatalf("dispatch %d round = %d, want %d", i, params[i].Round, want)
 		}
 	}
-	if !strings.Contains(params[0].RolePrompt, "接力讨论 2 轮") {
+	if !strings.Contains(params[0].RolePrompt, "第 1/2 轮接龙") {
 		t.Fatalf("round-1 prompt should announce the relay count, got %q", params[0].RolePrompt)
 	}
 	if !strings.Contains(params[2].RolePrompt, "第 2/2 轮") {
@@ -693,5 +717,176 @@ func TestRelay_EmptyReplyStillVisible(t *testing.T) {
 		if strings.Contains(reply.content, "本轮没有产出内容") {
 			t.Fatal("the placeholder must not be fed back as context")
 		}
+	}
+}
+
+// 接龙语义（用户只起个头，之后是成员之间来回）：第二位及以后的成员，指令必须
+// 点名**紧邻的上一位**，而不是笼统的「回应用户」。旧措辞把 agent 钉在「对用户
+// 表态」上，于是每位成员各喊一句客套话、谁也不接谁 —— 线上表现为「各说各的」。
+func TestBuildPrompt_PointsAtPreviousSpeaker(t *testing.T) {
+	hub := &chatroomRelayHub{rt: nilRelayRuntime()}
+	s := &relaySession{
+		chatroomRCID: "roomD",
+		userText:     "大家下午好啊",
+		isGroup:      true,
+		totalRounds:  1,
+		members: []relayMember{
+			{rcID: "rc_a", roleName: "hermes"},
+			{rcID: "rc_b", roleName: "openclaw"},
+		},
+	}
+
+	// 第一位：只有用户起的头可接，要明确告诉它「你开接」。
+	first := hub.buildPrompt(s, s.members[0])
+	if !strings.Contains(first, "现在轮到你开接") {
+		t.Fatalf("first speaker must be told to open: %q", first)
+	}
+	if strings.Contains(first, "请接住") {
+		t.Fatalf("first speaker has nobody to follow: %q", first)
+	}
+	if !strings.HasPrefix(first, "[group chat] ") {
+		t.Fatalf("relay prompt prefix must stay intact (CLI 靠它判定场合): %q", first)
+	}
+
+	// 第二位：必须点名接住 hermes，并且把 hermes 的原话带上。
+	s.replies = []relayReply{{roleName: "hermes", content: "下午好呀～今天过得怎么样？"}}
+	second := hub.buildPrompt(s, s.members[1])
+	if !strings.Contains(second, "请接住「hermes」刚才的话往下说") {
+		t.Fatalf("second speaker must be pointed at the previous one: %q", second)
+	}
+	if !strings.Contains(second, "下午好呀～今天过得怎么样？") {
+		t.Fatalf("previous speech must ride along: %q", second)
+	}
+	// 用户这一轮只起了个头，接力是成员之间的事 —— 不能再出现「回应用户」。
+	if strings.Contains(second, "回应用户") {
+		t.Fatalf("relay prompt must not ask the member to answer the user: %q", second)
+	}
+}
+
+// 多轮接龙：第二轮的第一位接的是**上一轮收尾那位**，不是从头重来；同时用户原话
+// 只作为「起头」出现一次，不再写成「用户刚在群里发言」那种与事实相反的话。
+func TestBuildPrompt_RoundTwoFollowsPreviousRoundTail(t *testing.T) {
+	hub := &chatroomRelayHub{rt: nilRelayRuntime()}
+	s := &relaySession{
+		chatroomRCID: "roomE",
+		userText:     "聊聊天气",
+		isGroup:      true,
+		totalRounds:  3,
+		roundIndex:   1,
+		members:      []relayMember{{rcID: "rc_a", roleName: "A"}},
+		history: []relayRound{{
+			userText: "聊聊天气",
+			replies: []relayReply{
+				{roleName: "A", content: "今天不错"},
+				{roleName: "B", content: "有点热"},
+			},
+		}},
+	}
+	prompt := hub.buildPrompt(s, s.members[0])
+	if !strings.Contains(prompt, "请接住「B」刚才的话往下说") {
+		t.Fatalf("round 2 must follow the previous round's tail: %q", prompt)
+	}
+	if !strings.Contains(prompt, "第 2/3 轮接龙") {
+		t.Fatalf("round hint missing: %q", prompt)
+	}
+	if !strings.Contains(prompt, "用户起的头：聊聊天气") {
+		t.Fatalf("the opening line must stay as the topic anchor: %q", prompt)
+	}
+	// 第二轮用户并没有发言，不能再说「用户刚在群里发言」。
+	if strings.Contains(prompt, "用户刚在群里发言") {
+		t.Fatalf("round 2 must not claim the user just spoke: %q", prompt)
+	}
+	// 上一轮 B 的原话必须在场（接力链条）。
+	if !strings.Contains(prompt, "有点热") {
+		t.Fatalf("previous round tail must ride along: %q", prompt)
+	}
+}
+
+// 空产出的成员必须留在**本轮**接力链上：下一位得知道他空手，否则会以为前面
+// 没人说过话、只能凭空表态。但他不该进历史存档 —— 用户下次发消息时那是噪音。
+func TestRelay_EmptyReplyFeedsNextSpeakerButNotArchive(t *testing.T) {
+	rec, client := newRelayRecorder(t)
+	rt := newDiscussionRuntime(nil, nil, client, "sys-node", testLogger())
+	hub := &chatroomRelayHub{sessions: map[string]*relaySession{}, rounds: map[string][]relayRound{}, rt: rt}
+	members := []relayMember{
+		{rcID: "rc_a", roleName: "A", order: 0},
+		{rcID: "rc_b", roleName: "B", order: 1},
+	}
+	if !hub.StartGroup(context.Background(), "g4", members, "生成个页面", "rc_user", 1) {
+		t.Fatal("StartGroup should succeed")
+	}
+	acceptFrom(t, hub, "g4", "rc_a", "") // A 空手
+	acceptFrom(t, hub, "g4", "rc_b", "B1")
+	waitUntil(t, "session cleanup", func() bool {
+		return relaySessionState(hub, "g4") == nil
+	})
+
+	privates, _ := rec.snapshot()
+	params := dispatchedParams(t, privates)
+	if len(params) != 2 {
+		t.Fatalf("want 2 dispatches, got %d", len(params))
+	}
+	// B 的提示词里必须写着 A 空手，并点名接 A（而不是让它当第一个接话的人）。
+	if !strings.Contains(params[1].RolePrompt, "本轮没有产出内容") {
+		t.Fatalf("next speaker must be told the previous one produced nothing: %q", params[1].RolePrompt)
+	}
+	if strings.Contains(params[1].RolePrompt, "现在轮到你开接") {
+		t.Fatalf("next speaker must not be treated as the opener: %q", params[1].RolePrompt)
+	}
+	// 也不能叫它「接住 A 的话」—— A 根本没交付正文，接不了。
+	if strings.Contains(params[1].RolePrompt, "请接住「A」") {
+		t.Fatalf("must not ask to follow a member who produced nothing: %q", params[1].RolePrompt)
+	}
+	if !strings.Contains(params[1].RolePrompt, "这轮没交出发言正文") {
+		t.Fatalf("next speaker must be told to carry the thread on its own: %q", params[1].RolePrompt)
+	}
+
+	hub.mu.Lock()
+	rounds := append([]relayRound(nil), hub.rounds["g4"]...)
+	hub.mu.Unlock()
+	for _, round := range rounds {
+		for _, reply := range round.replies {
+			if strings.Contains(reply.content, "本轮没有产出内容") {
+				t.Fatalf("placeholder must not reach the archive: %+v", round.replies)
+			}
+		}
+	}
+}
+
+// 接龙段与历史段一起装入时，整条提示词仍要不越 CLI 的 argv 上限 —— 越界即
+// 退化 stdin，openclaw/opencode/hermes 一律空转。
+func TestBuildPrompt_DialogueStaysUnderArgvCap(t *testing.T) {
+	hub := &chatroomRelayHub{rt: nilRelayRuntime()}
+	for i := 1; i <= maxRelayContextRounds; i++ {
+		hub.recordRound("roomZ", relayRound{
+			userText: strings.Repeat("问", 300),
+			replies: []relayReply{
+				{roleName: "A", content: strings.Repeat("答", 900)},
+				{roleName: "B", content: strings.Repeat("答", 900)},
+			},
+		})
+	}
+	members := []relayMember{{rcID: "rc_a", roleName: "A"}, {rcID: "rc_b", roleName: "B"}}
+	s := &relaySession{
+		chatroomRCID:  "roomZ",
+		userText:      strings.Repeat("档", relayMaxTextLength), // 用户起头拉到入口上限
+		isGroup:       true,
+		members:       members,
+		totalRounds:   3,
+		contextRounds: normalizeContextRounds(maxRelayContextRounds),
+	}
+	hub.mu.Lock()
+	hub.attachContextLocked(s)
+	hub.mu.Unlock()
+	s.replies = []relayReply{
+		{roleName: "A", content: strings.Repeat("新答", 4000)},
+	}
+	prompt := hub.buildPrompt(s, members[1])
+	if len([]rune(prompt)) >= argvPromptMaxChars {
+		t.Fatalf("dialogue prompt must stay under the argv cap (%d), got %d runes",
+			argvPromptMaxChars, len([]rune(prompt)))
+	}
+	if !strings.Contains(prompt, "用户起的头：") {
+		t.Fatal("the opening line must never be squeezed out")
 	}
 }
