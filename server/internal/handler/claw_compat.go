@@ -532,10 +532,48 @@ func (h *Handler) ClawUserInfo(w http.ResponseWriter, r *http.Request) {
 		u, err = h.clawQueryUser(ctx, "username", userID)
 	}
 	if err != nil {
+		// 群聊/聊天室成员里的 AI 节点（rc_node_*）不在 claw_im_users：前端
+		// loadAuthoritativeChatroom / loadGroupMembers 会对每个成员调这个
+		// 接口取昵称头像，节点查不到就 404，气泡退化成裸 id。回落查
+		// rongcloud_user（节点自己的融云账号资料），仍找不到才报 404。
+		if node, nodeErr := h.clawQueryRongCloudUser(ctx, userID); nodeErr == nil {
+			clawJSON(w, 200, 200, "", node)
+			return
+		}
 		clawJSON(w, 404, 404, "用户不存在", nil)
 		return
 	}
 	clawJSON(w, 200, 200, "", clawUserJSON(u))
+}
+
+// clawQueryRongCloudUser 按 rongcloud_user_id 查节点/系统账号的公开资料。
+// 返回的形态与 clawUserJSON 对齐（前端只读 username/nickname/portraitUri），
+// 额外带 isAiNode 供前端区分人类与节点。机器主节点（is_system_reserved）
+// 不对外暴露：它是身份派生的内部锚点，不该出现在成员资料里。
+func (h *Handler) clawQueryRongCloudUser(ctx context.Context, rcID string) (map[string]interface{}, error) {
+	row := h.DB.QueryRow(ctx, `
+		SELECT rongcloud_user_id, COALESCE(name, ''), COALESCE(portrait_uri, ''),
+		       COALESCE(is_ai_node, FALSE), COALESCE(is_system_reserved, FALSE)
+		FROM rongcloud_user WHERE rongcloud_user_id = $1`, rcID)
+	var id, name, portrait string
+	var isAI, isReserved bool
+	if err := row.Scan(&id, &name, &portrait, &isAI, &isReserved); err != nil {
+		return nil, err
+	}
+	if isReserved {
+		return nil, fmt.Errorf("system reserved account: %s", id)
+	}
+	display := name
+	if display == "" {
+		display = id
+	}
+	return map[string]interface{}{
+		"userId":      id,
+		"username":    id,
+		"nickname":    display,
+		"portraitUri": portrait,
+		"isAiNode":    isAI,
+	}, nil
 }
 
 // ClawUserUpdate POST /api/user/update
