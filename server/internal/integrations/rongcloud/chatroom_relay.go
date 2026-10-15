@@ -31,6 +31,15 @@ const (
 	// defaultRelayContextRounds 是会话没设置（或设成 0）时携带的历史轮数。
 	// 与 Web 端「AI 对话轮数」的默认值、旧后端的默认值保持一致。
 	defaultRelayContextRounds = 20
+
+	// defaultGroupRelayRounds 是普通群聊没设置轮数时，一条用户消息触发后 AI
+	// 成员之间自动接力的轮数（1 = 每人各答一次，即旧行为）。
+	defaultGroupRelayRounds = 3
+	// maxGroupRelayRounds 是群聊接力的轮数上限。每一轮都是「全员各跑一次
+	// agent」，M 个成员 × N 轮就是 M×N 次 agent 调用，所以必须封顶：设置项里
+	// 存的 20/50/100 是「上下文窗口」时代的量级，直接拿来当接力轮数会把设备
+	// 与融云发送配额一起打爆。
+	maxGroupRelayRounds = 10
 	// maxRelayContextRounds 是 Web 端允许设置的上限（ConversationCreationFields
 	// 的 ROUND_MAX），超过就按上限截断。
 	maxRelayContextRounds = 100
@@ -94,6 +103,17 @@ type relaySession struct {
 	// contextRounds 是本次中继携带的历史轮数上限（已归一化到
 	// 1..maxRelayContextRounds）。
 	contextRounds int
+	// totalRounds 是本次中继要跑几轮「全员发言」。普通群聊按「AI 对话轮数」
+	// 设置推进（用户发一条消息，AI 成员之间接力 N 轮）；聊天室恒为 1，保持
+	// 「一轮问答」的旧行为 —— 聊天室那个设置值另有「讨论默认轮数」的语义，
+	// 不能顺带当成接力轮数用。
+	totalRounds int
+	// roundIndex 是当前进行到第几轮（0 基）。dispatchTurn 报给设备端的
+	// round 参数与提示词里的轮次提示都用它。
+	roundIndex int
+	// allReplies 是本次中继累计的全部发言（跨轮），只用于收尾时并入滚动
+	// 缓存；s.replies 仍是「本轮」发言，每轮开始清空。
+	allReplies []relayReply
 }
 
 // relayRound 是一轮已完成的对话：一条用户消息 + 该轮各位 AI 的回应。
@@ -133,6 +153,20 @@ func normalizeContextRounds(value int) int {
 	}
 	if value > maxRelayContextRounds {
 		return maxRelayContextRounds
+	}
+	return value
+}
+
+// normalizeGroupRelayRounds 把群聊「AI 对话轮数」收敛成接力轮数。0/负数
+// （库里没存过、或旧数据）按默认值处理；超过 maxGroupRelayRounds 一律截到
+// 上限 —— 这个设置项历史上是「上下文窗口」，存着 20/50/100 的老群不该因为
+// 语义变化突然跑几十轮。
+func normalizeGroupRelayRounds(value int) int {
+	if value <= 0 {
+		return defaultGroupRelayRounds
+	}
+	if value > maxGroupRelayRounds {
+		return maxGroupRelayRounds
 	}
 	return value
 }
@@ -269,6 +303,10 @@ func (h *chatroomRelayHub) Start(ctx context.Context, chatroomRCID string, membe
 		topic:         topic,
 		requesterRCID: requesterRCID,
 		contextRounds: normalizeContextRounds(contextRounds),
+		// 聊天室闲聊恒为一轮：这个房间的 max_rounds 兼作「发起讨论时的默认
+		// 轮数」（见 conversation-kind / InfoPanel 文案），把它顺带解释成
+		// 闲聊接力轮数会让同一份配置有两个互相打架的含义。
+		totalRounds: 1,
 	}
 	h.attachContextLocked(session)
 	h.sessions[chatroomRCID] = session
@@ -280,11 +318,15 @@ func (h *chatroomRelayHub) Start(ctx context.Context, chatroomRCID string, membe
 
 // pump 依次派发成员。ctx 是请求生命周期之外的独立 context（WithoutCancel），
 // 保证 HTTP 200 之后中继仍继续跑。
+//
+// 多轮：一轮 = 全员各发言一次。跑完一轮后若 totalRounds 还没到，就把本轮发言
+// 并进历史、清空本轮发言、回到第一位成员继续 —— 这正是普通群聊「AI 之间自动
+// 聊 N 轮」的实现。聊天室 totalRounds 恒为 1，循环只走一圈，行为与从前一致。
 func (h *chatroomRelayHub) pump(ctx context.Context, s *relaySession) {
 	timeout := h.rt.interactiveTurnTimeout()
 	defer func() {
 		h.mu.Lock()
-		replies := append([]relayReply(nil), s.replies...)
+		replies := append([]relayReply(nil), s.allReplies...)
 		if cur, ok := h.sessions[s.chatroomRCID]; ok && cur == s {
 			delete(h.sessions, s.chatroomRCID)
 		}
@@ -292,39 +334,72 @@ func (h *chatroomRelayHub) pump(ctx context.Context, s *relaySession) {
 		// 本轮结束后并入滚动缓存，供下一条用户消息携带上下文。
 		h.recordRound(s.chatroomRCID, relayRound{userText: s.userText, replies: replies})
 	}()
-	for s.index < len(s.members) {
-		member := s.members[s.index]
-		requestID := fmt.Sprintf("relay_%d_%d", time.Now().UnixNano(), member.order)
-		done := make(chan struct{})
-		h.mu.Lock()
-		s.requestID = requestID
-		s.senderRCID = member.rcID
-		s.currentDone = done
-		h.mu.Unlock()
-		if err := h.dispatchTurn(ctx, s, member, requestID); err != nil {
-			h.rt.logger.Warn("relay: dispatch failed",
-				"chatroom", s.chatroomRCID, "target", member.rcID, "error", err)
-			// 派发失败视同该成员本轮跳过，继续下一位。
-			s.index++
-			continue
-		}
-		select {
-		case <-done:
-			// 回包已处理（broadcast 已在 AcceptResponse 里完成），前进。
-		case <-time.After(timeout):
-			h.rt.logger.Warn("relay: turn timed out",
-				"chatroom", s.chatroomRCID, "target", member.rcID)
-			// 超时后作废当前轮：迟到的回包因 requestID 已不匹配被丢弃。
+	for s.roundIndex < s.totalRounds {
+		for s.index < len(s.members) {
+			member := s.members[s.index]
+			requestID := fmt.Sprintf("relay_%d_%d_%d", time.Now().UnixNano(), s.roundIndex, member.order)
+			done := make(chan struct{})
 			h.mu.Lock()
-			if s.requestID == requestID {
-				s.requestID = ""
-			}
+			s.requestID = requestID
+			s.senderRCID = member.rcID
+			s.currentDone = done
 			h.mu.Unlock()
-		case <-ctx.Done():
+			if err := h.dispatchTurn(ctx, s, member, requestID); err != nil {
+				h.rt.logger.Warn("relay: dispatch failed",
+					"chatroom", s.chatroomRCID, "target", member.rcID,
+					"round", s.roundIndex+1, "error", err)
+				// 派发失败视同该成员本轮跳过，继续下一位。
+				s.index++
+				continue
+			}
+			select {
+			case <-done:
+				// 回包已处理（broadcast 已在 AcceptResponse 里完成），前进。
+			case <-time.After(timeout):
+				h.rt.logger.Warn("relay: turn timed out",
+					"chatroom", s.chatroomRCID, "target", member.rcID,
+					"round", s.roundIndex+1)
+				// 超时后作废当前轮：迟到的回包因 requestID 已不匹配被丢弃。
+				h.mu.Lock()
+				if s.requestID == requestID {
+					s.requestID = ""
+				}
+				h.mu.Unlock()
+			case <-ctx.Done():
+				return
+			}
+			s.index++
+		}
+		// 本轮全员发言结束：把这一轮并进历史，供下一轮的提示词使用。
+		h.closeRoundLocked(s)
+		if s.roundIndex+1 >= s.totalRounds {
 			return
 		}
-		s.index++
+		s.roundIndex++
+		s.index = 0
 	}
+}
+
+// closeRoundLocked 在持锁前提下收尾当前一轮：把本轮发言并进会话历史（下一轮
+// 的提示词据此承接）、并入累计发言，然后清空本轮发言。本轮无人回包时不留
+// 空轮，免得历史里多出一段「什么都没有」的记录。
+func (h *chatroomRelayHub) closeRoundLocked(s *relaySession) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(s.replies) == 0 {
+		return
+	}
+	// 首轮带用户原话；后续轮次是成员之间的接力，没有新的用户消息，
+	// userText 留空（renderRelayRound 会省略「用户：」那一行）。
+	userText := ""
+	if s.roundIndex == 0 {
+		userText = s.userText
+	}
+	round := relayRound{userText: userText}
+	round.replies = append(round.replies, s.replies...)
+	s.history = append(s.history, round)
+	s.allReplies = append(s.allReplies, s.replies...)
+	s.replies = nil
 }
 
 // dispatchTurn 私发 your_turn 给成员（CLI 零改动的既有协议）。
@@ -335,7 +410,7 @@ func (h *chatroomRelayHub) dispatchTurn(ctx context.Context, s *relaySession, me
 		convType = 3
 	}
 	params := map[string]interface{}{
-		"round":          1,
+		"round":          s.roundIndex + 1,
 		"speaking_order": member.order,
 		"role_name":      member.roleName,
 		"chatroom_id":    s.chatroomRCID,
@@ -371,6 +446,19 @@ func (h *chatroomRelayHub) buildPrompt(s *relaySession, member relayMember) stri
 		venue = "群聊"
 		scope = "这是普通群聊的一次自由对话。用户刚在群里发言"
 	}
+	// 接力轮次（普通群聊 > 1 轮时）：从第二轮起用户并没有再发言，是成员之间
+	// 接着聊。抬头必须换掉，否则 agent 会以为用户又提了一遍同样的问题，把
+	// 上一轮的回答原样再输出一遍。
+	roundNote := ""
+	if s.totalRounds > 1 {
+		if s.roundIndex > 0 {
+			scope = "这是普通群聊的一次自由讨论。成员们在接着上一轮的发言继续聊下去，用户这一轮没有再发言"
+			roundNote = fmt.Sprintf("\n\n现在是第 %d/%d 轮接力：请顺着上面成员们的观点继续推进（补充、质疑、收敛都行），不要重复你已经说过的内容。",
+				s.roundIndex+1, s.totalRounds)
+		} else {
+			roundNote = fmt.Sprintf("\n\n用户发一条消息后，你们会接力讨论 %d 轮；现在从你开始。", s.totalRounds)
+		}
+	}
 	// 本组议题（来自最近一次讨论）：讨论组的闲聊不是无根之水，成员应知道
 	// 这个组围绕什么展开。无历史讨论时整段省略。
 	contextBlock := ""
@@ -398,9 +486,9 @@ func (h *chatroomRelayHub) buildPrompt(s *relaySession, member relayMember) stri
 	// 上一轮聊过什么。
 	contextBlock += relayHistoryBlock(s.history, budget)
 	return fmt.Sprintf(
-		"[group chat] %s：\n\n%s%s\n\n"+
+		"[group chat] %s：\n\n%s%s%s\n\n"+
 			"请以「%s」的身份回应用户。回应会被广播回%s，请只输出回应正文，不要输出多余格式。%s",
-		scope, s.userText, contextBlock, member.roleName, venue, instr,
+		scope, s.userText, contextBlock, roundNote, member.roleName, venue, instr,
 	)
 }
 
@@ -490,11 +578,14 @@ func relayHistoryBlock(history []relayRound, budget int) string {
 	return b.String()
 }
 
-// renderRelayRound 渲染一轮记录：用户的提问 + 该轮各位成员的回应。
+// renderRelayRound 渲染一轮记录：用户的提问 + 该轮各位成员的回应。接力讨论
+// 的第二轮起没有新的用户消息，那一段整行省略（只留成员的发言）。
 func renderRelayRound(round relayRound) string {
 	var b strings.Builder
-	b.WriteString("\n用户：")
-	b.WriteString(clipRelayText(round.userText, relayHistoryReplyClip))
+	if strings.TrimSpace(round.userText) != "" {
+		b.WriteString("\n用户：")
+		b.WriteString(clipRelayText(round.userText, relayHistoryReplyClip))
+	}
 	for _, reply := range round.replies {
 		fmt.Fprintf(&b, "\n- %s：%s", reply.roleName, clipRelayText(reply.content, relayHistoryReplyClip))
 	}
@@ -544,6 +635,17 @@ func (h *chatroomRelayHub) AcceptResponse(ctx context.Context, senderID, request
 			s.replies = append(s.replies, relayReply{roleName: member.roleName, content: content})
 		}
 		h.mu.Unlock()
+	} else {
+		// 回包成功但正文为空。以前这里直接静默跳过 —— 用户看到的是「发了消息
+		// 却一条回复都没有」，完全无从判断是没在跑还是跑了没产出。设备端只把
+		// agent 的 stdout 当正文，而「生成个 HTML」这类请求多数是把文件写进
+		// 工作目录、stdout 近乎为空，于是空回包成了常态而非异常。
+		// 这里补一条占位气泡：中继照常推进，但空产出对用户可见。
+		h.rt.logger.Warn("relay: member returned empty content",
+			"chatroom", session.chatroomRCID, "target", senderID,
+			"round", session.roundIndex+1)
+		h.broadcastMemberSpeech(ctx, session, &member,
+			fmt.Sprintf("（%s 本轮没有产出内容）", member.roleName))
 	}
 	// 作废当前轮的 requestID（防重复回包重复推进），再唤醒 pump。
 	h.mu.Lock()

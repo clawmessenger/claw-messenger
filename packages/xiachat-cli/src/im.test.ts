@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -1383,3 +1383,114 @@ describe("会话形态判定与隔离（群聊不得被当成讨论组）", () =
     expect(seenKey).toBe("cm-private-user_a")
   })
 })
+
+// agent 把产物写进工作目录、stdout 却是空的，是「生成个文件」这类请求的常态。
+// 这一组用例锁住两件事：文件要被采集并作为 file_message 发出去；正文不能是空的
+// （空正文在中继那边等于「该成员没有产出」，在私聊里等于一个永远填不满的气泡）。
+describe("MessageDispatcher agent-produced files", () => {
+  function makeArtifactDeps() {
+    const sent: Array<{ to: string; objectName: string; content: string }> = [];
+    const streamed: Array<{
+      conversationType: number;
+      conversationId: string;
+      objectName: string;
+      content: string;
+    }> = [];
+    const uploaded: Array<{ path: string; name: string }> = [];
+    return { sent, streamed, uploaded };
+  }
+
+  it("uploads this turn's new files and sends them as file_message", async () => {
+    const root = mkdtempSync(join(tmpdir(), "cm-im-artifacts-"));
+    const deps = makeArtifactDeps();
+    const dispatcher = new MessageDispatcher({
+      send: async (to, objectName, content) => {
+        deps.sent.push({ to, objectName, content });
+      },
+      sendStream: async (conversationType, conversationId, objectName, content) => {
+        deps.streamed.push({ conversationType, conversationId, objectName, content });
+      },
+      artifactDir: root,
+      uploadArtifact: async (artifact) => {
+        deps.uploaded.push({ path: artifact.path, name: artifact.name });
+        return {
+          url: `/api/claw/files/node-x/${artifact.name}`,
+          name: artifact.name,
+          size: artifact.size,
+          type: "text/html",
+        };
+      },
+    });
+
+    await dispatcher.handle(
+      {
+        objectName: "RC:TxtMsg",
+        fromUserId: "user-1",
+        toUserId: "node-a",
+        targetId: "node-a",
+        conversationType: 1,
+        content: JSON.stringify({ content: "帮我生成一个落地页" }),
+      },
+      {
+        runTurn: async () => {
+          writeFileSync(join(root, "landing.html"), "<html>ok</html>", "utf8");
+          // agent 只写了文件，没打印任何东西 —— 正是线上「零回复」的成因。
+          return "";
+        },
+      },
+    );
+
+    expect(deps.uploaded.map((item) => item.name)).toEqual(["landing.html"]);
+    const fileMessage = deps.streamed.find((item) => item.objectName === "file_message");
+    expect(fileMessage).toBeTruthy();
+    expect(fileMessage!.conversationType).toBe(1);
+    expect(fileMessage!.conversationId).toBe("user-1");
+    const payload = JSON.parse(fileMessage!.content);
+    expect(payload.msg_type).toBe("file_message");
+    expect(payload.file.url).toContain("landing.html");
+
+    // 正文兜底：空 stdout 必须变成一句用户能看懂的话，且点到文件名。
+    expect(deps.sent).toHaveLength(1);
+    const reply = JSON.parse(deps.sent[0].content);
+    expect(reply.content).toContain("已生成 1 个文件");
+    expect(reply.content).toContain("landing.html");
+
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("says so explicitly when the turn produced nothing at all", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    await dispatcher.handle(
+      {
+        objectName: "RC:TxtMsg",
+        fromUserId: "user-1",
+        toUserId: "node-a",
+        targetId: "node-a",
+        conversationType: 1,
+        content: JSON.stringify({ content: "在吗" }),
+      },
+      { runTurn: async () => "" },
+    );
+    expect(deps.sent).toHaveLength(1);
+    expect(JSON.parse(deps.sent[0].content).content).toBe("（本轮没有产出内容）");
+  });
+
+  it("leaves a non-empty reply untouched (a fence must still become a card)", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    await dispatcher.handle(
+      {
+        objectName: "RC:TxtMsg",
+        fromUserId: "user-1",
+        toUserId: "node-a",
+        targetId: "node-a",
+        conversationType: 1,
+        content: JSON.stringify({ content: "生成一个页面" }),
+      },
+      { runTurn: async () => "```html\n<html>hi</html>\n```" },
+    );
+    expect(deps.sent).toHaveLength(1);
+    expect(deps.sent[0].objectName).toBe("card_message");
+  });
+});

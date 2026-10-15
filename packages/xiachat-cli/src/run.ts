@@ -250,6 +250,9 @@ const RUNTIME_RECOVERY_MIN_INTERVAL_MS = 5_000;
 export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
   await connectTransport(opts);
 
+  // 产出文件上传的「凭据缺失」告警只打一次（见 uploadArtifact）。
+  let artifactUploadWarned = false;
+
   // Catalogue the bound agent's models up front: the web's 设备管理 → 默认模型
   // panel aborts after 8s, and `openclaw models list` alone takes ~10s cold.
   // Warm-up runs in the background so it never delays message dispatch.
@@ -304,6 +307,35 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
     // html_revise 的上一版 HTML 落盘目录：放 agent 的工作目录里，读它不需要
     // 越出工作区（见 im.ts writeReviseSource）。
     reviseSourceDir: opts.cwd,
+    // agent 的工作目录：产物采集（artifacts.ts）在这里找本轮新写出的文件。
+    artifactDir: opts.cwd,
+    // 把产出文件送上服务端。设备凭据是这里的门槛：standalone `run` 模式
+    // （没走配对/注册换出的 credentialId+deviceSecret）拿不到它，只能放弃
+    // 上传 —— 回复本身照发，只是少一个文件气泡。这种情况只提示一次，免得
+    // 每个回合都刷一行日志。
+    uploadArtifact: async (artifact) => {
+      const { nodeId, credentialId, deviceSecret } = opts.creds;
+      if (!nodeId || !credentialId || !deviceSecret) {
+        if (!artifactUploadWarned) {
+          artifactUploadWarned = true;
+          console.error(
+            "artifact upload disabled: this node has no device credential (pair/register first); agent-produced files cannot be attached",
+          );
+        }
+        return undefined;
+      }
+      const data = new Uint8Array(readFileSync(artifact.path));
+      const result = await opts.api.uploadNodeFile(nodeId, credentialId, deviceSecret, {
+        data,
+        name: artifact.name,
+      });
+      return {
+        url: result.url,
+        name: result.filename || artifact.name,
+        size: result.size,
+        type: result.type || "application/octet-stream",
+      };
+    },
     // chat_stream 帧按会话类型路由：私聊走 PRIVATE 会话，群组/聊天室走
     // 对应会话号（由 runStreamedTurn 的 ctx.conversationType 决定）。
     sendStream: (conversationType, conversationId, objectName, content) =>
@@ -537,6 +569,10 @@ export async function createImlibTransport(): Promise<IMTransport> {
         ["chat_stream", true, false],
         ["chat_stop", false, false],
         ["chat_stop_result", false, false],
+        // file_message: agent 本轮产出的文件（HTML/报告/表格…）。持久化并计数，
+        // 与 web 端 CUSTOM_MESSAGE_TYPES 同源 —— 不注册这条，融云会把它当未知
+        // 类型丢掉，用户永远看不到文件气泡。
+        ["file_message", true, true],
       ] as const) {
         customMessages.set(name, imlib.registerMessageType<Record<string, unknown>>(name, persisted, counted));
       }

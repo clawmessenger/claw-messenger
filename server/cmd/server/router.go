@@ -1602,6 +1602,15 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// RongCloud public API (no auth — AI node registration and token refresh
 	// use the RongCloud node ID as credential, not the Multica session).
 	r.Get("/api/config/rongcloud", h.GetRongCloudConfig)
+	// C 端媒体/文件上传（旧 Python 契约：multipart file+type+filename →
+	// {code,data:{url,filename,type,size}}）。线上此前没有这条路由，前端上传
+	// 一直 404；头像走 dataURL 才没暴露出来。
+	r.Post("/api/upload", h.ClawUploadFile)
+	// 设备端把 agent 本轮产出的文件送上来（device credential 鉴权）。
+	r.Post("/api/claw/node-files", h.ClawNodeUploadFile)
+	// 产出文件的读回口。故意公开：URL 要能直接进 <img src> / iframe / 融云
+	// 消息体，原生请求带不了 Authorization；安全性由随机 key + 形状校验保证。
+	r.Get("/api/claw/files/*", h.ClawServeFile)
 	r.Post("/api/ai/register", h.RegisterRongCloudAINode)
 	r.Post("/api/claw/refresh-token/{nodeId}", h.RefreshRongCloudToken)
 	r.Post("/api/claw/device-credentials/enroll", h.EnrollDeviceCredential)

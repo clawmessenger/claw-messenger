@@ -2,14 +2,105 @@ package rongcloud
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
+
+// relayRecorder 是一个只记账的假融云：记录私聊派发（your_turn）与群/聊天室
+// 广播，用来验证「谁在第几轮被派发、广播了什么」。
+type relayRecorder struct {
+	mu       sync.Mutex
+	privates []map[string]string
+	group    []map[string]string
+}
+
+func newRelayRecorder(t *testing.T) (*relayRecorder, *rongcloudAPIClient) {
+	t.Helper()
+	rec := &relayRecorder{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("ParseForm: %v", err)
+		}
+		entry := make(map[string]string, len(r.PostForm))
+		for k, v := range r.PostForm {
+			entry[k] = strings.Join(v, ",")
+		}
+		rec.mu.Lock()
+		switch r.URL.Path {
+		case "/message/private/publish.json":
+			rec.privates = append(rec.privates, entry)
+		case "/message/group/publish.json":
+			rec.group = append(rec.group, entry)
+		}
+		rec.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"code":200,"msgUID":"uid-1"}`)
+	}))
+	t.Cleanup(srv.Close)
+	return rec, newRongCloudAPIClient("key", "secret", srv.URL, srv.Client(), testLogger())
+}
+
+func (r *relayRecorder) snapshot() (privates, group []map[string]string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]map[string]string(nil), r.privates...),
+		append([]map[string]string(nil), r.group...)
+}
+
+// broadcastTexts 解出所有群/聊天室广播的正文（按发生顺序）。
+func broadcastTexts(t *testing.T, group []map[string]string) []string {
+	t.Helper()
+	out := make([]string, 0, len(group))
+	for _, entry := range group {
+		var payload struct {
+			Content string `json:"content"`
+		}
+		if err := json.Unmarshal([]byte(entry["content"]), &payload); err != nil {
+			t.Fatalf("broadcast content is not JSON: %v (%s)", err, entry["content"])
+		}
+		out = append(out, payload.Content)
+	}
+	return out
+}
+
+// dispatchedParams 解出每次私聊派发的 round 与提示词。
+func dispatchedParams(t *testing.T, privates []map[string]string) []struct {
+	Round      int
+	RolePrompt string
+} {
+	t.Helper()
+	type dispatched struct {
+		RequestID string `json:"request_id"`
+		Params    struct {
+			Round      int    `json:"round"`
+			RolePrompt string `json:"role_prompt"`
+		} `json:"params"`
+	}
+	out := make([]struct {
+		Round      int
+		RolePrompt string
+	}, 0, len(privates))
+	for _, entry := range privates {
+		var decoded dispatched
+		if err := json.Unmarshal([]byte(entry["content"]), &decoded); err != nil {
+			t.Fatalf("dispatch content is not JSON: %v (%s)", err, entry["content"])
+		}
+		out = append(out, struct {
+			Round      int
+			RolePrompt string
+		}{Round: decoded.Params.Round, RolePrompt: decoded.Params.RolePrompt})
+	}
+	return out
+}
 
 // 测试聚焦 hub 自身状态机：按序推进、回包唤醒、超时跳过、迟到/伪造回包吞掉。
 // 派发动作（sendPrivateJSON → rt.client）在真 runtime 里走融云 HTTP；这里把
@@ -394,7 +485,7 @@ func TestBuildPrompt_StaysUnderArgvCap(t *testing.T) {
 	}
 }
 
-func TestGroupContextRounds_ReadsGroupSetting(t *testing.T) {
+func TestGroupRelayRounds_ReadsGroupSetting(t *testing.T) {
 	hub := &chatroomRelayHub{
 		rt: nilRelayRuntime(),
 		groupMirror: &GroupMirror{
@@ -403,8 +494,8 @@ func TestGroupContextRounds_ReadsGroupSetting(t *testing.T) {
 			},
 		},
 	}
-	if got := hub.groupContextRounds(context.Background(), "g1"); got != 7 {
-		t.Fatalf("groupContextRounds = %d, want 7 (stored setting)", got)
+	if got := hub.groupRelayRounds(context.Background(), "g1"); got != 7 {
+		t.Fatalf("groupRelayRounds = %d, want 7 (stored setting)", got)
 	}
 	// 群被镜像但没设过轮数（COALESCE 出来的 0）→ 默认值。
 	hub.groupMirror = &GroupMirror{
@@ -412,13 +503,34 @@ func TestGroupContextRounds_ReadsGroupSetting(t *testing.T) {
 			return []GroupProfile{{GroupID: "g2", MaxRounds: 0}}, nil
 		},
 	}
-	if got := hub.groupContextRounds(context.Background(), "g2"); got != defaultRelayContextRounds {
+	if got := hub.groupRelayRounds(context.Background(), "g2"); got != defaultGroupRelayRounds {
 		t.Fatalf("unset setting must fall back to default, got %d", got)
 	}
 	// 没配镜像回调 → 默认值，不 panic（部署可以不带群功能）。
 	hub.groupMirror = nil
-	if got := hub.groupContextRounds(context.Background(), "g3"); got != defaultRelayContextRounds {
+	if got := hub.groupRelayRounds(context.Background(), "g3"); got != defaultGroupRelayRounds {
 		t.Fatalf("nil mirror must fall back to default, got %d", got)
+	}
+}
+
+func TestNormalizeGroupRelayRounds(t *testing.T) {
+	cases := []struct {
+		in   int
+		want int
+	}{
+		{0, defaultGroupRelayRounds},
+		{-3, defaultGroupRelayRounds},
+		{1, 1},
+		{3, 3},
+		{maxGroupRelayRounds, maxGroupRelayRounds},
+		// 老群存着「上下文窗口」时代的 20/50/100，不能整份拿来当接力轮数。
+		{20, maxGroupRelayRounds},
+		{100, maxGroupRelayRounds},
+	}
+	for _, tc := range cases {
+		if got := normalizeGroupRelayRounds(tc.in); got != tc.want {
+			t.Fatalf("normalizeGroupRelayRounds(%d) = %d, want %d", tc.in, got, tc.want)
+		}
 	}
 }
 
@@ -450,3 +562,136 @@ func nilRelayRuntime() *discussionRuntime {
 }
 
 var _ = pgtype.Text{}
+
+// acceptFrom 等到 who 被登记为当前轮，然后投递一条回包。假的融云 client 让
+// dispatchTurn 真正成功，于是 pump 会按状态机前进（而不是走「派发失败跳过」）。
+func acceptFrom(t *testing.T, hub *chatroomRelayHub, room, who, text string) {
+	t.Helper()
+	var reqID string
+	waitUntil(t, "dispatch to "+who, func() bool {
+		hub.mu.Lock()
+		defer hub.mu.Unlock()
+		s := hub.sessions[room]
+		if s == nil || s.senderRCID != who || s.requestID == "" {
+			return false
+		}
+		reqID = s.requestID
+		return true
+	})
+	if !hub.AcceptResponse(context.Background(), who, reqID, text, false, "") {
+		t.Fatalf("response from %s was not accepted by the relay", who)
+	}
+}
+
+// 群聊「AI 对话轮数」= 2 时，一条用户消息应当让两位成员接力两轮：A1 B1 A2 B2。
+func TestGroupRelay_TwoRoundsAcrossMembers(t *testing.T) {
+	rec, client := newRelayRecorder(t)
+	rt := newDiscussionRuntime(nil, nil, client, "sys-node", testLogger())
+	hub := &chatroomRelayHub{sessions: map[string]*relaySession{}, rounds: map[string][]relayRound{}, rt: rt}
+	members := []relayMember{
+		{rcID: "rc_a", roleName: "A", order: 0},
+		{rcID: "rc_b", roleName: "B", order: 1},
+	}
+	if !hub.StartGroup(context.Background(), "g1", members, "让AI生成个页面", "rc_user", 2) {
+		t.Fatal("StartGroup should succeed")
+	}
+
+	acceptFrom(t, hub, "g1", "rc_a", "A1")
+	acceptFrom(t, hub, "g1", "rc_b", "B1")
+	// 第二轮：回到第一位成员，再由第二位收尾。
+	acceptFrom(t, hub, "g1", "rc_a", "A2")
+	acceptFrom(t, hub, "g1", "rc_b", "B2")
+
+	waitUntil(t, "session cleanup", func() bool {
+		return relaySessionState(hub, "g1") == nil
+	})
+
+	privates, group := rec.snapshot()
+	if got := broadcastTexts(t, group); len(got) != 4 ||
+		got[0] != "A1" || got[1] != "B1" || got[2] != "A2" || got[3] != "B2" {
+		t.Fatalf("broadcasts = %v, want [A1 B1 A2 B2]", got)
+	}
+	params := dispatchedParams(t, privates)
+	if len(params) != 4 {
+		t.Fatalf("want 4 dispatches, got %d", len(params))
+	}
+	for i, want := range []int{1, 1, 2, 2} {
+		if params[i].Round != want {
+			t.Fatalf("dispatch %d round = %d, want %d", i, params[i].Round, want)
+		}
+	}
+	if !strings.Contains(params[0].RolePrompt, "接力讨论 2 轮") {
+		t.Fatalf("round-1 prompt should announce the relay count, got %q", params[0].RolePrompt)
+	}
+	if !strings.Contains(params[2].RolePrompt, "第 2/2 轮") {
+		t.Fatalf("round-2 prompt should carry the round hint, got %q", params[2].RolePrompt)
+	}
+	// 第二轮必须能看到第一轮的发言（否则成员只会把上一轮原样再讲一遍）。
+	if !strings.Contains(params[2].RolePrompt, "A1") || !strings.Contains(params[2].RolePrompt, "B1") {
+		t.Fatalf("round-2 prompt must carry round-1 speeches, got %q", params[2].RolePrompt)
+	}
+
+	hub.mu.Lock()
+	rounds := append([]relayRound(nil), hub.rounds["g1"]...)
+	hub.mu.Unlock()
+	if len(rounds) != 1 {
+		t.Fatalf("want one recorded round for the next user message, got %d", len(rounds))
+	}
+	if rounds[0].userText != "让AI生成个页面" || len(rounds[0].replies) != 4 {
+		t.Fatalf("recorded round wrong: user=%q replies=%d", rounds[0].userText, len(rounds[0].replies))
+	}
+}
+
+// 群聊设成 1 轮时保持旧行为：每人只说一次就收尾。
+func TestGroupRelay_SingleRoundWhenConfiguredOne(t *testing.T) {
+	rec, client := newRelayRecorder(t)
+	rt := newDiscussionRuntime(nil, nil, client, "sys-node", testLogger())
+	hub := &chatroomRelayHub{sessions: map[string]*relaySession{}, rounds: map[string][]relayRound{}, rt: rt}
+	members := []relayMember{{rcID: "rc_a", roleName: "A", order: 0}}
+	if !hub.StartGroup(context.Background(), "g2", members, "hi", "rc_user", 1) {
+		t.Fatal("StartGroup should succeed")
+	}
+	acceptFrom(t, hub, "g2", "rc_a", "only-once")
+	waitUntil(t, "session cleanup", func() bool {
+		return relaySessionState(hub, "g2") == nil
+	})
+	privates, group := rec.snapshot()
+	if got := broadcastTexts(t, group); len(got) != 1 || got[0] != "only-once" {
+		t.Fatalf("broadcasts = %v, want [only-once]", got)
+	}
+	if params := dispatchedParams(t, privates); len(params) != 1 {
+		t.Fatalf("want exactly one dispatch, got %d", len(params))
+	}
+}
+
+// 回包成功但正文为空：中继以前直接静默跳过，用户看到「发了消息却零回复」。
+// 现在必须广播一条可见的占位，且不把空内容记进上下文。
+func TestRelay_EmptyReplyStillVisible(t *testing.T) {
+	rec, client := newRelayRecorder(t)
+	rt := newDiscussionRuntime(nil, nil, client, "sys-node", testLogger())
+	hub := &chatroomRelayHub{sessions: map[string]*relaySession{}, rounds: map[string][]relayRound{}, rt: rt}
+	members := []relayMember{{rcID: "rc_a", roleName: "A", order: 0}}
+	if !hub.StartGroup(context.Background(), "g3", members, "让AI生成个html", "rc_user", 1) {
+		t.Fatal("StartGroup should succeed")
+	}
+	acceptFrom(t, hub, "g3", "rc_a", "")
+	waitUntil(t, "session cleanup", func() bool {
+		return relaySessionState(hub, "g3") == nil
+	})
+	_, group := rec.snapshot()
+	got := broadcastTexts(t, group)
+	if len(got) != 1 || !strings.Contains(got[0], "本轮没有产出内容") {
+		t.Fatalf("empty reply should surface a visible placeholder, got %v", got)
+	}
+	hub.mu.Lock()
+	rounds := append([]relayRound(nil), hub.rounds["g3"]...)
+	hub.mu.Unlock()
+	if len(rounds) != 1 {
+		t.Fatalf("want one recorded round, got %d", len(rounds))
+	}
+	for _, reply := range rounds[0].replies {
+		if strings.Contains(reply.content, "本轮没有产出内容") {
+			t.Fatal("the placeholder must not be fed back as context")
+		}
+	}
+}

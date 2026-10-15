@@ -2,6 +2,7 @@ import { writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ARGV_PROMPT_MAX_CHARS } from "./agents.js";
+import { collectProducedArtifacts, snapshotWorkdir, type ProducedArtifact, type WorkdirSnapshot } from "./artifacts.js";
 import { decodeCommandContent, encodeCommandResult } from "./protocol.js";
 import { buildChatStreamFrame, encodeChatStreamWireFrames, parseChatStopRequest, type ChatStreamStatus } from "./chat-stream.js";
 import { buildHtmlCard, extractHtmlFence, htmlReviseFromFilePrompt, htmlRevisePrompt } from "./cards.js";
@@ -154,6 +155,22 @@ export interface DispatcherDeps {
   // by run.ts to the agent's working directory so the file lands inside the
   // workspace the agent may read; falls back to the OS temp dir when omitted.
   reviseSourceDir?: string;
+  // agent 的工作目录。设了它才会做「本轮产出了哪些文件」的采集（见
+  // artifacts.ts）：一轮开始前拍快照、结束后取差集。省略即不采集。
+  artifactDir?: string;
+  // 把采集到的文件送上服务端，返回可被 web 引用的地址。省略、抛错或返回
+  // undefined 都只意味着「这个文件没上去」，绝不影响正常回合。
+  uploadArtifact?: (artifact: ProducedArtifact) => Promise<UploadedArtifact | undefined>;
+}
+
+/** 一个已经落到服务端的产出文件。 */
+export interface UploadedArtifact {
+  /** 站点相对的 API 路径（/api/claw/files/<key>），由 web 端补自己的前缀。 */
+  url: string;
+  name: string;
+  size: number;
+  /** MIME，web 据此决定用 iframe / 图片 / 下载哪种方式打开。 */
+  type: string;
 }
 
 export interface TurnRunner {
@@ -487,6 +504,12 @@ export class MessageDispatcher {
       }
     };
     const canStream = Boolean(this.deps.sendStream) && Boolean(opts.turns.runTurnStreamed);
+    // 产物采集的第一张快照：必须在 agent 真正开跑之前拍，否则「本轮新建的文件」
+    // 会被算成「本来就有的文件」。目录很大时这一步也要花时间，所以只在真的
+    // 配了 artifactDir + uploadArtifact 时才拍。
+    const artifactSnapshot = this.deps.artifactDir && this.deps.uploadArtifact
+      ? snapshotWorkdir(this.deps.artifactDir)
+      : undefined;
     // Active-stream registry keyed by streamId for chat_stop cancellation.
     const controller = new AbortController();
     this.activeStreams.set(ctx.streamId, controller);
@@ -497,7 +520,9 @@ export class MessageDispatcher {
         // semantics (single chat: log only; your_turn: error command_result).
         try {
           const out = await opts.turns.runTurn(opts.prompt, opts.model, opts.sessionKey);
-          await opts.fallback(out);
+          const uploaded = await this.collectArtifacts(artifactSnapshot);
+          await opts.fallback(this.ensureVisibleReply(out, uploaded));
+          await this.sendArtifactMessages(ctx, uploaded);
         } catch (err) {
           const errMsg = err instanceof Error ? err.message : String(err);
           if (opts.onError) {
@@ -553,13 +578,91 @@ export class MessageDispatcher {
       if (controller.signal.aborted) {
         return;
       }
+      // 上传本轮产出的文件，拿到 web 可引用的地址。必须在发终帧之前做：
+      // web 端把「流式终帧」与「随后广播的兜底整包文本」按内容相等去重
+      // （lib/ai-message-lifecycle.ts 的 streamEchoIndex），两者正文一旦不同，
+      // 群里就会出现一对重复气泡。
+      const uploaded = await this.collectArtifacts(artifactSnapshot);
       // 终帧用完整全文（agent 的最终 stdout 可能比 chunk 累积更权威）。
-      const finalSnapshot = finalText || snapshot;
-      await emit(seq, "completed", finalSnapshot, reasoningSnapshot || undefined);
-      await opts.fallback(finalSnapshot);
+      const visibleText = this.ensureVisibleReply(finalText || snapshot, uploaded);
+      await emit(seq, "completed", visibleText, reasoningSnapshot || undefined);
+      await opts.fallback(visibleText);
+      await this.sendArtifactMessages(ctx, uploaded);
     } finally {
       this.activeStreams.delete(ctx.streamId);
     }
+  }
+
+  /**
+   * 采集本轮 agent 产出的文件并上传。任何一步失败都只是「这一轮没有附件」，
+   * 绝不能把正常回复带崩 —— 采集是锦上添花，不是回复的必经环节。
+   */
+  private async collectArtifacts(snapshot: WorkdirSnapshot | undefined): Promise<UploadedArtifact[]> {
+    const dir = this.deps.artifactDir;
+    const upload = this.deps.uploadArtifact;
+    if (!dir || !snapshot || !upload) return [];
+    let produced: ProducedArtifact[];
+    try {
+      produced = collectProducedArtifacts(dir, snapshot);
+    } catch (err) {
+      console.error("artifact scan failed:", err instanceof Error ? err.message : err);
+      return [];
+    }
+    const uploaded: UploadedArtifact[] = [];
+    for (const artifact of produced) {
+      try {
+        const result = await upload(artifact);
+        if (result) uploaded.push(result);
+      } catch (err) {
+        console.error(
+          `artifact upload failed (${artifact.name}):`,
+          err instanceof Error ? err.message : err,
+        );
+      }
+    }
+    if (uploaded.length > 0) {
+      console.log(`artifacts: uploaded ${uploaded.length} file(s) for this turn`);
+    }
+    return uploaded;
+  }
+
+  /** 把产出文件作为可点击的气泡发进本轮会话（私聊/群/聊天室/讨论组同一条路）。 */
+  private async sendArtifactMessages(
+    ctx: { conversationType: 1 | 3 | 4; conversationId: string },
+    uploaded: UploadedArtifact[],
+  ): Promise<void> {
+    const sendStream = this.deps.sendStream;
+    if (!sendStream || uploaded.length === 0) return;
+    for (const file of uploaded) {
+      const payload = JSON.stringify({
+        msg_type: "file_message",
+        protocol_version: 1,
+        node_id: this.deps.nodeId || this.deps.selfUserId || "",
+        file,
+      });
+      try {
+        await sendStream(ctx.conversationType, ctx.conversationId, "file_message", payload);
+      } catch (err) {
+        console.error("artifact message send failed:", err instanceof Error ? err.message : err);
+      }
+    }
+  }
+
+  /**
+   * 正文兜底：agent 写盘不打印是常态（尤其被要求「生成个文件」时），此时
+   * stdout 为空。空正文在中继那边会被当成「该成员没有产出」，在私聊里则表现
+   * 为一个永远填不满的气泡 —— 两种都是用户眼里的「没有任何回复」。所以这里
+   * 用「已生成哪些文件」或一句明确的说明把空正文补上。
+   *
+   * 注意只补空正文：agent 用 ```html 代码块作答时正文非空，得原样交给
+   * deliverAgentReply 走卡片，不能被这里改写。
+   */
+  private ensureVisibleReply(text: string, uploaded: UploadedArtifact[]): string {
+    if (text.trim()) return text;
+    if (uploaded.length > 0) {
+      return `已生成 ${uploaded.length} 个文件：${uploaded.map((file) => file.name).join("、")}`;
+    }
+    return "（本轮没有产出内容）";
   }
 
   // chat_stop 处理：取消活动流并回执。

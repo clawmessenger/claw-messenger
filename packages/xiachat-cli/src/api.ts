@@ -52,6 +52,17 @@ export interface AgentControlState {
   version: number;
 }
 
+// Result of POST /api/claw/node-files: where the file landed and how the web
+// should reference it. `url` is an API path (site-relative), never a filesystem
+// path — the web prefixes it with its own API base before rendering.
+export interface NodeFileUploadResult {
+  url: string;
+  key: string;
+  filename: string;
+  type: string;
+  size: number;
+}
+
 export class XiachatApi {
   constructor(private readonly baseUrl: string) {}
 
@@ -166,8 +177,38 @@ export class XiachatApi {
     return agents;
   }
 
-  private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
-    const res = await fetch(this.baseUrl + path, {
+  // 把 agent 本轮产出的文件送上来。鉴权沿用同组设备接口的约定：机器节点的
+  // device credential 以表单字段随 multipart 一起提交。服务端存好后返回一个
+  // API 路径（/api/claw/files/<key>），设备端把它塞进 file_message 发出去，
+  // web 端据此渲染文件气泡与右侧预览面板。
+  async uploadNodeFile(
+    nodeId: string,
+    credentialId: string,
+    secret: string,
+    file: { data: Uint8Array; name: string; contentType?: string },
+  ): Promise<NodeFileUploadResult> {
+    const form = new FormData();
+    form.append("nodeId", nodeId);
+    form.append("credentialId", credentialId);
+    form.append("secret", secret);
+    form.append(
+      "file",
+      new Blob([file.data as BlobPart], file.contentType ? { type: file.contentType } : undefined),
+      file.name,
+    );
+    const res = await fetch(this.baseUrl + "/api/claw/node-files", { method: "POST", body: form });
+    if (!res.ok) {
+      throw new Error(`POST /api/claw/node-files: HTTP ${res.status}`);
+    }
+    const body = (await res.json()) as { code?: number; message?: string; data?: NodeFileUploadResult };
+    const data = body.data;
+    if (!data?.url) {
+      throw new Error(`POST /api/claw/node-files: ${body.message || "unexpected response shape"}`);
+    }
+    return data;
+  }
+
+  private async request<T>(method: string, path: string, body?: unknown): Promise<T> {    const res = await fetch(this.baseUrl + path, {
       method,
       headers: body !== undefined ? { "Content-Type": "application/json" } : {},
       body: body !== undefined ? JSON.stringify(body) : undefined,
