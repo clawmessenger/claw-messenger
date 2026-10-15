@@ -20,6 +20,8 @@ export interface EchoAgentOptions {
   failWith?: { code: number; message: string };
   cjkSplit?: boolean;
   cjkRepeat?: number;
+  /** 固定 stdout 文本，用来复现特定输出形状（如 openclaw 的 --json 信封）。 */
+  stdoutText?: string;
 }
 
 // Creates a temporary directory holding a fake agent executable named `name`
@@ -44,6 +46,23 @@ export function createEchoAgentScript(name: string, opts: EchoAgentOptions = {})
       `process.stdout.write(full.subarray(0, splitAt), () => {`,
       `  setTimeout(() => process.stdout.end(full.subarray(splitAt)), 30);`,
       `});`,
+      `process.stdin.resume();`,
+    ].join("\n"));
+    if (isWin) {
+      writeFileSync(scriptPath, `@echo off\r\nnode "${cjsPath}"\r\n`, { mode: 0o755 });
+    } else {
+      writeFileSync(scriptPath, `#!/bin/sh\nexec node "${cjsPath}"\n`, { mode: 0o755 });
+      chmodSync(scriptPath, 0o755);
+    }
+    return makeFixture(dir, scriptPath, argsFile);
+  }
+
+  if (opts.stdoutText !== undefined) {
+    // 固定 stdout（经 node 写出，避免 .cmd 里引号/换行的转义地狱）。用来复现
+    // 特定输出形状，例如 openclaw 的 --json 信封。
+    const cjsPath = join(dir, "fixed-agent.cjs");
+    writeFileSync(cjsPath, [
+      `process.stdout.write(${JSON.stringify(opts.stdoutText)});`,
       `process.stdin.resume();`,
     ].join("\n"));
     if (isWin) {

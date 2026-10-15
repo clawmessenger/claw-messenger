@@ -47,13 +47,19 @@ const (
 	// 「上下文窗口」而不是历史存档，多留几轮只是为了让用户临时把上限调大时
 	// 立即有料可用，超出即丢。
 	maxRetainedRelayRounds = 100
-	// relayPromptContextLimit 是注入进提示词的上下文（议题 + 本次已发言成员 +
-	// 历史轮次）的字符总上限，与 v3 讨论那边的 interactivePromptContextLimit
+	// relayPromptContextLimit 是注入进提示词的上下文（议题 + 刚才接过的话 +
+	// 更早的轮次）的字符总上限，与 v3 讨论那边的 interactivePromptContextLimit
 	// 同源同理由：CLI 的 prompt 走 argv 时有 8000 字符上限（agents.ts 的
 	// ARGV_PROMPT_MAX_CHARS、discussion_bridge.go 的 argvPromptMaxChars），
 	// 超了会退化到 stdin 模式，而 openclaw / opencode / hermes 都不支持 stdin
-	// —— 代价是整轮空转。用户消息和角色人设不能被挤掉，所以只压缩上下文。
+	// —— 代价是整轮空转。用户起头的话与指令不能被挤掉，所以只压缩上下文。
 	relayPromptContextLimit = 4000
+	// relayPromptTotalLimit 是整条提示词的安全上限，比 CLI 的 argv 上限
+	// （8000）留出余量。上下文预算与它扣除固定文案后的余量取小：用户起的头
+	// 最长可达 relayMaxTextLength（4000），加上场景/指令/身份约束之后，光靠
+	// relayPromptContextLimit 兜不住 argv 上限 —— 一旦越界整轮退化成 stdin
+	// 模式空转，而且用户看到的是「发了消息没人应」。
+	relayPromptTotalLimit = 7000
 	// relayReplyClip 是「本次已发言成员」单条发言的截断长度上限（实际额度还要
 	// 按成员数平分，见 relayRepliesBlock）。
 	relayReplyClip = 1200
@@ -90,8 +96,9 @@ type relaySession struct {
 	// topic 是本讨论组的常驻议题（取最近一次讨论的议题；无历史讨论时为空）。
 	// 守门型角色强依赖它判定「本轮缺少必要输入」，缺失会让整轮空转。
 	topic string
-	// replies 是已发言成员的 (roleName, content) 列表：后续成员的提示词带上
-	// 前序发言，否则序号 2 看不到序号 1 说了什么，只能凭空表态。
+	// replies 是**本轮**已发言成员的 (roleName, content) 列表（每轮开始清空）。
+	// 它就是接力链条的当前段：下一位的提示词据此接住紧邻的上一位 —— 最后一条
+	// 即「要接的话头」（见 lastSpeaker / relayRepliesBlock）。
 	replies []relayReply
 	// requesterRCID 是发起这次闲聊中继的成员（web 用户）；流式帧的
 	// requester_id 字段用它，web 端 validStreamDelivery 据此校验。
@@ -103,10 +110,10 @@ type relaySession struct {
 	// contextRounds 是本次中继携带的历史轮数上限（已归一化到
 	// 1..maxRelayContextRounds）。
 	contextRounds int
-	// totalRounds 是本次中继要跑几轮「全员发言」。普通群聊按「AI 对话轮数」
-	// 设置推进（用户发一条消息，AI 成员之间接力 N 轮）；聊天室恒为 1，保持
-	// 「一轮问答」的旧行为 —— 聊天室那个设置值另有「讨论默认轮数」的语义，
-	// 不能顺带当成接力轮数用。
+	// totalRounds 是本次接龙要跑几轮「全员发言」。普通群聊按「AI 对话轮数」
+	// 设置推进（用户起个头，AI 成员之间接着上一位的话来回接龙 N 轮）；聊天室
+	// 恒为 1，保持「一轮问答」的旧行为 —— 聊天室那个设置值另有「讨论默认轮数」
+	// 的语义，不能顺带当成接龙轮数用。
 	totalRounds int
 	// roundIndex 是当前进行到第几轮（0 基）。dispatchTurn 报给设备端的
 	// round 参数与提示词里的轮次提示都用它。
@@ -126,6 +133,11 @@ type relayRound struct {
 type relayReply struct {
 	roleName string
 	content  string
+	// silent 标记这不是成员的真实发言，而是「本轮没交出正文」的占位。
+	// 它必须留在**本轮**接力链上（下一位得知道上一位空手，否则以为自己第一个
+	// 接、或者接错人），但不能进历史存档 —— 用户下次发消息时，上下文里不该
+	// 出现「（X 本轮没有产出内容）」这种噪音。
+	silent bool
 }
 
 type chatroomRelayHub struct {
@@ -380,9 +392,12 @@ func (h *chatroomRelayHub) pump(ctx context.Context, s *relaySession) {
 	}
 }
 
-// closeRoundLocked 在持锁前提下收尾当前一轮：把本轮发言并进会话历史（下一轮
-// 的提示词据此承接）、并入累计发言，然后清空本轮发言。本轮无人回包时不留
-// 空轮，免得历史里多出一段「什么都没有」的记录。
+// closeRoundLocked 在持锁前提下收尾当前一轮：把本轮真实发言并进会话历史（下一
+// 轮的提示词据此承接）、并入累计发言，然后清空本轮发言。本轮无人回包时不留空轮，
+// 免得历史里多出一段「什么都没有」的记录。
+//
+// 占位（silent）只活在**本轮**接力链上，不并入历史与累计发言：它们是「某位成员
+// 这轮空手」的提示，进了存档就变成用户下次对话里的噪音。
 func (h *chatroomRelayHub) closeRoundLocked(s *relaySession) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -396,9 +411,14 @@ func (h *chatroomRelayHub) closeRoundLocked(s *relaySession) {
 		userText = s.userText
 	}
 	round := relayRound{userText: userText}
-	round.replies = append(round.replies, s.replies...)
+	for _, reply := range s.replies {
+		if reply.silent {
+			continue
+		}
+		round.replies = append(round.replies, reply)
+		s.allReplies = append(s.allReplies, reply)
+	}
 	s.history = append(s.history, round)
-	s.allReplies = append(s.allReplies, s.replies...)
 	s.replies = nil
 }
 
@@ -432,65 +452,132 @@ func (h *chatroomRelayHub) dispatchTurn(ctx context.Context, s *relaySession, me
 	return h.rt.sendPrivateJSON(ctx, member.rcID, content)
 }
 
-// buildPrompt 组装闲聊提示词：群聊上下文 + 用户消息 + 角色人设 + 本组议题 +
-// 前序成员发言。守门型/承接型角色（如「守门人」）没有议题与前序发言会直接
-// 拒绝实质回应，整轮空转。
+// lastSpeaker 返回这轮该「接住」的那条发言：本轮已发言者里的最后一位 —— 接龙
+// 接的是紧邻的上一位，不是所有人。本轮还没人说话时（每轮的第一位）回看历史最后
+// 一轮的最后一条，这样第二轮的第一位接的仍是上一轮的收尾，而不是从头重来。
+// 返回 false 表示这是整场聊天的第一位发言者，只有用户起的头可接。
+//
+// 只在 pump goroutine 内调用（与 buildPrompt 同侧）。
+func (s *relaySession) lastSpeaker() (relayReply, bool) {
+	if n := len(s.replies); n > 0 {
+		return s.replies[n-1], true
+	}
+	for i := len(s.history) - 1; i >= 0; i-- {
+		if n := len(s.history[i].replies); n > 0 {
+			return s.history[i].replies[n-1], true
+		}
+	}
+	return relayReply{}, false
+}
+
+// buildPrompt 组装一次发言的提示词。
+//
+// 语义是「接龙」：用户只起了个头，之后是成员之间接着上一位的话往下聊。因此
+// 指令必须指向**紧邻的上一位**（「接住「X」的话」），而不是笼统的「回应用户」
+// —— 旧措辞把 agent 钉在「对用户表态」上，于是每位成员都独立喊一句客套话，
+// 谁也不接谁（线上表现为「各说各的」）。
 func (h *chatroomRelayHub) buildPrompt(s *relaySession, member relayMember) string {
 	instr := ""
 	if member.roleInstr != "" {
 		instr = "\n" + member.roleInstr + "\nStay in character."
 	}
 	venue := "聊天室"
-	scope := "这是讨论组的一次自由对话。用户刚在聊天室发言"
+	room := "讨论组"
 	if s.isGroup {
 		venue = "群聊"
-		scope = "这是普通群聊的一次自由对话。用户刚在群里发言"
+		room = "群"
 	}
-	// 接力轮次（普通群聊 > 1 轮时）：从第二轮起用户并没有再发言，是成员之间
-	// 接着聊。抬头必须换掉，否则 agent 会以为用户又提了一遍同样的问题，把
-	// 上一轮的回答原样再输出一遍。
-	roundNote := ""
-	if s.totalRounds > 1 {
-		if s.roundIndex > 0 {
-			scope = "这是普通群聊的一次自由讨论。成员们在接着上一轮的发言继续聊下去，用户这一轮没有再发言"
-			roundNote = fmt.Sprintf("\n\n现在是第 %d/%d 轮接力：请顺着上面成员们的观点继续推进（补充、质疑、收敛都行），不要重复你已经说过的内容。",
-				s.roundIndex+1, s.totalRounds)
+	prev, hasPrev := s.lastSpeaker()
+
+	scope := fmt.Sprintf("这是%s里的一次接龙聊天：用户起了个头，成员们依次接着上一位的话往下聊。", venue)
+	// 用户起的头是整场聊天的话题锚点。它是接力链条的起点，历史段可能因为预算
+	// 被截掉，所以这一段始终保留、不参与上下文压缩。
+	opening := ""
+	if t := strings.TrimSpace(s.userText); t != "" {
+		opening = "\n\n用户起的头：" + t
+	}
+	// 本轮要做的事：接住谁的话。第一位（只有用户起头可接）是「开接」。
+	turn := "\n\n现在轮到你开接：顺着用户起的头说下去，说完把话头留给下一位。"
+	if hasPrev {
+		if prev.silent {
+			// 上一位空手（「生成个文件」这类任务 stdout 近空是常态）：没有话可接，
+			// 让下一位自己把话头续上 —— 否则它会对着「（X 本轮没有产出内容）」
+			// 硬接一句，或者干脆又去重复用户的话。
+			turn = fmt.Sprintf(
+				"\n\n现在轮到你：「%s」这轮没交出发言正文，请你自己把话头续下去（顺着上面的对话往下说就行），说完把话头留给下一位；不要重复别人已经说过的内容。",
+				prev.roleName,
+			)
 		} else {
-			roundNote = fmt.Sprintf("\n\n用户发一条消息后，你们会接力讨论 %d 轮；现在从你开始。", s.totalRounds)
+			turn = fmt.Sprintf(
+				"\n\n现在轮到你：请接住「%s」刚才的话往下说（赞同、补充、追问、反驳都行），说完把话头留给下一位；不要重复别人已经说过的内容。",
+				prev.roleName,
+			)
 		}
 	}
-	// 本组议题（来自最近一次讨论）：讨论组的闲聊不是无根之水，成员应知道
-	// 这个组围绕什么展开。无历史讨论时整段省略。
-	contextBlock := ""
-	if s.topic != "" {
-		contextBlock = fmt.Sprintf("\n\n本讨论组的议题：%s", s.topic)
+	if s.totalRounds > 1 {
+		turn += fmt.Sprintf("（第 %d/%d 轮接龙）", s.roundIndex+1, s.totalRounds)
 	}
-	// 注入的上下文（本次已发言成员 + 历史轮次）共享一个字符预算，与 v3 讨论
-	// 那边的 interactivePromptContextLimit 同源：CLI 的 prompt 走 argv 有 8000
-	// 字符上限，超了会退化到 stdin，而 openclaw/opencode/hermes 都不支持 stdin
-	// ——整轮空转。用户消息与角色人设必须留下，所以压缩的只能是上下文。
-	budget := relayPromptContextLimit - len([]rune(contextBlock)) - len([]rune(instr))
+	tail := fmt.Sprintf("\n\n请以「%s」的身份发言，只输出发言正文，不要输出多余格式。%s", member.roleName, instr)
+
+	// 固定文案先占额度，剩下的才是上下文（议题 + 刚才接过的话 + 更早的轮次）的
+	// 预算 —— 用户起的头与本轮指令绝不能被上下文挤掉，同时整条提示词不越
+	// argv 上限（越界即退化 stdin，整轮空转）。
+	fixed := len([]rune(scope + opening + turn + tail))
+	budget := relayPromptContextLimit
+	if room := relayPromptTotalLimit - fixed; room < budget {
+		budget = room
+	}
 	if budget < 0 {
 		budget = 0
 	}
-	// 前序成员发言（本次中继已广播的）：后续成员承接而非凭空重复表态。优先级
-	// 高于历史轮次，先按成员数平分预算。
-	if len(s.replies) > 0 {
+
+	contextBlock := ""
+	if s.topic != "" && budget > 0 {
+		if block, used := clipToBudget(fmt.Sprintf("\n\n本%s的议题：%s", room, s.topic), budget); block != "" {
+			contextBlock = block
+			budget -= used
+		}
+	}
+	// 刚才接过的话（本次中继已广播的）：接力链条上最近的一段，优先级高于更早的
+	// 轮次 —— 接不上紧邻的上一位，比看不到早几轮严重得多。
+	if len(s.replies) > 0 && budget > 0 {
 		block, used := relayRepliesBlock(s.replies, budget)
 		contextBlock += block
 		budget -= used
 	}
-	// 历史上下文：「AI 对话轮数」设置决定最多携带几轮，更早的已截断；装不进
-	// 剩余预算的旧轮次也会被丢掉。设备端的 agent 会话只有 openclaw 跨界保留，
-	// 其余每轮都是新会话 —— 没有这一段，除了第一个发言者以外所有人都不记得
-	// 上一轮聊过什么。
 	contextBlock += relayHistoryBlock(s.history, budget)
-	return fmt.Sprintf(
-		"[group chat] %s：\n\n%s%s%s\n\n"+
-			"请以「%s」的身份回应用户。回应会被广播回%s，请只输出回应正文，不要输出多余格式。%s",
-		scope, s.userText, contextBlock, roundNote, member.roleName, venue, instr,
-	)
+
+	return "[group chat] " + scope + opening + contextBlock + turn + tail
 }
+
+// relayClipToRoom 把 text 压进 room 个字符，**结果长度保证不超过 room** ——
+// 含截断标记。clipToBudget 做不到这点：它返回「budget 个字符 + 标记」，调用方
+// 按它返回的额度扣预算就会超支。预算紧张的接力段必须用这个。
+func relayClipToRoom(text string, room int) string {
+	if room <= 0 {
+		return ""
+	}
+	runes := []rune(text)
+	if len(runes) <= room {
+		return text
+	}
+	if keep := room - len([]rune(relayClipSuffix)); keep > 0 {
+		return string(runes[:keep]) + relayClipSuffix
+	}
+	// 连标记都放不下：只留正文前缀，同样不越界。
+	return string(runes[:room])
+}
+
+// relayEmptyOutputNote 是成员本轮没交出正文时的占位文案：既作为气泡广播给
+// 用户（否则用户看到的是「发了消息却没人应」），也记进本轮发言 —— 接力链条上
+// 下一位必须知道上一位「说过了但没内容」，才不会以为前面没人说话。
+func relayEmptyOutputNote(roleName string) string {
+	return fmt.Sprintf("（%s 本轮没有产出内容）", roleName)
+}
+
+// relayClipSuffix 是截断标记。单列成常量是因为 relayRepliesBlock 必须能为它
+// 预留位置：截断后的真实长度是「额度 + 后缀」，调用方按额度扣预算会悄悄超支。
+const relayClipSuffix = "…（已截断）"
 
 // clipRelayText 截断超长文本，保留开头并注明截断。
 func clipRelayText(text string, limit int) string {
@@ -501,7 +588,7 @@ func clipRelayText(text string, limit int) string {
 	if len(runes) <= limit {
 		return text
 	}
-	return string(runes[:limit]) + "…（已截断）"
+	return string(runes[:limit]) + relayClipSuffix
 }
 
 // clipToBudget 把 text 压进 budget 个字符，返回结果与实际占用的额度。
@@ -513,31 +600,71 @@ func clipToBudget(text string, budget int) (string, int) {
 	if len(runes) <= budget {
 		return text, len(runes)
 	}
-	return string(runes[:budget]) + "…（已截断）", budget
+	return string(runes[:budget]) + relayClipSuffix, budget
 }
 
-// relayRepliesBlock 渲染「本次对话中已发言成员的观点」段。预算按成员数平分，
-// 免得前几位把额度吃光、后面发言的人根本看不到前面说了什么。
+// relayRepliesBlock 渲染「刚才已经接过的话」段。接龙场景里要紧的是**紧邻的上
+// 一位**，所以先用完整额度保住最后一条（relayReplyClip），更早的发言再按剩余
+// 预算平分 —— 接不上上一位比看不到更早的人严重得多。
+//
+// 返回段落与它实际占用的额度，且保证 (header + 正文) 不超过 budget（含换行
+// 分隔符）：调用方按返回值扣减预算，少算一个字符都会挤掉后面的历史段。
 func relayRepliesBlock(replies []relayReply, budget int) (string, int) {
 	if len(replies) == 0 || budget <= 0 {
 		return "", 0
 	}
-	perReply := budget / len(replies)
-	if perReply > relayReplyClip {
-		perReply = relayReplyClip
+	const header = "\n\n刚才已经接过的话（接住最后一位，不要重复别人的内容）：\n"
+	headerLen := len([]rune(header))
+	if headerLen >= budget {
+		return clipToBudget(header, budget)
 	}
+	// 最后一条 = 这轮要接住的话头。
+	last := replies[len(replies)-1]
+	lastLine := relayClipToRoom(relayReplyLine(last, relayReplyClip), budget-headerLen)
+	// 更早的发言按剩余额度平分；末尾还要留一个换行给「要接的那位」。
+	remaining := budget - headerLen - len([]rune(lastLine)) - 1
 	lines := make([]string, 0, len(replies))
-	for _, reply := range replies {
-		lines = append(lines, fmt.Sprintf("- %s：%s", reply.roleName, clipRelayText(reply.content, perReply)))
+	if earlier := replies[:len(replies)-1]; len(earlier) > 0 && remaining > 0 {
+		perReply := remaining / len(earlier)
+		if perReply > relayReplyClip {
+			perReply = relayReplyClip
+		}
+		for _, reply := range earlier {
+			line := relayReplyLine(reply, perReply)
+			sep := 0
+			if len(lines) > 0 {
+				sep = 1 // 与上一条之间的换行
+			}
+			if l := len([]rune(line)); l+sep <= remaining {
+				lines = append(lines, line)
+				remaining -= l + sep
+			}
+		}
 	}
-	return clipToBudget(fmt.Sprintf("\n\n本次对话中已发言成员的观点（承接或核验后再发言，不要凭空表态）：\n%s",
-		strings.Join(lines, "\n")), budget)
+	// 顺序保持先来后到，要接的那位放最后 —— 它就是接力锚点。
+	body := lastLine
+	if len(lines) > 0 {
+		body = strings.Join(lines, "\n") + "\n" + lastLine
+	}
+	return header + body, headerLen + len([]rune(body))
+}
+
+// relayReplyLine 渲染接力段里的一行。空产出的成员换一句独立说法：直接贴占位
+// 气泡的文案会读成「hermes：（hermes 本轮没有产出内容）」，角色名重复一遍。
+func relayReplyLine(reply relayReply, limit int) string {
+	if reply.silent {
+		return fmt.Sprintf("- %s：（本轮没有产出内容）", reply.roleName)
+	}
+	return fmt.Sprintf("- %s：%s", reply.roleName, clipRelayText(reply.content, limit))
 }
 
 // relayHistoryBlock 把最近若干轮已完成对话渲染成提示词里的上下文段。空历史、
-// 零预算返回空串（整段省略，旧报文形态逐字不变）。只渲染装得进 budget 的
-// **最新**轮次：装不下的旧轮次直接丢弃 —— 宁可少给上下文，也不能把提示词撑过
-// CLI 的 argv 上限（见 relayPromptContextLimit）。
+// 零预算返回空串（整段省略）。只渲染装得进 budget 的**最新**轮次：装不下的旧
+// 轮次直接丢弃 —— 宁可少给上下文，也不能把提示词撑过 CLI 的 argv 上限（见
+// relayPromptContextLimit）。
+//
+// 措辞是「把话头往下带」而不是「不要复述」：接龙本来就要求承接前文，明说
+// 「仅作背景、不要复述」会把 agent 推回「各自表态」的老路。
 func relayHistoryBlock(history []relayRound, budget int) string {
 	if len(history) == 0 || budget <= 0 {
 		return ""
@@ -570,7 +697,7 @@ func relayHistoryBlock(history []relayRound, budget int) string {
 		blocks[i], blocks[j] = blocks[j], blocks[i]
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "\n\n最近的对话记录（只保留最近 %d 轮，更早的已截断；仅作背景，不要复述）：",
+	fmt.Fprintf(&b, "\n\n更早的对话（只保留最近 %d 轮，更早的已截断；顺着往下聊，不要重复）：",
 		len(blocks))
 	for _, block := range blocks {
 		b.WriteString(block)
@@ -636,16 +763,22 @@ func (h *chatroomRelayHub) AcceptResponse(ctx context.Context, senderID, request
 		}
 		h.mu.Unlock()
 	} else {
-		// 回包成功但正文为空。以前这里直接静默跳过 —— 用户看到的是「发了消息
-		// 却一条回复都没有」，完全无从判断是没在跑还是跑了没产出。设备端只把
-		// agent 的 stdout 当正文，而「生成个 HTML」这类请求多数是把文件写进
-		// 工作目录、stdout 近乎为空，于是空回包成了常态而非异常。
-		// 这里补一条占位气泡：中继照常推进，但空产出对用户可见。
+		// 回包成功但正文为空。设备端只把 agent 的 stdout 当正文，而「生成个
+		// HTML」这类请求多数是把文件写进工作目录、stdout 近乎为空，于是空回包
+		// 成了常态而非异常。
+		// 补一条占位气泡，并且**记进本轮发言**：接力链条上后面的人必须知道
+		// 上一位没交出正文。以前只广播不记录，下一位从发言列表里看不到任何
+		// 前序，只能凭空表态 —— 正是「各说各的」的来源之一。
+		note := relayEmptyOutputNote(member.roleName)
 		h.rt.logger.Warn("relay: member returned empty content",
 			"chatroom", session.chatroomRCID, "target", senderID,
 			"round", session.roundIndex+1)
-		h.broadcastMemberSpeech(ctx, session, &member,
-			fmt.Sprintf("（%s 本轮没有产出内容）", member.roleName))
+		h.broadcastMemberSpeech(ctx, session, &member, note)
+		h.mu.Lock()
+		if s := session; s.requestID == requestID {
+			s.replies = append(s.replies, relayReply{roleName: member.roleName, content: note, silent: true})
+		}
+		h.mu.Unlock()
 	}
 	// 作废当前轮的 requestID（防重复回包重复推进），再唤醒 pump。
 	h.mu.Lock()
