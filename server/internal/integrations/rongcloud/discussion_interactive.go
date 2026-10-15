@@ -1391,21 +1391,52 @@ func (rt *discussionRuntime) interactiveCancel(ctx context.Context, d Discussion
 	return okResult(discussionSnapshotView(advanced, rt.latestArtifactPtr(ctx, advanced.DiscussionID)))
 }
 
-// interactiveRetry 重试一次失败的主持人汇总。
-func (rt *discussionRuntime) interactiveRetry(ctx context.Context, d DiscussionRecord, ownerRCID, actorRCID string) commandResult {
+// interactiveRetryAcceptsStatus 报告 interactiveRetry 是否接受该讨论状态。
+// failed 是经典入口（自动重试耗尽后用户手动拉起）；summarizing / synthesizing /
+// running 是「汇总迟迟不出、用户手动重派主持」的入口 —— 前端「重试主持任务」
+// 按钮在这些状态下就会亮起，只认 failed 会把这类请求全部挡在 409 上。
+func interactiveRetryAcceptsStatus(status string) bool {
+	switch status {
+	case DiscussionStatusFailed, DiscussionStatusSummarizing,
+		DiscussionStatusSynthesizing, DiscussionStatusRunning:
+		return true
+	}
+	return false
+}
+
+// interactiveRetry 重试一次失败的主持人汇总。除 failed 外，也接受卡在
+// summarizing / synthesizing / running 的讨论：前端「重试主持任务」按钮在这
+// 些状态下就会亮起（用户看到汇总迟迟不出时正是最需要手动重试的时刻），
+// 只认 failed 会把所有这类请求都挡在 409 上 —— 按钮形同虚设。
+func (rt *discussionRuntime) interactiveRetry(ctx context.Context, d DiscussionRecord, cmd CommandContent, ownerRCID, actorRCID string) commandResult {
 	if !canControl(d, ownerRCID, actorRCID) {
 		return errResult(403, "only the discussion owner may retry")
 	}
-	if d.Status != DiscussionStatusFailed {
+	// 前端带 stateVersion 做乐观并发：版本不一致说明它在看过期快照，让它先对齐。
+	if version, ok := paramInt(cmd, "stateVersion", "state_version", "version"); ok && version != d.Version {
+		return rt.versionConflictResult(ctx, d.DiscussionID)
+	}
+	retryable := interactiveRetryAcceptsStatus(d.Status)
+	if !retryable {
 		return errResult(409, "no failed work to retry")
 	}
-	advanced, err := rt.repo.AdvanceState(ctx, AdvanceDiscussionParams{
-		DiscussionID: d.DiscussionID, ExpectedVersion: d.Version,
-		Status: DiscussionStatusSummarizing, CurrentRound: d.CurrentRound,
-		RoundRevision: d.RoundRevision,
-	})
-	if err != nil {
-		return rt.advanceErrorResult(ctx, err, d.DiscussionID)
+	var advanced DiscussionRecord
+	if d.Status == DiscussionStatusFailed {
+		var err error
+		advanced, err = rt.repo.AdvanceState(ctx, AdvanceDiscussionParams{
+			DiscussionID: d.DiscussionID, ExpectedVersion: d.Version,
+			Status: DiscussionStatusSummarizing, CurrentRound: d.CurrentRound,
+			RoundRevision: d.RoundRevision,
+		})
+		if err != nil {
+			return rt.advanceErrorResult(ctx, err, d.DiscussionID)
+		}
+	} else {
+		// summarizing / synthesizing / running 下重试 = 重派当前轮主持工作。
+		// 旧行（仍在途的 dispatch）必须先置为终结态，否则超时恢复扫描仍会
+		// 盯着旧 request_id 对账，新旧两次派发的回调会互相踩。
+		rt.interactiveSettleActive(ctx, d.DiscussionID)
+		advanced = d
 	}
 	accepted, _, emitErr := rt.interactiveEmit(ctx, advanced, interactiveEvent{
 		EventType: "retry_accepted", ActorID: actorRCID,
@@ -1472,7 +1503,7 @@ func (rt *discussionRuntime) interactiveLifecycleAction(ctx context.Context, act
 		}
 		return rt.interactiveCancel(ctx, d, actor.RcID, paramTrim(cmd, "reason")), true
 	case "retry":
-		return rt.interactiveRetry(ctx, d, ownerRCID, actor.RcID), true
+		return rt.interactiveRetry(ctx, d, cmd, ownerRCID, actor.RcID), true
 	case "stop":
 		if !canControl(d, ownerRCID, actor.RcID) {
 			return errResult(403, "only the chatroom owner may stop a discussion"), true

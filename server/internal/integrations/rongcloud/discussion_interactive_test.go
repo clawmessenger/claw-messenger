@@ -165,9 +165,9 @@ func TestDiscussionEventSender(t *testing.T) {
 	})
 	d := DiscussionRecord{RoleSnapshot: snapshot}
 	cases := []struct {
-		name   string
-		actor  string
-		want   string
+		name  string
+		actor string
+		want  string
 	}{
 		{"member speaks as itself", "ai-a", "ai-a"},
 		{"host speaks as itself", "ai-host", "ai-host"},
@@ -374,6 +374,25 @@ func TestInteractiveInterjectionRoundFor(t *testing.T) {
 	for _, tc := range cases {
 		if got := interactiveInterjectionRoundFor(tc.status, tc.currentRound, tc.allDone, tc.maxRounds); got != tc.want {
 			t.Errorf("%s: got %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestInteractiveRetryAcceptsStatus 钉住手动重试的状态门限：前端「重试主持任务」
+// 按钮在 summarizing / synthesizing（含 failed）时亮起，服务端必须同样接受，
+// 否则按钮形同虚设（永远 409 no failed work to retry）。awaiting_user /
+// completed / cancelled 必须继续拒绝。
+func TestInteractiveRetryAcceptsStatus(t *testing.T) {
+	accepts := []string{DiscussionStatusFailed, DiscussionStatusSummarizing, DiscussionStatusSynthesizing, DiscussionStatusRunning}
+	for _, status := range accepts {
+		if !interactiveRetryAcceptsStatus(status) {
+			t.Errorf("status %q must be retryable", status)
+		}
+	}
+	rejects := []string{DiscussionStatusAwaitingUser, DiscussionStatusCompleted, DiscussionStatusCancelled, DiscussionStatusPlanning, ""}
+	for _, status := range rejects {
+		if interactiveRetryAcceptsStatus(status) {
+			t.Errorf("status %q must stay rejected", status)
 		}
 	}
 }
