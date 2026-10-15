@@ -127,7 +127,12 @@ const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
 // .cmd wrappers shrink that further), so very long prompts cannot ride as
 // argv — past this cap every agent falls back to stdin mode regardless of
 // strategy.
-const ARGV_PROMPT_MAX_CHARS = 8000;
+//
+// Exported because the html_revise path (im.ts) has to decide between
+// inlining the previous page and handing over a file path: it must use
+// exactly this threshold, or the prompt it builds still lands on the stdin
+// fallback that codex/opencode/hermes reject or hang on.
+export const ARGV_PROMPT_MAX_CHARS = 8000;
 
 // Returns the argv for an agent turn; an empty array means stdin mode
 // (unknown agent, or a prompt too long for argv).

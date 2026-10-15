@@ -86,3 +86,28 @@ export function htmlRevisePrompt(html: string, instruction: string): string {
     "2. 用一个 ```html 代码块包裹，不要在代码块外写多余解释。",
   ].join("\n");
 }
+
+// 上一版 HTML 过大时的替代提示词：把页面落盘，提示词只留文件路径，由 agent
+// 自己读。原因是内嵌会撑破 argv 上限（agents.ts ARGV_PROMPT_MAX_CHARS），整轮
+// 退化到 stdin —— codex/opencode/hermes 对 stdin 一律拒绝或挂起，只能等 120s
+// 超时，用户看到的是「生成失败」。agent 都是编码 CLI，读文件是基本功，提示词
+// 因此从「整页源码」缩回几百字符，重新走 argv 模式。
+export function htmlReviseFromFilePrompt(
+  htmlPath: string,
+  instruction: string,
+  htmlChars?: number,
+): string {
+  return [
+    "你之前生成了一个 HTML 页面，用户要求修改。上一版页面的源码已存为本地文件，请先读取它，再输出修改后的完整 HTML。",
+    "",
+    `【上一版 HTML 文件】${htmlPath}`,
+    ...(htmlChars ? [`（共 ${htmlChars} 字符，请完整读取，不要只读开头）`] : []),
+    "",
+    `【修改要求】${instruction}`,
+    "",
+    "要求：",
+    "1. 先用文件读取工具打开上面的路径，拿到上一版 HTML 全文。",
+    "2. 输出修改后的完整 HTML 文档（不要只输出差异，也不要省略未改动的部分）。",
+    "3. 用一个 ```html 代码块包裹，不要在代码块外写多余解释。",
+  ].join("\n");
+}

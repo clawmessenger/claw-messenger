@@ -1,5 +1,9 @@
 // @vitest-environment node
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { ARGV_PROMPT_MAX_CHARS } from "./agents.js";
 import { MessageDispatcher, planReadReceipt, resolveTurnVenue, turnSessionKey } from "./im.js";
 
 function makeDeps() {
@@ -276,6 +280,105 @@ describe("MessageDispatcher html cards", () => {
     const reply = deps.sent[1];
     expect(reply.objectName).toBe("RC:TxtMsg");
     expect(JSON.parse(reply.content).content).toContain("抱歉");
+  });
+
+  // 长页面内嵌会撑破 agents.ts 的 argv 上限，整轮退化到 stdin（codex/opencode/
+  // hermes 拒绝或挂起）→ 120s 超时 →「生成失败」。修法是落盘 + 只给路径。
+  it("hands a too-long previous HTML over as a file path instead of inlining it", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "cm-revise-"));
+    try {
+      const deps = makeDeps();
+      const dispatcher = new MessageDispatcher({ send: deps.send, reviseSourceDir: dir });
+      const bigHtml = `<h1>v1</h1>${"x".repeat(9000)}`;
+      await dispatcher.handle(txtMsg(JSON.stringify({ content: "做个页面" })), {
+        runTurn: async () => `这是页面：\n\n\`\`\`html\n${bigHtml}\n\`\`\``,
+      });
+      const cardId = JSON.parse(deps.sent[0].content).card.id as string;
+
+      let seenPrompt = "";
+      let seenSessionKey: string | undefined;
+      let fileDuringTurn = "";
+      // 落盘文件名由 cardId 推出（writeReviseSource），路径可精确预期。
+      const expectedPath = join(dir, `cm-revise-${cardId}.html`);
+      await dispatcher.handle(cardAction(cardId, { inputValue: "换成蓝色主题" }), {
+        runTurn: async (prompt, _model, sessionKey) => {
+          seenPrompt = prompt;
+          seenSessionKey = sessionKey;
+          expect(prompt).toContain(expectedPath);
+          fileDuringTurn = readFileSync(expectedPath, "utf8");
+          return "```html\n<h1>v2 blue</h1>\n```";
+        },
+      });
+
+      // 提示词缩回 argv 上限之内，且不再内嵌整页源码 —— 否则又落回 stdin。
+      expect(seenPrompt.length).toBeLessThanOrEqual(ARGV_PROMPT_MAX_CHARS);
+      expect(seenPrompt).not.toContain("x".repeat(200));
+      expect(seenPrompt).toContain("换成蓝色主题");
+      // revise 轮绑到该对端的私聊会话，不再落到共享的默认主会话。
+      expect(seenSessionKey).toBe(turnSessionKey("private", "user_1"));
+      // 文件里就是上一版 HTML，agent 读得到。
+      expect(fileDuringTurn).toBe(bigHtml);
+      // 用完即删。
+      expect(readdirSync(dir)).toHaveLength(0);
+      // 卡片照常原地替换。
+      const update = JSON.parse(deps.sent[1].content);
+      expect(deps.sent[1].objectName).toBe("card_update");
+      expect(update.cardId).toBe(cardId);
+      expect(update.card.sections.find((s: { kind: string }) => s.kind === "html").content).toContain("v2 blue");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps inlining a short previous HTML and writes no file", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "cm-revise-"));
+    try {
+      const deps = makeDeps();
+      const dispatcher = new MessageDispatcher({ send: deps.send, reviseSourceDir: dir });
+      await dispatcher.handle(txtMsg(JSON.stringify({ content: "做个页面" })), {
+        runTurn: async () => REPLY_WITH_HTML,
+      });
+      const cardId = JSON.parse(deps.sent[0].content).card.id as string;
+
+      let seenPrompt = "";
+      await dispatcher.handle(cardAction(cardId, { inputValue: "加个标题" }), {
+        runTurn: async (prompt) => {
+          seenPrompt = prompt;
+          return "```html\n<h1>v2</h1>\n```";
+        },
+      });
+
+      expect(seenPrompt).toContain("<h1>v1</h1>");
+      expect(readdirSync(dir)).toHaveLength(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("cleans the handed-off file up even when the revise turn fails", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "cm-revise-"));
+    try {
+      const deps = makeDeps();
+      const dispatcher = new MessageDispatcher({ send: deps.send, reviseSourceDir: dir });
+      const bigHtml = `<h1>v1</h1>${"x".repeat(9000)}`;
+      await dispatcher.handle(txtMsg(JSON.stringify({ content: "做个页面" })), {
+        runTurn: async () => `\`\`\`html\n${bigHtml}\n\`\`\``,
+      });
+      const cardId = JSON.parse(deps.sent[0].content).card.id as string;
+
+      await dispatcher.handle(cardAction(cardId, { inputValue: "再改" }), {
+        runTurn: async () => {
+          expect(readdirSync(dir)).toHaveLength(1);
+          throw new Error("agent turn timeout after 120000ms");
+        },
+      });
+
+      const parsed = JSON.parse(deps.sent[1].content);
+      expect(parsed.content).toContain("生成失败");
+      expect(readdirSync(dir)).toHaveLength(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

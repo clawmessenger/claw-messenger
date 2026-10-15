@@ -301,6 +301,9 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
     agentName: opts.agentName,
     selfUserId: opts.transport.getSelfUserId?.(),
     nodeId: opts.transport.getSelfUserId?.(),
+    // html_revise 的上一版 HTML 落盘目录：放 agent 的工作目录里，读它不需要
+    // 越出工作区（见 im.ts writeReviseSource）。
+    reviseSourceDir: opts.cwd,
     // chat_stream 帧按会话类型路由：私聊走 PRIVATE 会话，群组/聊天室走
     // 对应会话号（由 runStreamedTurn 的 ctx.conversationType 决定）。
     sendStream: (conversationType, conversationId, objectName, content) =>

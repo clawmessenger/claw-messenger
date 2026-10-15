@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
-import { buildHtmlCard, extractHtmlFence, htmlRevisePrompt } from "./cards.js";
+import { buildHtmlCard, extractHtmlFence, htmlReviseFromFilePrompt, htmlRevisePrompt } from "./cards.js";
 
 describe("extractHtmlFence", () => {
   it("extracts a single ```html block and returns the remaining text", () => {
@@ -107,5 +107,23 @@ describe("htmlRevisePrompt", () => {
     expect(prompt).toContain("<p>old</p>");
     expect(prompt).toContain("换成蓝色");
     expect(prompt).toContain("完整");
+  });
+});
+
+describe("htmlReviseFromFilePrompt", () => {
+  // 上一版页面落盘后的替代提示词：只给路径，必须短到稳走 argv 模式。
+  it("points the agent at the file on disk, not at inlined source", () => {
+    const prompt = htmlReviseFromFilePrompt("/tmp/cm-revise-card-1.html", "换成蓝色", 9000);
+    expect(prompt).toContain("/tmp/cm-revise-card-1.html");
+    expect(prompt).toContain("换成蓝色");
+    expect(prompt).toContain("9000");
+    expect(prompt).toContain("完整");
+    expect(prompt.length).toBeLessThan(800);
+  });
+
+  it("omits the size hint when the caller does not know it", () => {
+    const prompt = htmlReviseFromFilePrompt("/tmp/cm-revise-card-1.html", "加个页脚");
+    expect(prompt).toContain("/tmp/cm-revise-card-1.html");
+    expect(prompt).not.toContain("字符");
   });
 });

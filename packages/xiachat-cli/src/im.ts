@@ -1,6 +1,10 @@
+import { writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { ARGV_PROMPT_MAX_CHARS } from "./agents.js";
 import { decodeCommandContent, encodeCommandResult } from "./protocol.js";
 import { buildChatStreamFrame, encodeChatStreamWireFrames, parseChatStopRequest, type ChatStreamStatus } from "./chat-stream.js";
-import { buildHtmlCard, extractHtmlFence, htmlRevisePrompt } from "./cards.js";
+import { buildHtmlCard, extractHtmlFence, htmlReviseFromFilePrompt, htmlRevisePrompt } from "./cards.js";
 import {
   buildModelCatalogResponse,
   EMPTY_MODEL_CATALOG,
@@ -146,6 +150,10 @@ export interface DispatcherDeps {
   // The RongCloud user id of THIS node (stream frames carry node_id = self).
   // Falls back to selfUserId when omitted.
   nodeId?: string;
+  // Directory for the html_revise scratch file (see writeReviseSource). Wired
+  // by run.ts to the agent's working directory so the file lands inside the
+  // workspace the agent may read; falls back to the OS temp dir when omitted.
+  reviseSourceDir?: string;
 }
 
 export interface TurnRunner {
@@ -194,6 +202,34 @@ export function resolveTurnVenue(
 // 不带键时（openclaw）所有形态挤在同一个主会话里，讨论组的共识会被群聊继承。
 export function turnSessionKey(venue: TurnVenue, conversationId: string): string {
   return `cm-${venue}-${conversationId}`;
+}
+
+// html_revise 要把上一版 HTML 交给 agent。内嵌进提示词最省事，但页面一大就超过
+// agents.ts 的 argv 上限，整轮退化到 stdin —— codex/opencode/hermes 对 stdin
+// 一律拒绝或挂起，只能空转到 120s 超时，用户看到「生成失败: agent turn timeout
+// after 120000ms」。所以超限时改成落盘：提示词只留路径，agent 自己去读。
+// 落在 reviseSourceDir（run.ts 接的是 agent 的工作目录，保证在它可读范围内），
+// 缺省退到系统临时目录。用完即删 —— 交给调用方 cleanup()。
+export function writeReviseSource(
+  dir: string | undefined,
+  cardId: string,
+  html: string,
+): { path: string; cleanup: () => void } {
+  // cardId 目前只可能是本进程生成的 `card-<ts>-<rand>`，但仍按不可信输入处理：
+  // 它要参与文件名，绝不能让 `..` / 分隔符把文件写出目标目录。
+  const safeId = cardId.replace(/[^A-Za-z0-9_-]/g, "_");
+  const path = join(dir ?? tmpdir(), `cm-revise-${safeId}.html`);
+  writeFileSync(path, html, "utf8");
+  return {
+    path,
+    cleanup: () => {
+      try {
+        rmSync(path, { force: true });
+      } catch {
+        // 删不掉就算了：临时文件残留无害，不能因此打断这一轮。
+      }
+    },
+  };
 }
 
 // The web's 默认模型 panel aborts after 8s (15s while the node looks offline),
@@ -800,8 +836,25 @@ export class MessageDispatcher {
       return;
     }
 
+    let source: { path: string; cleanup: () => void } | undefined;
     try {
-      const out = await turns.runTurn(htmlRevisePrompt(entry.html, instruction));
+      // 上一版 HTML 内嵌进提示词，长页面会超过 argv 上限并退化到 stdin
+      // （见 writeReviseSource）：超限时改成落盘 + 只给路径。
+      const inlinePrompt = htmlRevisePrompt(entry.html, instruction);
+      let prompt = inlinePrompt;
+      if (inlinePrompt.length > ARGV_PROMPT_MAX_CHARS) {
+        try {
+          source = writeReviseSource(this.deps.reviseSourceDir, entry.cardId, entry.html);
+          prompt = htmlReviseFromFilePrompt(source.path, instruction, entry.html.length);
+        } catch {
+          // 落盘失败（目录只读等）：退回内嵌，行为与修前一致，不额外报错。
+          prompt = inlinePrompt;
+          source = undefined;
+        }
+      }
+      // 与私聊/群聊轮次一致地绑会话：不带 sessionKey 时 openclaw 会把 revise 轮
+      // 塞进所有会话共享的默认主会话，和别的会话串味。
+      const out = await turns.runTurn(prompt, undefined, turnSessionKey("private", msg.fromUserId));
       const { blocks, rest } = extractHtmlFence(out);
       if (blocks.length === 0) {
         // Model replied without a fence; surface it as text so nothing is lost.
@@ -823,6 +876,8 @@ export class MessageDispatcher {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       await this.deps.send(msg.fromUserId, "RC:TxtMsg", JSON.stringify({ content: `生成失败: ${message}` }));
+    } finally {
+      source?.cleanup();
     }
   }
 
