@@ -2,8 +2,9 @@
 //
 // 移植旧 Python 后端 /api/admin/* 的公开 HTTP 契约到 Go，供
 // clawmessenger-admin-web 直连。账号存 claw_admin_users（独立表）。
-// 最小可用策略：auth/users/stats/system-config/audit-logs 为真实数据；
-// admins/roles 提供基础 CRUD；nodes/groups/chatrooms/messages 返回空集。
+// auth/users/stats/system-config/audit-logs 在这里；admins/roles 提供基础 CRUD；
+// nodes/groups 见 claw_admin_nodes.go / claw_admin_groups.go；
+// chatrooms/discussions/messages 见 claw_admin_conversations.go。
 package handler
 
 import (
@@ -12,6 +13,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -21,6 +23,9 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5"
+
+	"github.com/multica-ai/multica/server/internal/integrations/rongcloud"
 )
 
 // ---- JWT (HS256, 紧凑形式 header.payload.signature) ----
@@ -136,7 +141,9 @@ func (h *Handler) requireClawAdmin(permission string, w http.ResponseWriter, r *
 		clawAdminFail(w, 401, "Invalid authentication token")
 		return nil
 	}
-	if permission != "" && !ident.Permissions[permission] {
+	// "*" 是角色编辑里可选的通配权限，前端 hasPermission 也这么认；
+	// 后端此前只做字面比对，导致带 "*" 的角色处处 403。
+	if permission != "" && !ident.Permissions[permission] && !ident.Permissions["*"] {
 		clawAdminFail(w, 403, "没有权限执行此操作")
 		return nil
 	}
@@ -169,7 +176,7 @@ func clawAdminPagination(r *http.Request) (page, pageSize int) {
 }
 
 func clawAdminLikePattern(keyword string) string {
- escaped := strings.ReplaceAll(keyword, "\\", "\\\\")
+	escaped := strings.ReplaceAll(keyword, "\\", "\\\\")
 	escaped = strings.ReplaceAll(escaped, "%", "\\%")
 	escaped = strings.ReplaceAll(escaped, "_", "\\_")
 	return "%" + escaped + "%"
@@ -282,10 +289,33 @@ func (h *Handler) ClawAdminMe(w http.ResponseWriter, r *http.Request) {
 
 // ---- /api/admin/users（数据源 claw_im_users） ----
 
+// clawAdminOperationUserPredicate 判定一个 IM 账号是不是「运维账号」。
+//
+// claw_im_users 只装人类 IM 账号（C 端注册写入，见 claw_compat.go），没有
+// account_type / ai_type 列，所以这两列都是**推导**出来的，而不是写死：
+//   - 运维账号 = 前缀 om_ 的运维单聊账号，或被 ai_type='ops' 的运维节点占用的账号；
+//   - AI 类型 = 该账号被哪个节点占用（rongcloud_node.rongcloud_user_id）。
+//
+// 推导而不是硬编码的意义在于接口与筛选器真的会动：以前 /api/admin/users 把
+// account_type 恒返回 'normal'、ai_type 恒返回 NULL，前端的「运维用户」和
+// 「AI 类型」两个筛选器点了等于没点。
+const clawAdminOperationUserPredicate = `(
+	starts_with(u.user_id, 'om_')
+	OR EXISTS(SELECT 1 FROM rongcloud_node n
+	          WHERE n.rongcloud_user_id = u.user_id AND n.ai_type = 'ops')
+)`
+
 const clawAdminUserSelect = `
-	SELECT user_id, username, COALESCE(nickname,''), COALESCE(phone,''), COALESCE(email,''),
-	       COALESCE(portrait_uri,''), status, 'normal'::text, NULL::text, created_at, updated_at
-	FROM claw_im_users`
+	SELECT u.user_id, u.username, COALESCE(u.nickname,''), COALESCE(u.phone,''), COALESCE(u.email,''),
+	       COALESCE(u.portrait_uri,''), u.status,
+	       CASE WHEN ` + clawAdminOperationUserPredicate + ` THEN 'operation' ELSE 'normal' END,
+	       (SELECT NULLIF(n.ai_type,'') FROM rongcloud_node n
+	        WHERE n.rongcloud_user_id = u.user_id AND NULLIF(n.ai_type,'') IS NOT NULL
+	        ORDER BY n.created_at DESC LIMIT 1),
+	       u.created_at, u.updated_at
+	FROM claw_im_users u`
+
+var clawAdminUserAccountTypes = map[string]bool{"normal": true, "operation": true}
 
 func (h *Handler) ClawAdminListUsers(w http.ResponseWriter, r *http.Request) {
 	if h.requireClawAdmin("user:read", w, r) == nil {
@@ -294,17 +324,33 @@ func (h *Handler) ClawAdminListUsers(w http.ResponseWriter, r *http.Request) {
 	page, pageSize := clawAdminPagination(r)
 	q := r.URL.Query()
 	keyword, status := strings.TrimSpace(q.Get("keyword")), strings.TrimSpace(q.Get("status"))
+	accountType := strings.TrimSpace(q.Get("account_type"))
+	aiType := strings.TrimSpace(q.Get("ai_type"))
+	if accountType != "" && !clawAdminUserAccountTypes[accountType] {
+		clawAdminFail(w, 400, "account_type has an unsupported value")
+		return
+	}
 	where, args := " WHERE 1=1", []interface{}{}
 	if keyword != "" {
 		args = append(args, clawAdminLikePattern(keyword))
-		where += fmt.Sprintf(" AND (user_id ILIKE $%d OR username ILIKE $%d OR nickname ILIKE $%d OR phone ILIKE $%d OR email ILIKE $%d)", len(args), len(args), len(args), len(args), len(args))
+		where += fmt.Sprintf(" AND (u.user_id ILIKE $%d OR u.username ILIKE $%d OR u.nickname ILIKE $%d OR u.phone ILIKE $%d OR u.email ILIKE $%d)", len(args), len(args), len(args), len(args), len(args))
 	}
 	if status != "" {
 		args = append(args, status)
-		where += fmt.Sprintf(" AND status = $%d", len(args))
+		where += fmt.Sprintf(" AND u.status = $%d", len(args))
+	}
+	switch accountType {
+	case "operation":
+		where += " AND " + clawAdminOperationUserPredicate
+	case "normal":
+		where += " AND NOT " + clawAdminOperationUserPredicate
+	}
+	if aiType != "" {
+		args = append(args, aiType)
+		where += fmt.Sprintf(" AND EXISTS(SELECT 1 FROM rongcloud_node n WHERE n.rongcloud_user_id = u.user_id AND n.ai_type = $%d)", len(args))
 	}
 	var total int
-	_ = h.DB.QueryRow(r.Context(), "SELECT COUNT(*) FROM claw_im_users"+where, args...).Scan(&total)
+	_ = h.DB.QueryRow(r.Context(), "SELECT COUNT(*) FROM claw_im_users u"+where, args...).Scan(&total)
 	args = append(args, pageSize, (page-1)*pageSize)
 	rows, err := h.DB.Query(r.Context(), clawAdminUserSelect+where+" ORDER BY created_at DESC LIMIT $"+strconv.Itoa(len(args)-1)+" OFFSET $"+strconv.Itoa(len(args)), args...)
 	if err != nil {
@@ -335,7 +381,7 @@ func (h *Handler) ClawAdminGetUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	userID := chi.URLParam(r, "id")
-	row := h.DB.QueryRow(r.Context(), clawAdminUserSelect+" WHERE user_id = $1", userID)
+	row := h.DB.QueryRow(r.Context(), clawAdminUserSelect+" WHERE u.user_id = $1", userID)
 	var username, nickname, phone, email, portrait, st, accountType string
 	var aiType *string
 	var createdAt, updatedAt time.Time
@@ -409,35 +455,201 @@ func (h *Handler) ClawAdminUpdateUserStatus(w http.ResponseWriter, r *http.Reque
 	clawAdminOK(w, map[string]interface{}{"ok": true})
 }
 
+// ClawAdminUserNodes 返回该用户名下（按融云好友边认领）的设备。
+//
+// 归属判定与「设备管理」页同源：rongcloud_node.owner_user_id 指向 multica 账号，
+// 和 IM 账号不是一个命名空间，能用的只有 NodeClaimants 反查出来的融云好友边
+// （见 claw_admin_nodes.go 的说明），所以这里直接复用同一套投影，两个页面列的
+// 同一台设备不会出现不同的名字或状态。
 func (h *Handler) ClawAdminUserNodes(w http.ResponseWriter, r *http.Request) {
 	if h.requireClawAdmin("user:read", w, r) == nil {
 		return
 	}
-	clawAdminOK(w, []interface{}{})
+	ctx := r.Context()
+	userID := strings.TrimSpace(chi.URLParam(r, "id"))
+	if _, found, err := h.clawAdminUserExists(ctx, userID); err != nil {
+		clawAdminFail(w, 503, "用户信息不可用")
+		return
+	} else if !found {
+		clawAdminFail(w, 404, "user not found")
+		return
+	}
+	if h.RongCloudNode == nil {
+		// 融云集成未启用时归属无法推导，明确回空而不是报错：用户详情页的
+		// 「拥有节点」只是一个标签页，不应因集成缺失整页 500。
+		clawAdminOK(w, []interface{}{})
+		return
+	}
+	claims, err := h.RongCloudNode.NodeClaimants(ctx, []string{userID})
+	if err != nil {
+		clawAdminOK(w, []interface{}{})
+		return
+	}
+	owned := make(map[string]bool, len(claims))
+	for nodeRCID, claimant := range claims {
+		if claimant == userID {
+			owned[nodeRCID] = true
+		}
+	}
+	if len(owned) == 0 {
+		clawAdminOK(w, []interface{}{})
+		return
+	}
+
+	records, err := h.clawAdminListNodeRecords(ctx)
+	if err != nil {
+		clawAdminFail(w, 503, "获取设备列表失败")
+		return
+	}
+	names, reserved, _ := h.clawAdminNodeUserNames(ctx)
+	descriptions, _ := h.clawAdminNodeDescriptions(ctx)
+	hostNodes := h.clawAdminReservedHostNodeKeys(ctx)
+	controls := h.clawAdminNodeControls(ctx)
+
+	items := []clawAdminNodeRow{}
+	for _, rec := range records {
+		if !owned[rec.RongcloudUserID] || !rongcloud.IsDisplayNode(rec.dbNode()) {
+			continue
+		}
+		items = append(items, h.clawAdminNodeRowFor(
+			rec, names[rec.RongcloudUserID], descriptions[rec.NodeID], userID, "",
+			reserved[rec.RongcloudUserID] || hostNodes[rec.NodeID], controls[uuidToText(rec.ID)],
+		))
+	}
+	clawAdminOK(w, items)
 }
 
+// ClawAdminUserGroups 返回该用户加入的群，直接复用群组的本地镜像查询，
+// 保证与「群组管理」页看到的同一条群数据完全一致。
 func (h *Handler) ClawAdminUserGroups(w http.ResponseWriter, r *http.Request) {
 	if h.requireClawAdmin("user:read", w, r) == nil {
 		return
 	}
-	clawAdminOK(w, []interface{}{})
+	userID := strings.TrimSpace(chi.URLParam(r, "id"))
+	if _, found, err := h.clawAdminUserExists(r.Context(), userID); err != nil {
+		clawAdminFail(w, 503, "用户信息不可用")
+		return
+	} else if !found {
+		clawAdminFail(w, 404, "user not found")
+		return
+	}
+	rows, err := h.DB.Query(r.Context(), `
+		SELECT g.group_id, g.group_name, g.owner_id, g.member_count, COALESCE(g.description, ''),
+		       g.created_at, g.updated_at
+		FROM rongcloud_group g
+		JOIN rongcloud_group_member m ON m.group_id = g.group_id
+		WHERE m.user_id = $1
+		ORDER BY g.created_at DESC`, userID)
+	if err != nil {
+		clawAdminFail(w, 503, "用户群组不可用")
+		return
+	}
+	defer rows.Close()
+	items := []map[string]interface{}{}
+	for rows.Next() {
+		group, err := clawAdminScanGroup(rows)
+		if err != nil {
+			continue
+		}
+		items = append(items, group)
+	}
+	if err := rows.Err(); err != nil {
+		clawAdminFail(w, 503, "用户群组不可用")
+		return
+	}
+	clawAdminOK(w, items)
+}
+
+// clawAdminUserExists 用于区分「用户不存在」（404）与「存在但没有节点/群」。
+func (h *Handler) clawAdminUserExists(ctx context.Context, userID string) (string, bool, error) {
+	if userID == "" {
+		return "", false, nil
+	}
+	var found string
+	err := h.DB.QueryRow(ctx, `SELECT user_id FROM claw_im_users WHERE user_id = $1 LIMIT 1`, userID).Scan(&found)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return found, true, nil
 }
 
 // ---- /api/admin/stats ----
 
+// ClawAdminStats 汇总看板卡片。这里所有数字都来自真实表，并且**与各自页面同源**：
+//   - 用户：claw_im_users（与「用户管理」同一张表；运维账号用与列表筛选器完全相同的
+//     推导规则，避免看板与列表页对不上）
+//   - 节点：复用 clawAdminListNodeRecords + rongcloud.IsDisplayNode + NodeService.IsOnline，
+//     与「节点管理」页的可见性与在线判据逐行一致（以前这里恒返回 0，
+//     页面上 11 台设备显示成 0）
+//   - 消息：rongcloud_discussion_event 行数（Go 侧唯一持久化的 IM 消息流）
 func (h *Handler) ClawAdminStats(w http.ResponseWriter, r *http.Request) {
 	if h.requireClawAdmin("stats:read", w, r) == nil {
 		return
 	}
-	var users int
-	_ = h.DB.QueryRow(r.Context(), "SELECT COUNT(*) FROM claw_im_users").Scan(&users)
+	ctx := r.Context()
+
+	var users, normalUsers, operationUsers int
+	_ = h.DB.QueryRow(ctx, `SELECT COUNT(*) FROM claw_im_users`).Scan(&users)
+	_ = h.DB.QueryRow(ctx, `SELECT COUNT(*) FROM claw_im_users u WHERE u.status = 'active'`).Scan(&normalUsers)
+	_ = h.DB.QueryRow(ctx, `SELECT COUNT(*) FROM claw_im_users u WHERE `+clawAdminOperationUserPredicate).Scan(&operationUsers)
+
+	// nodes / online / offline / provider 分布。取记录后在 Go 里过滤，而不是把
+	// IsDisplayNode 的判据（含 machineIdentityKey 的 sha256 分支）在 SQL 里重写一遍。
+	nodes, onlineNodes := 0, 0
+	providers := map[string]int{}
+	if records, err := h.clawAdminListNodeRecords(ctx); err == nil {
+		for _, rec := range records {
+			if !rongcloud.IsDisplayNode(rec.dbNode()) {
+				continue
+			}
+			nodes++
+			if h.clawAdminNodeStatusIsOnline(rec) {
+				onlineNodes++
+			}
+			if rec.AIType != "" {
+				providers[rec.AIType]++
+			}
+		}
+	}
+
+	var groups, chatrooms, discussions, messages, roundDocuments int
+	_ = h.DB.QueryRow(ctx, `SELECT COUNT(*) FROM rongcloud_group`).Scan(&groups)
+	_ = h.DB.QueryRow(ctx, `SELECT COUNT(*) FROM rongcloud_chatroom WHERE status = 'active'`).Scan(&chatrooms)
+	_ = h.DB.QueryRow(ctx, `SELECT COUNT(*) FROM rongcloud_discussion`).Scan(&discussions)
+	_ = h.DB.QueryRow(ctx, `SELECT COUNT(*) FROM rongcloud_discussion_event`).Scan(&messages)
+	_ = h.DB.QueryRow(ctx, `SELECT COUNT(*) FROM rongcloud_discussion_round_document`).Scan(&roundDocuments)
+
+	providerNodes := map[string]interface{}{}
+	for provider, count := range providers {
+		providerNodes[provider] = count
+	}
+
+	// openclaw_nodes / opencode_nodes / … 是旧契约里的具名计数，从同一份 provider
+	// 分布里取值，保证它们与 provider_nodes 永远一致。
+	named := func(provider string) int { return providers[provider] }
+
 	clawAdminOK(w, map[string]interface{}{
-		"users": users, "normal_users": users, "operation_users": 0,
-		"nodes": 0, "openclaw_nodes": 0, "opencode_nodes": 0, "codex_nodes": 0, "kimi_nodes": 0,
-		"online_nodes": 0, "offline_nodes": 0, "groups": 0,
-		"messages": 0, "im_messages": 0, "chat_messages": 0,
-		"audit_logs": h.clawAdminAuditCount(),
+		"users": users, "normal_users": normalUsers, "operation_users": operationUsers,
+		"nodes":          nodes,
+		"openclaw_nodes": named("openclaw"), "opencode_nodes": named("opencode"),
+		"codex_nodes": named("codex"), "kimi_nodes": named("kimi"),
+		"online_nodes": onlineNodes, "offline_nodes": nodes - onlineNodes,
+		"groups":    groups,
+		"chatrooms": chatrooms, "discussions": discussions,
+		"messages": messages, "im_messages": messages, "chat_messages": roundDocuments,
+		"provider_nodes": providerNodes,
+		"audit_logs":     h.clawAdminAuditCount(),
 	})
+}
+
+func (h *Handler) clawAdminNodeStatusIsOnline(rec clawAdminNodeRecord) bool {
+	if h.RongCloudNode == nil {
+		return false
+	}
+	return h.RongCloudNode.IsOnline(rec.ID)
 }
 
 func (h *Handler) clawAdminAuditCount() int {
@@ -554,7 +766,16 @@ func (h *Handler) ClawAdminSystemConfigList(w http.ResponseWriter, r *http.Reque
 		clawAdminOK(w, []interface{}{})
 		return
 	}
-	clawAdminOK(w, items)
+	// 含密钥的配置（融云 Access Key 等）不在这里透出，只在专属接口里脱敏返回。
+	secret := clawAdminSecretConfigKeys()
+	visible := items[:0]
+	for _, item := range items {
+		if key, ok := item["config_key"].(string); ok && secret[key] {
+			continue
+		}
+		visible = append(visible, item)
+	}
+	clawAdminOK(w, visible)
 }
 
 func (h *Handler) ClawAdminSystemConfigGet(w http.ResponseWriter, r *http.Request) {
@@ -562,6 +783,10 @@ func (h *Handler) ClawAdminSystemConfigGet(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	key := chi.URLParam(r, "key")
+	if clawAdminSecretConfigKeys()[key] {
+		clawAdminFail(w, 404, "config not found")
+		return
+	}
 	items, err := h.clawAdminSystemConfigRows(r.Context(), key)
 	if err != nil || len(items) == 0 {
 		clawAdminFail(w, 404, "config not found")
@@ -974,7 +1199,9 @@ func (h *Handler) ClawAdminUpsertRole(w http.ResponseWriter, r *http.Request, cr
 	clawAdminOK(w, item)
 }
 
-func (h *Handler) ClawAdminCreateRole(w http.ResponseWriter, r *http.Request) { h.ClawAdminUpsertRole(w, r, true) }
+func (h *Handler) ClawAdminCreateRole(w http.ResponseWriter, r *http.Request) {
+	h.ClawAdminUpsertRole(w, r, true)
+}
 func (h *Handler) ClawAdminUpdateRole(w http.ResponseWriter, r *http.Request) {
 	h.ClawAdminUpsertRole(w, r, false)
 }
@@ -999,24 +1226,4 @@ func (h *Handler) ClawAdminDeleteRole(w http.ResponseWriter, r *http.Request) {
 	}
 	h.clawAdminAudit(r, ident, "admin_role_delete", "role", roleID, nil)
 	clawAdminOK(w, map[string]interface{}{"ok": true})
-}
-
-// ---- nodes / groups / chatrooms / messages：空数据 ----
-
-func (h *Handler) ClawAdminEmptyPage(w http.ResponseWriter, r *http.Request) {
-	if h.requireClawAdmin("", w, r) == nil {
-		return
-	}
-	clawAdminOK(w, map[string]interface{}{"items": []interface{}{}, "total": 0, "page": 1, "page_size": 20})
-}
-
-func (h *Handler) ClawAdminEmptyList(w http.ResponseWriter, r *http.Request) {
-	if h.requireClawAdmin("", w, r) == nil {
-		return
-	}
-	clawAdminOK(w, []interface{}{})
-}
-
-func (h *Handler) ClawAdminNotFound(w http.ResponseWriter, r *http.Request) {
-	clawAdminFail(w, 404, "not found")
 }

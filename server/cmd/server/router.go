@@ -1680,6 +1680,11 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	r.Get("/api/admin/system/config", h.ClawAdminSystemConfigList)
 	r.Get("/api/admin/system/config/{key}", h.ClawAdminSystemConfigGet)
 	r.Put("/api/admin/system/config/{key}", h.ClawAdminSystemConfigPut)
+	// 管理端「融云控制台」内嵌页。Access Key 只落服务端，
+	// 前端拿到的是服务端换回来的访问令牌 URL（见 claw_admin_rongcloud_console.go）。
+	r.Get("/api/admin/rongcloud/console", h.ClawAdminGetRongCloudConsole)
+	r.Put("/api/admin/rongcloud/console", h.ClawAdminPutRongCloudConsole)
+	r.Post("/api/admin/rongcloud/console/token", h.ClawAdminRongCloudConsoleToken)
 	// 管理端「系统 → 讨论主持 AI」。旧 Python 后端把这组接口挂在
 	// /api/system/discussion-host（见 admin/routes/system.py），迁 Go 时漏了，
 	// 这里收进 /api/admin 命名空间，前端同步改路径。
@@ -1721,10 +1726,22 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	r.Delete("/api/admin/groups/{id}", h.ClawAdminDeleteGroup)
 	r.Get("/api/admin/groups/{id}/members", h.ClawAdminGroupMembers)
 	r.Delete("/api/admin/groups/{id}/members/{user_id}", h.ClawAdminRemoveGroupMember)
-	r.Get("/api/admin/chatrooms", h.ClawAdminEmptyPage)
-	r.Get("/api/admin/chatrooms/{id}", h.ClawAdminNotFound)
-	r.Get("/api/admin/chatrooms/{id}/messages", h.ClawAdminEmptyList)
-	r.Get("/api/admin/messages", h.ClawAdminEmptyPage)
+	// 聊天室管理：rongcloud_chatroom 房间实体（成员/消息数/阶段都从
+	// rongcloud_chatroom_member 与 rongcloud_discussion_event 现算，见
+	// claw_admin_conversations.go）。
+	r.Get("/api/admin/chatrooms", h.ClawAdminListChatRooms)
+	r.Get("/api/admin/chatrooms/{id}", h.ClawAdminGetChatRoom)
+	r.Get("/api/admin/chatrooms/{id}/messages", h.ClawAdminChatRoomMessages)
+	r.Delete("/api/admin/chatrooms/{id}", h.ClawAdminDeleteChatRoom)
+	// 讨论组管理：rongcloud_discussion 讨论实例（状态/轮次/主持 + 事件时间线 +
+	// 逐轮纪要）。与聊天室是一对多，两个页面各看一层。
+	r.Get("/api/admin/discussions", h.ClawAdminListDiscussions)
+	r.Get("/api/admin/discussions/{id}", h.ClawAdminGetDiscussion)
+	r.Get("/api/admin/discussions/{id}/events", h.ClawAdminDiscussionEvents)
+	r.Get("/api/admin/discussions/{id}/round-documents", h.ClawAdminDiscussionRoundDocuments)
+	// 消息查询：rongcloud_discussion_event（Go 侧唯一持久化的 IM 消息归档 ——
+	// 融云只负责投递，普通单聊/群聊消息不入库）。
+	r.Get("/api/admin/messages", h.ClawAdminMessages)
 
 	// Composio OAuth callback (MUL-3843). NOT under the Auth group on purpose:
 	// Composio 302-redirects the user's browser here at the end of the OAuth
