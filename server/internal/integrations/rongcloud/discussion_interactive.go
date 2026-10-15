@@ -51,10 +51,26 @@ const (
 	// contribution 上限是 100_000 字符，超了会被整条丢弃。
 	interactiveMaxSummaryBytes = 90_000
 
-	// interactivePromptContextLimit 是注入到设备提示词里的上下文（话题/目标/插话）
+	// interactivePromptContextLimit 是注入到设备提示词里的上下文（话题/目标/插话/前序发言）
 	// 的字符上限：CLI 的 prompt 走 argv 时有 8000 字符上限，超了会退化到 stdin，
 	// 这里保守收口，避免把角色人设挤没。
 	interactivePromptContextLimit = 4000
+
+	// interactiveReplyClip 是单条成员发言在上下文里的截断长度。主持人靠本轮发言出
+	// 纪要，所以给得比闲聊中继（relayHistoryReplyClip=300）宽。
+	interactiveReplyClip = 800
+
+	// interactiveSummaryClip 是上一轮主持纪要在上下文里的截断长度：它是下一轮成员
+	// 延续讨论的主锚点。
+	interactiveSummaryClip = 1500
+
+	// interactiveHostReplyClip 是主持人出纪要时单条成员发言的截断长度。它比普通成员
+	// 那一档宽：本轮发言是纪要的唯一素材，截得太狠会丢立场细节。
+	interactiveHostReplyClip = 1200
+
+	// interactivePriorReplyClip 是更早轮次成员发言的截断长度：只作背景，压得更短，
+	// 好把额度留给最近一轮。
+	interactivePriorReplyClip = 400
 
 	// interactiveMaxHostRetries 是主持人出纪要失败后的最大重试次数（超过即 failed）。
 	interactiveMaxHostRetries = 2
@@ -529,9 +545,10 @@ func (rt *discussionRuntime) interactiveMemberEnabled(ctx context.Context, d Dis
 }
 
 // interactiveBuildPrompt 拼出私发给设备的你的角色提示词：人设 + 本轮上下文
-// （话题/目标 + 本轮用户插话）。设备端（CLI）把 role_prompt 原样塞进 agent 提示词，
-// 所以插话就是从这里进入后续 agent 的上下文 —— 轮次指针不受影响。
-func (rt *discussionRuntime) interactiveBuildPrompt(d DiscussionRecord, role interactiveRole, extra string, opinions []interactiveOpinion) string {
+// （话题/目标 + 前序发言 + 本轮用户插话 + 本轮要求）。设备端（CLI）把 role_prompt
+// 原样塞进 agent 提示词，所以插话与前序发言都是从这里进入 agent 的上下文
+// —— 轮次指针不受影响。
+func (rt *discussionRuntime) interactiveBuildPrompt(d DiscussionRecord, role interactiveRole, extra string, opinions []interactiveOpinion, history interactiveHistory) string {
 	parts := make([]string, 0, 4)
 	if role.RoleInstructions != "" {
 		parts = append(parts, role.RoleInstructions)
@@ -541,29 +558,46 @@ func (rt *discussionRuntime) interactiveBuildPrompt(d DiscussionRecord, role int
 			parts = append(parts, hostPrompt)
 		}
 	}
-	context := []string{}
+	core := []string{}
 	if d.Topic != "" {
-		context = append(context, "讨论话题："+d.Topic)
+		core = append(core, "讨论话题："+d.Topic)
 	}
 	if d.Goal != "" {
-		context = append(context, "讨论目标："+d.Goal)
+		core = append(core, "讨论目标："+d.Goal)
 	}
 	if len(opinions) > 0 {
 		lines := []string{"本轮用户插话（必须纳入你的发言）："}
 		for _, opinion := range opinions {
 			lines = append(lines, "- "+opinion.content)
 		}
-		context = append(context, strings.Join(lines, "\n"))
+		core = append(core, strings.Join(lines, "\n"))
+	}
+	coreText := strings.Join(core, "\n")
+	// 话题/目标/插话与本轮要求先占额度，剩下的才是前序发言的预算：宁可少给历史，
+	// 也不能把本轮指令挤出上下文。截断也一律按 rune 走（旧实现按字节切片，会把
+	// 多字节字符切成乱码，而且切掉的正是最新的那段）。
+	budget := interactivePromptContextLimit - len([]rune(coreText)) - len([]rune(extra))
+	if budget < 0 {
+		budget = 0
+	}
+	block := coreText
+	if prior := interactiveHistoryBlock(history, d.CurrentRound, role.IsHost, budget); prior != "" {
+		if block != "" {
+			block += "\n"
+		}
+		block += prior
 	}
 	if extra != "" {
-		context = append(context, extra)
-	}
-	if len(context) > 0 {
-		block := "[本轮上下文]\n" + strings.Join(context, "\n")
-		if len(block) > interactivePromptContextLimit {
-			block = block[:interactivePromptContextLimit]
+		if block != "" {
+			block += "\n"
 		}
-		parts = append(parts, block)
+		block += extra
+	}
+	if block != "" {
+		if len([]rune(block)) > interactivePromptContextLimit {
+			block = clipRelayText(block, interactivePromptContextLimit)
+		}
+		parts = append(parts, "[本轮上下文]\n"+block)
 	}
 	return strings.Join(parts, "\n\n")
 }
@@ -575,34 +609,245 @@ type interactiveOpinion struct {
 	content    string
 }
 
-// interactiveConsumedOpinions 返回「本轮消费」的用户插话（consumedFromRound == 当前轮）。
-// 与旧后端 _context 的取值一致：插话只在被投递的那一轮生效，不跨轮重复注入。
-func (rt *discussionRuntime) interactiveConsumedOpinions(d DiscussionRecord) []interactiveOpinion {
-	events, err := rt.repo.ListEventsAfter(context.Background(), d.DiscussionID, 0)
-	if err != nil {
-		return nil
+// interactiveStatement 是提示词上下文里的一条已发生发言（成员发言或主持纪要）。
+type interactiveStatement struct {
+	Round    int
+	MemberID string
+	RoleName string
+	Content  string
+}
+
+// label 是这条发言在上下文里的署名：优先角色名（快照里 nickname 与 roleName 同值），
+// 最后才退化到 rc 账号。
+func (s interactiveStatement) label() string {
+	if name := strings.TrimSpace(s.RoleName); name != "" {
+		return name
 	}
-	out := []interactiveOpinion{}
-	for _, e := range events {
-		if e.EventType != "user_interjection" {
+	return s.MemberID
+}
+
+// interactiveHistory 是一次讨论里已经发生过的发言快照，用于拼「前序发言」上下文。
+type interactiveHistory struct {
+	// contributions 是各轮成员发言（事件顺序；同轮同人只留最后一次，重试不重复）。
+	contributions []interactiveStatement
+	// summaries 是各轮主持纪要（事件顺序；同轮只留最后一次）。
+	summaries []interactiveStatement
+}
+
+// roundStatements 返回某一轮已完成的成员发言（保持发言顺序）。
+func (h interactiveHistory) roundStatements(round int) []interactiveStatement {
+	out := make([]interactiveStatement, 0, len(h.contributions))
+	for _, statement := range h.contributions {
+		if statement.Round == round {
+			out = append(out, statement)
+		}
+	}
+	return out
+}
+
+// lastSummaryBefore 返回第 round 轮之前最近的一轮主持纪要。
+func (h interactiveHistory) lastSummaryBefore(round int) (interactiveStatement, bool) {
+	var found interactiveStatement
+	ok := false
+	for _, summary := range h.summaries {
+		if summary.Round >= round {
 			continue
 		}
+		if !ok || summary.Round >= found.Round {
+			found = summary
+			ok = true
+		}
+	}
+	return found, ok
+}
+
+// interactivePromptInputs 一次读回该讨论的事件流，派生出「本轮消费的用户插话」与
+// 「已发生的前序发言」。派发一轮要同时用这两样，一次拉取避免两处看到不同快照。
+func (rt *discussionRuntime) interactivePromptInputs(d DiscussionRecord) ([]interactiveOpinion, interactiveHistory) {
+	history := interactiveHistory{}
+	events, err := rt.repo.ListEventsAfter(context.Background(), d.DiscussionID, 0)
+	if err != nil {
+		return nil, history
+	}
+	names := interactiveRoleNames(d)
+	opinions := []interactiveOpinion{}
+	contributionAt := map[string]int{}
+	summaryAt := map[int]int{}
+	for _, e := range events {
 		var payload map[string]interface{}
 		if err := json.Unmarshal(e.Payload, &payload); err != nil {
 			continue
 		}
-		round, _ := payload["consumedFromRound"].(float64)
-		if int(round) != d.CurrentRound {
-			continue
+		switch e.EventType {
+		case "user_interjection":
+			// 插话只在被投递的那一轮生效，不跨轮重复注入（与旧后端 _context 一致）。
+			round, _ := payload["consumedFromRound"].(float64)
+			if int(round) != d.CurrentRound {
+				continue
+			}
+			content, _ := payload["content"].(string)
+			if content == "" {
+				continue
+			}
+			uid, _ := payload["messageUid"].(string)
+			opinions = append(opinions, interactiveOpinion{messageUID: uid, content: content})
+		case "contribution_completed":
+			round, _ := payload["round"].(float64)
+			content, _ := payload["content"].(string)
+			if content == "" || int(round) <= 0 {
+				continue
+			}
+			statement := interactiveStatement{
+				Round: int(round), MemberID: e.ActorID,
+				RoleName: names[e.ActorID], Content: content,
+			}
+			key := fmt.Sprintf("%d:%s", statement.Round, statement.MemberID)
+			if index, ok := contributionAt[key]; ok {
+				// 重试/整段重放：后者才是作数的发言。
+				history.contributions[index] = statement
+				continue
+			}
+			contributionAt[key] = len(history.contributions)
+			history.contributions = append(history.contributions, statement)
+		case "round_summary_completed":
+			round, _ := payload["round"].(float64)
+			content, _ := payload["content"].(string)
+			if content == "" || int(round) <= 0 {
+				continue
+			}
+			statement := interactiveStatement{
+				Round: int(round), MemberID: e.ActorID,
+				RoleName: names[e.ActorID], Content: content,
+			}
+			if index, ok := summaryAt[statement.Round]; ok {
+				history.summaries[index] = statement
+				continue
+			}
+			summaryAt[statement.Round] = len(history.summaries)
+			history.summaries = append(history.summaries, statement)
 		}
-		content, _ := payload["content"].(string)
-		if content == "" {
-			continue
-		}
-		uid, _ := payload["messageUid"].(string)
-		out = append(out, interactiveOpinion{messageUID: uid, content: content})
 	}
-	return out
+	return opinions, history
+}
+
+// interactiveRoleNames 取角色板「rc 账号 → 展示名」，给上下文里的发言署名用。
+func interactiveRoleNames(d DiscussionRecord) map[string]string {
+	names := map[string]string{}
+	ordinary, host, ok := interactiveRoles(d)
+	if !ok {
+		return names
+	}
+	record := func(role interactiveRole) {
+		name := strings.TrimSpace(role.RoleName)
+		if name == "" {
+			name = strings.TrimSpace(role.Nickname)
+		}
+		if name != "" {
+			names[role.MemberID] = name
+		}
+	}
+	for _, role := range ordinary {
+		record(role)
+	}
+	record(host)
+	return names
+}
+
+// interactiveHistoryBlock 把「已经发生过的发言」渲染成设备提示词里的前序上下文段。
+//
+// 缺了这一段：第二位成员只能凭空表态、第二轮会从零重新开始，主持人更是拿不到任何
+// 成员发言 —— 它只能回「缺少前序发言记录，无法复述成员立场与分歧。请提供第 N 轮的
+// 发言内容」。线上 2026-10-15 的「第二轮不延续第一轮」就是这条路径。
+//
+// 预算与 relayPromptContextLimit 同源（CLI prompt 走 argv 有 8000 字符上限）：按段
+// 优先级装入，装不下的丢掉，只有第一段允许被截断。返回空串表示没有任何可注入的
+// 前序上下文（旧报文形态逐字不变）。
+func interactiveHistoryBlock(h interactiveHistory, currentRound int, forHost bool, budget int) string {
+	if budget <= 0 {
+		return ""
+	}
+	sections := make([]string, 0, 3)
+	used := 0
+	// take 按优先级装入一段：装得下就装，装不下就停（第一段允许截断，至少给一段上下文）。
+	take := func(block string) bool {
+		if block == "" {
+			return true
+		}
+		size := len([]rune(block))
+		if used+size <= budget {
+			sections = append(sections, block)
+			used += size
+			return true
+		}
+		if len(sections) == 0 {
+			if clipped, _ := clipToBudget(block, budget); clipped != "" {
+				sections = append(sections, clipped)
+			}
+		}
+		return false
+	}
+	if forHost {
+		// 主持人出本轮纪要：本轮成员发言是唯一素材，必须优先且尽量完整地给到。
+		statements := h.roundStatements(currentRound)
+		take(renderInteractiveStatements(
+			fmt.Sprintf("本轮（第 %d 轮）成员发言（写纪要的全部素材，请据此复述成员立场与分歧）：", currentRound),
+			statements, shareBudget(budget, len(statements), interactiveHostReplyClip)))
+		// 上一轮纪要跟在后面（装得下才给）：跨轮的分歧与共识要能延续，不然每轮纪要
+		// 都是孤立快照。
+		if summary, ok := h.lastSummaryBefore(currentRound); ok {
+			take("\n上一轮主持纪要（用于延续共识与分歧）：\n" + clipRelayText(summary.Content, interactiveSummaryClip))
+		}
+	} else {
+		// 普通成员：先给上一轮纪要（跨轮延续的主锚点），再给更早轮次的发言，最后给
+		// 本轮已发言成员（承接或核验，而不是重复表态）。
+		if summary, ok := h.lastSummaryBefore(currentRound); ok {
+			take("\n上一轮主持纪要（据此继续推进，不要从零重开）：\n" + clipRelayText(summary.Content, interactiveSummaryClip))
+		}
+		for round := currentRound - 1; round >= 1; round-- {
+			statements := h.roundStatements(round)
+			if len(statements) == 0 {
+				continue
+			}
+			if !take(renderInteractiveStatements(
+				fmt.Sprintf("第 %d 轮成员发言：", round),
+				statements, shareBudget(budget, len(statements), interactivePriorReplyClip))) {
+				break
+			}
+		}
+		statements := h.roundStatements(currentRound)
+		take(renderInteractiveStatements(
+			"本轮已发言成员的观点（承接或核验后再发言，不要重复）：",
+			statements, shareBudget(budget, len(statements), interactivePriorReplyClip)))
+	}
+	return strings.Join(sections, "")
+}
+
+// shareBudget 把一段预算按条数平分，并夹在 [120, max] 之间：条数多时不至于把后面的
+// 发言挤成空串，条数少时也不浪费额度。
+func shareBudget(budget, count, max int) int {
+	if count <= 0 {
+		return 0
+	}
+	share := budget / (count + 1)
+	if share > max {
+		share = max
+	}
+	if share < 120 {
+		share = 120
+	}
+	return share
+}
+
+// renderInteractiveStatements 把一批发言渲染成列表段（自带前导换行，便于直接拼接）。
+func renderInteractiveStatements(header string, items []interactiveStatement, perItem int) string {
+	if len(items) == 0 {
+		return ""
+	}
+	lines := make([]string, 0, len(items))
+	for _, item := range items {
+		lines = append(lines, fmt.Sprintf("- %s：%s", item.label(), clipRelayText(item.Content, perItem)))
+	}
+	return "\n" + header + "\n" + strings.Join(lines, "\n")
 }
 
 // interactiveRoundAllDone 判断本轮所有普通成员是否都已「完成或跳过」。
@@ -676,16 +921,24 @@ func (rt *discussionRuntime) interactiveDispatch(ctx context.Context, d Discussi
 	action := "assignment"
 	eventType := "assignment_created"
 	extra := "请针对当前轮次给出你的分析。"
+	if d.CurrentRound > 1 {
+		// 第二轮起：没有这句抬头时，成员会把本轮当成一次全新讨论，从零重开（线上
+		// 2026-10-15 的现象）。前序发言由 interactiveHistoryBlock 一并注入。
+		extra = fmt.Sprintf("这是第 %d 轮：请承接上文[前序发言]继续推进（补充、质疑、收敛都行），"+
+			"不要从头重来，也不要重复自己已经说过的内容。", d.CurrentRound)
+	}
 	if role.IsHost {
 		action = "summary"
 		eventType = "host_turn_requested"
 		extra = fmt.Sprintf("本轮（第 %d 轮）所有成员已发言完毕，请输出本轮纪要："+
-			"成员立场、已达成的共识、仍存在的分歧、以及下一轮建议聚焦的问题。", d.CurrentRound)
+			"成员立场、已达成的共识、仍存在的分歧、以及下一轮建议聚焦的问题。\n"+
+			"成员发言已在上文[前序发言]中逐条给出，请直接据此撰写；即便信息不完整，也请基于现有"+
+			"发言给出纪要与待确认项，不要向我索要材料。", d.CurrentRound)
 	}
-	// 本轮被消费的用户插话：同一份快照同时用于提示词拼接与回执落库，
+	// 本轮被消费的用户插话 + 前序发言：同一份快照同时用于提示词拼接与回执落库，
 	// 避免重复全量拉事件，也避免两处看到不同快照。
-	opinions := rt.interactiveConsumedOpinions(d)
-	prompt := rt.interactiveBuildPrompt(d, role, extra, opinions)
+	opinions, history := rt.interactivePromptInputs(d)
+	prompt := rt.interactiveBuildPrompt(d, role, extra, opinions, history)
 
 	// 插话消费回执：本轮真正注入该成员提示词的插话落 interjection_applied，
 	// 前端据此把气泡从「已接受」升级为「已纳入发言参考」。

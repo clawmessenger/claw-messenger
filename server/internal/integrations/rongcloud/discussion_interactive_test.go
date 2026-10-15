@@ -3,8 +3,10 @@ package rongcloud
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // TestInteractiveV3EventWhitelist 钉住前端 discussion-v3.ts 的 eventData 键集合。
@@ -393,6 +395,196 @@ func TestInteractiveRetryAcceptsStatus(t *testing.T) {
 	for _, status := range rejects {
 		if interactiveRetryAcceptsStatus(status) {
 			t.Errorf("status %q must stay rejected", status)
+		}
+	}
+}
+
+// ---- 前序发言上下文（2026-10-15 线上：「第二轮不延续第一轮」）----------------
+
+// TestInteractiveHistoryBlock_FeedsHostThisRound 钉住主持人拿不到素材的回归：
+// 出本轮纪要的那一次派发必须把本轮成员发言带上，否则主持人只会回
+// 「缺少前序发言记录，无法复述成员立场与分歧。请提供第 N 轮的发言内容」。
+func TestInteractiveHistoryBlock_FeedsHostThisRound(t *testing.T) {
+	history := interactiveHistory{contributions: []interactiveStatement{
+		{Round: 1, MemberID: "m1", RoleName: "观看着", Content: "我认为应该先做 A。"},
+		{Round: 1, MemberID: "m2", RoleName: "提问者", Content: "我担心 A 的成本。"},
+	}}
+	block := interactiveHistoryBlock(history, 1, true, interactivePromptContextLimit)
+	for _, want := range []string{"成员发言", "观看着", "先做 A", "提问者", "成本"} {
+		if !strings.Contains(block, want) {
+			t.Errorf("host context missing %q: %q", want, block)
+		}
+	}
+}
+
+// TestInteractiveHistoryBlock_ContinuesPreviousRound 第二轮成员必须同时看到上一轮
+// 纪要与上一轮发言 —— 只给纪要会把第 1 轮的具体观点丢掉，成员照样从头重开。
+func TestInteractiveHistoryBlock_ContinuesPreviousRound(t *testing.T) {
+	history := interactiveHistory{
+		contributions: []interactiveStatement{{Round: 1, MemberID: "m1", RoleName: "观看着", Content: "第一轮的观点"}},
+		summaries:     []interactiveStatement{{Round: 1, MemberID: "h", RoleName: "中立主持人", Content: "第一轮纪要：共识是 X"}},
+	}
+	block := interactiveHistoryBlock(history, 2, false, interactivePromptContextLimit)
+	for _, want := range []string{"上一轮主持纪要", "第一轮纪要：共识是 X", "第 1 轮成员发言", "第一轮的观点"} {
+		if !strings.Contains(block, want) {
+			t.Errorf("round-2 member context missing %q: %q", want, block)
+		}
+	}
+}
+
+// TestInteractiveHistoryBlock_FirstRoundShowsEarlierPeers 第 1 轮没有纪要可给，
+// 但同轮的先发言者必须给到 —— 否则第二位成员只能凭空表态。
+func TestInteractiveHistoryBlock_FirstRoundShowsEarlierPeers(t *testing.T) {
+	history := interactiveHistory{contributions: []interactiveStatement{
+		{Round: 1, MemberID: "m1", RoleName: "观看着", Content: "我先说观察"},
+	}}
+	block := interactiveHistoryBlock(history, 1, false, interactivePromptContextLimit)
+	if !strings.Contains(block, "本轮已发言成员的观点") || !strings.Contains(block, "我先说观察") {
+		t.Errorf("round-1 member context must carry earlier peers: %q", block)
+	}
+	if strings.Contains(block, "上一轮主持纪要") {
+		t.Errorf("round 1 has no previous summary to inject: %q", block)
+	}
+}
+
+// TestInteractiveHistoryBlock_EmptyKeepsLegacyShape 没有历史时整段省略（旧报文逐字不变）。
+func TestInteractiveHistoryBlock_EmptyKeepsLegacyShape(t *testing.T) {
+	if block := interactiveHistoryBlock(interactiveHistory{}, 1, false, 4000); block != "" {
+		t.Errorf("empty history must render nothing, got %q", block)
+	}
+	if block := interactiveHistoryBlock(interactiveHistory{}, 1, true, 4000); block != "" {
+		t.Errorf("empty history must render nothing for the host, got %q", block)
+	}
+}
+
+// TestInteractiveHistoryBlock_HonoursBudget 预算不足时先装最新锚点（上一轮纪要），
+// 且整体绝不超预算 —— prompt 走 argv 有 8000 字符上限，超了整轮退化 stdin 空转。
+func TestInteractiveHistoryBlock_HonoursBudget(t *testing.T) {
+	history := interactiveHistory{
+		contributions: []interactiveStatement{
+			{Round: 1, MemberID: "m1", RoleName: "甲", Content: strings.Repeat("一", 500)},
+			{Round: 2, MemberID: "m1", RoleName: "甲", Content: strings.Repeat("二", 500)},
+			{Round: 2, MemberID: "m2", RoleName: "乙", Content: strings.Repeat("三", 500)},
+		},
+		summaries: []interactiveStatement{{Round: 1, MemberID: "h", RoleName: "主持", Content: strings.Repeat("纪", 800)}},
+	}
+	block := interactiveHistoryBlock(history, 2, false, 900)
+	if got := len([]rune(block)); got > 900 {
+		t.Fatalf("block = %d runes, want <= 900", got)
+	}
+	if !strings.Contains(block, "上一轮主持纪要") {
+		t.Errorf("latest anchor must be packed first: %q", block)
+	}
+}
+
+// TestInteractiveBuildPrompt_StaysWithinRuneBudget 超长发言不会把上下文顶过上限，
+// 也不能按字节切片切出乱码（旧实现 block[:limit] 就干过这件事）。
+func TestInteractiveBuildPrompt_StaysWithinRuneBudget(t *testing.T) {
+	long := strings.Repeat("很长的发言内容", 2000)
+	history := interactiveHistory{
+		contributions: []interactiveStatement{
+			{Round: 1, MemberID: "m1", RoleName: "观看着", Content: long},
+			{Round: 2, MemberID: "m2", RoleName: "提问者", Content: long},
+		},
+		summaries: []interactiveStatement{{Round: 1, MemberID: "h", RoleName: "主持", Content: long}},
+	}
+	d := DiscussionRecord{Topic: strings.Repeat("话题", 50), Goal: "目标", CurrentRound: 2}
+	rt := &discussionRuntime{}
+	prompt := rt.interactiveBuildPrompt(d, interactiveRole{MemberID: "m2", RoleName: "提问者"},
+		"这是第 2 轮：请承接上文[前序发言]继续推进。", nil, history)
+	if !utf8.ValidString(prompt) {
+		t.Fatal("prompt contains invalid UTF-8 (byte-sliced multi-byte text)")
+	}
+	_, contextBlock, found := strings.Cut(prompt, "[本轮上下文]\n")
+	if !found {
+		t.Fatalf("prompt lost its context block: %q", prompt)
+	}
+	if got := len([]rune(contextBlock)); got > interactivePromptContextLimit {
+		t.Fatalf("context block = %d runes, want <= %d", got, interactivePromptContextLimit)
+	}
+	for _, want := range []string{"讨论话题：", "上一轮主持纪要", "第 1 轮成员发言", "本轮已发言成员的观点"} {
+		if !strings.Contains(contextBlock, want) {
+			t.Errorf("context block missing %q", want)
+		}
+	}
+}
+
+// TestInteractivePromptInputsFromRealEvents 用真库把「事件流 → 前序发言/纪要」这条
+// 聚合链路钉住：线上 2026-10-15 的「第二轮不延续第一轮」「主持人索要第 1 轮发言」
+// 就是这一步只回了插话、没有任何发言导致的。
+func TestInteractivePromptInputsFromRealEvents(t *testing.T) {
+	repo, pool := newDiscussionTestRepo(t)
+	ctx := context.Background()
+	roleSnapshot := mustJSON(map[string]interface{}{
+		"m1":   map[string]interface{}{"memberId": "m1", "nodeId": "n1", "nickname": "观看着", "roleName": "观看着", "speakingOrder": float64(0)},
+		"m2":   map[string]interface{}{"memberId": "m2", "nodeId": "n2", "nickname": "提问者", "roleName": "提问者", "speakingOrder": float64(1)},
+		"host": map[string]interface{}{"memberId": "host", "nodeId": "n3", "nickname": "中立主持人", "roleName": "中立主持人", "isHost": true},
+	})
+	created, err := repo.Create(ctx, CreateDiscussionParams{
+		DiscussionID: uniqueID("disc"), ChatroomID: uniqueID("room"),
+		WorkspaceID: testUUID(t, "550e8400-e29b-41d4-a716-446655440000"),
+		CreatedBy:   "user-1", Topic: "Q4 排期", Goal: "定下里程碑",
+		Mode: DiscussionModeRoundtable, Status: DiscussionStatusRunning,
+		RoundPolicy:        RoundPolicyUserConfirmed,
+		RoleSnapshot:       roleSnapshot,
+		HostConfigSnapshot: mustJSON(map[string]interface{}{"discussion_host_prompt": "你是中立主持人"}),
+	})
+	if err != nil {
+		t.Fatalf("create discussion: %v", err)
+	}
+	cleanupDiscussion(t, pool, created.DiscussionID)
+
+	seq := int64(0)
+	appendEvent := func(eventType, actor string, payload map[string]interface{}) {
+		seq++
+		if _, err := repo.AppendEvent(ctx, AppendDiscussionEventParams{
+			DiscussionID: created.DiscussionID, Seq: seq, EventType: eventType,
+			ActorID: actor, Payload: mustJSON(payload),
+			IdempotencyKey: fmt.Sprintf("%s-%s-%d", eventType, actor, seq),
+		}); err != nil {
+			t.Fatalf("append %s: %v", eventType, err)
+		}
+	}
+	appendEvent("contribution_completed", "m1", map[string]interface{}{"round": 1, "content": "第一轮甲的判断"})
+	appendEvent("contribution_completed", "m2", map[string]interface{}{"round": 1, "content": "第一轮乙的判断"})
+	appendEvent("round_summary_completed", "host", map[string]interface{}{"round": 1, "content": "第一轮纪要：共识 X"})
+	appendEvent("contribution_completed", "m1", map[string]interface{}{"round": 2, "content": "第二轮甲的判断"})
+	appendEvent("user_interjection", "owner", map[string]interface{}{"consumedFromRound": 2, "content": "用户插话", "messageUid": "u1"})
+
+	record, err := repo.Get(ctx, created.DiscussionID)
+	if err != nil {
+		t.Fatalf("get discussion: %v", err)
+	}
+	record.CurrentRound = 2
+
+	rt := &discussionRuntime{repo: repo, logger: testLogger()}
+	opinions, history := rt.interactivePromptInputs(record)
+	if len(opinions) != 1 || opinions[0].content != "用户插话" {
+		t.Fatalf("opinions = %+v, want only the current-round interjection", opinions)
+	}
+	if len(history.contributions) != 3 {
+		t.Fatalf("contributions = %d, want 3: %+v", len(history.contributions), history.contributions)
+	}
+	if len(history.summaries) != 1 {
+		t.Fatalf("summaries = %+v, want 1", history.summaries)
+	}
+	if history.contributions[0].RoleName != "观看着" {
+		t.Errorf("statement must carry the role-board label: %+v", history.contributions[0])
+	}
+
+	memberPrompt := rt.interactiveBuildPrompt(record, interactiveRole{MemberID: "m2", RoleName: "提问者"},
+		"这是第 2 轮：请承接上文[前序发言]继续推进。", opinions, history)
+	for _, want := range []string{"第一轮纪要：共识 X", "第一轮甲的判断", "第二轮甲的判断", "用户插话"} {
+		if !strings.Contains(memberPrompt, want) {
+			t.Errorf("round-2 member prompt missing %q:/n%s", want, memberPrompt)
+		}
+	}
+
+	hostPrompt := rt.interactiveBuildPrompt(record, interactiveRole{MemberID: "host", RoleName: "中立主持人", IsHost: true},
+		"本轮（第 2 轮）所有成员已发言完毕，请输出本轮纪要。", nil, history)
+	for _, want := range []string{"你是中立主持人", "第二轮甲的判断", "第一轮纪要：共识 X"} {
+		if !strings.Contains(hostPrompt, want) {
+			t.Errorf("host prompt missing %q:/n%s", want, hostPrompt)
 		}
 	}
 }
