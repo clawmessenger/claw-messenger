@@ -13,6 +13,7 @@ import {
 } from "./main.js";
 import { Keystore } from "./keystore.js";
 import { XiachatApi, type AgentControlState } from "./api.js";
+import { defaultDaemonPaths } from "./daemon.js";
 
 interface FakeChild extends EventEmitter {
   stdout: null;
@@ -96,6 +97,12 @@ function makeHarness(initialControl: AgentControlState[] = []): Harness {
     }) as unknown as typeof spawn,
     onSupervisorSignal: (fn) => { shutdown = fn },
     supervisorControlPollMs: CONTROL_TICK_MS,
+    // 这些用例跑的是真正的 `run`，state/pid 文件必须落在临时目录里：
+    //   · 用默认的 ~/.clawmessenger，`run` 会读到**这台机器上真实在跑的 supervisor**
+    //     → 被新加的防重复护栏拒绝启动 → 所有用例超时；
+    //   · 更要命的是 onStopped 会 clearSupervisorState(真实路径)，把线上的
+    //     supervisor.pid 删掉 —— 下次 `run` / 开机自启就以为没人跑而多起一份。
+    daemonPaths: defaultDaemonPaths(join(dir, ".clawmessenger")),
   });
 
   const run = program.parseAsync(["node", "clawmessenger", "run"]);

@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   createDaemon,
   defaultDaemonPaths,
+  findLiveSupervisor,
   formatDaemonStatus,
   supervisorSpawnArgv,
   writeSupervisorState,
@@ -125,6 +126,48 @@ describe("supervisorSpawnArgv", () => {
     expect(supervisorSpawnArgv("/repo/packages/xiachat-cli/dist/bin.js")).toEqual([
       "/repo/packages/xiachat-cli/dist/bin.js",
     ]);
+  });
+});
+
+describe("findLiveSupervisor", () => {
+  const nothingAlive = (): boolean => false;
+
+  it("reports nothing when the state dir is empty", () => {
+    const h = harness();
+    expect(findLiveSupervisor(h.paths, nothingAlive)).toBeNull();
+  });
+
+  it("ignores a pid file left behind by a process that is gone", () => {
+    const h = harness();
+    mkdirSync(h.paths.stateDir, { recursive: true });
+    writeFileSync(h.paths.pidFile, "4242\n");
+    expect(findLiveSupervisor(h.paths, nothingAlive)).toBeNull();
+  });
+
+  it("reports the live pid together with the agents it published", () => {
+    const h = harness();
+    state(h.paths, 4242, ["opencode", "ops"]);
+    const found = findLiveSupervisor(h.paths, (pid) => pid === 4242);
+    expect(found?.pid).toBe(4242);
+    expect(found?.state?.agents).toEqual(["opencode", "ops"]);
+  });
+
+  it("finds a supervisor that has a pid file but has not published its state yet", () => {
+    const h = harness();
+    mkdirSync(h.paths.stateDir, { recursive: true });
+    writeFileSync(h.paths.pidFile, "777\n");
+    const found = findLiveSupervisor(h.paths, (pid) => pid === 777);
+    expect(found?.pid).toBe(777);
+    expect(found?.state).toBeNull();
+  });
+
+  it("falls back to the state file when the pid file went missing", () => {
+    const h = harness();
+    state(h.paths, 888, ["hermes"]);
+    rmSync(h.paths.pidFile, { force: true });
+    const found = findLiveSupervisor(h.paths, (pid) => pid === 888);
+    expect(found?.pid).toBe(888);
+    expect(found?.state?.agents).toEqual(["hermes"]);
   });
 });
 

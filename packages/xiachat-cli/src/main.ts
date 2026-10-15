@@ -8,9 +8,11 @@ import { discoverAgents } from "./agents.js";
 import { DEFAULT_SERVER_URL, machineId, defaultProcessedUidsPath } from "./config.js";
 import { ensureOpencodeInstalled, OPS_AGENT_NAME, OPS_TURN_TIMEOUT_MS, setupOpsWorkdir } from "./ops.js";
 import {
+  ALLOW_DUPLICATE_SUPERVISOR_ENV,
   clearSupervisorState,
   createDaemon,
   defaultDaemonPaths,
+  findLiveSupervisor,
   formatDaemonStatus,
   supervisorSpawnArgv,
   writeSupervisorState,
@@ -24,6 +26,15 @@ import {
 // different keys.
 export function pairIdempotencyKey(ticket: string, mid: string): string {
   return `idem-${createHash("sha256").update(`${ticket}:${mid}`).digest("hex").slice(0, 24)}`;
+}
+
+/**
+ * 是否允许并排跑第二份 supervisor（见 ALLOW_DUPLICATE_SUPERVISOR_ENV）。
+ * 默认不允许 —— 两份 supervisor 会派生完全相同的融云节点 id。
+ */
+export function allowDuplicateSupervisor(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = (env[ALLOW_DUPLICATE_SUPERVISOR_ENV] ?? "").trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
 }
 
 export interface BuildProgramOpts {
@@ -205,6 +216,26 @@ export function buildProgram(opts: BuildProgramOpts): Command {
       if (!creds) throw new Error("no credentials; run clawmessenger register or pair first");
       const api = opts.apiFactory(creds.serverUrl);
       if (!cmdOpts.agent) {
+        // `start` 已经会拒绝重复启动，但 supervisor 还会被别的入口直接拉起：
+        // 开机自启的 .vbs、守护脚本的 `-Action run`、用户在终端里手敲
+        // `clawmessenger run`。这些入口全部绕过 start，于是能在已有一份在跑时
+        // 再起一份 —— 两份 supervisor 派生**完全相同**的融云节点 id，互相踢线
+        // （设备列表一会在线一会离线），同一条私聊还会被两套各答一次
+        // （重复回复）。所以 supervisor 自己必须再拦一道。
+        const conflict = findLiveSupervisor(daemonPaths);
+        if (conflict && conflict.pid !== process.pid && !allowDuplicateSupervisor()) {
+          const agents = conflict.state?.agents.length ? `, agents: ${conflict.state.agents.join(", ")}` : "";
+          opts.stdout.write(
+            `another clawmessenger supervisor is already running (PID ${conflict.pid}${agents}).\n` +
+              "refusing to start a second one: both would log in as the same RongCloud nodes, so the\n" +
+              "device would flip online/offline and every private message would be answered twice.\n\n" +
+              "  stop it       : clawmessenger stop\n" +
+              "  or restart it : clawmessenger restart\n" +
+              `  start anyway  : set ${ALLOW_DUPLICATE_SUPERVISOR_ENV}=1\n`,
+          );
+          process.exitCode = 1;
+          return;
+        }
         await runSupervisor({
           opts,
           creds,
@@ -503,7 +534,15 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
     const child = spawnChild(
       process.execPath,
       [...spawnArgvPrefix, ...entry.runArgs],
-      { env: { ...process.env, CLAWMESSENGER_AGENT_CREDS: JSON.stringify(entry.childCreds) } },
+      {
+        env: { ...process.env, CLAWMESSENGER_AGENT_CREDS: JSON.stringify(entry.childCreds) },
+        // supervisor 是 detached + windowsHide 拉起的，自己没有控制台；这里的子进程
+        // 若不带 windowsHide，Windows 会为每个 console 子进程**新分配一个可见的
+        // 控制台窗口**——绑了几个 agent 就弹几个黑窗。用户点 X 关窗只杀掉该 agent
+        // 子进程，下方的退避重启（1s→2s→4s…）马上又把它拉回来，看起来就是
+        // 「窗口关都关不掉」。stdio 走默认管道，输出仍进 supervisor 日志，不受影响。
+        windowsHide: true,
+      },
     );
     entry.child = child;
     entry.startedAt = Date.now();

@@ -1,9 +1,11 @@
 // @vitest-environment node
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { buildProgram } from "./main.js";
+import { allowDuplicateSupervisor, buildProgram } from "./main.js";
 import { Keystore } from "./keystore.js";
 import type { XiachatApi } from "./api.js";
 import { defaultDaemonPaths, type Daemon } from "./daemon.js";
@@ -342,5 +344,70 @@ describe("clawmessenger background commands", () => {
       /unknown daemon action 'explode'/,
     );
     expect(calls).toEqual([]);
+  });
+});
+
+describe("clawmessenger run (supervisor mode)", () => {
+  // 回归护栏：supervisor 会被 start 之外的入口直接拉起（开机自启 .vbs、守护脚本的
+  // -Action run、手敲 `clawmessenger run`），那些入口绕过 start 的检查。两份
+  // supervisor 派生同样的融云节点 id —— 互相踢线 + 同一条私聊被各答一次。
+  it("refuses to start a second supervisor while one is already running", async () => {
+    const keystore = tempKeystore();
+    keystore.save({ nodeId: "node_9", token: "t", serverUrl: "http://srv" });
+    const stateDir = mkdtempSync(join(tmpdir(), "clawmessenger-supervisor-guard-"));
+    dirs.push(stateDir);
+    const paths = defaultDaemonPaths(stateDir);
+    // 需要一个「确实活着、但不是本进程」的 pid，否则会命中「pid 就是我自己」的放行分支。
+    const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1e9)"], { stdio: "ignore" });
+    const previousExitCode = process.exitCode;
+    try {
+      await once(sleeper, "spawn");
+      const pid = sleeper.pid as number;
+      writeFileSync(paths.pidFile, `${pid}\n`);
+      writeFileSync(
+        paths.stateFile,
+        JSON.stringify({
+          pid,
+          startedAt: 1,
+          execPath: "/opt/clawmessenger/clawmessenger",
+          cwd: "/home/u",
+          agents: ["opencode", "ops"],
+        }),
+      );
+
+      const lines: string[] = [];
+      const program = buildProgram({
+        keystore,
+        apiFactory: () => ({}) as unknown as XiachatApi,
+        stdout: { write: (s: string) => { lines.push(s); return true; } } as unknown as NodeJS.WriteStream,
+        daemonPaths: paths,
+      });
+      await program.parseAsync(["node", "clawmessenger", "run"]);
+
+      const text = lines.join("");
+      expect(text).toContain(`another clawmessenger supervisor is already running (PID ${pid}`);
+      expect(text).toContain("opencode, ops");
+      expect(text).toContain("clawmessenger stop");
+      expect(text).toContain("CLAWMESSENGER_ALLOW_DUPLICATE_SUPERVISOR=1");
+      expect(process.exitCode).toBe(1);
+    } finally {
+      process.exitCode = previousExitCode;
+      sleeper.kill();
+    }
+  });
+});
+
+describe("allowDuplicateSupervisor", () => {
+  it("is off unless the operator asks for it", () => {
+    expect(allowDuplicateSupervisor({})).toBe(false);
+    for (const v of ["0", "false", "no", "", "  ", "maybe"]) {
+      expect(allowDuplicateSupervisor({ CLAWMESSENGER_ALLOW_DUPLICATE_SUPERVISOR: v })).toBe(false);
+    }
+  });
+
+  it("accepts the documented truthy spellings, whitespace and case included", () => {
+    for (const v of ["1", "true", "TRUE", "yes", "on", " on "]) {
+      expect(allowDuplicateSupervisor({ CLAWMESSENGER_ALLOW_DUPLICATE_SUPERVISOR: v })).toBe(true);
+    }
   });
 });

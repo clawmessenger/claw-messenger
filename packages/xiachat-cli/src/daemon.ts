@@ -161,6 +161,48 @@ function defaultIsAlive(pid: number): boolean {
   }
 }
 
+/**
+ * `run` 用这个环境变量强行绕过「已有 supervisor 在跑」的拦截。
+ * 只在真的要并排跑第二份（例如本机调试）时才用 —— 两份 supervisor 会派生
+ * **完全相同**的融云节点 id，互相踢线，且每条私聊被各答一次。
+ */
+export const ALLOW_DUPLICATE_SUPERVISOR_ENV = "CLAWMESSENGER_ALLOW_DUPLICATE_SUPERVISOR";
+
+export function readSupervisorPid(paths: DaemonPaths = defaultDaemonPaths()): number | undefined {
+  try {
+    const digits = readFileSync(paths.pidFile, "utf8").replace(/[^0-9]/g, "");
+    if (!digits) return undefined;
+    const pid = Number.parseInt(digits, 10);
+    return Number.isInteger(pid) && pid > 0 ? pid : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * 「现在有没有另一个 supervisor 在跑」的**唯一判据**，`start` 与 `run` 共用。
+ *
+ * pid 文件优先（Windows 上没有命令行可核对），状态文件补上详情。返回 null 表示没有。
+ *
+ * 为什么 `run` 也必须自己看一遍：`start` 的拦截只覆盖「通过 start 启动」这一条路，
+ * 而 supervisor 还会被别的入口直接拉起 —— 开机自启的 .vbs / 守护脚本的
+ * `-Action run` / 用户在终端里手敲 `clawmessenger run`。这些入口全部绕过 start，
+ * 于是能在已有一份在跑的情况下再起一份：两份都派生同样的融云节点 id，互相踢线
+ * （设备列表一会在线一会离线），同一条私聊被两套各答一次（重复回复）。
+ */
+export function findLiveSupervisor(
+  paths: DaemonPaths = defaultDaemonPaths(),
+  isAlive: (pid: number) => boolean = defaultIsAlive,
+): { pid: number; state: SupervisorState | null } | null {
+  const state = readSupervisorState(paths);
+  for (const candidate of [readSupervisorPid(paths), state?.pid]) {
+    if (candidate && isAlive(candidate)) {
+      return { pid: candidate, state: state && state.pid === candidate ? state : null };
+    }
+  }
+  return null;
+}
+
 export function formatDuration(ms: number): string {
   if (!Number.isFinite(ms) || ms < 0) return "?";
   const s = Math.floor(ms / 1000);
@@ -283,27 +325,11 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
       "clawmessenger.vbs",
     );
 
-  const readPidFile = (): number | undefined => {
-    try {
-      const digits = readFileSync(paths.pidFile, "utf8").replace(/[^0-9]/g, "");
-      if (!digits) return undefined;
-      const pid = Number.parseInt(digits, 10);
-      return Number.isInteger(pid) && pid > 0 ? pid : undefined;
-    } catch {
-      return undefined;
-    }
-  };
+  const readPidFile = (): number | undefined => readSupervisorPid(paths);
 
   /** pid 文件优先（Windows 上没有命令行可核对），状态文件补上详情。 */
-  const findRunning = (): { pid: number; state: SupervisorState | null } | null => {
-    const state = readSupervisorState(paths);
-    for (const candidate of [readPidFile(), state?.pid]) {
-      if (candidate && isAlive(candidate)) {
-        return { pid: candidate, state: state && state.pid === candidate ? state : null };
-      }
-    }
-    return null;
-  };
+  const findRunning = (): { pid: number; state: SupervisorState | null } | null =>
+    findLiveSupervisor(paths, isAlive);
 
   const stateFilesPresent = (): boolean => existsSync(paths.pidFile) || existsSync(paths.stateFile);
 
@@ -337,13 +363,8 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
   };
 
   const targetPidFile = (): string | undefined => {
-    try {
-      const digits = readFileSync(paths.pidFile, "utf8").replace(/[^0-9]/g, "");
-      const pid = Number.parseInt(digits, 10);
-      return Number.isInteger(pid) && pid > 0 ? String(pid) : undefined;
-    } catch {
-      return undefined;
-    }
+    const pid = readSupervisorPid(paths);
+    return pid === undefined ? undefined : String(pid);
   };
 
   async function start(o: DaemonStartOptions = {}): Promise<void> {
