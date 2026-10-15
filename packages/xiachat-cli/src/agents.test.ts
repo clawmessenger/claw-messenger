@@ -5,7 +5,6 @@ import {
   buildSpawnInvocation,
   buildModelArgs,
   discoverAgents,
-  emitsJsonEnvelope,
   extractOpenclawReply,
   KNOWN_AGENT_CLIS,
   normalizeOpenclawOutput,
@@ -218,16 +217,6 @@ describe("extractOpenclawReply", () => {
 
   it("falls back to raw trimmed text when extraction comes up empty", () => {
     expect(extractOpenclawReply("  \n raw fallback \n ")).toBe("raw fallback");
-  });
-});
-
-describe("emitsJsonEnvelope", () => {
-  it("只把 openclaw 当作一次性 JSON 信封型 agent", () => {
-    expect(emitsJsonEnvelope("openclaw")).toBe(true);
-    expect(emitsJsonEnvelope("opencode")).toBe(false);
-    expect(emitsJsonEnvelope("hermes")).toBe(false);
-    expect(emitsJsonEnvelope("codex")).toBe(false);
-    expect(emitsJsonEnvelope(undefined)).toBe(false);
   });
 });
 
@@ -506,43 +495,6 @@ describe("runAgentTurn", () => {
       });
       expect(out).toContain("stream me");
       expect(chunks).toContain("stream me");
-    } finally {
-      fixture.cleanup();
-    }
-  });
-
-  // openclaw 的 stdout 是 `agent --local --json` 的完整信封（含输入提示词全文
-  // 与执行 trace）。一旦把原始增量当正文回调出去，web 的打字气泡里就会出现
-  // 一整坨 JSON；而终帧与兜底广播给的是 extractOpenclawReply 提取后的正文，
-  // 两者内容不等，web 的 streamEchoIndex 按内容相等去重就失效，聊天里于是
-  // 出现一对「内容重复」的气泡（一条 JSON、一条正文）。所以 openclaw 必须
-  // 跳过增量回调，只靠终帧一次性给出正文。
-  it("openclaw 的 --json 信封不进增量回调，终值仍是提取后的正文", async () => {
-    const envelope = JSON.stringify({
-      payloads: [{ text: "正文一号", mediaUrl: null }],
-      meta: {
-        finalPromptText: "[group chat] 请以「rc_node_x_openclaw」的身份发言，只输出发言正文。",
-        finalAssistantVisibleText: "正文一号",
-        finalAssistantRawText: "正文一号",
-        replyInvalid: false,
-        livenessState: "working",
-        executionTrace: { winnerProvider: "openai", winnerModel: "gpt-5.6-sol" },
-      },
-    });
-    const fixture = createEchoAgentScript("openclaw", { stdoutText: envelope });
-    try {
-      let chunks = "";
-      const out = await runAgentTurn({
-        execPath: fixture.agentPath,
-        agentName: "openclaw",
-        prompt: "p",
-        timeoutMs: 30_000,
-        onChunk: (c) => { chunks += c; },
-      });
-      // 信封一个字符都不许流进增量 —— 它就是气泡里那坨 JSON 的来源。
-      expect(chunks).toBe("");
-      // 但终值仍然要拿到提取后的正文，不能因此变成空回复。
-      expect(out).toBe("正文一号");
     } finally {
       fixture.cleanup();
     }

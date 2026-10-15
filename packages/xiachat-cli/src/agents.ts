@@ -337,18 +337,6 @@ export function extractOpenclawReply(raw: string): string {
   return raw.trim();
 }
 
-// 有些 agent 的 stdout 是「一次性 JSON 信封」，而不是逐段正文：openclaw 的
-// `agent --local --json` 把输入提示词、最终回复、执行 trace 打包成一个 JSON
-// 一次吐出。这类 agent 绝不能参与增量回调 —— 原始增量是整份信封（含提示词
-// 全文），web 的打字气泡里会出现一整坨 JSON；而终帧与兜底广播走的是
-// extractOpenclawReply 提取后的正文，两者内容不等，web 按内容相等去重的
-// streamEchoIndex（ai-message-lifecycle.ts）就失效，聊天里于是出现一对
-// 「内容重复」的气泡（一条 JSON、一条正文）。
-// 它们只发「处理中 → 完成」两端：终帧本身携带完整正文，气泡照样填满。
-export function emitsJsonEnvelope(agentName: string | undefined): boolean {
-  return agentName === "openclaw";
-}
-
 export async function discoverAgents(opts: { extraPath?: string }): Promise<AgentInfo[]> {
   // When extraPath is provided (even empty) we scan ONLY there (tests and
   // explicit overrides must not pick up a real claude on the dev machine);
@@ -621,9 +609,6 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
     // 切分（\n 边界），thinking/text 增量分道回调；原始字节照常入 chunks，
     // 结束时用 extractStreamJsonFinalText 提取权威正文。
     const streamJsonMode = agentSupportsReasoning(opts.agentName) && argvMode;
-    // 非 stream-json 的 agent 才走「原始 stdout 即正文」的增量回调；JSON 信封
-    // 型 agent（openclaw）跳过，避免把整份信封当正文流出去（见 emitsJsonEnvelope）。
-    const streamRawStdout = !emitsJsonEnvelope(opts.agentName);
     let lineBuf = "";
     const emitStreamJson = (flushed: string) => {
       const delta = parseStreamJsonLine(flushed);
@@ -640,7 +625,7 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
           chunks.push(tail);
           totalBytes += tail.length;
           const delta = decoder.write(tail);
-          if (!streamJsonMode && delta && streamRawStdout) opts.onChunk?.(delta);
+          if (!streamJsonMode && delta) opts.onChunk?.(delta);
         }
         decoder = new StringDecoder("utf8"); // drop any held partial sequence
         truncated = true;
@@ -659,7 +644,7 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
           lineBuf = lineBuf.slice(nl + 1);
           emitStreamJson(line);
         }
-      } else if (delta && streamRawStdout) {
+      } else if (delta) {
         opts.onChunk?.(delta);
       }
     });
