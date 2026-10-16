@@ -4,6 +4,11 @@ import { access, constants } from "node:fs/promises";
 import { delimiter, dirname, join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 
+import {
+  type ActivityStep,
+  createActivityTracker,
+} from "./agent-activity.js";
+
 // Mirrors knownAgentCLIs in server/internal/integrations/rongcloud/
 // discussion_bridge.go — keep both lists in sync.
 export const KNOWN_AGENT_CLIS: readonly string[] = [
@@ -35,6 +40,10 @@ export interface RunAgentTurnOpts {
   // thinking/reasoning 过程文本与正文分道回调。不支持思考流的 agent
   // 不调用它，调用方天然降级为纯正文流。
   onReasoningChunk?: (chunk: string) => void;
+  // 过程流（可选）：agent 本轮的工具调用步骤。回调的是**全量快照**而非增量，
+  // 与 text/reasoning 同语义 —— 调用方只管存最新的那份。仅 stream-json 型
+  // agent（claude/codex）会产生，其余 agent 一次都不回调。
+  onActivity?: (steps: ActivityStep[]) => void;
   signal?: AbortSignal;
   // 会话隔离键（可选）。多个会话形态共用同一个 agent 二进制，而 agent CLI
   // 默认把它们全塞进自己的「主会话」：openclaw 的默认键就是 agent:main:main，
@@ -625,7 +634,18 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
     // 型 agent（openclaw）跳过，避免把整份信封当正文流出去（见 emitsJsonEnvelope）。
     const streamRawStdout = !emitsJsonEnvelope(opts.agentName);
     let lineBuf = "";
+    // 过程流追踪器：逐行消化工具事件，全量快照上抛。没有回调方就不建，省掉
+    // 每行一次的解析开销。
+    const activity = opts.onActivity ? createActivityTracker() : undefined;
+    const emitActivity = (): void => {
+      if (!activity || !opts.onActivity) return;
+      opts.onActivity(activity.snapshot());
+    };
     const emitStreamJson = (flushed: string) => {
+      // 工具事件先消化：同一个 JSONL 行里 tool 事件与正文不会共存（claude 的
+      // tool_use 走 content_block_*，codex 走 item.*），但收尾事件的顺序不能
+      // 依赖 —— 先更新步骤再发正文，用户才不会看到「正文已出、步骤还没出」。
+      if (activity && activity.push(flushed)) emitActivity();
       const delta = parseStreamJsonLine(flushed);
       if (!delta) return;
       if (delta.reasoning !== undefined) opts.onReasoningChunk?.(delta.reasoning);
@@ -676,11 +696,16 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
           if (streamJsonMode) {
             // 冲刷残行后提取权威正文；提取失败（非标准输出）兜底原文。
             emitStreamJson(lineBuf);
+            // 收尾：异常退出/事件流缺失都不会有 content_block_stop，悬着的
+            // 「进行中」步骤必须在这里结掉，否则气泡里永远转圈。
+            if (activity && activity.finish()) emitActivity();
             resolve(extractStreamJsonFinalText(stdout) ?? stdout);
           } else {
             resolve(opts.agentName === "openclaw" ? extractOpenclawReply(stdout) : stdout);
           }
         } else {
+          // 失败退出同样收尾：failed 帧要带着完整步骤，别留下「进行中」。
+          if (activity && activity.finish()) emitActivity();
           reject(new Error(`agent exited with code ${code}: ${stderr}`));
         }
       });

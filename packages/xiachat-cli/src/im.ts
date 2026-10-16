@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ARGV_PROMPT_MAX_CHARS } from "./agents.js";
 import { collectProducedArtifacts, snapshotWorkdir, type ProducedArtifact, type WorkdirSnapshot } from "./artifacts.js";
+import type { ActivityStep } from "./agent-activity.js";
 import { decodeCommandContent, encodeCommandResult } from "./protocol.js";
 import { buildChatStreamFrame, encodeChatStreamWireFrames, parseChatStopRequest, type ChatStreamStatus } from "./chat-stream.js";
 import { buildHtmlCard, extractHtmlFence, htmlReviseFromFilePrompt, htmlRevisePrompt } from "./cards.js";
@@ -181,7 +182,10 @@ export interface TurnRunner {
   runTurnStreamed?: (
     prompt: string,
     model: string | undefined,
-    onDelta: (delta: string, reasoningDelta?: string) => void,
+    // 三个参数都是「最新全量的一部分」：正文增量、思考流增量、过程流快照。
+    // 分开传而不是合成一个对象，是为了让调用方（run.ts 的 onChunk /
+    // onReasoningChunk / onActivity）各自只需管自己那一摊。
+    onDelta: (delta: string, reasoningDelta?: string, activity?: ActivityStep[]) => void,
     signal?: AbortSignal,
     sessionKey?: string,
   ) => Promise<string>;
@@ -472,7 +476,14 @@ export class MessageDispatcher {
       conversationType: opts.conversationType,
       conversationId: opts.conversationId,
     };
-    const frame = (seq: number, status: ChatStreamStatus, text: string, reasoning?: string, errorCode?: string) => {
+    const frame = (
+      seq: number,
+      status: ChatStreamStatus,
+      text: string,
+      reasoning?: string,
+      errorCode?: string,
+      activity?: ActivityStep[],
+    ) => {
       const serialized = buildChatStreamFrame({
         streamId: ctx.streamId,
         requestMessageId: ctx.requestMessageId,
@@ -484,6 +495,7 @@ export class MessageDispatcher {
         status,
         text,
         ...(reasoning ? { reasoning } : {}),
+        ...(activity && activity.length > 0 ? { activity } : {}),
         ...(errorCode ? { errorCode } : {}),
       });
       // 融云单条消息 ~9KB 上限：超限帧切 wire 分块（web 端重组器还原）。
@@ -491,11 +503,18 @@ export class MessageDispatcher {
       const payload = JSON.parse(serialized) as Record<string, unknown>;
       return encodeChatStreamWireFrames(payload);
     };
-    const emit = async (seq: number, status: ChatStreamStatus, text: string, reasoning?: string, errorCode?: string) => {
+    const emit = async (
+      seq: number,
+      status: ChatStreamStatus,
+      text: string,
+      reasoning?: string,
+      errorCode?: string,
+      activity?: ActivityStep[],
+    ) => {
       const sendStream = this.deps.sendStream;
       if (!sendStream) return;
       try {
-        for (const wire of frame(seq, status, text, reasoning, errorCode)) {
+        for (const wire of frame(seq, status, text, reasoning, errorCode, activity)) {
           await sendStream(ctx.conversationType, ctx.conversationId, wire.objectName, wire.content);
         }
       } catch (err) {
@@ -513,6 +532,8 @@ export class MessageDispatcher {
     // Active-stream registry keyed by streamId for chat_stop cancellation.
     const controller = new AbortController();
     this.activeStreams.set(ctx.streamId, controller);
+    // 过程流的补偿帧定时器：声明在 try 之外，finally 才能把它撤掉（见文件末尾）。
+    let pendingActivityFlush: ReturnType<typeof setTimeout> | null = null;
     try {
       if (!canStream) {
         // Degraded path (tests, or an agent without streamed stdout): the
@@ -539,17 +560,34 @@ export class MessageDispatcher {
       let snapshot = "";
       // 思考流快照：与正文快照同帧携带（reasoning 字段），同 seq 递增。
       let reasoningSnapshot = "";
+      // 过程流快照：agent 本轮的工具调用步骤（联网搜索/执行命令/读写文件…）。
+      let activitySnapshot: ActivityStep[] = [];
       let lastSent = 0;
-      const sendDelta = async (delta: string, reasoningDelta?: string) => {
+      // 节流窗口内到达的过程流更新需要一次补偿帧：长工具阶段正文久久不来，
+      // 若完全等下一个 chunk，用户就看不到「正在联网搜索」这一步。
+      const emitStreamingFrame = async () => {
+        const frameSeq = seq;
+        seq += 1;
+        lastSent = Date.now();
+        await emit(frameSeq, "streaming", snapshot, reasoningSnapshot || undefined, undefined, activitySnapshot);
+      };
+      const sendDelta = async (delta: string, reasoningDelta?: string, activity?: ActivityStep[]) => {
         if (controller.signal.aborted) return;
         snapshot += delta;
         if (reasoningDelta) reasoningSnapshot += reasoningDelta;
+        if (activity) activitySnapshot = activity;
         const now = Date.now();
         // 节流：距上一帧不足间隔时只攒不动，由下个 chunk 或终帧冲刷。
-        if (now - lastSent < STREAM_FRAME_INTERVAL_MS) return;
-        lastSent = now;
-        await emit(seq, "streaming", snapshot, reasoningSnapshot || undefined);
-        seq += 1;
+        if (now - lastSent < STREAM_FRAME_INTERVAL_MS) {
+          if (activity && pendingActivityFlush === null) {
+            pendingActivityFlush = setTimeout(() => {
+              pendingActivityFlush = null;
+              void emitStreamingFrame();
+            }, STREAM_FRAME_INTERVAL_MS - (now - lastSent));
+          }
+          return;
+        }
+        await emitStreamingFrame();
       };
       let finalText = "";
       try {
@@ -562,11 +600,11 @@ export class MessageDispatcher {
         );
       } catch (err) {
         if (controller.signal.aborted) {
-          await emit(seq, "cancelled", snapshot, reasoningSnapshot || undefined);
+          await emit(seq, "cancelled", snapshot, reasoningSnapshot || undefined, undefined, activitySnapshot);
           return;
         }
         const errMsg = err instanceof Error ? err.message : String(err);
-        await emit(seq, "failed", snapshot, reasoningSnapshot || undefined, errMsg.slice(0, 120));
+        await emit(seq, "failed", snapshot, reasoningSnapshot || undefined, errMsg.slice(0, 120), activitySnapshot);
         if (opts.onError) {
           await opts.onError(errMsg);
           return;
@@ -585,10 +623,15 @@ export class MessageDispatcher {
       const uploaded = await this.collectArtifacts(artifactSnapshot);
       // 终帧用完整全文（agent 的最终 stdout 可能比 chunk 累积更权威）。
       const visibleText = this.ensureVisibleReply(finalText || snapshot, uploaded);
-      await emit(seq, "completed", visibleText, reasoningSnapshot || undefined);
+      await emit(seq, "completed", visibleText, reasoningSnapshot || undefined, undefined, activitySnapshot);
       await opts.fallback(visibleText);
       await this.sendArtifactMessages(ctx, uploaded);
     } finally {
+      // 补偿帧还在等就别再发了：这一轮已经收尾，晚到的帧只会顶掉终帧。
+      if (pendingActivityFlush !== null) {
+        clearTimeout(pendingActivityFlush);
+        pendingActivityFlush = null;
+      }
       this.activeStreams.delete(ctx.streamId);
     }
   }

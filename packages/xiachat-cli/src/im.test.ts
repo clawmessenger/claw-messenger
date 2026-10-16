@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { ARGV_PROMPT_MAX_CHARS } from "./agents.js";
+import type { ActivityStep } from "./agent-activity.js";
 import { MessageDispatcher, planReadReceipt, resolveTurnVenue, turnSessionKey } from "./im.js";
 
 function makeDeps() {
@@ -1119,6 +1120,38 @@ describe("MessageDispatcher chat_stream streaming", () => {
     const result = sent.find((s) => s.type === "command")
     expect(result).toBeDefined()
     expect(JSON.parse(result!.content).payload.kind).toBe("text")
+  })
+
+  it("过程流快照随帧上屏，长工具阶段也有补偿帧", async () => {
+    const { deps, streams } = buildDeps()
+    const dispatcher = new MessageDispatcher(deps)
+    const turns = {
+      runTurn: async () => { throw new Error("should use streamed variant") },
+      runTurnStreamed: async (
+        _p: string,
+        _m: string | undefined,
+        onDelta: (d: string, r?: string, a?: ActivityStep[]) => void,
+      ) => {
+        // 先只报工具调用、正文久久不来：过程流必须靠补偿帧自己上屏。
+        onDelta("", undefined, [{ id: "t1", kind: "search", label: "联网搜索", detail: "虾说", status: "running" }])
+        await new Promise((r) => setTimeout(r, 700))
+        onDelta("答案")
+        return "答案"
+      },
+    }
+    await dispatcher.handle({
+      objectName: "RC:TxtMsg", fromUserId: "user_a", toUserId: "", targetId: "node_self",
+      conversationType: 1, content: JSON.stringify({ content: "hi" }),
+    }, turns)
+
+    const frames = streams.map((s) => parseFrame(s.content))
+    const withActivity = frames.filter((f) => Array.isArray(f.activity))
+    expect(withActivity.length).toBeGreaterThanOrEqual(1)
+    // 正文到达之前就已经有一帧把「正在联网搜索」推上去了
+    expect(Number(withActivity[0].seq)).toBeGreaterThan(0)
+    expect((withActivity[0].activity as Array<Record<string, unknown>>)[0]).toMatchObject({ label: "联网搜索" })
+    // 终帧携带完整过程流
+    expect((frames.at(-1)!.activity as Array<Record<string, unknown>>)[0]).toMatchObject({ label: "联网搜索" })
   })
 
   it("chat_stop cancels the active stream and acks accepted", async () => {

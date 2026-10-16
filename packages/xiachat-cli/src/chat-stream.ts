@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
 
+import type { ActivityStep } from "./agent-activity.js";
+
 // chat_stream 协议生产端：把 agent 的一轮回答以流式快照帧发进会话，
 // web 端（clawmessenger-web src/lib/chat-stream.ts）解析后逐帧渲染。
 //
@@ -11,6 +13,9 @@ import { createHash } from "node:crypto";
 // - conversation_type: 1 私聊 / 3 普通群组 / 4 聊天室；
 // - reasoning 是可选的**思考流全量快照**（agent 的 thinking/reasoning
 //   过程），与 text 同帧携带、同 seq 递增；web 端渲染为可折叠「思考过程」。
+// - activity 是可选的**过程流全量快照**（agent 本轮调过的工具步骤：联网搜索、
+//   执行命令、读写文件…），同样与 text 同帧同 seq；三者合起来是气泡里的
+//   「过程」面板。
 // - 单帧序列化后 <= 9000 字节直发（objectName: chat_stream）；超过则按
 //   wire 分块协议（chat_stream_chunk，与 web 端 ChatStreamWireReassembler
 //   互为生产/消费端）分块发送，web 侧重组回完整帧。旧版「按 1800 字符
@@ -33,6 +38,12 @@ export interface ChatStreamFrameInput {
   text: string;
   /** 思考流全量快照（可选）：agent 的 thinking/reasoning 过程文本。 */
   reasoning?: string;
+  /**
+   * 过程流全量快照（可选）：agent 本轮调用过的工具步骤（联网搜索、执行命令、
+   * 读写文件…）。与 text/reasoning 同一套快照语义，web 端渲染成气泡里的
+   * 「过程」面板。没有过程可展示时整字段省略。
+   */
+  activity?: ActivityStep[];
   errorCode?: string;
 }
 
@@ -56,6 +67,7 @@ export function buildChatStreamFrame(input: ChatStreamFrameInput): string {
     text: input.text,
   };
   if (input.reasoning) payload.reasoning = input.reasoning;
+  if (input.activity && input.activity.length > 0) payload.activity = input.activity;
   if (input.errorCode) payload.error_code = input.errorCode;
   return JSON.stringify(payload);
 }

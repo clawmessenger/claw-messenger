@@ -1138,6 +1138,16 @@ func (rt *discussionRuntime) interactiveDispatch(ctx context.Context, d Discussi
 		"role_name":      role.RoleName,
 		"chatroom_id":    d.ChatroomID,
 		"role_prompt":    prompt,
+		// 流式帧路由参数：CLI 据此把 chat_stream 帧直接广播进讨论所在的聊天室
+		// 会话，web 才能看到成员「边想边说」。缺了它 CLI 会退回私聊（1）并把
+		// 帧发给一个根本不存在的私聊 targetId —— 讨论组于是完全没有流式，
+		// 只有轮次结束后的 contribution_completed 整包。
+		//
+		// 与 chatroom_relay.go 的 dispatchTurn、discussion_coordinator.go 的
+		// sendYourTurn 保持同一约定：讨论一定发生在聊天室（4）。
+		// requester_id 留空（正式轮次由服务端编排而非某用户发起，web 端
+		// validStreamDelivery 对群/聊天室只校验 conversation_id）。
+		"conversation_type": 4,
 	}
 	if role.Model != "" {
 		params["model"] = role.Model

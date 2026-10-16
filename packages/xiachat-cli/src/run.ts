@@ -370,6 +370,9 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
         // 思考流增量直接并入 onDelta 第二参：runStreamedTurn 维护
         // reasoningSnapshot 并与正文同帧发出。
         onReasoningChunk: (reasoning) => onDelta("", reasoning),
+        // 过程流（工具调用步骤）走第三参：全量快照，runStreamedTurn 存最新的
+        // 那份并与正文同帧发出。非 stream-json 型 agent 一次都不回调。
+        onActivity: (steps) => onDelta("", undefined, steps),
         signal,
         sessionKey,
       }),

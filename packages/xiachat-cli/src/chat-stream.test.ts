@@ -15,6 +15,16 @@ describe("chat_stream 帧编码", () => {
     expect("reasoning" in without).toBe(false);
   });
 
+  it("activity 非空时进帧、空数组时省略", () => {
+    const steps = [{ id: "t1", kind: "search" as const, label: "联网搜索", detail: "虾说", status: "done" as const }];
+    const withActivity = JSON.parse(buildChatStreamFrame({ ...baseFrame, activity: steps }));
+    expect(withActivity.activity).toEqual(steps);
+    const empty = JSON.parse(buildChatStreamFrame({ ...baseFrame, activity: [] }));
+    expect("activity" in empty).toBe(false);
+    const without = JSON.parse(buildChatStreamFrame(baseFrame));
+    expect("activity" in without).toBe(false);
+  });
+
   it("error_code 正确从 errorCode 输出", () => {
     const frame = JSON.parse(buildChatStreamFrame({ ...baseFrame, status: "failed", errorCode: "boom" }));
     expect(frame.error_code).toBe("boom");
