@@ -374,3 +374,24 @@ describe("CUSTOM_MESSAGE_TYPES（融云注册表）", () => {
     for (const type of webSide) expect(names.has(type)).toBe(true);
   });
 });
+
+describe("SendThrottle（全连接串行发送队列）", () => {
+  it("相邻发送间隔不小于 220ms，且错误不卡死队列", async () => {
+    vi.useFakeTimers();
+    const { SendThrottle } = await import("./run.js");
+    const throttle = new SendThrottle();
+    const stamps: number[] = [];
+    const p1 = throttle.run(async () => { stamps.push(Date.now()); });
+    const p2 = throttle.run(async () => { stamps.push(Date.now()); });
+    const p3 = throttle.run(async () => { throw new Error("boom"); });
+    const p4 = throttle.run(async () => { stamps.push(Date.now()); });
+    await vi.runAllTimersAsync();
+    await Promise.all([p1, p2, p3.catch(() => {}), p4]);
+    expect(stamps.length).toBe(3);
+    for (let i = 1; i < stamps.length; i += 1) {
+      expect(stamps[i] - stamps[i - 1]).toBeGreaterThanOrEqual(200);
+    }
+    await expect(p3).rejects.toThrow("boom");
+    vi.useRealTimers();
+  });
+});

@@ -504,8 +504,37 @@ const SEND_FREQUENCY_TOO_FAST = 20604;
 const SEND_RETRY_ATTEMPTS = 4;
 const SEND_RETRY_BASE_MS = 250;
 
+// 全连接串行发送队列：融云限速是「整个连接每秒 ≤5 条」，不分消息类型。
+// 流帧每 500ms 一帧、一帧超 9KB 又切多个 wire 分块，突发就是限速的数倍 ——
+// 事后退避重试追不上持续突发。所有发送（流帧/分块/command_result/文本）都
+// 过同一个最小间隔队列，从源头不触发 20604；退避重试保留作最后防线。
+// 间隔取 220ms（≈4.5 条/秒），给限速窗口留余量。
+const SEND_QUEUE_INTERVAL_MS = 220;
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * 串行发送节流器：同一进程内所有融云发送共享一个队列，相邻两条间隔不小于
+ * SEND_QUEUE_INTERVAL_MS。回调抛错原样上抛（调用方决定重试/放弃），队列
+ * 不因单条失败卡死。
+ */
+export class SendThrottle {
+  private queue: Promise<void> = Promise.resolve();
+  private lastStart = 0;
+
+  run<T>(task: () => Promise<T>): Promise<T> {
+    const result = this.queue.then(async () => {
+      const wait = this.lastStart + SEND_QUEUE_INTERVAL_MS - Date.now();
+      if (wait > 0) await sleep(wait);
+      this.lastStart = Date.now();
+      return task();
+    });
+    // 队列链不吞错也不因错断：失败的结果照样返回给调用方，链本身继续。
+    this.queue = result.then(() => undefined, () => undefined);
+    return result;
+  }
 }
 
 /**
@@ -540,6 +569,8 @@ export async function createImlibTransport(): Promise<IMTransport> {
   const imlib = await import("@rongcloud/imlib-next");
   const listeners: Array<(msg: InboundIMMessage) => void> = [];
   const customMessages = new Map<string, CommandMessageCtor>();
+  // 本连接共用的串行发送队列（每连接一个实例，见 SendThrottle 注释）。
+  const sendThrottle = new SendThrottle();
   // The user id this transport is logged in as, captured at connect time so
   // the run loop can drop RongCloud's echoes of our own sent messages.
   let selfUserId: string | undefined;
@@ -617,15 +648,17 @@ export async function createImlibTransport(): Promise<IMTransport> {
     async sendMessage(toUserId: string, objectName: string, content: string): Promise<void> {
       const conversation = { conversationType: imlib.ConversationType.PRIVATE, targetId: toUserId };
       const message = toBaseMessage(objectName, content);
-      for (let attempt = 1; ; attempt += 1) {
-        const res = await imlib.sendMessage(conversation, message);
-        if (res.isOk) return;
-        if (res.code !== SEND_FREQUENCY_TOO_FAST || attempt >= SEND_RETRY_ATTEMPTS) {
-          throw new Error(`imlib sendMessage failed: ${res.code} ${res.msg}`);
+      return sendThrottle.run(async () => {
+        for (let attempt = 1; ; attempt += 1) {
+          const res = await imlib.sendMessage(conversation, message);
+          if (res.isOk) return;
+          if (res.code !== SEND_FREQUENCY_TOO_FAST || attempt >= SEND_RETRY_ATTEMPTS) {
+            throw new Error(`imlib sendMessage failed: ${res.code} ${res.msg}`);
+          }
+          // Back off and try again: 250ms, 500ms, 1s.
+          await sleep(SEND_RETRY_BASE_MS * 2 ** (attempt - 1));
         }
-        // Back off and try again: 250ms, 500ms, 1s.
-        await sleep(SEND_RETRY_BASE_MS * 2 ** (attempt - 1));
-      }
+      });
     },
     // Sends into private (1) / group (3) / chatroom (4) conversations.
     // chat_stream frames for relay turns address the room itself.
@@ -638,14 +671,16 @@ export async function createImlibTransport(): Promise<IMTransport> {
         targetId,
       };
       const message = toBaseMessage(objectName, content);
-      for (let attempt = 1; ; attempt += 1) {
-        const res = await imlib.sendMessage(conversation, message);
-        if (res.isOk) return;
-        if (res.code !== SEND_FREQUENCY_TOO_FAST || attempt >= SEND_RETRY_ATTEMPTS) {
-          throw new Error(`imlib sendMessage failed: ${res.code} ${res.msg}`);
+      return sendThrottle.run(async () => {
+        for (let attempt = 1; ; attempt += 1) {
+          const res = await imlib.sendMessage(conversation, message);
+          if (res.isOk) return;
+          if (res.code !== SEND_FREQUENCY_TOO_FAST || attempt >= SEND_RETRY_ATTEMPTS) {
+            throw new Error(`imlib sendMessage failed: ${res.code} ${res.msg}`);
+          }
+          await sleep(SEND_RETRY_BASE_MS * 2 ** (attempt - 1));
         }
-        await sleep(SEND_RETRY_BASE_MS * 2 ** (attempt - 1));
-      }
+      });
     },
     onMessage(cb): void {
       listeners.push(cb);
