@@ -547,6 +547,22 @@ export class MessageDispatcher {
     // 流式心跳定时器：同理，finally 撤。
     let pingTimer: ReturnType<typeof setInterval> | null = null;
     try {
+      // 流式心跳：relay_ 轮**从轮次一开始**就发，不分区分流式/降级路径 ——
+      // openclaw 这类不流式的运行时全程沉默、只在结束时发一帧，若只挂在
+      // 流式分支，它长跑超 60s 照样被服务端轮次超时掐掉（15:36 实测）。
+      // 只要轮还没完成，心跳就证明「这位还活着」，服务端持续续期。
+      if (ctx.requestMessageId.startsWith("relay_") && opts.yourTurnFrom && this.deps.send) {
+        const pingRequestId = `relay_ping_${ctx.requestMessageId}`;
+        const pingTarget = opts.yourTurnFrom;
+        pingTimer = setInterval(() => {
+          if (controller.signal.aborted) return;
+          void this.deps.send!(
+            pingTarget,
+            "command",
+            encodeCommandResult(pingRequestId, "text", { content: "" }),
+          ).catch(() => {});
+        }, STREAM_PING_INTERVAL_MS);
+      }
       if (!canStream) {
         // Degraded path (tests, or an agent without streamed stdout): the
         // old single-shot reply is the whole turn — including the old error
@@ -584,25 +600,6 @@ export class MessageDispatcher {
         return last && last[0] === "r" ? timeline.length - 1 : null;
       };
       let lastSent = 0;
-      // 流式心跳：your_turn 轮流式期间每隔 STREAM_PING_INTERVAL_MS 私聊回
-      // 轮次派发者（= 服务端系统节点）一条 command 心跳（request_id =
-      // relay_ping_<轮次id>）。流帧是群/聊天室广播、不经服务端 webhook，
-      // 服务端只能靠心跳知道「成员还在产出」，否则轮次超时一到就放行下一位
-      // —— 长思考轮必然被掐。服务端对非中继轮次的心跳是 no-op，老服务端
-      // 不识别前缀时也只是找不到会话后丢弃，协议安全。（pingTimer 声明在
-      // try 之外，这里只赋值。）
-      if (ctx.requestMessageId.startsWith("relay_") && opts.yourTurnFrom && this.deps.send) {
-        const pingRequestId = `relay_ping_${ctx.requestMessageId}`;
-        const pingTarget = opts.yourTurnFrom;
-        pingTimer = setInterval(() => {
-          if (controller.signal.aborted) return;
-          void this.deps.send!(
-            pingTarget,
-            "command",
-            encodeCommandResult(pingRequestId, "text", { content: "" }),
-          ).catch(() => {});
-        }, STREAM_PING_INTERVAL_MS);
-      }
       // 节流窗口内到达的过程流更新需要一次补偿帧：长工具阶段正文久久不来，
       // 若完全等下一个 chunk，用户就看不到「正在联网搜索」这一步。
       const emitStreamingFrame = async () => {
