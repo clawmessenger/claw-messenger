@@ -6,6 +6,7 @@ import { StringDecoder } from "node:string_decoder";
 
 import {
   type ActivityStep,
+  classifyTool,
   createActivityTracker,
 } from "./agent-activity.js";
 
@@ -95,10 +96,13 @@ export function buildModelArgs(name: string, model: string | undefined): string[
   return ["--model", model];
 }
 
-// 思考流可用性：这三个 agent 都能以结构化事件模式运行，thinking/reasoning
-// 事件可被解析（见 parseStreamJsonLine）。其余 agent（stdin 模式或无结构化
-// 输出）不吐思考流。
-const STREAM_JSON_AGENTS = new Set(["claude", "codex", "opencode"]);
+// 结构化事件流可用性：这些 agent 都能以「逐行 JSON 事件」模式运行，正文增量
+// 与工具步骤可被解析（见 parseStreamJsonLine / agent-activity.ts）。claude /
+// codex / opencode 另外还会上报 thinking/reasoning 文本；hermes 的流里只有
+// text 与 tool_use/tool_result（它的 stream_json.py 明确不把 reasoning 放进
+// 协议），所以它贡献的是「逐字正文 + 工具过程」，没有思考文本。
+// 其余 agent（stdin 模式、或只吐一次性 JSON 信封如 openclaw）不在此列。
+const STREAM_JSON_AGENTS = new Set(["claude", "codex", "opencode", "hermes"]);
 
 export function agentSupportsReasoning(name: string | undefined): boolean {
   return name !== undefined && STREAM_JSON_AGENTS.has(name);
@@ -138,7 +142,14 @@ const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
     ...(sessionKey ? ["--session-key", sessionKey] : []),
     ...buildModelArgs("openclaw", model),
   ],
-  hermes: (prompt, model) => ["-z", prompt, ...buildModelArgs("hermes", model)],
+  // hermes chat -q … --format stream-json：1.0+ 的 one-shot 结构化事件流
+  // （system/init → text 增量 / tool_use / tool_result → result）。旧的
+  // `-z <prompt>` 只有「最后一坨正文」，工具过程与逐字上屏都拿不到，群聊里
+  // 就只能等整包落地。--oneshot 保证非 TTY 下也是「答完即退」。
+  hermes: (prompt, model) => [
+    "chat", "-q", prompt, "--oneshot", "--format", "stream-json",
+    ...buildModelArgs("hermes", model),
+  ],
 };
 
 // Windows CreateProcess caps the whole command line near 32k chars (and
@@ -334,6 +345,11 @@ export function parseOpenclawJsonOutput(raw: string): string | undefined {
   };
   if (Array.isArray(envelope.payloads)) {
     const texts = envelope.payloads
+      // 思考（isReasoning）与错误（isError）payload 不是正文：混进气泡就是
+      // 把模型的内心独白当成回答。它们走 extractOpenclawEnvelopeDetails。
+      .filter((p) => !(typeof p === "object" && p !== null
+        && ((p as { isReasoning?: unknown }).isReasoning === true
+          || (p as { isError?: unknown }).isError === true)))
       .map((p) => (typeof p === "object" && p !== null ? (p as { text?: unknown }).text : undefined))
       .filter((t): t is string => typeof t === "string" && t.length > 0);
     if (texts.length > 0) return texts.join("\n");
@@ -365,6 +381,67 @@ export function extractOpenclawReply(raw: string): string {
 // 它们只发「处理中 → 完成」两端：终帧本身携带完整正文，气泡照样填满。
 export function emitsJsonEnvelope(agentName: string | undefined): boolean {
   return agentName === "openclaw";
+}
+
+/**
+ * openclaw 的 `agent --local --json` 信封里，除了最终正文还带着本条回复的
+ * payloads（isReasoning 的那些就是模型的思考）与 toolSummary（工具调用汇总）。
+ *
+ * 信封是**一次性**的，所以这里拿到的思考不是逐字流，而是在一轮结束时整段补上
+ * —— 群聊/讨论组里 openclaw 节点因此至少能展开「它想了什么、调了什么工具」，
+ * 而不是只有一个光秃秃的结论。字段缺失时一律返回空对象（老版本信封）。
+ */
+export interface OpenclawEnvelopeDetails {
+  reasoning?: string;
+  tools?: { name: string; calls: number; failures: number }[];
+}
+
+export function extractOpenclawEnvelopeDetails(raw: string): OpenclawEnvelopeDetails {
+  const text = stripAnsiCodes(raw).trim();
+  if (!text.startsWith("{")) return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return {};
+  }
+  if (typeof parsed !== "object" || parsed === null) return {};
+  const envelope = parsed as {
+    payloads?: unknown;
+    toolSummary?: unknown;
+  };
+  const details: OpenclawEnvelopeDetails = {};
+  if (Array.isArray(envelope.payloads)) {
+    const reasoning = envelope.payloads
+      .map((payload) => (typeof payload === "object" && payload !== null
+        ? payload as { isReasoning?: unknown; text?: unknown } : undefined))
+      .filter((payload): payload is { isReasoning?: unknown; text?: unknown } =>
+        payload?.isReasoning === true && typeof payload.text === "string")
+      .map((payload) => (payload.text as string).trim())
+      .filter((chunk) => chunk.length > 0);
+    if (reasoning.length > 0) details.reasoning = reasoning.join("\n\n");
+  }
+  const summary = envelope.toolSummary;
+  if (summary && typeof summary === "object" && !Array.isArray(summary)) {
+    const rec = summary as { tools?: unknown; calls?: unknown; failures?: unknown };
+    const names = Array.isArray(rec.tools)
+      ? rec.tools.filter((name): name is string => typeof name === "string" && name.trim().length > 0)
+      : [];
+    const totalCalls = typeof rec.calls === "number" && rec.calls > 0 ? rec.calls : names.length;
+    const failures = typeof rec.failures === "number" && rec.failures > 0 ? rec.failures : 0;
+    if (names.length > 0) {
+      // 信封只给「工具名 + 总次数」，没有逐次调用 → 每种工具一条汇总步骤，
+      // 次数作为摘要。宁可粒度粗一点也不编造不存在的调用顺序；多种工具时
+      // 总次数无法摊到具体某个工具上，就按 1 次展示、丢失败计数。
+      const single = names.length === 1;
+      details.tools = names.map((name) => ({
+        name,
+        calls: single ? totalCalls : 1,
+        failures: single ? failures : 0,
+      }));
+    }
+  }
+  return details;
 }
 
 export async function discoverAgents(opts: { extraPath?: string }): Promise<AgentInfo[]> {
@@ -541,6 +618,13 @@ export function parseStreamJsonLine(line: string): StreamJsonDelta | null {
     return null;
   }
 
+  // --- hermes ---
+  // 形状：{"type":"text","text":"…"}（增量，无 part）/ {"type":"tool_use",…}
+  // opencode 的 text 事件一定带 part，所以「有 text 没 part」只可能是 hermes。
+  if (event.type === "text" && event.part === undefined && typeof event.text === "string") {
+    return { text: event.text };
+  }
+
   // --- opencode ---
   if (event.type === "reasoning" || event.type === "text") {
     const part = event.part as Record<string, unknown> | undefined;
@@ -564,6 +648,10 @@ export function parseStreamJsonLine(line: string): StreamJsonDelta | null {
 export function extractStreamJsonFinalText(raw: string): string | undefined {
   const texts: string[] = [];
   let claudeResult: string | undefined;
+  // hermes：{"type":"text","text":…} 是**增量**（没有 part），逐条追加即可；
+  // 末尾的 {"type":"result","text":…} 是同一次回答的权威全文，优先用它。
+  const hermesDeltas: string[] = [];
+  let hermesResult: string | undefined;
   // opencode 的正文按 part 分片上报，同一 part 可能重复出现 → 以 id 去重、保序。
   const opencodeTexts = new Map<string, string>();
   for (const line of raw.split("\n")) {
@@ -583,10 +671,16 @@ export function extractStreamJsonFinalText(raw: string): string | undefined {
         && (typeof part.type !== "string" || part.type === "text")) {
         const id = typeof part.id === "string" ? part.id : `anon-${opencodeTexts.size}`;
         opencodeTexts.set(id, part.text);
+      } else if (typeof event.text === "string" && event.text) {
+        hermesDeltas.push(event.text);
       }
     }
     if (event.type === "result" && typeof event.result === "string") {
       claudeResult = event.result;
+    }
+    // hermes 的 result 事件用 text 字段（claude 用 result），且总在最后一条。
+    if (event.type === "result" && typeof event.text === "string") {
+      hermesResult = event.text;
     }
     if (event.type === "assistant") {
       const message = event.message as Record<string, unknown> | undefined;
@@ -609,6 +703,11 @@ export function extractStreamJsonFinalText(raw: string): string | undefined {
     }
   }
   if (claudeResult !== undefined && claudeResult.length > 0) return claudeResult;
+  if (hermesResult !== undefined && hermesResult.trim().length > 0) return hermesResult;
+  if (hermesDeltas.length > 0) {
+    const hm = hermesDeltas.join("");
+    if (hm.trim().length > 0) return hm;
+  }
   if (opencodeTexts.size > 0) {
     const oc = [...opencodeTexts.values()].join("").trim();
     if (oc.length > 0) return oc;
@@ -771,6 +870,25 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
             if (activity && activity.finish()) emitActivity();
             resolve(extractStreamJsonFinalText(stdout) ?? stdout);
           } else {
+            // JSON 信封型 agent（openclaw）：正文之外还能从信封里拿到本轮的
+            // 思考与工具汇总。只能在一轮结束时整段补上（信封是一次性的），
+            // 但足以让群聊/讨论组里的气泡有过程可展开。
+            if (emitsJsonEnvelope(opts.agentName)) {
+              const details = extractOpenclawEnvelopeDetails(stdout);
+              if (details.reasoning) opts.onReasoningChunk?.(details.reasoning);
+              if (details.tools && details.tools.length > 0 && opts.onActivity) {
+                opts.onActivity(details.tools.map((tool) => {
+                  const cls = classifyTool(tool.name);
+                  return {
+                    id: `oc-${tool.name}`,
+                    kind: cls.kind,
+                    label: cls.label,
+                    ...(tool.calls > 1 ? { detail: `共 ${tool.calls} 次` } : {}),
+                    status: tool.failures > 0 && tool.failures >= tool.calls ? "failed" : "done",
+                  } satisfies ActivityStep;
+                }));
+              }
+            }
             resolve(opts.agentName === "openclaw" ? extractOpenclawReply(stdout) : stdout);
           }
         } else {

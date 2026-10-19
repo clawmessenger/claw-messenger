@@ -6,6 +6,7 @@ import {
   buildModelArgs,
   discoverAgents,
   emitsJsonEnvelope,
+  extractOpenclawEnvelopeDetails,
   extractOpenclawReply,
   KNOWN_AGENT_CLIS,
   normalizeOpenclawOutput,
@@ -73,11 +74,15 @@ describe("buildAgentArgs", () => {
     expect(buildAgentArgs("opencode", "hi", undefined, "cm-group-g1")).toEqual([
       "run", "hi", "--format", "json", "--thinking",
     ]);
-    expect(buildAgentArgs("hermes", "hi", undefined, "cm-group-g1")).toEqual(["-z", "hi"]);
+    expect(buildAgentArgs("hermes", "hi", undefined, "cm-group-g1")).toEqual([
+      "chat", "-q", "hi", "--oneshot", "--format", "stream-json",
+    ]);
   });
 
-  it("hermes uses -z with -m", () => {
-    expect(buildAgentArgs("hermes", "hi", "m1")).toEqual(["-z", "hi", "-m", "m1"]);
+  it("hermes 走 chat -q + 结构化事件流（-z 只有整包正文，拿不到工具过程）", () => {
+    expect(buildAgentArgs("hermes", "hi", "m1")).toEqual([
+      "chat", "-q", "hi", "--oneshot", "--format", "stream-json", "-m", "m1",
+    ]);
   });
 
   // The panel stores `provider/model`; codex and hermes take the provider
@@ -92,7 +97,8 @@ describe("buildAgentArgs", () => {
 
   it("hermes passes the provider separately", () => {
     expect(buildAgentArgs("hermes", "hi", "quukk/glm-5.3")).toEqual([
-      "-z", "hi", "-m", "glm-5.3", "--provider", "quukk",
+      "chat", "-q", "hi", "--oneshot", "--format", "stream-json",
+      "-m", "glm-5.3", "--provider", "quukk",
     ]);
   });
 
@@ -107,7 +113,9 @@ describe("buildAgentArgs", () => {
     expect(buildAgentArgs("codex", "hi")).toEqual(["exec", "hi", "--json", "--skip-git-repo-check"]);
     expect(buildAgentArgs("opencode", "hi")).toEqual(["run", "hi", "--format", "json", "--thinking"]);
     expect(buildAgentArgs("openclaw", "hi")).toEqual(["agent", "--local", "--json", "-m", "hi"]);
-    expect(buildAgentArgs("hermes", "hi")).toEqual(["-z", "hi"]);
+    expect(buildAgentArgs("hermes", "hi")).toEqual([
+      "chat", "-q", "hi", "--oneshot", "--format", "stream-json",
+    ]);
   });
 
   it("returns [] for agents without a strategy", () => {
@@ -231,6 +239,48 @@ describe("extractOpenclawReply", () => {
 
   it("falls back to raw trimmed text when extraction comes up empty", () => {
     expect(extractOpenclawReply("  \n raw fallback \n ")).toBe("raw fallback");
+  });
+});
+
+describe("extractOpenclawEnvelopeDetails", () => {
+  it("把 isReasoning 的 payload 抽成思考（不进正文）", () => {
+    const raw = JSON.stringify({
+      payloads: [
+        { text: "先想想用户要什么", isReasoning: true },
+        { text: "你好，有什么可以帮你？" },
+      ],
+    });
+    expect(extractOpenclawEnvelopeDetails(raw).reasoning).toBe("先想想用户要什么");
+    // 正文里绝不能混进思考
+    expect(parseOpenclawJsonOutput(raw)).toBe("你好，有什么可以帮你？");
+  });
+
+  it("多种思考 payload 按顺序拼接", () => {
+    const raw = JSON.stringify({
+      payloads: [{ text: "第一段", isReasoning: true }, { text: "第二段", isReasoning: true }],
+    });
+    expect(extractOpenclawEnvelopeDetails(raw).reasoning).toBe("第一段\n\n第二段");
+  });
+
+  it("toolSummary 折成每一种工具一条汇总步骤", () => {
+    const raw = JSON.stringify({
+      payloads: [{ text: "已查完" }],
+      toolSummary: { calls: 3, tools: ["web_search"], failures: 0, totalToolTimeMs: 1200 },
+    });
+    expect(extractOpenclawEnvelopeDetails(raw).tools).toEqual([
+      { name: "web_search", calls: 3, failures: 0 },
+    ]);
+    const many = JSON.stringify({ toolSummary: { calls: 4, tools: ["web_search", "terminal"] } });
+    expect(extractOpenclawEnvelopeDetails(many).tools).toEqual([
+      { name: "web_search", calls: 1, failures: 0 },
+      { name: "terminal", calls: 1, failures: 0 },
+    ]);
+  });
+
+  it("没有思考/工具字段时返回空对象（老信封）", () => {
+    expect(extractOpenclawEnvelopeDetails(JSON.stringify({ payloads: [{ text: "hi" }] }))).toEqual({});
+    expect(extractOpenclawEnvelopeDetails("收到")).toEqual({});
+    expect(extractOpenclawEnvelopeDetails("")).toEqual({});
   });
 });
 

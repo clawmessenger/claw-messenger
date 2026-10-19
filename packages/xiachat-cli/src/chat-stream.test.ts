@@ -116,10 +116,30 @@ describe("stream-json 解析器", () => {
     expect(extractStreamJsonFinalText(raw)).toBe("答案。");
   });
 
+  it("hermes：text 事件是增量（没有 part），result 里带权威全文", () => {
+    expect(parseStreamJsonLine('{"type":"text","text":"上海"}'))
+      .toEqual({ text: "上海" });
+    const raw = [
+      '{"type":"system","subtype":"init","model":"glm-5.3"}',
+      '{"type":"text","text":"上海"}',
+      '{"type":"text","text":"多云。"}',
+      '{"type":"result","exit_code":0,"text":"上海多云。"}',
+    ].join("\n");
+    expect(extractStreamJsonFinalText(raw)).toBe("上海多云。");
+    // 没有 result（被截断/提前退出）时退回增量拼接
+    expect(extractStreamJsonFinalText('{"type":"text","text":"a"}\n{"type":"text","text":"b"}'))
+      .toBe("ab");
+    // 工具事件不进文本通道
+    expect(parseStreamJsonLine('{"type":"tool_use","name":"web_search","input":{"query":"天气"}}')).toBeNull();
+  });
+
   it("思考流可用性标记", () => {
     expect(agentSupportsReasoning("claude")).toBe(true);
     expect(agentSupportsReasoning("codex")).toBe(true);
     expect(agentSupportsReasoning("opencode")).toBe(true);
+    // hermes 的事件流里没有 reasoning（只有 text/tool），但它在集合里才能走
+    // stream-json 模式拿到工具过程 —— 集合语义是「结构化事件流」。
+    expect(agentSupportsReasoning("hermes")).toBe(true);
     expect(agentSupportsReasoning("openclaw")).toBe(false);
     expect(agentSupportsReasoning(undefined)).toBe(false);
   });

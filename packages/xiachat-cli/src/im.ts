@@ -623,6 +623,14 @@ export class MessageDispatcher {
       const uploaded = await this.collectArtifacts(artifactSnapshot);
       // 终帧用完整全文（agent 的最终 stdout 可能比 chunk 累积更权威）。
       const visibleText = this.ensureVisibleReply(finalText || snapshot, uploaded);
+      // 每轮一行诊断（不含正文）：排查「某个会话看不到思考/过程」时先看这里
+      // —— 设备端唯一一处把三路快照的长度写进日志的地方。reasoning=0 说明
+      // 这一轮的 agent 根本没吐思考文本（或它的结构化输出没开），不是 web 丢帧。
+      console.log(
+        `stream: conv=${ctx.conversationType}/${ctx.conversationId} req=${ctx.requestMessageId}`
+        + ` text=${visibleText.length} reasoning=${reasoningSnapshot.length}`
+        + ` activity=${activitySnapshot.length} frames=${seq}`,
+      );
       await emit(seq, "completed", visibleText, reasoningSnapshot || undefined, undefined, activitySnapshot);
       await opts.fallback(visibleText);
       await this.sendArtifactMessages(ctx, uploaded);

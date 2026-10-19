@@ -1,10 +1,11 @@
 // agent-activity.ts —— 过程流（activity）：把一轮 agent 里「调了什么工具」
 // 落成可上屏的步骤列表，与思考流（reasoning）一起构成用户眼里的「过程」。
 //
-// 数据源：claude（--output-format stream-json --verbose）、codex（exec --json）
-// 与 opencode（run --format json），三者都是逐行 JSON 事件流，工具事件与正文
-// 分道。其余 agent 没有结构化输出，**不做猜测式解析** —— 猜错的代价是把日志
-// 噪声写进用户气泡，比「没有过程」更糟。它们天然降级为只有正文 + 思考。
+// 数据源：claude（--output-format stream-json --verbose）、codex（exec --json）、
+// opencode（run --format json）与 hermes（chat -q --format stream-json），四者都是
+// 逐行 JSON 事件流，工具事件与正文分道。其余 agent 没有结构化输出，**不做猜测
+// 式解析** —— 猜错的代价是把日志噪声写进用户气泡，比「没有过程」更糟。它们天然
+// 降级为只有正文（openclaw 的思考在其一次性 JSON 信封里，由 agents.ts 单独提取）。
 //
 // 语义与 chat_stream 的 text/reasoning 一致：**全量快照**。每一行事件消化后
 // 调用方拿到的是当轮完整的步骤数组（不是增量），丢帧无害。
@@ -43,10 +44,18 @@ const TOOL_LABELS: Readonly<Record<string, { kind: ActivityKind; label: string }
   web_fetch: { kind: "fetch", label: "抓取网页" },
   fetch: { kind: "fetch", label: "抓取网页" },
   bash: { kind: "command", label: "执行命令" },
+  // hermes 的 shell 工具叫 terminal（execute_code 跑代码片段）
+  terminal: { kind: "command", label: "执行命令" },
+  execute_code: { kind: "command", label: "执行代码" },
   command_execution: { kind: "command", label: "执行命令" },
   exec_command: { kind: "command", label: "执行命令" },
   read: { kind: "file", label: "读取文件" },
+  read_file: { kind: "file", label: "读取文件" },
   write: { kind: "file", label: "写入文件" },
+  write_file: { kind: "file", label: "写入文件" },
+  search_files: { kind: "file", label: "搜索内容" },
+  web_extract: { kind: "fetch", label: "抓取网页" },
+  browser_navigate: { kind: "fetch", label: "打开网页" },
   edit: { kind: "file", label: "编辑文件" },
   multiedit: { kind: "file", label: "编辑文件" },
   notebookedit: { kind: "file", label: "编辑文件" },
@@ -312,20 +321,47 @@ export function createActivityTracker(): ActivityTracker {
     // 一次工具调用可能先以 running 上报、完成后再上报一次（同一 callID）。
     if (type === "tool_use") {
       const part = asRecord(event.part);
-      if (!part || asString(part.type) !== "tool") return false;
-      const tool = asString(part.tool) || "tool";
-      const id = asString(part.callID) || asString(part.id) || `${tool}-${steps.length}`;
-      const state = asRecord(part.state);
-      const status = asString(state?.status);
-      const failed = status === "error" || status === "failed";
-      const cls = classifyTool(tool);
+      if (part) {
+        if (asString(part.type) !== "tool") return false;
+        const tool = asString(part.tool) || "tool";
+        const id = asString(part.callID) || asString(part.id) || `${tool}-${steps.length}`;
+        const state = asRecord(part.state);
+        const status = asString(state?.status);
+        const failed = status === "error" || status === "failed";
+        const cls = classifyTool(tool);
+        return upsert(id, {
+          kind: cls.kind,
+          label: cls.label,
+          // 摘要优先取调用参数（bash 的 command、read 的 filePath…），退到 state.title。
+          detail: summarizeToolDetail(state?.input) ?? summarizeToolDetail(state?.title),
+          status: failed ? "failed" : (status === "running" || status === "pending" ? "running" : "done"),
+        });
+      }
+      // --- hermes：chat -q … --format stream-json ---
+      // 形状：{type:"tool_use", name:"web_search", input:{…}, tool_call_id?}
+      //       {type:"tool_result", name:…, tool_call_id?, is_error?}
+      // 没有 part 时按 hermes 处理：先 running，tool_result 到了再收尾。
+      const name = asString(event.name) || "tool";
+      const id = asString(event.tool_call_id) || `${name}-${steps.length}`;
+      const cls = classifyTool(name);
       return upsert(id, {
         kind: cls.kind,
         label: cls.label,
-        // 摘要优先取调用参数（bash 的 command、read 的 filePath…），退到 state.title。
-        detail: summarizeToolDetail(state?.input) ?? summarizeToolDetail(state?.title),
-        status: failed ? "failed" : (status === "running" || status === "pending" ? "running" : "done"),
+        detail: summarizeToolDetail(event.input),
+        status: "running",
       });
+    }
+
+    if (type === "tool_result") {
+      // hermes：按 tool_call_id 收尾；老版本没带 id 时退到「同名最近一步」。
+      const explicit = asString(event.tool_call_id);
+      const name = asString(event.name);
+      const target = explicit
+        ? byId.get(explicit)
+        : [...steps].reverse().find((step) => step.status === "running"
+          && (!name || step.label === classifyTool(name).label));
+      if (!target) return false;
+      return markDone(target.id, event.is_error === true ? "failed" : "done");
     }
 
     // opencode 每步结束：这一步里没再更新的工具视为已完成，别让气泡一直转圈

@@ -256,4 +256,32 @@ describe("createActivityTracker · 健壮性", () => {
       expect(typeof step.endedAt).toBe("number");
     });
   });
+  describe("hermes（chat -q --format stream-json）", () => {
+    it("tool_use 建步骤、tool_result 收尾，工具名映射成中文", () => {
+      const tracker = createActivityTracker();
+      expect(tracker.push(line({ type: "tool_use", name: "web_search",
+        input: { query: "今天上海天气" }, tool_call_id: "call_1" }))).toBe(true);
+      expect(tracker.snapshot()).toMatchObject([
+        { id: "call_1", kind: "search", label: "联网搜索", detail: "今天上海天气", status: "running" },
+      ]);
+      expect(tracker.push(line({ type: "tool_result", name: "web_search", tool_call_id: "call_1" }))).toBe(true);
+      expect(tracker.snapshot()[0]).toMatchObject({ status: "done" });
+      expect(typeof tracker.snapshot()[0]!.endedAt).toBe("number");
+    });
+
+    it("terminal 映射成「执行命令」；is_error 的 result 标失败", () => {
+      const tracker = createActivityTracker();
+      tracker.push(line({ type: "tool_use", name: "terminal", input: { command: "ls -la" } }));
+      expect(tracker.snapshot()[0]).toMatchObject({ kind: "command", label: "执行命令", detail: "ls -la" });
+      tracker.push(line({ type: "tool_result", name: "terminal", is_error: true }));
+      expect(tracker.snapshot()[0]).toMatchObject({ status: "failed" });
+    });
+
+    it("result 事件把悬着的步骤收尾", () => {
+      const tracker = createActivityTracker();
+      tracker.push(line({ type: "tool_use", name: "read_file", input: { path: "a.md" }, tool_call_id: "c9" }));
+      tracker.push(line({ type: "result", exit_code: 0, text: "ok" }));
+      expect(tracker.snapshot()[0]).toMatchObject({ status: "done" });
+    });
+  });
 });
