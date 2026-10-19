@@ -548,6 +548,8 @@ export class MessageDispatcher {
     let pingTimer: ReturnType<typeof setInterval> | null = null;
     /** 本轮心跳失败次数（0 = 链路健康），用于收尾时汇总。 */
     let pingFailures = 0;
+    /** 帧序号。声明在 try 之外：失败收尾也要发一帧，catch 里得看得见它。 */
+    let seq = 0;
     /** 轮次开始时刻：日志里打 elapsed，用来回答「这一轮到底跑了多久」。 */
     const turnStartedAt = Date.now();
     try {
@@ -596,17 +598,23 @@ export class MessageDispatcher {
           await this.sendArtifactMessages(ctx, uploaded);
         } catch (err) {
           const errMsg = err instanceof Error ? err.message : String(err);
+          // 与流式路径同一原则：中继轮失败也要有日志（原来只在私聊分支打）。
+          console.error(
+            `turn failed: conv=${ctx.conversationType}/${ctx.conversationId}`
+            + ` req=${ctx.requestMessageId}`
+            + ` elapsed=${Math.round((Date.now() - turnStartedAt) / 1000)}s`
+            + ` err=${errMsg}`,
+          );
           if (opts.onError) {
             await opts.onError(errMsg);
             return;
           }
           // Single-chat failure: do not reply; the user can retry.
-          console.error("agent turn failed:", errMsg);
         }
         return;
       }
       await emit(0, "processing", "");
-      let seq = 1;
+      seq = 1;
       let snapshot = "";
       // 思考流快照：与正文快照同帧携带（reasoning 字段），同 seq 递增。
       let reasoningSnapshot = "";
@@ -711,6 +719,27 @@ export class MessageDispatcher {
       await emit(seq, "completed", visibleText, reasoningSnapshot || undefined, undefined, activitySnapshot, timeline);
       await opts.fallback(visibleText);
       await this.sendArtifactMessages(ctx, uploaded);
+    } catch (err) {
+      // 失败必须留痕 + 发终帧。原来这条路径只有 finally：异常冒泡出去，
+      // 前端收不到任何终态（「正在思考」永远转圈），设备端也没有一行日志
+      // —— 18:13 的现场就是 hermes 的模型 429 每轮静默失败，服务端照常派
+      // 下一位，看起来像「上一位卡住、下一位抢话」。
+      const errMsg = err instanceof Error ? err.message : String(err);
+      console.error(
+        `stream failed: conv=${ctx.conversationType}/${ctx.conversationId}`
+        + ` req=${ctx.requestMessageId}`
+        + ` elapsed=${Math.round((Date.now() - turnStartedAt) / 1000)}s`
+        + ` err=${errMsg}`,
+      );
+      // chat_stop 的收尾由 handleChatStop 负责，别在这里抢发帧。
+      if (!controller.signal.aborted) {
+        await emit(seq, "failed", "", undefined, "agent_failed").catch(() => {});
+      }
+      // 中继轮（your_turn）必须回 command_result：服务端靠它推进下一位，
+      // 不回就只能干等超时。重复回包由服务端按 requestID 吞掉，安全。
+      if (opts.onError) {
+        await opts.onError(errMsg).catch(() => {});
+      }
     } finally {
       // 心跳随轮次结束：终帧/取消/失败之后都不再发。
       if (pingTimer !== null) {
