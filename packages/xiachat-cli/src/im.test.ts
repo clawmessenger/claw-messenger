@@ -1216,6 +1216,77 @@ describe("MessageDispatcher chat_stream streaming", () => {
   })
 })
 
+describe("chat_stream timeline（思考段与工具调用交错）", () => {
+  function buildStreams() {
+    const streams: Array<{ conversationType: number; conversationId: string; content: string }> = []
+    const deps = {
+      sent: [],
+      send: async () => {},
+      sendStream: async (conversationType: 1 | 3 | 4, conversationId: string, _o: string, content: string) => {
+        streams.push({ conversationType, conversationId, content })
+      },
+      selfUserId: "node_self",
+    }
+    return { deps, streams }
+  }
+
+  it("思考增量接到同段；工具调用新开条目；思考再续新开段", async () => {
+    const { deps, streams } = buildStreams()
+    const dispatcher = new MessageDispatcher(deps)
+    const turns = {
+      runTurn: async () => { throw new Error("should use streamed variant") },
+      runTurnStreamed: async (_p: string, _m: string | undefined, onDelta: (d: string, r?: string, a?: ActivityStep[]) => void) => {
+        onDelta("", "先想想");               // 段1 开始
+        onDelta("", " 用户要什么");          // 段1 续
+        onDelta("", undefined, [
+          { id: "call_1", kind: "search", label: "联网搜索", status: "running", startedAt: 1 },
+        ]);
+        onDelta("", "再想想细节");            // 工具之后 → 新段
+        return "答案";
+      },
+    }
+    await dispatcher.handle({
+      objectName: "RC:TxtMsg", fromUserId: "user_a", toUserId: "", targetId: "node_self",
+      conversationType: 1, content: JSON.stringify({ content: "hi" }),
+    }, turns)
+
+    const terminal = streams
+      .map((s) => JSON.parse(s.content) as Record<string, unknown>)
+      .at(-1)!;
+    const timeline = terminal.timeline as Array<[string, string]>;
+    expect(timeline).toEqual([
+      ["r", "先想想 用户要什么"],
+      ["s", "call_1"],
+      ["r", "再想想细节"],
+    ]);
+    // reasoning 全文快照与终帧仍在（向后兼容）
+    expect(terminal.reasoning).toBe("先想想 用户要什么再想想细节");
+    expect(terminal.text).toBe("答案");
+  });
+
+  it("同一工具重复上报不重复入时间线", async () => {
+    const { deps, streams } = buildStreams()
+    const dispatcher = new MessageDispatcher(deps)
+    const turns = {
+      runTurn: async () => { throw new Error("should use streamed variant") },
+      runTurnStreamed: async (_p: string, _m: string | undefined, onDelta: (d: string, r?: string, a?: ActivityStep[]) => void) => {
+        onDelta("", undefined, [{ id: "call_1", kind: "search", label: "联网搜索", status: "running" }]);
+        onDelta("", undefined, [{ id: "call_1", kind: "search", label: "联网搜索", status: "done", startedAt: 1, endedAt: 2 }]);
+        return "答案";
+      },
+    }
+    await dispatcher.handle({
+      objectName: "RC:TxtMsg", fromUserId: "user_a", toUserId: "", targetId: "node_self",
+      conversationType: 1, content: JSON.stringify({ content: "hi" }),
+    }, turns)
+
+    const terminal = streams
+      .map((s) => JSON.parse(s.content) as Record<string, unknown>)
+      .at(-1)!;
+    expect(terminal.timeline).toEqual([["s", "call_1"]]);
+  });
+});
+
 describe("planReadReceipt (已读回执判定)", () => {
   it("单聊：收到带 needReceipt 的消息 → 回给发送方", () => {
     expect(planReadReceipt({

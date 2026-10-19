@@ -26,6 +26,17 @@ import type { ActivityStep } from "./agent-activity.js";
 
 export type ChatStreamStatus = "processing" | "streaming" | "completed" | "cancelled" | "failed";
 
+/**
+ * 时间线条目：按真实发生顺序记录「一段思考」与「一次工具调用」的交错关系。
+ *   ["r", "先想想用户要什么…"]  —— 一段思考文本（追加语义）
+ *   ["s", "call_1"]             —— 一次工具调用，id 对应 activity[].id
+ * 工具步骤的完整内容（label/detail/status/耗时）仍在 activity 快照里，
+ * timeline 只存引用，避免同一步骤在两处各存一份、翻倍帧体积。
+ */
+export type ChatStreamTimelineEntry =
+  | ["r", string]
+  | ["s", string];
+
 export interface ChatStreamFrameInput {
   streamId: string;
   requestMessageId: string;
@@ -44,6 +55,11 @@ export interface ChatStreamFrameInput {
    * 「过程」面板。没有过程可展示时整字段省略。
    */
   activity?: ActivityStep[];
+  /**
+   * 过程时间线全量快照（可选）：思考段与工具调用的真实顺序。给 web 渲染
+   * 「思考卡片 ↔ 工具卡片交错」用；缺省时 web 端退回平铺渲染（老协议兼容）。
+   */
+  timeline?: ChatStreamTimelineEntry[];
   errorCode?: string;
 }
 
@@ -68,6 +84,7 @@ export function buildChatStreamFrame(input: ChatStreamFrameInput): string {
   };
   if (input.reasoning) payload.reasoning = input.reasoning;
   if (input.activity && input.activity.length > 0) payload.activity = input.activity;
+  if (input.timeline && input.timeline.length > 0) payload.timeline = input.timeline;
   if (input.errorCode) payload.error_code = input.errorCode;
   return JSON.stringify(payload);
 }

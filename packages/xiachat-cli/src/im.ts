@@ -5,7 +5,7 @@ import { ARGV_PROMPT_MAX_CHARS } from "./agents.js";
 import { collectProducedArtifacts, snapshotWorkdir, type ProducedArtifact, type WorkdirSnapshot } from "./artifacts.js";
 import type { ActivityStep } from "./agent-activity.js";
 import { decodeCommandContent, encodeCommandResult } from "./protocol.js";
-import { buildChatStreamFrame, encodeChatStreamWireFrames, parseChatStopRequest, type ChatStreamStatus } from "./chat-stream.js";
+import { buildChatStreamFrame, encodeChatStreamWireFrames, parseChatStopRequest, type ChatStreamStatus, type ChatStreamTimelineEntry } from "./chat-stream.js";
 import { buildHtmlCard, extractHtmlFence, htmlReviseFromFilePrompt, htmlRevisePrompt } from "./cards.js";
 import {
   buildModelCatalogResponse,
@@ -483,6 +483,7 @@ export class MessageDispatcher {
       reasoning?: string,
       errorCode?: string,
       activity?: ActivityStep[],
+      timeline?: ChatStreamTimelineEntry[],
     ) => {
       const serialized = buildChatStreamFrame({
         streamId: ctx.streamId,
@@ -496,6 +497,7 @@ export class MessageDispatcher {
         text,
         ...(reasoning ? { reasoning } : {}),
         ...(activity && activity.length > 0 ? { activity } : {}),
+        ...(timeline && timeline.length > 0 ? { timeline } : {}),
         ...(errorCode ? { errorCode } : {}),
       });
       // 融云单条消息 ~9KB 上限：超限帧切 wire 分块（web 端重组器还原）。
@@ -510,11 +512,12 @@ export class MessageDispatcher {
       reasoning?: string,
       errorCode?: string,
       activity?: ActivityStep[],
+      timeline?: ChatStreamTimelineEntry[],
     ) => {
       const sendStream = this.deps.sendStream;
       if (!sendStream) return;
       try {
-        for (const wire of frame(seq, status, text, reasoning, errorCode, activity)) {
+        for (const wire of frame(seq, status, text, reasoning, errorCode, activity, timeline)) {
           await sendStream(ctx.conversationType, ctx.conversationId, wire.objectName, wire.content);
         }
       } catch (err) {
@@ -562,6 +565,15 @@ export class MessageDispatcher {
       let reasoningSnapshot = "";
       // 过程流快照：agent 本轮的工具调用步骤（联网搜索/执行命令/读写文件…）。
       let activitySnapshot: ActivityStep[] = [];
+      // 过程时间线：思考段与工具调用的真实顺序。思考增量接到最后一个思考段
+      // （新的一段思考——工具之后又思考——新开条目）；工具步骤只存 id 引用
+      // （内容在 activitySnapshot 里），这样同一份信息不会在帧里存两遍。
+      // web 端按它渲染「思考卡片 ↔ 工具卡片」交错的流式时间线。
+      let timeline: ChatStreamTimelineEntry[] = [];
+      const activeReasoningEntry = (): number | null => {
+        const last = timeline[timeline.length - 1];
+        return last && last[0] === "r" ? timeline.length - 1 : null;
+      };
       let lastSent = 0;
       // 节流窗口内到达的过程流更新需要一次补偿帧：长工具阶段正文久久不来，
       // 若完全等下一个 chunk，用户就看不到「正在联网搜索」这一步。
@@ -569,13 +581,27 @@ export class MessageDispatcher {
         const frameSeq = seq;
         seq += 1;
         lastSent = Date.now();
-        await emit(frameSeq, "streaming", snapshot, reasoningSnapshot || undefined, undefined, activitySnapshot);
+        await emit(frameSeq, "streaming", snapshot, reasoningSnapshot || undefined, undefined, activitySnapshot, timeline);
       };
       const sendDelta = async (delta: string, reasoningDelta?: string, activity?: ActivityStep[]) => {
         if (controller.signal.aborted) return;
         snapshot += delta;
-        if (reasoningDelta) reasoningSnapshot += reasoningDelta;
-        if (activity) activitySnapshot = activity;
+        if (reasoningDelta) {
+          reasoningSnapshot += reasoningDelta;
+          const at = activeReasoningEntry();
+          if (at !== null) timeline[at]![1] += reasoningDelta;
+          else timeline.push(["r", reasoningDelta]);
+        }
+        if (activity) {
+          // 工具步骤按 activity 快照里的顺序补进时间线：新步骤（id 没出现过）
+          // 追加 ["s", id]；已有的只更新快照，时间线不动。claude/opencode 的
+          // 工具在思考之后出现，顺序天然正确。
+          const seen = new Set(timeline.filter((e): e is ["s", string] => e[0] === "s").map((e) => e[1]));
+          for (const step of activity) {
+            if (!seen.has(step.id)) timeline.push(["s", step.id]);
+          }
+          activitySnapshot = activity;
+        }
         const now = Date.now();
         // 节流：距上一帧不足间隔时只攒不动，由下个 chunk 或终帧冲刷。
         if (now - lastSent < STREAM_FRAME_INTERVAL_MS) {
@@ -600,11 +626,11 @@ export class MessageDispatcher {
         );
       } catch (err) {
         if (controller.signal.aborted) {
-          await emit(seq, "cancelled", snapshot, reasoningSnapshot || undefined, undefined, activitySnapshot);
+          await emit(seq, "cancelled", snapshot, reasoningSnapshot || undefined, undefined, activitySnapshot, timeline);
           return;
         }
         const errMsg = err instanceof Error ? err.message : String(err);
-        await emit(seq, "failed", snapshot, reasoningSnapshot || undefined, errMsg.slice(0, 120), activitySnapshot);
+        await emit(seq, "failed", snapshot, reasoningSnapshot || undefined, errMsg.slice(0, 120), activitySnapshot, timeline);
         if (opts.onError) {
           await opts.onError(errMsg);
           return;
@@ -631,7 +657,7 @@ export class MessageDispatcher {
         + ` text=${visibleText.length} reasoning=${reasoningSnapshot.length}`
         + ` activity=${activitySnapshot.length} frames=${seq}`,
       );
-      await emit(seq, "completed", visibleText, reasoningSnapshot || undefined, undefined, activitySnapshot);
+      await emit(seq, "completed", visibleText, reasoningSnapshot || undefined, undefined, activitySnapshot, timeline);
       await opts.fallback(visibleText);
       await this.sendArtifactMessages(ctx, uploaded);
     } finally {
