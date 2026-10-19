@@ -941,3 +941,11 @@ func TestRelayHub_StreamPingUnknownTurnConsumed(t *testing.T) {
 		t.Fatal("non-ping request id must not be consumed by the ping path")
 	}
 }
+
+func TestRelayTurnTimeoutFloor(t *testing.T) {
+	// 60s（管理端初始配置）必须被抬到 180s 保底 —— openclaw 这类不流式的
+	// 长思考轮 90~120s，60s 会让下一位提前开跑。
+	if relayTurnTimeoutFloor < 150*time.Second {
+		t.Fatalf("floor too small for long thinking turns: %v", relayTurnTimeoutFloor)
+	}
+}

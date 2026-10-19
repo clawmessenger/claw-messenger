@@ -355,6 +355,16 @@ func (h *chatroomRelayHub) Start(ctx context.Context, chatroomRCID string, membe
 // 聊 N 轮」的实现。聊天室 totalRounds 恒为 1，循环只走一圈，行为与从前一致。
 func (h *chatroomRelayHub) pump(ctx context.Context, s *relaySession) {
 	timeout := h.rt.interactiveTurnTimeout()
+	// 保底：中继单轮等待不低于 relayTurnTimeoutFloor（见常量注释）。
+	extended := false
+	if timeout < relayTurnTimeoutFloor {
+		timeout = relayTurnTimeoutFloor
+		extended = true
+	}
+	if extended {
+		h.rt.logger.Info("relay: turn timeout raised to floor",
+			"chatroom", s.chatroomRCID, "timeout", timeout)
+	}
 	defer func() {
 		h.mu.Lock()
 		replies := append([]relayReply(nil), s.allReplies...)
@@ -780,6 +790,13 @@ func renderRelayRound(round relayRound) string {
 // 「成员还在产出」的信号。老设备不发心跳 → 行为与从前一致（纯固定超时）。
 const relayPingPrefix = "relay_ping_"
 
+// relayTurnTimeoutFloor 是群聊/聊天室中继单轮的**保底**等待时长，不受管理端
+// 「系统主持 timeout_seconds」（初始 60s）影响。群聊里长思考的运行时（openclaw
+// 这类不流式的）单轮动辄 90~120s，60s 一到服务端就放行下一位，用户看到的就是
+// 「上一位还在思考，下一位已经开跑」。心跳能续期，但心跳链路的任何一环出问题
+// 都不该让房间越序 —— 保底值兜住最常见的长轮，心跳负责更长的情况。
+const relayTurnTimeoutFloor = 180 * time.Second
+
 // NotifyStreamActivity 心跳入口：按前缀还原真实轮次 request_id 并续期。
 // 返回 true 表示这条消息被当作心跳消化（调用方不要再当回包处理）。
 func (h *chatroomRelayHub) NotifyStreamActivity(requestID string) bool {
@@ -791,10 +808,20 @@ func (h *chatroomRelayHub) NotifyStreamActivity(requestID string) bool {
 	defer h.mu.Unlock()
 	for _, s := range h.sessions {
 		if s.requestID == turnID && s.turnExt != nil {
-			s.turnExt.deadline = time.Now().Add(h.rt.interactiveTurnTimeout())
+			window := h.rt.interactiveTurnTimeout()
+			if window < relayTurnTimeoutFloor {
+				window = relayTurnTimeoutFloor
+			}
+			s.turnExt.deadline = time.Now().Add(window)
+			// 心跳是排查「轮次越序」的关键证据，按 Info 留痕（每 15s 一条，
+			// 量可控）；连续出现即证明心跳链路通。
+			h.rt.logger.Info("relay: turn extended by heartbeat",
+				"chatroom", s.chatroomRCID, "turn", turnID)
 			return true
 		}
 	}
+	h.rt.logger.Warn("relay: heartbeat for unknown/stale turn",
+		"turn", turnID)
 	// 心跳晚到（轮已推进/超时作废）：同样按心跳消化，别往下漏。
 	return true
 }
