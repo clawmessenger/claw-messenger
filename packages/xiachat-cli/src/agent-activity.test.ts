@@ -161,4 +161,64 @@ describe("createActivityTracker · 健壮性", () => {
     snapshot[0]!.status = "failed";
     expect(tracker.snapshot()[0]?.status).toBe("running");
   });
+
+  // opencode `run --format json` 的真实 tool_use 事件（1.19 实测抓取）。
+  describe("opencode tool_use", () => {
+    const opencodeTool = (part: Record<string, unknown>): string =>
+      line({ type: "tool_use", timestamp: 1, part: { type: "tool", ...part } });
+
+    it("按 callID 落一步，命令与状态都取到", () => {
+      const tracker = createActivityTracker();
+      expect(tracker.push(opencodeTool({
+        tool: "bash",
+        callID: "call_1",
+        state: { status: "completed", input: { command: "ls" }, title: "ls" },
+      }))).toBe(true);
+      expect(tracker.snapshot()).toEqual([
+        { id: "call_1", kind: "command", label: "执行命令", detail: "ls", status: "done" },
+      ]);
+    });
+
+    it("先 running 后 completed 只更新同一步，不新增步骤", () => {
+      const tracker = createActivityTracker();
+      tracker.push(opencodeTool({
+        tool: "bash", callID: "call_2", state: { status: "running", input: { command: "npm test" } },
+      }));
+      expect(tracker.snapshot()[0]?.status).toBe("running");
+      tracker.push(opencodeTool({
+        tool: "bash", callID: "call_2", state: { status: "completed", input: { command: "npm test" } },
+      }));
+      const steps = tracker.snapshot();
+      expect(steps).toHaveLength(1);
+      expect(steps[0]?.status).toBe("done");
+    });
+
+    it("error 状态记成失败；读文件走 file 类别", () => {
+      const tracker = createActivityTracker();
+      tracker.push(opencodeTool({
+        tool: "read", callID: "call_3", state: { status: "error", input: { filePath: "/tmp/a.txt" } },
+      }));
+      expect(tracker.snapshot()[0]).toMatchObject({
+        kind: "file", label: "读取文件", detail: "/tmp/a.txt", status: "failed",
+      });
+    });
+
+    it("step_finish 把仍 running 的步骤收尾", () => {
+      const tracker = createActivityTracker();
+      tracker.push(opencodeTool({
+        tool: "grep", callID: "call_4", state: { status: "running", input: { pattern: "TODO" } },
+      }));
+      expect(tracker.push(line({ type: "step_finish", part: { type: "step-finish", reason: "stop" } }))).toBe(true);
+      expect(tracker.snapshot()[0]?.status).toBe("done");
+    });
+
+    it("没有 callID 时用 part.id 兜底，纯文本 part 不算工具", () => {
+      const tracker = createActivityTracker();
+      expect(tracker.push(line({ type: "text", part: { id: "p1", type: "text", text: "hi" } }))).toBe(false);
+      expect(tracker.push(opencodeTool({
+        id: "prt_9", tool: "webfetch", state: { status: "completed", input: { url: "https://x.dev" } },
+      }))).toBe(true);
+      expect(tracker.snapshot()[0]).toMatchObject({ id: "prt_9", kind: "fetch", detail: "https://x.dev" });
+    });
+  });
 });

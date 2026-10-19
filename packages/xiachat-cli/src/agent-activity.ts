@@ -1,10 +1,10 @@
 // agent-activity.ts —— 过程流（activity）：把一轮 agent 里「调了什么工具」
 // 落成可上屏的步骤列表，与思考流（reasoning）一起构成用户眼里的「过程」。
 //
-// 数据源只有两个 agent：claude（--output-format stream-json --verbose）与
-// codex（exec --json），两者都是逐行 JSON 事件流，工具事件与正文分道。其余
-// agent 没有结构化输出，**不做猜测式解析** —— 猜错的代价是把日志噪声写进
-// 用户气泡，比「没有过程」更糟。它们天然降级为只有正文 + 思考。
+// 数据源：claude（--output-format stream-json --verbose）、codex（exec --json）
+// 与 opencode（run --format json），三者都是逐行 JSON 事件流，工具事件与正文
+// 分道。其余 agent 没有结构化输出，**不做猜测式解析** —— 猜错的代价是把日志
+// 噪声写进用户气泡，比「没有过程」更糟。它们天然降级为只有正文 + 思考。
 //
 // 语义与 chat_stream 的 text/reasoning 一致：**全量快照**。每一行事件消化后
 // 调用方拿到的是当轮完整的步骤数组（不是增量），丢帧无害。
@@ -49,7 +49,9 @@ const TOOL_LABELS: Readonly<Record<string, { kind: ActivityKind; label: string }
   file_change: { kind: "file", label: "修改文件" },
   glob: { kind: "file", label: "查找文件" },
   ls: { kind: "file", label: "列出目录" },
+  list: { kind: "file", label: "列出目录" },
   grep: { kind: "file", label: "搜索内容" },
+  patch: { kind: "file", label: "编辑文件" },
   task: { kind: "tool", label: "子任务" },
   todowrite: { kind: "tool", label: "更新待办" },
   todo_list: { kind: "tool", label: "更新待办" },
@@ -202,8 +204,8 @@ export function createActivityTracker(): ActivityTracker {
     if (!event) return false;
     const type = asString(event.type);
 
-    // 两个 agent 的「本轮结束」事件：把悬着的 running 收掉。
-    if (type === "result" || type === "turn.completed") return finish();
+    // 三个 agent 的「本轮结束」事件：把悬着的 running 收掉。
+    if (type === "result" || type === "turn.completed" || type === "step_finish") return finish();
 
     // --- claude：stream_event 里逐个 content block 上报 ---
     if (type === "stream_event") {
@@ -295,6 +297,31 @@ export function createActivityTracker(): ActivityTracker {
         status: type === "item.started" ? "running" : (failed ? "failed" : "done"),
       });
     }
+
+    // --- opencode：run --format json 的 tool_use 事件 ---
+    // 形状：{type:"tool_use", part:{type:"tool", tool:"bash", callID:"call_…",
+    //        state:{status:"completed"|"running"|"error", input:{…}, title:"…"}}}
+    // 一次工具调用可能先以 running 上报、完成后再上报一次（同一 callID）。
+    if (type === "tool_use") {
+      const part = asRecord(event.part);
+      if (!part || asString(part.type) !== "tool") return false;
+      const tool = asString(part.tool) || "tool";
+      const id = asString(part.callID) || asString(part.id) || `${tool}-${steps.length}`;
+      const state = asRecord(part.state);
+      const status = asString(state?.status);
+      const failed = status === "error" || status === "failed";
+      const cls = classifyTool(tool);
+      return upsert(id, {
+        kind: cls.kind,
+        label: cls.label,
+        // 摘要优先取调用参数（bash 的 command、read 的 filePath…），退到 state.title。
+        detail: summarizeToolDetail(state?.input) ?? summarizeToolDetail(state?.title),
+        status: failed ? "failed" : (status === "running" || status === "pending" ? "running" : "done"),
+      });
+    }
+
+    // opencode 每步结束：这一步里没再更新的工具视为已完成，别让气泡一直转圈
+    // （上面的 step_finish 分支已经收尾，这里不再重复）。
 
     return false;
   };

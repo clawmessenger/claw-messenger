@@ -95,10 +95,10 @@ export function buildModelArgs(name: string, model: string | undefined): string[
   return ["--model", model];
 }
 
-// 思考流可用性：这两个 agent 以 stream-json 模式运行，thinking/reasoning
+// 思考流可用性：这三个 agent 都能以结构化事件模式运行，thinking/reasoning
 // 事件可被解析（见 parseStreamJsonLine）。其余 agent（stdin 模式或无结构化
 // 输出）不吐思考流。
-const STREAM_JSON_AGENTS = new Set(["claude", "codex"]);
+const STREAM_JSON_AGENTS = new Set(["claude", "codex", "opencode"]);
 
 export function agentSupportsReasoning(name: string | undefined): boolean {
   return name !== undefined && STREAM_JSON_AGENTS.has(name);
@@ -120,7 +120,16 @@ const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
     "--json", "--skip-git-repo-check",
     ...buildModelArgs("codex", model),
   ],
-  opencode: (prompt, model) => ["run", prompt, ...buildModelArgs("opencode", model)],
+  // --format json --thinking：opencode 1.19 起支持逐行 JSON 事件（reasoning /
+  // tool_use / text / step_start / step_finish），是思考流与过程流的数据源。
+  // 不传这两个参数时它只输出「格式化好的纯文本」，思考与工具步骤全都拿不到
+  // ——私聊里「AI 答了但看不到它想了什么、调了什么」就是这么来的。
+  // ⚠️ `--format` 是 1.19 才有的参数；更老的 opencode 收到未知参数会直接退出。
+  opencode: (prompt, model) => [
+    "run", prompt,
+    "--format", "json", "--thinking",
+    ...buildModelArgs("opencode", model),
+  ],
   // --session-key 把这一轮绑到「会话形态 + 会话 id」的独立会话上。不带它时
   // openclaw 一律走默认主会话（agent:main:main），群聊会被讨论组的上下文
   // 带跑（见 RunAgentTurnOpts.sessionKey）。
@@ -474,9 +483,23 @@ export function runAgentCommand(opts: RunAgentCommandOpts): Promise<string> {
 //   {"type":"item.completed","item":{"type":"agent_message","text":"…"}}
 //   {"type":"item.started","item":{"type":"agent_message"}}
 //   {"type":"turn.completed","usage":{…}}
+//
+// opencode run --format json --thinking（1.19 实测）：
+//   {"type":"step_start","part":{"type":"step-start"}}
+//   {"type":"reasoning","part":{"id":"prt_…","type":"reasoning","text":"…"}}
+//   {"type":"tool_use","part":{"type":"tool","tool":"bash","callID":"call_…","state":{…}}}
+//   {"type":"text","part":{"id":"prt_…","type":"text","text":"…"}}
+//   {"type":"step_finish","part":{"type":"step-finish","reason":"stop"}}
+// 与 claude/codex 的关键差异：它上报的是**整段 part 的全文**（同一 part 可能被
+// 反复上报），不是增量。所以解析结果带 replace/partId，由调用方按 part 去重后
+// 只发新增后缀，否则正文会成倍重复。
 export interface StreamJsonDelta {
   reasoning?: string;
   text?: string;
+  /** 整段全文语义下，这条内容属于哪个 part（opencode 用；其余 agent 不带）。 */
+  partId?: string;
+  /** true = 本次给出的是该 part 的完整文本，调用方需自行换算增量。 */
+  replace?: boolean;
 }
 
 export function parseStreamJsonLine(line: string): StreamJsonDelta | null {
@@ -517,14 +540,32 @@ export function parseStreamJsonLine(line: string): StreamJsonDelta | null {
     }
     return null;
   }
+
+  // --- opencode ---
+  if (event.type === "reasoning" || event.type === "text") {
+    const part = event.part as Record<string, unknown> | undefined;
+    if (!part || typeof part.text !== "string" || !part.text) return null;
+    // 只认与事件同名的 part 类型：`reasoning` 事件里偶尔会混进别的 part。
+    const partType = typeof part.type === "string" ? part.type : "";
+    const id = typeof part.id === "string" ? part.id : undefined;
+    if (event.type === "reasoning") {
+      if (partType && partType !== "reasoning") return null;
+      return { reasoning: part.text, partId: id, replace: true };
+    }
+    if (partType && partType !== "text") return null;
+    return { text: part.text, partId: id, replace: true };
+  }
   return null;
 }
 
 // 从 stream-json 全量 stdout 提取最终正文（claude 优先 result.result / 最长
-// assistant 文本；codex 聚合 agent_message）。空时返回 undefined 走兜底。
+// assistant 文本；codex 聚合 agent_message；opencode 按 part 顺序拼 text part）。
+// 空时返回 undefined 走兜底。
 export function extractStreamJsonFinalText(raw: string): string | undefined {
   const texts: string[] = [];
   let claudeResult: string | undefined;
+  // opencode 的正文按 part 分片上报，同一 part 可能重复出现 → 以 id 去重、保序。
+  const opencodeTexts = new Map<string, string>();
   for (const line of raw.split("\n")) {
     const trimmed = line.trim();
     if (!trimmed.startsWith("{")) continue;
@@ -536,6 +577,14 @@ export function extractStreamJsonFinalText(raw: string): string | undefined {
     }
     if (typeof parsed !== "object" || parsed === null) continue;
     const event = parsed as Record<string, unknown>;
+    if (event.type === "text") {
+      const part = event.part as Record<string, unknown> | undefined;
+      if (part && typeof part.text === "string" && part.text
+        && (typeof part.type !== "string" || part.type === "text")) {
+        const id = typeof part.id === "string" ? part.id : `anon-${opencodeTexts.size}`;
+        opencodeTexts.set(id, part.text);
+      }
+    }
     if (event.type === "result" && typeof event.result === "string") {
       claudeResult = event.result;
     }
@@ -560,6 +609,10 @@ export function extractStreamJsonFinalText(raw: string): string | undefined {
     }
   }
   if (claudeResult !== undefined && claudeResult.length > 0) return claudeResult;
+  if (opencodeTexts.size > 0) {
+    const oc = [...opencodeTexts.values()].join("").trim();
+    if (oc.length > 0) return oc;
+  }
   const joined = texts.join("\n").trim();
   return joined.length > 0 ? joined : undefined;
 }
@@ -626,7 +679,7 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
     };
     opts.signal?.addEventListener("abort", onAbort, { once: true });
 
-    // stream-json 模式（claude/codex）：stdout 是逐行 JSON 事件流。行缓冲
+    // stream-json 模式（claude/codex/opencode）：stdout 是逐行 JSON 事件流。行缓冲
     // 切分（\n 边界），thinking/text 增量分道回调；原始字节照常入 chunks，
     // 结束时用 extractStreamJsonFinalText 提取权威正文。
     const streamJsonMode = agentSupportsReasoning(opts.agentName) && argvMode;
@@ -641,6 +694,18 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
       if (!activity || !opts.onActivity) return;
       opts.onActivity(activity.snapshot());
     };
+    // opencode 上报的是「整段 part 全文」而不是增量，这里按 part 记住已经发出的
+    // 长度，只补新增后缀。少了这一层，同一段文字会被反复追加 → 气泡里正文翻倍。
+    const partSent = new Map<string, number>();
+    const emitPart = (kind: "reasoning" | "text", partId: string, full: string): void => {
+      const key = `${kind}:${partId}`;
+      const prev = partSent.get(key) ?? 0;
+      if (full.length <= prev) return;
+      partSent.set(key, full.length);
+      const suffix = full.slice(prev);
+      if (kind === "reasoning") opts.onReasoningChunk?.(suffix);
+      else opts.onChunk?.(suffix);
+    };
     const emitStreamJson = (flushed: string) => {
       // 工具事件先消化：同一个 JSONL 行里 tool 事件与正文不会共存（claude 的
       // tool_use 走 content_block_*，codex 走 item.*），但收尾事件的顺序不能
@@ -648,6 +713,11 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
       if (activity && activity.push(flushed)) emitActivity();
       const delta = parseStreamJsonLine(flushed);
       if (!delta) return;
+      if (delta.replace && delta.partId) {
+        if (delta.reasoning !== undefined) emitPart("reasoning", delta.partId, delta.reasoning);
+        if (delta.text !== undefined) emitPart("text", delta.partId, delta.text);
+        return;
+      }
       if (delta.reasoning !== undefined) opts.onReasoningChunk?.(delta.reasoning);
       if (delta.text !== undefined) opts.onChunk?.(delta.text);
     };

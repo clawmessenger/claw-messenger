@@ -43,7 +43,18 @@ describe("buildAgentArgs", () => {
   });
 
   it("opencode uses run subcommand with --model", () => {
-    expect(buildAgentArgs("opencode", "hi", "glm-4.7")).toEqual(["run", "hi", "--model", "glm-4.7"]);
+    expect(buildAgentArgs("opencode", "hi", "glm-4.7")).toEqual([
+      "run", "hi", "--format", "json", "--thinking", "--model", "glm-4.7",
+    ]);
+  });
+
+  // 没有这两个参数时 opencode 只输出格式化纯文本，思考与工具步骤全都拿不到
+  // ——私聊里「看不到它想了什么」的根因。--format 是 1.19 才有的参数。
+  it("opencode 强制开 JSON 事件流，思考流与过程流才有数据源", () => {
+    const args = buildAgentArgs("opencode", "hi");
+    expect(args).toEqual(["run", "hi", "--format", "json", "--thinking"]);
+    expect(args).toContain("--format");
+    expect(args[args.indexOf("--format") + 1]).toBe("json");
   });
 
   it("openclaw uses agent --local --json -m with --model", () => {
@@ -59,7 +70,9 @@ describe("buildAgentArgs", () => {
   });
 
   it("不支持会话键的 agent 忽略它（opencode/hermes 每轮本就是新会话）", () => {
-    expect(buildAgentArgs("opencode", "hi", undefined, "cm-group-g1")).toEqual(["run", "hi"]);
+    expect(buildAgentArgs("opencode", "hi", undefined, "cm-group-g1")).toEqual([
+      "run", "hi", "--format", "json", "--thinking",
+    ]);
     expect(buildAgentArgs("hermes", "hi", undefined, "cm-group-g1")).toEqual(["-z", "hi"]);
   });
 
@@ -92,7 +105,7 @@ describe("buildAgentArgs", () => {
   it("omits model flags when no model is given", () => {
     expect(buildAgentArgs("claude", "hi")).toEqual(["-p", "hi", "--output-format", "stream-json", "--verbose"]);
     expect(buildAgentArgs("codex", "hi")).toEqual(["exec", "hi", "--json", "--skip-git-repo-check"]);
-    expect(buildAgentArgs("opencode", "hi")).toEqual(["run", "hi"]);
+    expect(buildAgentArgs("opencode", "hi")).toEqual(["run", "hi", "--format", "json", "--thinking"]);
     expect(buildAgentArgs("openclaw", "hi")).toEqual(["agent", "--local", "--json", "-m", "hi"]);
     expect(buildAgentArgs("hermes", "hi")).toEqual(["-z", "hi"]);
   });

@@ -87,9 +87,39 @@ describe("stream-json 解析器", () => {
     expect(extractStreamJsonFinalText("完全不是 JSON")).toBeUndefined();
   });
 
+  // opencode 1.19 `run --format json --thinking` 的真实事件形状（实测抓取）：
+  // 与另外两家不同，它上报的是整段 part 全文，所以解析结果带 partId + replace，
+  // 由调用方换算成增量。
+  it("opencode reasoning / text 事件带上 partId 与整段语义", () => {
+    expect(parseStreamJsonLine(JSON.stringify({
+      type: "reasoning",
+      part: { id: "prt_r1", type: "reasoning", text: "先跑 ls 看看" },
+    }))).toEqual({ reasoning: "先跑 ls 看看", partId: "prt_r1", replace: true });
+    expect(parseStreamJsonLine(JSON.stringify({
+      type: "text",
+      part: { id: "prt_t1", type: "text", text: "done" },
+    }))).toEqual({ text: "done", partId: "prt_t1", replace: true });
+    // 非正文/思考的事件不进文本通道（工具走 activity 追踪器）
+    expect(parseStreamJsonLine('{"type":"step_start","part":{"type":"step-start"}}')).toBeNull();
+    expect(parseStreamJsonLine('{"type":"tool_use","part":{"type":"tool","tool":"bash"}}')).toBeNull();
+    expect(parseStreamJsonLine('{"type":"text","part":{"type":"text","text":""}}')).toBeNull();
+  });
+
+  it("opencode 最终正文：按 part 去重再拼接（同一 part 重复上报不翻倍）", () => {
+    const raw = [
+      '{"type":"step_start","part":{"type":"step-start"}}',
+      '{"type":"text","part":{"id":"prt_1","type":"text","text":"答"}}',
+      '{"type":"text","part":{"id":"prt_1","type":"text","text":"答案"}}',
+      '{"type":"text","part":{"id":"prt_2","type":"text","text":"。"}}',
+      '{"type":"step_finish","part":{"type":"step-finish","reason":"stop"}}',
+    ].join("\n");
+    expect(extractStreamJsonFinalText(raw)).toBe("答案。");
+  });
+
   it("思考流可用性标记", () => {
     expect(agentSupportsReasoning("claude")).toBe(true);
     expect(agentSupportsReasoning("codex")).toBe(true);
+    expect(agentSupportsReasoning("opencode")).toBe(true);
     expect(agentSupportsReasoning("openclaw")).toBe(false);
     expect(agentSupportsReasoning(undefined)).toBe(false);
   });
