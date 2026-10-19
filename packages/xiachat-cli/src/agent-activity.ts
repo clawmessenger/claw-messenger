@@ -21,6 +21,10 @@ export interface ActivityStep {
   /** 参数摘要：搜索词 / 命令 / 文件路径，过长会被裁剪。 */
   detail?: string;
   status: ActivityStatus;
+  /** 该步开始时间（epoch ms）。web 用它算每步耗时；历史消息里也保留。 */
+  startedAt?: number;
+  /** 该步进入终态的时间（epoch ms）。running 时缺省。 */
+  endedAt?: number;
 }
 
 // 一帧里最多带多少步：快照是全量的，步骤多了会把帧顶爆（进而走 wire 分块）。
@@ -155,13 +159,19 @@ export function createActivityTracker(): ActivityTracker {
   const idByIndex = new Map<number, string>();
 
   const upsert = (id: string, next: Omit<ActivityStep, "id">): boolean => {
+    const now = Date.now();
     const existing = byId.get(id);
     if (existing) {
+      // 进终态的那一刻打结束时间；调用方不必关心时间戳，避免各处重复实现。
+      const enteringTerminal = existing.status === "running" && next.status !== "running";
       const merged: ActivityStep = {
         ...existing,
         ...next,
         // 已有摘要不补空：收尾事件往往不带参数，不能把摘要抹掉。
         detail: next.detail ?? existing.detail,
+        // 首见时间只认第一次，后续重复上报不能把它刷新（否则每步耗时恒为 0）。
+        startedAt: existing.startedAt ?? now,
+        endedAt: enteringTerminal ? now : existing.endedAt,
       };
       if (
         merged.kind === existing.kind && merged.label === existing.label
@@ -175,26 +185,24 @@ export function createActivityTracker(): ActivityTracker {
       return true;
     }
     if (steps.length >= ACTIVITY_MAX_STEPS) return false;
-    const step: ActivityStep = { id, ...next };
+    const step: ActivityStep = { id, ...next, startedAt: now };
     byId.set(id, step);
     steps.push(step);
     return true;
   };
 
   const markDone = (id: string, status: ActivityStatus): boolean => {
-    if (!byId.has(id)) return false;
-    return upsert(id, { ...byId.get(id)!, status });
+    const existing = byId.get(id);
+    if (!existing) return false;
+    return upsert(id, { kind: existing.kind, label: existing.label, status });
   };
 
   const finish = (): boolean => {
     let changed = false;
-    for (const step of steps) {
+    // 走 upsert 而不是就地改 status：终态的 endedAt 由 upsert 统一打。
+    for (const step of [...steps]) {
       if (step.status !== "running") continue;
-      const done: ActivityStep = { ...step, status: "done" };
-      byId.set(step.id, done);
-      const at = steps.findIndex((s) => s.id === step.id);
-      if (at >= 0) steps[at] = done;
-      changed = true;
+      if (upsert(step.id, { kind: step.kind, label: step.label, status: "done" })) changed = true;
     }
     return changed;
   };

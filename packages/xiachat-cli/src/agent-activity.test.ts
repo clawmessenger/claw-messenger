@@ -64,7 +64,7 @@ describe("createActivityTracker · claude", () => {
   it("content_block_start 起步、content_block_stop 收尾", () => {
     const tracker = createActivityTracker();
     expect(tracker.push(claudeToolStart(1, "toolu_1", "WebSearch", { query: "虾说 讨论组" }))).toBe(true);
-    expect(tracker.snapshot()).toEqual([{
+    expect(tracker.snapshot()).toMatchObject([{
       id: "toolu_1", kind: "search", label: "联网搜索", detail: "虾说 讨论组", status: "running",
     }]);
     expect(tracker.push(claudeBlockStop(1))).toBe(true);
@@ -77,7 +77,7 @@ describe("createActivityTracker · claude", () => {
       type: "assistant",
       message: { content: [{ type: "tool_use", id: "t2", name: "Bash", input: { command: "git status" } }] },
     }));
-    expect(tracker.snapshot()).toEqual([{
+    expect(tracker.snapshot()).toMatchObject([{
       id: "t2", kind: "command", label: "执行命令", detail: "git status", status: "running",
     }]);
   });
@@ -174,7 +174,7 @@ describe("createActivityTracker · 健壮性", () => {
         callID: "call_1",
         state: { status: "completed", input: { command: "ls" }, title: "ls" },
       }))).toBe(true);
-      expect(tracker.snapshot()).toEqual([
+      expect(tracker.snapshot()).toMatchObject([
         { id: "call_1", kind: "command", label: "执行命令", detail: "ls", status: "done" },
       ]);
     });
@@ -219,6 +219,41 @@ describe("createActivityTracker · 健壮性", () => {
         id: "prt_9", tool: "webfetch", state: { status: "completed", input: { url: "https://x.dev" } },
       }))).toBe(true);
       expect(tracker.snapshot()[0]).toMatchObject({ id: "prt_9", kind: "fetch", detail: "https://x.dev" });
+    });
+  });
+
+  describe("步骤时间戳（web 展示每步耗时用）", () => {
+    it("首见打 startedAt，进终态才打 endedAt", () => {
+      const tracker = createActivityTracker();
+      tracker.push(claudeToolStart(0, "t1", "Bash", { command: "ls" }));
+      const running = tracker.snapshot()[0]!;
+      expect(typeof running.startedAt).toBe("number");
+      expect(running.endedAt).toBeUndefined();
+
+      tracker.push(claudeBlockStop(0));
+      const done = tracker.snapshot()[0]!;
+      expect(done.startedAt).toBe(running.startedAt);
+      expect(typeof done.endedAt).toBe("number");
+      expect(done.endedAt!).toBeGreaterThanOrEqual(done.startedAt!);
+    });
+
+    it("同一步重复上报不刷新 startedAt（否则每步耗时恒为 0）", () => {
+      const tracker = createActivityTracker();
+      tracker.push(claudeToolStart(0, "t1", "Bash", { command: "ls" }));
+      const first = tracker.snapshot()[0]!.startedAt;
+      tracker.push(line({ type: "assistant", message: { content: [
+        { type: "tool_use", id: "t1", name: "Bash", input: { command: "ls -la" } },
+      ] } }));
+      expect(tracker.snapshot()[0]!.startedAt).toBe(first);
+    });
+
+    it("被 finish 收尾的 running 步也有 endedAt", () => {
+      const tracker = createActivityTracker();
+      tracker.push(claudeToolStart(0, "t1", "Bash", { command: "ls" }));
+      tracker.push(line({ type: "result", result: "ok" }));
+      const step = tracker.snapshot()[0]!;
+      expect(step.status).toBe("done");
+      expect(typeof step.endedAt).toBe("number");
     });
   });
 });
