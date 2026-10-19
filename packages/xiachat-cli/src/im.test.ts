@@ -1214,6 +1214,37 @@ describe("MessageDispatcher chat_stream streaming", () => {
     expect(parsed.status).toBe("rejected")
     expect(parsed.code).toBe("no_active_task")
   })
+
+  // 线上 18:13 的现场：hermes 的模型额度耗尽（HTTP 429 [1308]），agent 进程
+  // 二十秒就退出，web 端却永远显示「正在思考」。两个根因都锁在这里：
+  //   1) 失败终帧必须真的发出去（0.2.37 之前流式路径连 catch 都没有）；
+  //   2) error_code 必须是**标识符**——把 stderr 原样塞进去，一个换行就让
+  //      web 端 parseChatStreamEvent 判整帧无效，等于没发。
+  it("agent 额度耗尽时发 failed 终帧，error_code 是带语义的标识符而不是 stderr", async () => {
+    const { deps, streams } = buildDeps()
+    const dispatcher = new MessageDispatcher(deps)
+    const stderr = [
+      "HTTP 429: [1308][已达到 5 小时的使用上限。您的限额将在 2026-10-19 19:40:03 重置。]",
+      "  at request (llmapi.quukk.com:443)",
+    ].join("\n")
+    await dispatcher.handle({
+      objectName: "RC:TxtMsg", fromUserId: "user_a", toUserId: "", targetId: "node_self",
+      conversationType: 1, content: JSON.stringify({ content: "hi" }),
+    }, {
+      runTurn: async () => { throw new Error("unused") },
+      runTurnStreamed: async () => { throw new Error(`agent exited with code 1: ${stderr}`) },
+    })
+
+    const failed = streams.map((s) => parseFrame(s.content)).filter((f) => f.status === "failed")
+    expect(failed.length).toBeGreaterThanOrEqual(1)
+    const code = failed.at(-1)!.error_code
+    expect(code).toBe("model_quota_exhausted")
+    // 与 web 端 validChatIdentifier 同一套约束：无控制字符、首尾无空白。
+    expect(typeof code).toBe("string")
+    expect((code as string).trim()).toBe(code)
+    expect(/[\p{Cc}\p{Cf}]/u.test(code as string)).toBe(false)
+    expect((code as string).length).toBeLessThanOrEqual(256)
+  })
 })
 
 describe("chat_stream timeline（思考段与工具调用交错）", () => {

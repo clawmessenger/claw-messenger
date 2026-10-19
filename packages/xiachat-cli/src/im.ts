@@ -7,6 +7,7 @@ import type { ActivityStep } from "./agent-activity.js";
 import { decodeCommandContent, encodeCommandResult } from "./protocol.js";
 import { buildChatStreamFrame, encodeChatStreamWireFrames, parseChatStopRequest, type ChatStreamStatus, type ChatStreamTimelineEntry } from "./chat-stream.js";
 import { buildHtmlCard, extractHtmlFence, htmlReviseFromFilePrompt, htmlRevisePrompt } from "./cards.js";
+import { classifyTurnError, describeTurnError } from "./turn-error.js";
 import {
   buildModelCatalogResponse,
   EMPTY_MODEL_CATALOG,
@@ -598,13 +599,20 @@ export class MessageDispatcher {
           await this.sendArtifactMessages(ctx, uploaded);
         } catch (err) {
           const errMsg = err instanceof Error ? err.message : String(err);
+          const errorCode = classifyTurnError(errMsg);
           // 与流式路径同一原则：中继轮失败也要有日志（原来只在私聊分支打）。
           console.error(
             `turn failed: conv=${ctx.conversationType}/${ctx.conversationId}`
             + ` req=${ctx.requestMessageId}`
             + ` elapsed=${Math.round((Date.now() - turnStartedAt) / 1000)}s`
+            + ` code=${errorCode}(${describeTurnError(errorCode)})`
             + ` err=${errMsg}`,
           );
+          // 兜底路径整轮没发过任何流帧，失败时同样要给前端一个终态：否则气泡
+          // 里连打字气泡都没有，用户只看到一条永远空着的 AI 消息。seq 用 0
+          // 即可（这条流不会有别的帧）。老 web 不认 error_code 也能看到
+          // 「生成失败」。
+          await emit(0, "failed", "", undefined, errorCode);
           if (opts.onError) {
             await opts.onError(errMsg);
             return;
@@ -685,7 +693,16 @@ export class MessageDispatcher {
           return;
         }
         const errMsg = err instanceof Error ? err.message : String(err);
-        await emit(seq, "failed", snapshot, reasoningSnapshot || undefined, errMsg.slice(0, 120), activitySnapshot, timeline);
+        const errorCode = classifyTurnError(errMsg);
+        // error_code 必须是标识符（无控制字符/无首尾空白/≤256 字节）：web 端
+        // parseChatStreamEvent 校验不过就整帧丢弃。以前这里塞的是
+        // errMsg.slice(0, 120)，stderr 一带换行整帧就没了 —— 前端于是永远
+        // 「正在思考」。分类短码同时解决「帧被丢」和「前端该显示什么」。
+        console.error(
+          `stream turn failed: conv=${ctx.conversationType}/${ctx.conversationId}`
+          + ` req=${ctx.requestMessageId} code=${errorCode}(${describeTurnError(errorCode)})`,
+        );
+        await emit(seq, "failed", snapshot, reasoningSnapshot || undefined, errorCode, activitySnapshot, timeline);
         if (opts.onError) {
           await opts.onError(errMsg);
           return;
@@ -725,15 +742,17 @@ export class MessageDispatcher {
       // —— 18:13 的现场就是 hermes 的模型 429 每轮静默失败，服务端照常派
       // 下一位，看起来像「上一位卡住、下一位抢话」。
       const errMsg = err instanceof Error ? err.message : String(err);
+      const errorCode = classifyTurnError(errMsg);
       console.error(
         `stream failed: conv=${ctx.conversationType}/${ctx.conversationId}`
         + ` req=${ctx.requestMessageId}`
         + ` elapsed=${Math.round((Date.now() - turnStartedAt) / 1000)}s`
+        + ` code=${errorCode}(${describeTurnError(errorCode)})`
         + ` err=${errMsg}`,
       );
       // chat_stop 的收尾由 handleChatStop 负责，别在这里抢发帧。
       if (!controller.signal.aborted) {
-        await emit(seq, "failed", "", undefined, "agent_failed").catch(() => {});
+        await emit(seq, "failed", "", undefined, errorCode);
       }
       // 中继轮（your_turn）必须回 command_result：服务端靠它推进下一位，
       // 不回就只能干等超时。重复回包由服务端按 requestID 吞掉，安全。
