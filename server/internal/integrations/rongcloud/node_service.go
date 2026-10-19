@@ -114,6 +114,28 @@ func (s *NodeService) GetNodeByNodeID(ctx context.Context, nodeIDText string) (d
 	return s.queries.GetRongCloudNodeByNodeID(ctx, nodeIDText)
 }
 
+// OmStatusForNode 返回给定节点所在机器的运维助手（ops 节点）的融云 id 与在线状态。
+//
+// 背景：ops 节点在设备列表里是隐藏的，只以 om_rongcloud_id 的形式挂在同机
+// agent 节点上；而 ops agent 进程和其他 agent 一样按自己的 nodeId 心跳，所以
+// 它的在线状态可以直接从心跳表读。没有 MachineID（未绑定机器）或机器上没有
+// ops 节点时 found=false，调用方据此省略字段，让前端回退到节点自身状态。
+func (s *NodeService) OmStatusForNode(ctx context.Context, node db.RongcloudNode) (omRongcloudID string, online bool, found bool, err error) {
+	if node.MachineID == "" {
+		return "", false, false, nil
+	}
+	nodes, err := s.queries.ListRongCloudNodesByWorkspace(ctx, node.WorkspaceID)
+	if err != nil {
+		return "", false, false, fmt.Errorf("list nodes: %w", err)
+	}
+	for _, n := range nodes {
+		if n.MachineID == node.MachineID && n.AiType.String == OpsAgentType {
+			return n.RongcloudUserID, s.IsOnline(n.ID), true, nil
+		}
+	}
+	return "", false, false, nil
+}
+
 func pgText(s string) pgtype.Text {
 	return pgtype.Text{String: s, Valid: s != ""}
 }

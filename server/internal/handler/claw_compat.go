@@ -1069,7 +1069,17 @@ func (h *Handler) ClawNodeStatus(w http.ResponseWriter, r *http.Request) {
 		clawJSON(w, 500, 500, "��ѯ�ڵ�ʧ��", nil)
 		return
 	}
-	clawJSON(w, 200, 200, "", map[string]interface{}{"online": h.RongCloudNode.IsOnline(node.ID)})
+	resp := map[string]interface{}{"online": h.RongCloudNode.IsOnline(node.ID)}
+	// 运维助手（ops 节点）在设备列表里是隐藏的，但它的会话页头需要真实的
+	// 在线状态 —— 否则前端只能写死 false，「运维助手离线」就成了常态误报。
+	// 机器上没有 ops 节点时不下发该字段，前端回退到节点自身状态。
+	if omRC, omOnline, found, err := h.RongCloudNode.OmStatusForNode(r.Context(), node); err != nil {
+		slog.Warn("claw: om status lookup failed", "nodeId", nodeID, "error", err)
+	} else if found {
+		resp["om_online"] = omOnline
+		resp["om_rongcloud_id"] = omRC
+	}
+	clawJSON(w, 200, 200, "", resp)
 }
 
 // ClawUpdateNode POST /api/claw/nodes/{nodeId} 旧站编辑设备资料（昵称/头像）走 HTTP，
