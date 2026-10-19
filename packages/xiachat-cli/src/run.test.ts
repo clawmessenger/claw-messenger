@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  CUSTOM_MESSAGE_TYPES,
   SessionQueue,
   connectTransport,
   createBoundedMap,
@@ -353,3 +354,23 @@ describe("startRunLoop fast path", () => {
     expect(h.sent.every((frame) => !frame.content.includes("claw_runtime_recovery_response"))).toBe(true)
   })
 })
+
+describe("CUSTOM_MESSAGE_TYPES（融云注册表）", () => {
+  it("包含 chat_stream 与 chat_stream_chunk（>9KB 帧的 wire 分块）", () => {
+    const names = CUSTOM_MESSAGE_TYPES.map(([name]) => name);
+    expect(names).toContain("chat_stream");
+    expect(names).toContain("chat_stream_chunk");
+    // 分块与主帧同策略：持久化存历史、不计未读。
+    const chunk = CUSTOM_MESSAGE_TYPES.find(([name]) => name === "chat_stream_chunk")!;
+    expect(chunk[1]).toBe(true);
+    expect(chunk[2]).toBe(false);
+  });
+
+  it("web 端注册的流类型这里一个都不能少（缺了融云直接拒发）", () => {
+    // web 端 src/services/im.ts CUSTOM_MESSAGE_TYPES 里与本端同源的类型。
+    const webSide = ["chat_stream", "chat_stream_chunk", "chat_stop", "chat_stop_result",
+      "command", "card_message", "card_update", "card_action"];
+    const names = new Set(CUSTOM_MESSAGE_TYPES.map(([name]) => name));
+    for (const type of webSide) expect(names.has(type)).toBe(true);
+  });
+});

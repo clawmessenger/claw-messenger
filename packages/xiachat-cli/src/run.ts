@@ -508,6 +508,30 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * 设备端注册的融云自定义消息（objectName → [持久化, 计未读]）。与 web 端
+ * src/services/im.ts 的同名表同源 —— 缺一条，那类消息就被融云当未知类型拒发
+ * （unsupported objectName）。0.2.29 漏了 chat_stream_chunk：超过 9KB 的流帧
+ * 全部被拒，长思考/长正文轮次在 web 上永远停在流式中，直到兜底整包文本落地
+ * 才补上 —— 0.2.30 修。
+ */
+export const CUSTOM_MESSAGE_TYPES: ReadonlyArray<readonly [string, boolean, boolean]> = [
+  ["command", true, true],
+  ["card_message", true, true],
+  ["card_update", true, true],
+  ["card_action", false, false],
+  // chat_stream: persisted but uncounted — same registration the web
+  // uses, so the frames store as history yet never badge unread.
+  ["chat_stream", true, false],
+  // >9KB 帧的 wire 分块（web 端 ChatStreamWireReassembler 重组）。
+  ["chat_stream_chunk", true, false],
+  ["chat_stop", false, false],
+  ["chat_stop_result", false, false],
+  // file_message: agent 本轮产出的文件（HTML/报告/表格…）。持久化并计数，
+  // 不注册这条，融云会把它当未知类型丢掉，用户永远看不到文件气泡。
+  ["file_message", true, true],
+];
+
 export async function createImlibTransport(): Promise<IMTransport> {
   // imlib-next is browser-built; give it the minimal Node globals it
   // touches (window/localStorage/XHR) before importing.
@@ -562,21 +586,7 @@ export async function createImlibTransport(): Promise<IMTransport> {
       // (protocol.ts, web im.ts CUSTOM_MESSAGE_TYPES); registered before
       // sending. card_message/card_update are persisted; card_action is
       // transient (fire-and-forget interaction).
-      for (const [name, persisted, counted] of [
-        ["command", true, true],
-        ["card_message", true, true],
-        ["card_update", true, true],
-        ["card_action", false, false],
-        // chat_stream: persisted but uncounted — same registration the web
-        // uses, so the frames store as history yet never badge unread.
-        ["chat_stream", true, false],
-        ["chat_stop", false, false],
-        ["chat_stop_result", false, false],
-        // file_message: agent 本轮产出的文件（HTML/报告/表格…）。持久化并计数，
-        // 与 web 端 CUSTOM_MESSAGE_TYPES 同源 —— 不注册这条，融云会把它当未知
-        // 类型丢掉，用户永远看不到文件气泡。
-        ["file_message", true, true],
-      ] as const) {
+      for (const [name, persisted, counted] of CUSTOM_MESSAGE_TYPES) {
         customMessages.set(name, imlib.registerMessageType<Record<string, unknown>>(name, persisted, counted));
       }
       const res = await imlib.connect(token);
