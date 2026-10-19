@@ -197,21 +197,40 @@ func TestPerAgentOpsRCUserID(t *testing.T) {
 	if got := perAgentOpsRCUserID("hermes_1234567890"); got != "hermes_1234567890_ops" {
 		t.Errorf("perAgentOpsRCUserID = %q", got)
 	}
-	// 机器级 ops 账号（ops_<key>）不能被误判为 per-agent，否则
-	// om_rongcloud_id（机器级兼容入口）会被 per-agent 行抢掉。
+}
+
+func TestClassifyOpsRCUser(t *testing.T) {
+	// 同机 agent 集合：新命名（<agent>_<key>）与旧命名（rc_node_<key>_<agent>）
+	// 两种方案的机器都要能正确分类。
+	agentRCs := map[string]bool{
+		"hermes_1234567890":          true,
+		"opencode_oc5yj7nusm":        true,
+		"rc_node_3300776275_opencode": true,
+		"rc_node_3300776275_hermes":   true,
+	}
 	cases := []struct {
-		rc   string
-		want bool
+		rc        string
+		wantOwner string
+		wantPer   bool
 	}{
-		{"hermes_1234567890_ops", true},
-		{"opencode_oc5yj7nusm_ops", true},
-		{"ops_1234567890", false},     // 机器级 ops
-		{"hermes_1234567890", false},  // 普通 agent
-		{"rc_node_1234567890", false}, // 机器节点
+		// per-agent：去掉 _ops 后命中同机 agent。
+		{"hermes_1234567890_ops", "hermes_1234567890", true},
+		{"opencode_oc5yj7nusm_ops", "opencode_oc5yj7nusm", true},
+		{"rc_node_3300776275_opencode_ops", "rc_node_3300776275_opencode", true},
+		// 机器级新方案（ops_<key>）：不以 _ops 结尾。
+		{"ops_1234567890", "", false},
+		// 机器级旧方案（rc_node_<key>_ops）：以 _ops 结尾但 base 是机器节点，
+		// 不是任何 agent —— 线上小久就是这种，误判为 per-agent 会让
+		// om_rongcloud_id 消失、前端运维按钮不见。
+		{"rc_node_3300776275_ops", "", false},
+		// base 不在本机 agent 集合里的 _ops 账号一律按机器级兜底。
+		{"ghost_1234567890_ops", "", false},
 	}
 	for _, tc := range cases {
-		if got := isPerAgentOpsRCUser(tc.rc); got != tc.want {
-			t.Errorf("isPerAgentOpsRCUser(%q) = %v, want %v", tc.rc, got, tc.want)
+		owner, perAgent := classifyOpsRCUser(tc.rc, agentRCs)
+		if owner != tc.wantOwner || perAgent != tc.wantPer {
+			t.Errorf("classifyOpsRCUser(%q) = (%q, %v), want (%q, %v)",
+				tc.rc, owner, perAgent, tc.wantOwner, tc.wantPer)
 		}
 	}
 }

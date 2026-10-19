@@ -1171,8 +1171,15 @@ func (h *Handler) ClawDeleteNode(w http.ResponseWriter, r *http.Request) {
 		clawJSON(w, 500, 500, "查询节点失败", nil)
 		return
 	}
-	if err := h.RongCloudNode.UnbindNode(r.Context(), node, userID); err != nil {
-		slog.Warn("claw: node unbind failed", "nodeId", nodeID, "error", err)
+	// unregister=true：用户在前端确认弹窗里选了「注销 Agent 并解绑」—— 融云
+	// 账号永久注销（不可恢复），必须显式 opt-in；缺省仅解除绑定。
+	if r.URL.Query().Get("unregister") == "true" {
+		err = h.RongCloudNode.UnregisterNode(r.Context(), node, userID)
+	} else {
+		err = h.RongCloudNode.UnbindNode(r.Context(), node, userID)
+	}
+	if err != nil {
+		slog.Warn("claw: node unbind failed", "nodeId", nodeID, "unregister", r.URL.Query().Get("unregister"), "error", err)
 		clawJSON(w, 500, 500, "取消绑定失败", nil)
 		return
 	}
