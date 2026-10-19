@@ -98,10 +98,12 @@ export function buildModelArgs(name: string, model: string | undefined): string[
 
 // 结构化事件流可用性：这些 agent 都能以「逐行 JSON 事件」模式运行，正文增量
 // 与工具步骤可被解析（见 parseStreamJsonLine / agent-activity.ts）。claude /
-// codex / opencode 另外还会上报 thinking/reasoning 文本；hermes 的流里只有
-// text 与 tool_use/tool_result（它的 stream_json.py 明确不把 reasoning 放进
-// 协议），所以它贡献的是「逐字正文 + 工具过程」，没有思考文本。
-// 其余 agent（stdin 模式、或只吐一次性 JSON 信封如 openclaw）不在此列。
+// codex / opencode 原生上报 thinking/reasoning；hermes 上游的 stream_json.py
+// 只把 text 与 tool_use/tool_result 写进协议（-q 静默模式还会把 reasoning
+// 回调置空），需要跑 scripts/patch-hermes-reasoning.py 把思考接进来 ——
+// 没打补丁时它只贡献「逐字正文 + 工具过程」。
+// 其余 agent（stdin 模式、或只吐一次性 JSON 信封如 openclaw）不在此列；
+// openclaw 的信封里没有 reasoning payload（实测 2026.9.2），只有 toolSummary。
 const STREAM_JSON_AGENTS = new Set(["claude", "codex", "opencode", "hermes"]);
 
 export function agentSupportsReasoning(name: string | undefined): boolean {
@@ -619,10 +621,16 @@ export function parseStreamJsonLine(line: string): StreamJsonDelta | null {
   }
 
   // --- hermes ---
-  // 形状：{"type":"text","text":"…"}（增量，无 part）/ {"type":"tool_use",…}
-  // opencode 的 text 事件一定带 part，所以「有 text 没 part」只可能是 hermes。
+  // 形状：{"type":"text","text":"…"}（增量，无 part）/ {"type":"tool_use",…} /
+  // {"type":"reasoning","text":"…"}（增量，0.21.3 起补齐：TTY 的 [thinking] 框
+  // 走同一个 reasoning_callback，之前静默模式把它置空所以思考整段丢失）。
+  // opencode 的事件一定带 part，所以「有 text 没 part」只可能是 hermes。
   if (event.type === "text" && event.part === undefined && typeof event.text === "string") {
     return { text: event.text };
+  }
+  if (event.type === "reasoning" && event.part === undefined
+    && typeof event.text === "string" && event.text) {
+    return { reasoning: event.text };
   }
 
   // --- opencode ---
@@ -786,6 +794,14 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
     // 型 agent（openclaw）跳过，避免把整份信封当正文流出去（见 emitsJsonEnvelope）。
     const streamRawStdout = !emitsJsonEnvelope(opts.agentName);
     let lineBuf = "";
+    // 本轮收到过多少段思考。hermes 的思考要靠本机 stream_json.py 补丁才能进
+    // JSONL（见 scripts/patch-hermes-reasoning.py），缺补丁时给一行日志提示，
+    // 免得又去 web 侧翻帧。
+    let reasoningChunks = 0;
+    const deliverReasoning = (chunk: string): void => {
+      reasoningChunks += 1;
+      opts.onReasoningChunk?.(chunk);
+    };
     // 过程流追踪器：逐行消化工具事件，全量快照上抛。没有回调方就不建，省掉
     // 每行一次的解析开销。
     const activity = opts.onActivity ? createActivityTracker() : undefined;
@@ -802,7 +818,7 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
       if (full.length <= prev) return;
       partSent.set(key, full.length);
       const suffix = full.slice(prev);
-      if (kind === "reasoning") opts.onReasoningChunk?.(suffix);
+      if (kind === "reasoning") deliverReasoning(suffix);
       else opts.onChunk?.(suffix);
     };
     const emitStreamJson = (flushed: string) => {
@@ -817,7 +833,7 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
         if (delta.text !== undefined) emitPart("text", delta.partId, delta.text);
         return;
       }
-      if (delta.reasoning !== undefined) opts.onReasoningChunk?.(delta.reasoning);
+      if (delta.reasoning !== undefined) deliverReasoning(delta.reasoning);
       if (delta.text !== undefined) opts.onChunk?.(delta.text);
     };
     child.stdout.on("data", (buf: Buffer) => {
@@ -875,7 +891,7 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
             // 但足以让群聊/讨论组里的气泡有过程可展开。
             if (emitsJsonEnvelope(opts.agentName)) {
               const details = extractOpenclawEnvelopeDetails(stdout);
-              if (details.reasoning) opts.onReasoningChunk?.(details.reasoning);
+              if (details.reasoning) deliverReasoning(details.reasoning);
               if (details.tools && details.tools.length > 0 && opts.onActivity) {
                 opts.onActivity(details.tools.map((tool) => {
                   const cls = classifyTool(tool.name);
@@ -888,6 +904,12 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
                   } satisfies ActivityStep;
                 }));
               }
+            }
+            if (opts.agentName === "hermes" && reasoningChunks === 0) {
+              console.warn(
+                "hermes 未上报思考：本机 hermes 的 stream_json.py 可能还没打补丁，"
+                + "跑一次 scripts/patch-hermes-reasoning.py（hermes 升级会被覆盖）",
+              );
             }
             resolve(opts.agentName === "openclaw" ? extractOpenclawReply(stdout) : stdout);
           }

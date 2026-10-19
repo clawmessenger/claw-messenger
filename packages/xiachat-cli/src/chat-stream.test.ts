@@ -133,12 +133,24 @@ describe("stream-json 解析器", () => {
     expect(parseStreamJsonLine('{"type":"tool_use","name":"web_search","input":{"query":"天气"}}')).toBeNull();
   });
 
+  it("hermes：reasoning 事件是增量、无 part，与 opencode 的同名事件区分开", () => {
+    // hermes 0.21.3 的 reasoning_callback 已经接进 JSONL（本机补丁），形状与 text 一样
+    // 是「无 part 的增量」；opencode 的 reasoning 一定带 part 且是整段全文。
+    expect(parseStreamJsonLine('{"type":"reasoning","text":"先比较"}'))
+      .toEqual({ reasoning: "先比较" });
+    expect(parseStreamJsonLine(JSON.stringify({
+      type: "reasoning", part: { id: "prt_1", type: "reasoning", text: "整段" },
+    }))).toEqual({ reasoning: "整段", partId: "prt_1", replace: true });
+    // 空文本不产出（避免把空帧推给前端）
+    expect(parseStreamJsonLine('{"type":"reasoning","text":""}')).toBeNull();
+  });
+
   it("思考流可用性标记", () => {
     expect(agentSupportsReasoning("claude")).toBe(true);
     expect(agentSupportsReasoning("codex")).toBe(true);
     expect(agentSupportsReasoning("opencode")).toBe(true);
-    // hermes 的事件流里没有 reasoning（只有 text/tool），但它在集合里才能走
-    // stream-json 模式拿到工具过程 —— 集合语义是「结构化事件流」。
+    // hermes 走 chat -q --format stream-json：text 增量 + tool_use/tool_result，
+    // 思考事件由本机 stream_json.py 补丁接上 reasoning_callback 后才有。
     expect(agentSupportsReasoning("hermes")).toBe(true);
     expect(agentSupportsReasoning("openclaw")).toBe(false);
     expect(agentSupportsReasoning(undefined)).toBe(false);
