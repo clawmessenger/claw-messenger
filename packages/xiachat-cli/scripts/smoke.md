@@ -46,7 +46,7 @@ await imlib.sendMessage(
 );
 ```
 
-验证：CLI 日志出现 `im in: type=RC:TxtMsg from=rc_node_...`；连发 3 条（queueDepth=1）第 3 条触发 busy hint，对端收到 `正在思考中…` 回包。
+验证：CLI 日志出现 `im in: type=RC:TxtMsg from=rc_node_...`；连发 3 条（queueDepth=1）第 3 条被丢弃，对端收到 `chat_stream` 失败终帧（`error_code=agent_busy`）。
 agent 执行：claude/codex/opencode 走 argv 模式（`-p`/`exec`/`run` 子命令，见 agents.ts buildAgentArgs），>8000 字符 prompt 自动回退 STDIN。
 
 ## 3. 讨论

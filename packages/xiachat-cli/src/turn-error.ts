@@ -29,6 +29,9 @@ export type TurnErrorCode =
   | "model_rate_limited"
   /** 本轮跑超时被我们自己掐掉。 */
   | "turn_timeout"
+  /** 会话队列满（1 在执行 + 1 排队），这条消息被直接丢弃。
+   *  由 run.ts 的 SessionQueue 在忙碌时发出，不经过 classifyTurnError。 */
+  | "agent_busy"
   /** 其余一切失败（进程崩溃、输出解析失败、未知错误）。 */
   | "agent_failed";
 
@@ -109,6 +112,7 @@ export function describeTurnError(code: TurnErrorCode): string {
     case "model_auth_failed": return "模型鉴权失败（key 无效/无权限）";
     case "model_rate_limited": return "模型请求被限流";
     case "turn_timeout": return "本轮执行超时";
+    case "agent_busy": return "上一个任务还在执行，本条消息被丢弃";
     case "agent_failed": return "agent 执行失败";
   }
 }

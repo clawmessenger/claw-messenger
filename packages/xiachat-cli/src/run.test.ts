@@ -7,8 +7,8 @@ import {
   CUSTOM_MESSAGE_TYPES,
   SessionQueue,
   connectTransport,
-  createBoundedMap,
   createInboundReplayDedupe,
+  sendBusyDropNotice,
   startRunLoop,
 } from "./run.js";
 import type { IMTransport, InboundIMMessage } from "./im.js";
@@ -73,37 +73,60 @@ describe("createInboundReplayDedupe (offline replay storm)", () => {
   });
 });
 
-describe("createBoundedMap (busyPeer cap)", () => {
-  it("evicts the oldest entry past the cap", () => {
-    const m = createBoundedMap(3);
-    m.set("a", "1");
-    m.set("b", "2");
-    m.set("c", "3");
-    m.set("d", "4");
-    expect(m.size).toBe(3);
-    expect(m.get("a")).toBeUndefined();
-    expect(m.get("d")).toBe("4");
+describe("sendBusyDropNotice (queue-full terminal frame)", () => {
+  const msg: InboundIMMessage = {
+    objectName: "RC:TxtMsg",
+    fromUserId: "user_1",
+    targetId: "ops_1",
+    conversationType: 1,
+    content: "{}",
+    messageUId: "uid-9",
+  } as unknown as InboundIMMessage;
+
+  function fakeTransport() {
+    const sent: Array<{ to: string; objectName: string; content: string }> = [];
+    const transport = {
+      sent,
+      sendMessage(to: string, objectName: string, content: string): Promise<void> {
+        sent.push({ to, objectName, content });
+        return Promise.resolve();
+      },
+    };
+    return transport as unknown as IMTransport & { sent: typeof sent };
+  }
+
+  it("sends a chat_stream failed frame with error_code=agent_busy", async () => {
+    const transport = fakeTransport();
+    sendBusyDropNotice(transport, msg, "ops_1");
+    await new Promise((r) => setTimeout(r, 0));
+    expect(transport.sent).toHaveLength(1);
+    const { to, objectName, content } = transport.sent[0];
+    expect(to).toBe("user_1");
+    expect(objectName).toBe("chat_stream");
+    const frame = JSON.parse(content);
+    // 信封字段逐条对齐 web 端 validStreamDelivery 的私聊校验：
+    // node_id=发送账号、conversation_id/requester_id=发消息的用户。
+    expect(frame).toMatchObject({
+      msg_type: "chat_stream",
+      protocol_version: 1,
+      status: "failed",
+      error_code: "agent_busy",
+      text: "",
+      seq: 0,
+      node_id: "ops_1",
+      conversation_type: 1,
+      conversation_id: "user_1",
+      requester_id: "user_1",
+      request_message_id: "uid-9",
+    });
+    expect(frame.stream_id).toContain("uid-9");
   });
 
-  it("re-setting an existing key refreshes recency", () => {
-    const m = createBoundedMap(3);
-    m.set("a", "1");
-    m.set("b", "2");
-    m.set("a", "1b"); // refresh a to most-recent
-    m.set("c", "3");
-    m.set("d", "4"); // evicts b, not a
-    expect(m.size).toBe(3);
-    expect(m.get("a")).toBe("1b");
-    expect(m.get("b")).toBeUndefined();
-    expect(m.get("d")).toBe("4");
-  });
-
-  it("updates the value of an existing key", () => {
-    const m = createBoundedMap(2);
-    m.set("a", "1");
-    m.set("a", "2");
-    expect(m.size).toBe(1);
-    expect(m.get("a")).toBe("2");
+  it("stays silent for non-private conversations or unknown self id", () => {
+    const transport = fakeTransport();
+    sendBusyDropNotice(transport, { ...msg, conversationType: 3 } as InboundIMMessage, "ops_1");
+    sendBusyDropNotice(transport, msg, undefined);
+    expect(transport.sent).toHaveLength(0);
   });
 });
 
@@ -143,9 +166,9 @@ describe("SessionQueue", () => {
     const onBusy = vi.fn();
     const q = new SessionQueue({ concurrencyPerConversation: 1, queueDepth: 1, onBusy });
     const slow = async () => { await new Promise((r) => setTimeout(r, 40)); };
-    q.enqueue("conv-1", slow);
-    q.enqueue("conv-1", slow); // queued (depth 1)
-    q.enqueue("conv-1", slow); // busy -> onBusy("conv-1")
+    expect(q.enqueue("conv-1", slow)).toBe(true);
+    expect(q.enqueue("conv-1", slow)).toBe(true); // queued (depth 1)
+    expect(q.enqueue("conv-1", slow)).toBe(false); // busy -> dropped, caller must answer
     await q.idle();
     expect(onBusy).toHaveBeenCalledTimes(1);
     expect(onBusy).toHaveBeenCalledWith("conv-1");

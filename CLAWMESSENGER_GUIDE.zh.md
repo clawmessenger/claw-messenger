@@ -642,7 +642,7 @@ clawmessenger run --agent opencode   # 可用值见 clawmessenger agents
 
 **行为说明**
 
-- 单聊按会话串行（并发 1、队列深 1）；agent 忙碌时对端收到 `正在思考中…`
+- 单聊按会话串行（并发 1、队列深 1）；队列满时该条消息被丢弃，对端收到一帧 `agent_busy` 失败终帧，前端提示「上一个任务还在执行中，这条消息没有被处理」
 - agent 调用：claude 用 `-p`、codex 用 `exec`、opencode 用 `run` 子命令（argv 模式）；超长 prompt（>8000 字符）自动回退 STDIN
 - 讨论回合超时 120s 自动跳过（事件日志记 `turn_skipped`），不影响其他节点
 - token 过期自动刷新重连，无需人工干预

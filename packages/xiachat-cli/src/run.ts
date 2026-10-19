@@ -4,6 +4,7 @@ import { dirname } from "node:path";
 import type { IMTransport, InboundIMMessage, TurnRunner } from "./im.js";
 import { MessageDispatcher, planReadReceipt } from "./im.js";
 import { runAgentTurn, runAgentCommand } from "./agents.js";
+import { buildChatStreamFrame } from "./chat-stream.js";
 import { createModelCatalogLoader, parseModelCatalogRequest } from "./model-catalog.js";
 import {
   createRuntimeProber,
@@ -36,20 +37,26 @@ export class SessionQueue {
 
   constructor(private readonly opts: SessionQueueOpts) {}
 
-  enqueue(conversationKey: string, task: () => Promise<void>): void {
+  /**
+   * 返回 false 表示队列满（onBusy 已触发），这条任务被丢弃 —— 调用方需要
+   * 据此给用户一个明确的终态（见 startRunLoop 的 agent_busy 失败帧），
+   * 否则 web 端的「正在思考」占位气泡会永远转圈。
+   */
+  enqueue(conversationKey: string, task: () => Promise<void>): boolean {
     const activeCount = this.active.get(conversationKey) ?? 0;
     const waiting = this.waiting.get(conversationKey) ?? [];
     if (activeCount >= this.opts.concurrencyPerConversation) {
       const depth = this.opts.queueDepth ?? Number.MAX_SAFE_INTEGER;
       if (waiting.length >= depth) {
         this.opts.onBusy?.(conversationKey);
-        return;
+        return false;
       }
       waiting.push({ key: conversationKey, run: task });
       this.waiting.set(conversationKey, waiting);
-      return;
+      return true;
     }
     this.start(conversationKey, task);
+    return true;
   }
 
   private start(conversationKey: string, task: () => Promise<void>): void {
@@ -190,31 +197,42 @@ function readProcessedUids(path: string | undefined): string[] {
   }
 }
 
-// Bounded LRU-ish map (the run loop's busyPeer tracker): Map preserves
-// insertion order, so on insert past the cap the oldest entry is evicted;
-// a re-set refreshes recency via delete+set.
-export interface BoundedMap {
-  get(key: string): string | undefined;
-  set(key: string, value: string): void;
-  readonly size: number;
-}
-
-export function createBoundedMap(maxEntries: number): BoundedMap {
-  const entries = new Map<string, string>();
-  return {
-    get: (key) => entries.get(key),
-    set(key, value) {
-      entries.delete(key);
-      entries.set(key, value);
-      if (entries.size > maxEntries) {
-        const oldest = entries.keys().next().value;
-        if (oldest !== undefined) entries.delete(oldest);
-      }
-    },
-    get size() {
-      return entries.size;
-    },
-  };
+/**
+ * 队列满丢弃一条私聊消息时，给发送方回一帧规范的 chat_stream failed 终帧
+ * （error_code=agent_busy）。
+ *
+ * 为什么不用纯文本：旧实现的「正在思考中…」会被 web 端当成普通 AI 消息，
+ * 原位替换掉用户提问时预埋的「正在思考」占位气泡；等排队的回合开始流式，
+ * 又追加一条新气泡 —— 一条提问留下两个气泡，而且文案有歧义（读起来像
+ * 「这条正在处理」，实际是被丢弃了）。failed 终帧走 web 的占位替换 +
+ * 失败文案路径（chatStreamFailureText），一个气泡、一句明白话。
+ *
+ * 信封字段与 web 端 validStreamDelivery 的私聊校验逐条对齐：
+ * node_id 必须等于发送账号（selfUserId），conversation_id/requester_id
+ * 都是发消息的那个用户。selfUserId 缺失时无法通过校验，静默放弃（下一条
+ * 正常回帧仍会顶掉占位气泡）。
+ */
+export function sendBusyDropNotice(
+  transport: IMTransport,
+  msg: InboundIMMessage,
+  selfUserId: string | undefined,
+): void {
+  // 只有私聊有「占位气泡等替换」的问题；群/聊天室由协调者串行，不会溢出。
+  if (msg.conversationType !== 1 || !selfUserId) return;
+  const requestMessageId = msg.messageUId || `req-${Date.now()}`;
+  const frame = buildChatStreamFrame({
+    streamId: `stream-${requestMessageId}-busy`,
+    requestMessageId,
+    requesterId: msg.fromUserId,
+    nodeId: selfUserId,
+    conversationType: 1,
+    conversationId: msg.fromUserId,
+    seq: 0,
+    status: "failed",
+    text: "",
+    errorCode: "agent_busy",
+  });
+  void transport.sendMessage(msg.fromUserId, "chat_stream", frame).catch(() => {});
 }
 
 export interface ConnectTransportOpts {
@@ -384,24 +402,9 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
         sessionKey,
       }),
   };
-  // onBusy only receives the conversation key; remember the latest peer per
-  // conversation so the busy hint can be addressed (private chat only).
-  // Bounded so a hostile/long-lived peer stream cannot grow it forever.
-  const busyPeer = createBoundedMap(128);
   const queue = new SessionQueue({
     concurrencyPerConversation: 1,
     queueDepth: 1,
-    onBusy: (key) => {
-      const [convType] = key.split(":", 2);
-      if (convType !== "1") return;
-      const peer = busyPeer.get(key);
-      if (!peer) return;
-      // Single chat busy hint; discussion turns never overflow (coordinator
-      // serializes turns itself).
-      void opts.transport
-        .sendMessage(peer, "RC:TxtMsg", JSON.stringify({ content: "正在思考中…" }))
-        .catch(() => {});
-    },
   });
 
   const selfUserId = opts.transport.getSelfUserId?.();
@@ -432,7 +435,6 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
       return;
     }
     const key = conversationKeyOf(msg);
-    busyPeer.set(key, msg.fromUserId);
     // 模型目录请求是廉价的协议查询，web 侧只等 8s。若走会话队列，一次长 agent
     // 回合（最长 120s）会把它拖过超时，或因为队列只有 1 个等待位而被直接丢弃。
     if (msg.objectName === "command" && parseModelCatalogRequest(msg.content)) {
@@ -453,7 +455,7 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
         return;
       }
     }
-    queue.enqueue(key, async () => {
+    const accepted = queue.enqueue(key, async () => {
       try {
         await dispatcher.handle(msg, turns);
       } catch (err) {
@@ -463,6 +465,15 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
         console.error("dispatch failed:", err instanceof Error ? err.message : err);
       }
     });
+    if (!accepted) {
+      // 队列满（1 在执行 + 1 排队），这条消息被丢弃。必须给用户一个明确的
+      // 终态：旧实现回纯文本「正在思考中…」，web 端会拿它原位替换占位气泡，
+      // 之后排队的回合开始流式时又追加一条新气泡 —— 一条提问两个气泡，而且
+      // 文案读起来像「正在处理你这条」，实际上消息根本没进队列。改成规范的
+      // chat_stream failed 终帧（error_code=agent_busy）：web 端把占位气泡
+      // 原位翻成「上一个任务还在执行」的明确失败文案，不会再有第二个气泡。
+      sendBusyDropNotice(opts.transport, msg, selfUserId);
+    }
   });
 
   opts.stdout.write("clawmessenger run: connected and dispatching\n");
