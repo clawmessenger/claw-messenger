@@ -189,6 +189,10 @@ func (h *chatroomRelayHub) startQueued(ctx context.Context, prev *relaySession, 
 // deadline 重置，pump 的等待循环每次醒来都看它。互斥量就是 relayHub 的 h.mu。
 type turnExtension struct {
 	deadline time.Time
+	// renews 是这一轮被心跳续期的次数。超时日志会带上它：0 说明心跳根本没到
+	// 服务端（设备端没发/被限流/被吞），非 0 说明链路通、只是恰好在两次心跳
+	// 之间超时。排查「谁还在思考却被跳过」时这是唯一能区分两种原因的数字。
+	renews int
 }
 
 // minDuration 返回较小者，pump 等待循环用它限制单次睡眠。
@@ -470,10 +474,15 @@ func (h *chatroomRelayHub) pump(ctx context.Context, s *relaySession) {
 				h.rt.logger.Warn("relay: dispatch failed",
 					"chatroom", s.chatroomRCID, "target", member.rcID,
 					"round", s.roundIndex+1, "error", err)
-				// 派发失败视同该成员本轮跳过，继续下一位。
+				// 派发失败视同该成员本轮跳过，继续下一位。必须把 requestID
+				// 清掉：否则它仍指向一条从未送达的命令，漏进来的回包会被当
+				// 成这一位的完成（测试里表现为「轮次已结束但还看得见 requestID」）。
 				h.mu.Lock()
 				if s.turnExt == ext {
 					s.turnExt = nil
+				}
+				if s.requestID == requestID {
+					s.requestID = ""
 				}
 				h.mu.Unlock()
 				s.index++
@@ -492,11 +501,22 @@ func (h *chatroomRelayHub) pump(ctx context.Context, s *relaySession) {
 					break waitLoop // 轮已被作废/推进，别再等
 				}
 				if remaining <= 0 {
+					renews := ext.renews
 					h.mu.Unlock()
 					// 超时后作废当前轮：迟到的回包因 requestID 已不匹配被丢弃。
-					h.rt.logger.Warn("relay: turn timed out",
-						"chatroom", s.chatroomRCID, "target", member.rcID,
-						"round", s.roundIndex+1, "timeout", timeout)
+					// renews=0 与 renews>0 是两种完全不同的故障：
+					//   0  → 设备端心跳从未到达（没发/被限流/被吞），链路断在上游；
+					//   >0 → 链路是通的，只是心跳间断超过空闲窗口（agent 真卡死）。
+					if renews == 0 {
+						h.rt.logger.Warn("relay: turn timed out with no heartbeat",
+							"chatroom", s.chatroomRCID, "target", member.rcID,
+							"round", s.roundIndex+1, "timeout", timeout,
+							"hint", "device heartbeat never reached the server")
+					} else {
+						h.rt.logger.Warn("relay: turn timed out",
+							"chatroom", s.chatroomRCID, "target", member.rcID,
+							"round", s.roundIndex+1, "timeout", timeout, "renews", renews)
+					}
 					h.mu.Lock()
 					stale := s.requestID != requestID
 					if !stale {
@@ -904,11 +924,19 @@ const relayPingPrefix = "relay_ping_"
 // 「上一位还在思考，下一位已经开跑」。心跳能续期，但心跳链路的任何一环出问题
 // 都不该让房间越序 —— 保底值兜住常见的长轮，心跳负责更长的情况。
 //
-// 180s → 300s：17:13 实测 hermes 的深思考轮超过 3 分钟（reasoning 上万字），
-// 180s 到点照样被跳过，表现为「hermes 还在思考，openclaw 已经开跑」。保底值
-// 与 CLI 的 agent 单轮上限（run.ts turnTimeoutMs）取同一量级，避免「服务端
-// 比设备端先放弃」——那种情况下设备还在产出，服务端却已经派人接棒。
-const relayTurnTimeoutFloor = 300 * time.Second
+// 180s → 300s → 600s：17:13 实测 hermes 的深思考轮超过 3 分钟（reasoning 上万
+// 字），180s 到点照样被跳过，表现为「hermes 还在思考，openclaw 已经开跑」。
+// 这里的语义是「**防死锁**」而不是「正常轮次的上限」：按序发言要求必须等前一位
+// 说完，等多久都不该算错；只有设备端彻底没有信号时才该跳过。所以保底给到
+// 10 分钟，真正的「掉线」判定交给心跳的空闲窗口（relayHeartbeatIdleWindow）。
+const relayTurnTimeoutFloor = 600 * time.Second
+
+// relayHeartbeatIdleWindow 是「最后一次心跳之后还能等多久」。
+//
+// 这是超时的正确语义：不是从派发起算固定的墙钟，而是每次心跳都把 deadline 推到
+// 「现在 + 窗口」。设备端每 15s 一条心跳，窗口取 120s（漏掉 7 条才算掉线）——
+// 既容忍融云偶发限流/丢包，也不会让一个真挂死的成员把整个房间按住十分钟。
+const relayHeartbeatIdleWindow = 120 * time.Second
 
 // NotifyStreamActivity 心跳入口：按前缀还原真实轮次 request_id 并续期。
 // 返回 true 表示这条消息被当作心跳消化（调用方不要再当回包处理）。
@@ -921,15 +949,20 @@ func (h *chatroomRelayHub) NotifyStreamActivity(requestID string) bool {
 	defer h.mu.Unlock()
 	for _, s := range h.sessions {
 		if s.requestID == turnID && s.turnExt != nil {
+			// 续期窗口 = 空闲窗口（管理端配得更大就取更大的）：心跳在就无限续，
+			// 断了 120s 才判掉线。
 			window := h.rt.interactiveTurnTimeout()
-			if window < relayTurnTimeoutFloor {
-				window = relayTurnTimeoutFloor
+			if window < relayHeartbeatIdleWindow {
+				window = relayHeartbeatIdleWindow
 			}
 			s.turnExt.deadline = time.Now().Add(window)
-			// 心跳是排查「轮次越序」的关键证据，按 Info 留痕（每 15s 一条，
-			// 量可控）；连续出现即证明心跳链路通。
-			h.rt.logger.Info("relay: turn extended by heartbeat",
-				"chatroom", s.chatroomRCID, "turn", turnID)
+			s.turnExt.renews++
+			// 每 4 次（约 1 分钟）留一条：每条都打会刷屏（3 名成员 × 4 条/分），
+			// 一条没有则说明心跳完全没到服务端 —— 这正是排查越序的第一现场。
+			if s.turnExt.renews == 1 || s.turnExt.renews%4 == 0 {
+				h.rt.logger.Info("relay: turn extended by heartbeat",
+					"chatroom", s.chatroomRCID, "turn", turnID, "renews", s.turnExt.renews)
+			}
 			return true
 		}
 	}

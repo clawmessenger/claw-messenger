@@ -171,7 +171,12 @@ func TestRelayMembersFor_OrderAndFilter(t *testing.T) {
 }
 
 func TestRelayHub_SequentialDispatch(t *testing.T) {
-	hub := &chatroomRelayHub{sessions: map[string]*relaySession{}, rt: nilRelayRuntime()}
+	// 必须用假 client：sendPrivateJSON 在 client 为 nil 时直接报错，pump 会
+	// 走「派发失败跳过」分支，成员登记只在毫秒级窗口里可见 —— 那样的用例
+	// 依赖调度，稳不稳全看运气（曾长期偶发失败）。
+	_, client := newRelayRecorder(t)
+	rt := newDiscussionRuntime(nil, nil, client, "sys-node", testLogger())
+	hub := &chatroomRelayHub{sessions: map[string]*relaySession{}, rounds: map[string][]relayRound{}, rt: rt}
 	members := []relayMember{
 		{rcID: "rc_a", roleName: "A", order: 0},
 		{rcID: "rc_b", roleName: "B", order: 1},
@@ -180,9 +185,9 @@ func TestRelayHub_SequentialDispatch(t *testing.T) {
 	if !hub.Start(ctx, "room1", members, "hello", "", "", 0) {
 		t.Fatal("start should succeed")
 	}
-	if hub.Start(ctx, "room1", members, "again", "", "", 0) {
-		t.Fatal("second start must be rejected while running")
-	}
+	// 「忙时再发一条」现在的语义是**排队**（返回 queued），不再拒绝；那条行为由
+	// TestRelayHub_QueuesMessageWhileBusy 专门覆盖 —— 这里不调，否则 pump 收尾
+	// 后会立刻接着跑排队的那条，session 永远不清理。
 	// 首位成员被登记为当前轮。
 	waitUntil(t, "first member dispatched", func() bool {
 		s := relaySessionState(hub, "room1")
@@ -198,15 +203,27 @@ func TestRelayHub_SequentialDispatch(t *testing.T) {
 	default:
 		t.Fatal("done should be closed after response")
 	}
-	// 第二位成员被登记（注意：rt.client == nil 会让 dispatchTurn 失败，
-	// pump 视同跳过——为了真正测「推进」，我们改用错误回包路径:不行。
-	// dispatchTurn 失败直接 index++，所以 rc_b 也会被登记后立刻跳过。
-	// 本测试主要验证状态机推进顺序，接受这种近似。）
 	// 迟到的第一轮回包必须被吞掉。
 	if !hub.AcceptResponse(ctx, "rc_a", reqID, "late", false, "") {
 		t.Fatal("stale response must be consumed (true), not forwarded")
 	}
-	// 会话最终被清理（两位成员都因 dispatch 失败被跳过）。
+	// 第二位成员接棒：上一位回包后才会派发（严格按序）。
+	var reqB string
+	waitUntil(t, "second member dispatched", func() bool {
+		s := relaySessionState(hub, "room1")
+		if s == nil || s.senderRCID != "rc_b" || s.requestID == "" {
+			return false
+		}
+		reqB = s.requestID
+		return true
+	})
+	if reqB == reqID {
+		t.Fatalf("second turn must use a fresh request id, got %q twice", reqB)
+	}
+	if !hub.AcceptResponse(ctx, "rc_b", reqB, "answer-b", false, "") {
+		t.Fatal("second response should be accepted")
+	}
+	// 全员发言结束 → 会话清理。
 	waitUntil(t, "session cleanup", func() bool {
 		return relaySessionState(hub, "room1") == nil
 	})

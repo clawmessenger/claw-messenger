@@ -28,11 +28,11 @@ func (h *systemHandler) handleNodeMessage(ctx context.Context, msg NormalizedMes
 	case objectNameCommand:
 		h.handleCommandResult(ctx, msg)
 	case objectNameStream:
-		// 流帧心跳：当前轮成员的每一帧都给中继轮次续期，长思考轮不再被
-		// 固定超时掐断（见 chatroom_relay.go NotifyStreamActivity）。
-		if h.relayHub != nil {
-			h.relayHub.NotifyStreamActivity(msg.FromUserID)
-		}
+		// 这里是 v1 的 RC:StreamMsg（老圆桌协议），拿不到中继轮次的
+		// request_id —— 中继续期只走私聊心跳（relay_ping_ 前缀的
+		// command_result，见 handleCommandResult）。曾经在这里按
+		// msg.FromUserID 调 NotifyStreamActivity，但那个函数要的是
+		// request_id、传用户 id 恒为 false，等于没做事还会误导排查。
 		h.handleStreamMessage(ctx, msg)
 	case objectNameText:
 		h.handleTextResponse(ctx, msg)
