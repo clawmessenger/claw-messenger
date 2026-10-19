@@ -496,15 +496,22 @@ func (h *chatroomRelayHub) pump(ctx context.Context, s *relaySession) {
 					// 超时后作废当前轮：迟到的回包因 requestID 已不匹配被丢弃。
 					h.rt.logger.Warn("relay: turn timed out",
 						"chatroom", s.chatroomRCID, "target", member.rcID,
-						"round", s.roundIndex+1)
+						"round", s.roundIndex+1, "timeout", timeout)
 					h.mu.Lock()
-					if s.requestID == requestID {
+					stale := s.requestID != requestID
+					if !stale {
 						s.requestID = ""
 					}
 					if s.turnExt == ext {
 						s.turnExt = nil
 					}
 					h.mu.Unlock()
+					// 超时不能只写日志：前端那条「正在思考」的气泡在等一条
+					// 结束信号，群里什么都不发就会永远转圈（且下一位已经开口，
+					// 用户看到的是「上一位卡住、下一位抢话」）。补一条占位。
+					if !stale {
+						h.noteSkippedMember(ctx, s, &member, relayTimeoutNote(member.roleName))
+					}
 					break waitLoop
 				}
 				h.mu.Unlock()
@@ -717,6 +724,29 @@ func relayEmptyOutputNote(roleName string) string {
 	return fmt.Sprintf("（%s 本轮没有产出内容）", roleName)
 }
 
+// relayTimeoutNote / relayTurnFailedNote 是「这一轮该成员没交出发言」的两条
+// 占位。它们的存在不是为了内容，而是**给前端一个结束信号**：成员的「正在
+// 思考」气泡靠一条属于该成员的消息（或流的终帧）收尾，超时/失败时服务端若
+// 什么都不发，卡片就永远停在转圈状态 —— 而下一轮成员已经开口，用户看到的
+// 就是「上一位卡住不动，下一位抢话」。
+func relayTimeoutNote(roleName string) string {
+	return fmt.Sprintf("（%s 本轮思考超时，已跳过）", roleName)
+}
+
+func relayTurnFailedNote(roleName string) string {
+	return fmt.Sprintf("（%s 本轮未能发言）", roleName)
+}
+
+// noteSkippedMember 广播「本轮没交出发言」的占位，并记进本轮发言（silent：
+// 不进历史与上下文，避免下次对话里出现一堆噪音）。
+// 不持 h.mu 调用 —— broadcastMemberSpeech 自己会取锁。
+func (h *chatroomRelayHub) noteSkippedMember(ctx context.Context, s *relaySession, member *relayMember, note string) {
+	h.broadcastMemberSpeech(ctx, s, member, note)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	s.replies = append(s.replies, relayReply{roleName: member.roleName, content: note, silent: true})
+}
+
 // relayClipSuffix 是截断标记。单列成常量是因为 relayRepliesBlock 必须能为它
 // 预留位置：截断后的真实长度是「额度 + 后缀」，调用方按额度扣预算会悄悄超支。
 const relayClipSuffix = "…（已截断）"
@@ -872,8 +902,13 @@ const relayPingPrefix = "relay_ping_"
 // 「系统主持 timeout_seconds」（初始 60s）影响。群聊里长思考的运行时（openclaw
 // 这类不流式的）单轮动辄 90~120s，60s 一到服务端就放行下一位，用户看到的就是
 // 「上一位还在思考，下一位已经开跑」。心跳能续期，但心跳链路的任何一环出问题
-// 都不该让房间越序 —— 保底值兜住最常见的长轮，心跳负责更长的情况。
-const relayTurnTimeoutFloor = 180 * time.Second
+// 都不该让房间越序 —— 保底值兜住常见的长轮，心跳负责更长的情况。
+//
+// 180s → 300s：17:13 实测 hermes 的深思考轮超过 3 分钟（reasoning 上万字），
+// 180s 到点照样被跳过，表现为「hermes 还在思考，openclaw 已经开跑」。保底值
+// 与 CLI 的 agent 单轮上限（run.ts turnTimeoutMs）取同一量级，避免「服务端
+// 比设备端先放弃」——那种情况下设备还在产出，服务端却已经派人接棒。
+const relayTurnTimeoutFloor = 300 * time.Second
 
 // NotifyStreamActivity 心跳入口：按前缀还原真实轮次 request_id 并续期。
 // 返回 true 表示这条消息被当作心跳消化（调用方不要再当回包处理）。
@@ -939,6 +974,18 @@ func (h *chatroomRelayHub) AcceptResponse(ctx context.Context, senderID, request
 	if failed {
 		h.rt.logger.Warn("relay: member turn failed",
 			"chatroom", session.chatroomRCID, "target", senderID, "error", errMsg)
+		// 失败同样要留下一条属于该成员的消息：设备端报错时往往已经流过若干
+		// 帧，前端的气泡正等收尾。有正文就照发，没有就发占位。
+		note := content
+		if note == "" {
+			note = relayTurnFailedNote(member.roleName)
+		}
+		h.broadcastMemberSpeech(ctx, session, &member, note)
+		h.mu.Lock()
+		if s := session; s.requestID == requestID {
+			s.replies = append(s.replies, relayReply{roleName: member.roleName, content: note, silent: true})
+		}
+		h.mu.Unlock()
 	} else if content != "" {
 		h.broadcastMemberSpeech(ctx, session, &member, content)
 		// 积累进会话上下文：后续成员的提示词会带上这条发言。
