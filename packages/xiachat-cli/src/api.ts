@@ -39,6 +39,9 @@ export interface MachineAgentCredential {
   token: string;
   credentialId: string;
   deviceSecret: string;
+  // 仅 per-agent 运维节点（agent === "ops" 且 rc 为 "<agentRC>_ops"）携带：
+  // 该 ops 子进程专属服务的 agent 融云 id。缺省 = 机器级 ops（全机共享）。
+  opsFor?: string;
 }
 
 // One bound agent's operator-desired run-state, as returned by
@@ -128,7 +131,10 @@ export class XiachatApi {
     const raw = await this.request<{ data?: { nodes?: MachineAgentCredential[] } }>(
       "POST",
       "/api/claw/device/nodes",
-      { nodeId, credentialId, secret },
+      // wantPerAgentOps：请服务端为本机每个 agent 确保专属运维节点并下发
+      // （运维会话按智能体隔离）；旧服务端不认识该字段会忽略，结果退化为
+      // 只有机器级 ops —— 与旧行为一致。
+      { nodeId, credentialId, secret, wantPerAgentOps: true },
     );
     const nodes = raw.data?.nodes;
     if (!Array.isArray(nodes)) {

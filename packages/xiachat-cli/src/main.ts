@@ -2,8 +2,9 @@ import { Command } from "commander";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import * as os from "node:os";
+import * as path from "node:path";
 import { Keystore, type StoredCredentials } from "./keystore.js";
-import { XiachatApi } from "./api.js";
+import { XiachatApi, type MachineAgentCredential } from "./api.js";
 import { discoverAgents } from "./agents.js";
 import { DEFAULT_SERVER_URL, machineId, defaultProcessedUidsPath } from "./config.js";
 import { ensureOpencodeInstalled, OPS_AGENT_NAME, OPS_TURN_TIMEOUT_MS, setupOpsWorkdir } from "./ops.js";
@@ -68,7 +69,7 @@ export function buildProgram(opts: BuildProgramOpts): Command {
   program
     .name("clawmessenger")
     .description("User-device agent CLI over RongCloud IM")
-    .version("0.2.38")
+    .version("0.2.39")
     // Tests parse this program in-process; commander would otherwise
     // process.exit on missing options and kill the vitest runner.
     .exitOverride();
@@ -206,7 +207,8 @@ export function buildProgram(opts: BuildProgramOpts): Command {
     )
     .option("--agent <name>", "agent CLI name; must be discoverable on PATH (see clawmessenger agents)")
     .option("--model <model>", "model override passed to the agent CLI")
-    .action(async (cmdOpts: { agent?: string; model?: string }) => {
+    .option("--ops-suffix <suffix>", "ops agent only: per-agent workdir suffix (supervisor passes the served agent's RongCloud id)")
+    .action(async (cmdOpts: { agent?: string; model?: string; opsSuffix?: string }) => {
       // Supervisor-spawned children carry their agent-specific credentials
       // in the environment; a plain `clawmessenger run` never sees them otherwise
       // because each child overwrites nothing in the shared keystore.
@@ -274,7 +276,17 @@ export function buildProgram(opts: BuildProgramOpts): Command {
       let ensureRuntime: (() => Promise<void>) | undefined;
       if (cmdOpts.agent === OPS_AGENT_NAME) {
         const opencode = await ensureOpencodeInstalled();
-        const workdir = await setupOpsWorkdir();
+        // per-agent 运维子进程（supervisor 传 --ops-suffix <agentRC>）用独立
+        // workdir：opencode 的会话状态按目录隔离，共享目录会让多个 ops
+        // 子进程互相踩会话文件。suffix 只能是 rc id 字符集，防目录穿越。
+        let workdirOverride: string | undefined;
+        if (cmdOpts.opsSuffix) {
+          if (!/^[A-Za-z0-9_-]+$/.test(cmdOpts.opsSuffix)) {
+            throw new Error(`invalid --ops-suffix ${JSON.stringify(cmdOpts.opsSuffix)}: only [A-Za-z0-9_-] allowed`);
+          }
+          workdirOverride = path.join(os.homedir(), ".clawmessenger", "ops", cmdOpts.opsSuffix);
+        }
+        const workdir = await setupOpsWorkdir(workdirOverride);
         agentExecPath = opencode.path;
         agentName = "opencode";
         turnTimeoutMs = OPS_TURN_TIMEOUT_MS;
@@ -490,6 +502,19 @@ interface SupervisedAgent {
   timer?: NodeJS.Timeout;
 }
 
+// per-agent 运维节点（opsFor 非空）在 supervisor 里以 "ops@<agentRC>" 为键，
+// 与机器级 ops（键 "ops"）并存 —— 否则多台 ops 行在同一个 Map 键上互相覆盖，
+// 只有最后一台会被拉起。
+function supervisedKey(agent: MachineAgentCredential): string {
+  return agent.agent === OPS_AGENT_NAME && agent.opsFor ? `ops@${agent.opsFor}` : agent.agent;
+}
+
+// 控制状态（/api/claw/device/control 的键是 ai_type）对所有 ops 子进程共享
+// 同一个 "ops" 键：停 ops 即停全部运维子进程，与机型粒度的运维语义一致。
+function controlKeyFor(supervisedKeyName: string): string {
+  return supervisedKeyName.startsWith("ops@") ? OPS_AGENT_NAME : supervisedKeyName;
+}
+
 export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void> {
   const { opts, creds, api } = supervisor;
   if (!creds.credentialId || !creds.deviceSecret) {
@@ -621,11 +646,12 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
   };
 
   const applyControlStates = (desired: Map<string, "running" | "stopped">): void => {
-    for (const [agent, state] of desired) {
-      const entry = managed.get(agent);
+    for (const [key, entry] of managed) {
+      // per-agent 运维子进程（ops@<agentRC>）共享 "ops" 的控制状态。
+      const state = desired.get(controlKeyFor(key));
       // An agent the supervisor never started (its CLI is not on PATH) is not
       // ours to converge; the server still lists it because the node is bound.
-      if (!entry) continue;
+      if (!entry || !state) continue;
       if (state === "stopped") stopAgent(entry);
       else startAgent(entry);
     }
@@ -646,11 +672,17 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
         continue;
       }
     }
+    const key = supervisedKey(agent);
     const runArgs = ["run", "--agent", agent.agent];
     if (supervisor.model) runArgs.push("--model", supervisor.model);
+    // per-agent 运维子进程用独立 workdir（opencode 会话状态按目录隔离，
+    // 共享目录会让多个 ops 子进程互相踩会话文件）。
+    if (agent.agent === OPS_AGENT_NAME && agent.opsFor) {
+      runArgs.push("--ops-suffix", agent.opsFor);
+    }
     const desired = initialDesired.get(agent.agent) ?? "running";
     const entry: SupervisedAgent = {
-      agent: agent.agent,
+      agent: key,
       runArgs,
       childCreds: {
         nodeId: agent.nodeId,
@@ -665,7 +697,7 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
       state: desired === "running" ? "running" : "stopped",
       desired,
     };
-    managed.set(agent.agent, entry);
+    managed.set(key, entry);
     if (desired === "running") {
       launch(entry);
     } else {

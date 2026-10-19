@@ -65,7 +65,7 @@ const realSetTimeout = globalThis.setTimeout;
 const realSleep = (ms: number): Promise<void> =>
   new Promise((resolve) => { realSetTimeout(resolve, ms); });
 
-function makeHarness(initialControl: AgentControlState[] = []): Harness {
+function makeHarness(initialControl: AgentControlState[] = [], bound: unknown[] = BOUND_OPS): Harness {
   const dir = mkdtempSync(join(tmpdir(), "clawmessenger-supervisor-"));
   dirs.push(dir);
   const keystore = new Keystore(join(dir, "creds.json"));
@@ -79,7 +79,7 @@ function makeHarness(initialControl: AgentControlState[] = []): Harness {
 
   const api = new XiachatApi("http://unused.local");
   vi.spyOn(api, "bindDeviceAgents").mockImplementation(async () => ({}) as never);
-  vi.spyOn(api, "fetchDeviceNodes").mockImplementation(async () => BOUND_OPS as never);
+  vi.spyOn(api, "fetchDeviceNodes").mockImplementation(async () => bound as never);
   // The control poll runs on a timer, so leaving it unmocked would fire real
   // requests at http://unused.local the moment the clock advances.
   vi.spyOn(api, "fetchDeviceControl").mockImplementation(async () => initialControl);
@@ -183,6 +183,41 @@ describe("runSupervisor restart backoff", () => {
       token: "tok",
       serverUrl: "http://unused.local",
     });
+  });
+
+  // 运维会话按智能体隔离：服务端为每个 agent 下发专属 ops 节点（opsFor 非空），
+  // supervisor 必须为它们各起一个子进程 —— 用同一个 Map 键会互相覆盖。
+  it("spawns a dedicated ops child per agent when per-agent ops nodes come back", async () => {
+    const harness = makeHarness([], [
+      { agent: "ops", nodeId: "node_ops", rongCloudUser: "ops_key1", token: "tok", credentialId: "dc", deviceSecret: "sec" },
+      { agent: "ops", nodeId: "node_ops_hermes", rongCloudUser: "hermes_key1_ops", token: "tok_h", credentialId: "dc_h", deviceSecret: "sec_h", opsFor: "hermes_key1" },
+      { agent: "ops", nodeId: "node_ops_opencode", rongCloudUser: "opencode_key1_ops", token: "tok_o", credentialId: "dc_o", deviceSecret: "sec_o", opsFor: "opencode_key1" },
+    ]);
+    await vi.waitFor(() => expect(harness.spawned.length).toBe(3), { timeout: 5_000 });
+
+    // 机器级 ops：不带 --ops-suffix（共享 workdir，旧行为）。
+    expect(harness.spawned[0].args.slice(-3)).toEqual(["run", "--agent", "ops"]);
+    // per-agent ops：各带自己的 workdir 后缀与子进程凭据。
+    expect(harness.spawned[1].args.slice(-5)).toEqual(["run", "--agent", "ops", "--ops-suffix", "hermes_key1"]);
+    expect(harness.spawned[2].args.slice(-5)).toEqual(["run", "--agent", "ops", "--ops-suffix", "opencode_key1"]);
+    expect(JSON.parse(String(harness.spawned[1].env.CLAWMESSENGER_AGENT_CREDS))).toMatchObject({ nodeId: "node_ops_hermes", token: "tok_h" });
+    expect(JSON.parse(String(harness.spawned[2].env.CLAWMESSENGER_AGENT_CREDS))).toMatchObject({ nodeId: "node_ops_opencode", token: "tok_o" });
+  });
+
+  // 操作员在控制台停掉 ops，per-agent 运维子进程必须一起停（共享 "ops" 控制键）。
+  it("stops per-agent ops children when the operator stops ops", async () => {
+    const harness = makeHarness(
+      [{ agent: "ops", nodeId: "node_ops", desiredState: "stopped", version: 1 }],
+      [
+        { agent: "ops", nodeId: "node_ops", rongCloudUser: "ops_key1", token: "tok", credentialId: "dc", deviceSecret: "sec" },
+        { agent: "ops", nodeId: "node_ops_hermes", rongCloudUser: "hermes_key1_ops", token: "tok_h", credentialId: "dc_h", deviceSecret: "sec_h", opsFor: "hermes_key1" },
+      ],
+    );
+    // 两个 ops 子进程都被期望状态按住：一个都不该拉起。等 supervisor 横幅
+    // 出现再断言（启动要扫 PATH，固定 sleep 不可靠）。
+    await vi.waitFor(() => expect(harness.output.join("")).toContain("supervisor:"), { timeout: 5_000 });
+    expect(harness.spawned).toHaveLength(0);
+    expect(harness.output.join("")).toContain("0 of 2 agent(s) online");
   });
 
   it("restarts a dead agent on an exponential backoff", async () => {
