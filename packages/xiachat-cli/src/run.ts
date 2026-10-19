@@ -223,6 +223,13 @@ export interface ConnectTransportOpts {
   transport: IMTransport;
 }
 
+// 单轮 agent 的默认上限。120s 对深思考的运行时不够：hermes 的长思考轮实测
+// 会跑过 3 分钟（reasoning 上万字），被掐断时服务端收到的是一条失败回包，
+// 于是下一位立刻接棒 —— 用户看到的就是「上一位还在思考，下一位已经开口」。
+// 取 300s 与服务端中继保底（relayTurnTimeoutFloor）同一量级，避免两端任意
+// 一侧先放弃；真正的兜底仍由服务端超时负责。
+export const DEFAULT_TURN_TIMEOUT_MS = 300_000;
+
 export interface StartRunLoopOpts extends ConnectTransportOpts {
   agentExecPath: string;
   // Selects the per-agent invocation strategy (argv vs stdin); see
@@ -350,7 +357,7 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
         agentName: opts.agentName,
         prompt,
         model: opts.model ?? model,
-        timeoutMs: opts.turnTimeoutMs ?? 120_000,
+        timeoutMs: opts.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS,
         cwd: opts.cwd,
         sessionKey,
       }),
@@ -364,7 +371,7 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
         agentName: opts.agentName,
         prompt,
         model: opts.model ?? model,
-        timeoutMs: opts.turnTimeoutMs ?? 120_000,
+        timeoutMs: opts.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS,
         cwd: opts.cwd,
         onChunk: onDelta,
         // 思考流增量直接并入 onDelta 第二参：runStreamedTurn 维护

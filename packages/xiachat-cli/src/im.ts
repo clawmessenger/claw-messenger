@@ -546,6 +546,8 @@ export class MessageDispatcher {
     let pendingActivityFlush: ReturnType<typeof setTimeout> | null = null;
     // 流式心跳定时器：同理，finally 撤。
     let pingTimer: ReturnType<typeof setInterval> | null = null;
+    /** 本轮心跳失败次数（0 = 链路健康），用于收尾时汇总。 */
+    let pingFailures = 0;
     try {
       // 流式心跳：relay_ 轮**从轮次一开始**就发，不分区分流式/降级路径 ——
       // openclaw 这类不流式的运行时全程沉默、只在结束时发一帧，若只挂在
@@ -554,13 +556,26 @@ export class MessageDispatcher {
       if (ctx.requestMessageId.startsWith("relay_") && opts.yourTurnFrom && this.deps.send) {
         const pingRequestId = `relay_ping_${ctx.requestMessageId}`;
         const pingTarget = opts.yourTurnFrom;
+        // 心跳失败不能静默：它是服务端唯一的「还在产出」信号，融云限流
+        // （20604）或网络抖动都会让长轮悄悄失去续期，症状是「上一位还在
+        // 思考、下一位已经开跑」。首次失败与每 8 次失败各留一行，收尾时
+        // 再打一条汇总，便于现场判断那条链路断在哪。
+        pingFailures = 0;
         pingTimer = setInterval(() => {
           if (controller.signal.aborted) return;
           void this.deps.send!(
             pingTarget,
             "command",
             encodeCommandResult(pingRequestId, "text", { content: "" }),
-          ).catch(() => {});
+          ).catch((err) => {
+            pingFailures += 1;
+            if (pingFailures === 1 || pingFailures % 8 === 0) {
+              console.error(
+                `relay ping failed (${pingFailures}) req=${ctx.requestMessageId}:`,
+                err instanceof Error ? err.message : err,
+              );
+            }
+          });
         }, STREAM_PING_INTERVAL_MS);
       }
       if (!canStream) {
@@ -690,6 +705,9 @@ export class MessageDispatcher {
       if (pingTimer !== null) {
         clearInterval(pingTimer);
         pingTimer = null;
+      }
+      if (pingFailures > 0) {
+        console.error(`relay ping summary: ${pingFailures} failure(s) req=${ctx.requestMessageId}`);
       }
       // 补偿帧还在等就别再发了：这一轮已经收尾，晚到的帧只会顶掉终帧。
       if (pendingActivityFlush !== null) {
