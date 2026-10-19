@@ -126,6 +126,63 @@ type relaySession struct {
 	// （hermes 长思考 90~120s，默认 60s 超时一到下一位就开跑，用户看到的
 	// 「上一位还在流式下一位已开跑」就是它）。nil 表示当前无轮可续。
 	turnExt *turnExtension
+	// pending 是「中继进行中用户又发了消息」时排下的下一段中继。旧行为是
+	// 直接回 409「上一条消息的回应还在进行中」，用户那条消息就永远没人接
+	// ——长思考轮下尤其明显（等 3 分钟才轮到自己说话，却说不上）。
+	// 现在改为排队：当前中继跑完，接着用 pending 起一段新的。
+	pending *relayPending
+}
+
+// relayPending 是中继忙时排队的用户消息（同一房间只留最新一条，多条按
+// 换行拼接，不丢内容）。
+type relayPending struct {
+	userText      string
+	requesterRCID string
+	totalRounds   int
+	contextRounds int
+}
+
+// enqueueLocked 把一条用户消息排进会话待办；调用方持有 h.mu。
+func enqueueLocked(s *relaySession, userText, requesterRCID string, totalRounds, contextRounds int) {
+	if s.pending == nil {
+		s.pending = &relayPending{
+			userText:      userText,
+			requesterRCID: requesterRCID,
+			totalRounds:   totalRounds,
+			contextRounds: contextRounds,
+		}
+		return
+	}
+	merged := s.pending.userText + "\n" + userText
+	if runes := []rune(merged); len(runes) > relayMaxTextLength {
+		merged = string(runes[len(runes)-relayMaxTextLength:])
+	}
+	s.pending.userText = merged
+	s.pending.requesterRCID = requesterRCID
+	s.pending.totalRounds = totalRounds
+	s.pending.contextRounds = contextRounds
+}
+
+// startQueued 在当前中继收尾后接着跑排队的那条用户消息。复用同一份成员
+// 列表与房间形态（群/聊天室、议题），只把 userText/requester 换成新的。
+func (h *chatroomRelayHub) startQueued(ctx context.Context, prev *relaySession, p *relayPending) {
+	next := &relaySession{
+		chatroomRCID:  prev.chatroomRCID,
+		members:       prev.members,
+		userText:      p.userText,
+		isGroup:       prev.isGroup,
+		topic:         prev.topic,
+		requesterRCID: p.requesterRCID,
+		contextRounds: p.contextRounds,
+		totalRounds:   p.totalRounds,
+	}
+	h.mu.Lock()
+	h.attachContextLocked(next)
+	h.sessions[prev.chatroomRCID] = next
+	h.mu.Unlock()
+	h.rt.logger.Info("relay: queued message started",
+		"chatroom", prev.chatroomRCID, "chars", len([]rune(p.userText)))
+	go h.pump(ctx, next)
 }
 
 // turnExtension 是当前轮的可重置计时：NotifyStreamActivity 收到心跳时把
@@ -301,13 +358,15 @@ func (h *chatroomRelayHub) StartRelay(ctx context.Context, chatroomRCID, request
 	}
 	// HTTP 请求返回后中继要继续跑：换独立 context。
 	bgCtx := context.WithoutCancel(ctx)
-	if !h.Start(bgCtx, chatroomRCID, members, text, topic, requesterRCID, int(room.MaxRounds)) {
-		return errRelayResult(409, "上一条消息的回应还在进行中，请稍候")
+	started, queued := h.StartOrQueue(bgCtx, chatroomRCID, members, text, topic, requesterRCID, int(room.MaxRounds))
+	if !started && !queued {
+		return errRelayResult(409, "当前无法发起对话，请稍后重试")
 	}
 	return commandResult{code: 200, data: map[string]interface{}{
 		"ok":         true,
 		"chatroomId": chatroomRCID,
 		"speakers":   len(members),
+		"queued":     queued,
 	}}
 }
 
@@ -319,13 +378,27 @@ func errRelayResult(code int, msg string) commandResult {
 // 可以提示「上一条消息的回应还在进行中」）。contextRounds 是该房间的
 // 「AI 对话轮数」设置：每个成员的提示词最多携带这么多轮历史对话。
 func (h *chatroomRelayHub) Start(ctx context.Context, chatroomRCID string, members []relayMember, userText, topic, requesterRCID string, contextRounds int) bool {
+	started, _ := h.StartOrQueue(ctx, chatroomRCID, members, userText, topic, requesterRCID, contextRounds)
+	return started
+}
+
+// StartOrQueue 与 Start 相同，差别只在房间忙时的处理：不拒绝，而是把这条
+// 用户消息排进当前会话的待办（pump 收尾后自动接着跑）。返回 (started, queued)：
+// started=false && queued=true 表示已排队；两者都 false 表示没有可发言成员。
+//
+// 为什么要排队：群/聊天室的中继一轮要等每位成员跑完 agent（长思考 1~3 分钟），
+// 用户在等待期间发消息是极自然的动作。旧行为回 409，消息就永远没有回应，
+// 用户在 UI 上只看到「发出去了没人理」。
+func (h *chatroomRelayHub) StartOrQueue(ctx context.Context, chatroomRCID string, members []relayMember, userText, topic, requesterRCID string, contextRounds int) (bool, bool) {
 	if len(members) == 0 {
-		return false
+		return false, false
 	}
 	h.mu.Lock()
-	if _, busy := h.sessions[chatroomRCID]; busy {
+	if existing, busy := h.sessions[chatroomRCID]; busy {
+		enqueueLocked(existing, userText, requesterRCID, existing.totalRounds,
+			normalizeContextRounds(contextRounds))
 		h.mu.Unlock()
-		return false
+		return false, true
 	}
 	session := &relaySession{
 		chatroomRCID:  chatroomRCID,
@@ -344,7 +417,7 @@ func (h *chatroomRelayHub) Start(ctx context.Context, chatroomRCID string, membe
 	h.mu.Unlock()
 
 	go h.pump(ctx, session)
-	return true
+	return true, false
 }
 
 // pump 依次派发成员。ctx 是请求生命周期之外的独立 context（WithoutCancel），
@@ -368,12 +441,17 @@ func (h *chatroomRelayHub) pump(ctx context.Context, s *relaySession) {
 	defer func() {
 		h.mu.Lock()
 		replies := append([]relayReply(nil), s.allReplies...)
+		pending := s.pending
 		if cur, ok := h.sessions[s.chatroomRCID]; ok && cur == s {
 			delete(h.sessions, s.chatroomRCID)
 		}
 		h.mu.Unlock()
 		// 本轮结束后并入滚动缓存，供下一条用户消息携带上下文。
 		h.recordRound(s.chatroomRCID, relayRound{userText: s.userText, replies: replies})
+		// 用户在中继期间发的消息：现在接着跑，不再静默丢弃。
+		if pending != nil {
+			h.startQueued(ctx, s, pending)
+		}
 	}()
 	for s.roundIndex < s.totalRounds {
 		for s.index < len(s.members) {

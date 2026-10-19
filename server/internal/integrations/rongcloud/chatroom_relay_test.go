@@ -949,3 +949,26 @@ func TestRelayTurnTimeoutFloor(t *testing.T) {
 		t.Fatalf("floor too small for long thinking turns: %v", relayTurnTimeoutFloor)
 	}
 }
+
+func TestRelayHub_QueuesMessageWhileBusy(t *testing.T) {
+	hub := &chatroomRelayHub{sessions: map[string]*relaySession{}, rt: nilRelayRuntime()}
+	members := []relayMember{{rcID: "rc_a", roleName: "A", order: 0}}
+	ctx := context.Background()
+	if started, queued := hub.StartOrQueue(ctx, "roomQ", members, "第一句", "", "rc_user", 0); !started || queued {
+		t.Fatalf("first StartOrQueue should start, got started=%v queued=%v", started, queued)
+	}
+	// 忙碌时：不拒绝、不报错，而是排队 —— 用户在中继期间发的消息不能再被丢弃。
+	if started, queued := hub.StartOrQueue(ctx, "roomQ", members, "第二句", "", "rc_user", 0); started || !queued {
+		t.Fatalf("second StartOrQueue should queue, got started=%v queued=%v", started, queued)
+	}
+	s := relaySessionState(hub, "roomQ")
+	if s == nil || s.pending == nil || s.pending.userText != "第二句" {
+		t.Fatalf("pending should hold the queued text, got %+v", s)
+	}
+	// 再来一条：追加而不是覆盖。
+	_, _ = hub.StartOrQueue(ctx, "roomQ", members, "第三句", "", "rc_user", 0)
+	s = relaySessionState(hub, "roomQ")
+	if s.pending.userText != "第二句\n第三句" {
+		t.Fatalf("queued texts should be appended, got %q", s.pending.userText)
+	}
+}

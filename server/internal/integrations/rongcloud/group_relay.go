@@ -42,13 +42,17 @@ func (h *chatroomRelayHub) StartGroupRelay(ctx context.Context, groupID, request
 		return errRelayResult(409, "该群没有可发言的 AI 成员")
 	}
 	bgCtx := context.WithoutCancel(ctx)
-	if !h.StartGroup(bgCtx, groupID, speakers, text, requesterRCID, h.groupRelayRounds(ctx, groupID)) {
-		return errRelayResult(409, "上一条消息的回应还在进行中，请稍候")
+	started, queued := h.StartGroupOrQueue(bgCtx, groupID, speakers, text, requesterRCID, h.groupRelayRounds(ctx, groupID))
+	if !started && !queued {
+		return errRelayResult(409, "当前无法发起对话，请稍后重试")
 	}
 	return commandResult{code: 200, data: map[string]interface{}{
 		"ok":       true,
 		"groupId":  groupID,
 		"speakers": len(speakers),
+		// queued=true：上一条消息的中继还在跑，这条已排队，跑完自动接上
+		// （web 不用特别处理，但要能区分「已开始」和「已排队」）。
+		"queued": queued,
 	}}
 }
 
@@ -76,15 +80,24 @@ func (h *chatroomRelayHub) groupRelayRounds(ctx context.Context, groupID string)
 // StartGroup 发起一次群中继（复用 hub 的 sessions 表，键即群 id）。
 // rounds 是该群的「AI 对话轮数」设置：一次中继要跑几轮全员发言。
 func (h *chatroomRelayHub) StartGroup(ctx context.Context, groupID string, members []relayMember, userText, requesterRCID string, rounds int) bool {
+	started, _ := h.StartGroupOrQueue(ctx, groupID, members, userText, requesterRCID, rounds)
+	return started
+}
+
+// StartGroupOrQueue 与 StartGroup 相同，差别只在群已有中继在跑时不拒绝，
+// 而是把用户消息排进当前会话的待办（pump 收尾后自动接着跑）。见
+// chatroomRelayHub.StartOrQueue 的说明。
+func (h *chatroomRelayHub) StartGroupOrQueue(ctx context.Context, groupID string, members []relayMember, userText, requesterRCID string, rounds int) (bool, bool) {
 	if len(members) == 0 {
-		return false
-	}
-	h.mu.Lock()
-	if _, busy := h.sessions[groupID]; busy {
-		h.mu.Unlock()
-		return false
+		return false, false
 	}
 	total := normalizeGroupRelayRounds(rounds)
+	h.mu.Lock()
+	if existing, busy := h.sessions[groupID]; busy {
+		enqueueLocked(existing, userText, requesterRCID, total, normalizeContextRounds(rounds))
+		h.mu.Unlock()
+		return false, true
+	}
 	session := &relaySession{
 		chatroomRCID:  groupID,
 		members:       members,
@@ -99,7 +112,7 @@ func (h *chatroomRelayHub) StartGroup(ctx context.Context, groupID string, membe
 	h.mu.Unlock()
 
 	go h.pump(ctx, session)
-	return true
+	return true, false
 }
 
 // groupHasMember 报告 requesterRCID 是否在群成员行里。
