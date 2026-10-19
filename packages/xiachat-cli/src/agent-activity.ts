@@ -21,6 +21,10 @@ export interface ActivityStep {
   label: string;
   /** 参数摘要：搜索词 / 命令 / 文件路径，过长会被裁剪。 */
   detail?: string;
+  /** 完整输入（未截断到 120 字，上限 STEP_DETAIL_MAX_CHARS）：web 卡片展开看详情。 */
+  inputDetail?: string;
+  /** 结果摘要（工具输出头部）：web 卡片展开看详情。 */
+  outputDetail?: string;
   status: ActivityStatus;
   /** 该步开始时间（epoch ms）。web 用它算每步耗时；历史消息里也保留。 */
   startedAt?: number;
@@ -33,6 +37,10 @@ export interface ActivityStep {
 export const ACTIVITY_MAX_STEPS = 20;
 // 单条摘要的字符上限（含省略号）。
 const DETAIL_MAX_CHARS = 120;
+// 展开详情的字符上限：完整到能看懂，但不至于把流帧顶爆（一帧总量仍受
+// 9KB wire 分块约束，20 步 × 2KB 详情在最坏情形会分块，属可接受代价）。
+const STEP_INPUT_MAX_CHARS = 2000;
+const STEP_OUTPUT_MAX_CHARS = 1500;
 
 // 已知工具 → { 类别, 中文名 }。键不区分大小写（各 agent 拼写不一）。
 // 未命中的按原名作为 tool 展示 —— 至少用户能看到「调了什么」。
@@ -88,6 +96,62 @@ function clip(value: string): string {
   return oneLine.length <= DETAIL_MAX_CHARS
     ? oneLine
     : `${oneLine.slice(0, DETAIL_MAX_CHARS - 1)}…`;
+}
+
+/** 展开详情用的「保留换行」截断：命令/代码的可读性全靠换行，不压成一行。 */
+function clipDetail(value: string, max: number): string {
+  const trimmed = value.replace(/\r\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+  return trimmed.length <= max ? trimmed : `${trimmed.slice(0, max - 1)}…`;
+}
+
+/**
+ * 完整输入详情：把工具入参整成可读文本。优先具名字段（命令/查询/路径…），
+ * 全部未命中时把整个 input JSON 序列化（截断）—— 展开详情要「看具体内容」，
+ * 比摘要激进得多。
+ */
+export function summarizeToolInputDetail(input: unknown): string | undefined {
+  if (typeof input === "string") return input.trim() ? clipDetail(input, STEP_INPUT_MAX_CHARS) : undefined;
+  if (!input || typeof input !== "object") return undefined;
+  const rec = input as Record<string, unknown>;
+  for (const key of DETAIL_KEYS) {
+    const value = rec[key];
+    if (typeof value === "string" && value.trim()) return clipDetail(value, STEP_INPUT_MAX_CHARS);
+    if (Array.isArray(value) && value.length > 0) {
+      const joined = value.map((v) => (typeof v === "string" ? v : JSON.stringify(v))).join("\n");
+      if (joined.trim()) return clipDetail(joined, STEP_INPUT_MAX_CHARS);
+    }
+    if (value && typeof value === "object") {
+      return clipDetail(JSON.stringify(value, null, 2), STEP_INPUT_MAX_CHARS);
+    }
+  }
+  const json = JSON.stringify(rec, null, 2);
+  return json === "{}" ? undefined : clipDetail(json, STEP_INPUT_MAX_CHARS);
+}
+
+/**
+ * 工具结果详情：从 tool_result 的 content 里取可读文本（字符串或
+ * {type:"text",text:…} 数组），保留换行截断。取不到就 undefined（web 不展示
+ * 输出区）。
+ */
+export function summarizeToolResultDetail(content: unknown): string | undefined {
+  if (typeof content === "string") return content.trim() ? clipDetail(content, STEP_OUTPUT_MAX_CHARS) : undefined;
+  if (Array.isArray(content)) {
+    const texts = content
+      .map((item) => {
+        if (typeof item === "string") return item;
+        const rec = item as Record<string, unknown>;
+        if (rec && typeof rec === "object" && typeof rec.text === "string") return rec.text;
+        return undefined;
+      })
+      .filter((t): t is string => typeof t === "string" && t.length > 0);
+    const joined = texts.join("\n");
+    return joined.trim() ? clipDetail(joined, STEP_OUTPUT_MAX_CHARS) : undefined;
+  }
+  if (content && typeof content === "object") {
+    const rec = content as Record<string, unknown>;
+    if (typeof rec.text === "string" && rec.text.trim()) return clipDetail(rec.text, STEP_OUTPUT_MAX_CHARS);
+  }
+  return undefined;
 }
 
 /**
@@ -178,6 +242,8 @@ export function createActivityTracker(): ActivityTracker {
         ...next,
         // 已有摘要不补空：收尾事件往往不带参数，不能把摘要抹掉。
         detail: next.detail ?? existing.detail,
+        inputDetail: next.inputDetail ?? existing.inputDetail,
+        outputDetail: next.outputDetail ?? existing.outputDetail,
         // 首见时间只认第一次，后续重复上报不能把它刷新（否则每步耗时恒为 0）。
         startedAt: existing.startedAt ?? now,
         endedAt: enteringTerminal ? now : existing.endedAt,
@@ -185,6 +251,8 @@ export function createActivityTracker(): ActivityTracker {
       if (
         merged.kind === existing.kind && merged.label === existing.label
         && merged.detail === existing.detail && merged.status === existing.status
+        && merged.inputDetail === existing.inputDetail
+        && merged.outputDetail === existing.outputDetail
       ) {
         return false;
       }
@@ -242,13 +310,21 @@ export function createActivityTracker(): ActivityTracker {
             kind: cls.kind,
             label: cls.label,
             detail: summarizeToolDetail(block.input),
+            inputDetail: summarizeToolInputDetail(block.input),
             status: "running",
           });
         }
         // 工具结果块开始：说明上一步已经跑完。
         if (blockType === "tool_result" && index > 0) {
           const id = idByIndex.get(index - 1);
-          if (id) return markDone(id, "done");
+          if (id) {
+            return upsert(id, {
+              kind: byId.get(id)!.kind,
+              label: byId.get(id)!.label,
+              outputDetail: summarizeToolResultDetail(block.content),
+              status: "done",
+            });
+          }
         }
         return false;
       }
@@ -276,6 +352,7 @@ export function createActivityTracker(): ActivityTracker {
           kind: cls.kind,
           label: cls.label,
           detail: summarizeToolDetail(block.input),
+          inputDetail: summarizeToolInputDetail(block.input),
           status: "running",
         })) changed = true;
       });
@@ -293,7 +370,16 @@ export function createActivityTracker(): ActivityTracker {
         if (!block || asString(block.type) !== "tool_result") continue;
         const id = asString(block.tool_use_id);
         if (!id) continue;
-        if (markDone(id, block.is_error === true ? "failed" : "done")) changed = true;
+        const existing = byId.get(id);
+        const failed = block.is_error === true;
+        if (existing) {
+          if (upsert(id, {
+            kind: existing.kind,
+            label: existing.label,
+            outputDetail: summarizeToolResultDetail(block.content),
+            status: failed ? "failed" : "done",
+          })) changed = true;
+        } else if (markDone(id, failed ? "failed" : "done")) changed = true;
       }
       return changed;
     }
@@ -311,6 +397,7 @@ export function createActivityTracker(): ActivityTracker {
         kind: cls.kind,
         label: cls.label,
         detail: summarizeToolDetail(item),
+        inputDetail: summarizeToolInputDetail(item),
         status: type === "item.started" ? "running" : (failed ? "failed" : "done"),
       });
     }
@@ -334,6 +421,9 @@ export function createActivityTracker(): ActivityTracker {
           label: cls.label,
           // 摘要优先取调用参数（bash 的 command、read 的 filePath…），退到 state.title。
           detail: summarizeToolDetail(state?.input) ?? summarizeToolDetail(state?.title),
+          inputDetail: summarizeToolInputDetail(state?.input),
+          // opencode 的输出在 state.output（有的话）。
+          outputDetail: summarizeToolResultDetail(state?.output),
           status: failed ? "failed" : (status === "running" || status === "pending" ? "running" : "done"),
         });
       }
@@ -348,6 +438,7 @@ export function createActivityTracker(): ActivityTracker {
         kind: cls.kind,
         label: cls.label,
         detail: summarizeToolDetail(event.input),
+        inputDetail: summarizeToolInputDetail(event.input),
         status: "running",
       });
     }
@@ -361,7 +452,12 @@ export function createActivityTracker(): ActivityTracker {
         : [...steps].reverse().find((step) => step.status === "running"
           && (!name || step.label === classifyTool(name).label));
       if (!target) return false;
-      return markDone(target.id, event.is_error === true ? "failed" : "done");
+      return upsert(target.id, {
+        kind: target.kind,
+        label: target.label,
+        outputDetail: summarizeToolResultDetail(event.result ?? event.content ?? event.output),
+        status: event.is_error === true ? "failed" : "done",
+      });
     }
 
     // opencode 每步结束：这一步里没再更新的工具视为已完成，别让气泡一直转圈
