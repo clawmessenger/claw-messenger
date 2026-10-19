@@ -964,12 +964,15 @@ func (h *Handler) ClawDeviceNodes(w http.ResponseWriter, r *http.Request) {
 		NodeID       string `json:"nodeId"`
 		CredentialID string `json:"credentialId"`
 		Secret       string `json:"secret"`
+		// 新 CLI（0.2.39+）置真：为本机每个 agent 确保专属运维节点并随凭据
+		// 下发（运维会话按智能体隔离）。缺省 false 保持旧行为。
+		WantPerAgentOps bool `json:"wantPerAgentOps"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil || req.NodeID == "" || req.CredentialID == "" || req.Secret == "" {
 		clawJSON(w, 400, 400, "缺少设备凭据", nil)
 		return
 	}
-	creds, err := h.RongCloudNode.MachineAgentCredentials(r.Context(), req.NodeID, req.CredentialID, req.Secret)
+	creds, err := h.RongCloudNode.MachineAgentCredentials(r.Context(), req.NodeID, req.CredentialID, req.Secret, req.WantPerAgentOps)
 	if err != nil {
 		if errors.Is(err, rongcloud.ErrInvalidDeviceCredential) {
 			clawJSON(w, 401, 401, "设备凭据无效", nil)

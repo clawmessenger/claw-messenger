@@ -128,10 +128,24 @@ func (s *NodeService) OmStatusForNode(ctx context.Context, node db.RongcloudNode
 	if err != nil {
 		return "", false, false, fmt.Errorf("list nodes: %w", err)
 	}
+	// 优先该 agent 的专属运维节点（新 CLI 起的 per-agent ops 子进程按自己的
+	// nodeId 心跳）；机器上只有机器级 ops（旧 CLI）时回退到它。
+	perAgentRC := perAgentOpsRCUserID(node.RongcloudUserID)
+	var machineLevel *db.RongcloudNode
 	for _, n := range nodes {
-		if n.MachineID == node.MachineID && n.AiType.String == OpsAgentType {
+		if n.MachineID != node.MachineID || n.AiType.String != OpsAgentType {
+			continue
+		}
+		if n.RongcloudUserID == perAgentRC {
 			return n.RongcloudUserID, s.IsOnline(n.ID), true, nil
 		}
+		if !isPerAgentOpsRCUser(n.RongcloudUserID) {
+			copied := n
+			machineLevel = &copied
+		}
+	}
+	if machineLevel != nil {
+		return machineLevel.RongcloudUserID, s.IsOnline(machineLevel.ID), true, nil
 	}
 	return "", false, false, nil
 }
@@ -528,7 +542,11 @@ func (s *NodeService) LegacyNodeRecords(ctx context.Context, userID string) ([]m
 	// The ops (运维) node for each machine powers the maintenance feature but
 	// must not surface as its own device row. Index it by machine so the
 	// visible agent nodes can advertise the capability via om_rongcloud_id.
+	// per-agent ops 节点（rc 以 "_ops" 结尾）单独建索引：om_rongcloud_id 始终
+	// 指向机器级 ops（旧前端/旧 CLI 的兼容入口），ops_rongcloud_id 才是该
+	// agent 专属的运维会话对端。
 	opsByMachine := make(map[string]string)
+	opsByAgentRC := make(map[string]string)
 	// The machine's own infrastructure node is hidden too, but its nickname is
 	// the only human-readable label for the box ("小久", "SHGuoZiWei-10.1.1.225").
 	// Agent nodes are named after their agent and the machine key the web
@@ -538,7 +556,11 @@ func (s *NodeService) LegacyNodeRecords(ctx context.Context, userID string) ([]m
 	machineNameByMachine := make(map[string]string)
 	for _, n := range nodes {
 		if n.AiType.String == OpsAgentType && n.MachineID != "" {
-			opsByMachine[n.MachineID] = n.RongcloudUserID
+			if isPerAgentOpsRCUser(n.RongcloudUserID) {
+				opsByAgentRC[strings.TrimSuffix(n.RongcloudUserID, "_ops")] = n.RongcloudUserID
+			} else {
+				opsByMachine[n.MachineID] = n.RongcloudUserID
+			}
 		}
 		if !isMachineNode(n) {
 			continue
@@ -585,6 +607,12 @@ func (s *NodeService) LegacyNodeRecords(ctx context.Context, userID string) ([]m
 		// can still offer the 运维 entry point without listing the ops node.
 		if opsRC, ok := opsByMachine[n.MachineID]; ok && opsRC != "" {
 			record["om_rongcloud_id"] = opsRC
+			record["has_om_capability"] = true
+		}
+		// per-agent 运维节点存在时下发专属对端：新前端优先用它开运维会话，
+		// 每个智能体的运维聊天记录在融云侧就是两条独立私聊。
+		if opsRC, ok := opsByAgentRC[n.RongcloudUserID]; ok && opsRC != "" {
+			record["ops_rongcloud_id"] = opsRC
 			record["has_om_capability"] = true
 		}
 		// The box this agent runs on. Sibling agent nodes of one machine all
@@ -1040,6 +1068,10 @@ type MachineAgentCredential struct {
 	Token         string `json:"token"`
 	CredentialID  string `json:"credentialId"`
 	DeviceSecret  string `json:"deviceSecret"`
+	// OpsFor 仅出现在 per-agent 运维节点行上：该 ops 节点专属服务于哪个
+	// agent 的融云 id（"<agentRC>"，本行 rc 为 "<agentRC>_ops"）。supervisor
+	// 据此为每个 agent 各起一个 ops 子进程；空串 = 机器级 ops（全机共享）。
+	OpsFor string `json:"opsFor,omitempty"`
 }
 
 // BindAgents materialises the user's check-box selection: every selected
@@ -1281,17 +1313,55 @@ func isAgentNodeOfMachine(n db.RongcloudNode, machineID, agent string) bool {
 	return n.MachineID == machineID && n.AiType.String == agent
 }
 
+// perAgentOpsRCUserID 是某个 agent 专属运维节点的融云 id："<agentRC>_ops"。
+//
+// 背景：早期 ops 运维节点是全机一个（"ops_<key>"），同机所有智能体的「运维」
+// 入口都指向同一个融云账号 —— 私聊会话按（自己, 对方）归档，于是打开智能体 B
+// 的运维会看到智能体 A 的运维聊天记录。per-agent ops 节点让每个智能体的运维
+// 会话拥有独立对端，融云侧天然隔离。机器级 ops 节点保留（旧 CLI/旧会话兼容）。
+func perAgentOpsRCUserID(agentRCUserID string) string { return agentRCUserID + "_ops" }
+
+// isPerAgentOpsRCUser 区分 per-agent 运维节点与机器级 ops 节点：
+// 前者 "<agentRC>_ops" 以 "_ops" 结尾；后者 "ops_<key>" 不会。
+func isPerAgentOpsRCUser(rcUserID string) bool { return strings.HasSuffix(rcUserID, "_ops") }
+
 // ensureAgentNode creates (or reuses) the rongcloud user + node + device
 // credential for one agent on the given machine.
 func (s *NodeService) ensureAgentNode(ctx context.Context, machineNode db.RongcloudNode, machineID, agent string) (agentNodeBinding, error) {
-	existing, found, err := s.findMachineAgentNode(ctx, machineNode.WorkspaceID, machineID, agent)
-	if err != nil {
-		return agentNodeBinding{}, fmt.Errorf("lookup agent node: %w", err)
+	return s.ensureAgentNodeWithRC(ctx, machineNode, machineID, agent, "")
+}
+
+// ensureAgentNodeWithRC 是 ensureAgentNode 的本体；rcOverride 非空时按融云 id
+// 精确定位节点（per-agent ops 节点：同 (machine_id, ai_type=ops) 下有多行，
+// 不能用 findMachineAgentNode 的首命中语义），其余创建/复用逻辑不变。
+func (s *NodeService) ensureAgentNodeWithRC(ctx context.Context, machineNode db.RongcloudNode, machineID, agent, rcOverride string) (agentNodeBinding, error) {
+	var existing db.RongcloudNode
+	var found bool
+	if rcOverride != "" {
+		nodes, err := s.queries.ListRongCloudNodesByMachineID(ctx, machineID)
+		if err != nil {
+			return agentNodeBinding{}, fmt.Errorf("list machine nodes: %w", err)
+		}
+		for _, n := range nodes {
+			if !isMachineNode(n) && n.RongcloudUserID == rcOverride {
+				existing, found = n, true
+				break
+			}
+		}
+	} else {
+		var err error
+		existing, found, err = s.findMachineAgentNode(ctx, machineNode.WorkspaceID, machineID, agent)
+		if err != nil {
+			return agentNodeBinding{}, fmt.Errorf("lookup agent node: %w", err)
+		}
 	}
 	// A node bound before the "<agent>_<machine>" scheme existed keeps its
 	// RongCloud id: that id is the account's primary key, so re-deriving it
 	// would mint a second account and list the same agent twice.
 	rcUserID := agentNodeRCUserID(agent, machineID)
+	if rcOverride != "" {
+		rcUserID = rcOverride
+	}
 	if found && existing.RongcloudUserID != "" {
 		rcUserID = existing.RongcloudUserID
 	}
@@ -1424,7 +1494,13 @@ func (s *NodeService) ensureAgentNode(ctx context.Context, machineNode db.Rongcl
 // MachineAgentCredentials authenticates a device supervisor (machine node
 // credential) and returns the connection material of every bound agent node
 // on that machine.
-func (s *NodeService) MachineAgentCredentials(ctx context.Context, machineNodeIDText, credentialID, secret string) ([]MachineAgentCredential, error) {
+//
+// wantPerAgentOps 由新 CLI（0.2.39+）在 fetchDeviceNodes 时置真：为本机每个
+// 已绑定的非 ops agent 确保一个专属运维节点（rc "<agentRC>_ops"）并随凭据
+// 下发，supervisor 据此为每个 agent 各起一个 ops 子进程，运维会话按智能体
+// 隔离。旧 CLI 不传该标志 → 不创建、不下发，行为与之前完全一致（全机共享
+// 机器级 ops），避免「新服务端 + 旧设备端」时运维入口指向无人应答的账号。
+func (s *NodeService) MachineAgentCredentials(ctx context.Context, machineNodeIDText, credentialID, secret string, wantPerAgentOps ...bool) ([]MachineAgentCredential, error) {
 	if s.queries == nil {
 		return nil, errors.New("rongcloud: database not configured")
 	}
@@ -1458,6 +1534,28 @@ func (s *NodeService) MachineAgentCredentials(ctx context.Context, machineNodeID
 	if err != nil {
 		return nil, fmt.Errorf("rongcloud: list machine nodes: %w", err)
 	}
+	if len(wantPerAgentOps) > 0 && wantPerAgentOps[0] {
+		// 为本机每个已绑定的非 ops agent 确保专属运维节点（幂等）。单个失败
+		// 不阻断整体下发：缺的 agent 退化为机器级 ops（前端回退 om_ 账号）。
+		created := false
+		for _, n := range nodes {
+			if n.ID == machineNode.ID || isMachineNode(n) || !n.AiType.Valid || n.AiType.String == "" || n.AiType.String == OpsAgentType {
+				continue
+			}
+			if _, err := s.ensureAgentNodeWithRC(ctx, machineNode, machineID, OpsAgentType, perAgentOpsRCUserID(n.RongcloudUserID)); err != nil {
+				s.logger.Warn("rongcloud: ensure per-agent ops node failed",
+					"agent_rc", n.RongcloudUserID, "error", err)
+				continue
+			}
+			created = true
+		}
+		if created {
+			// 重新拉一次，把刚建出来（或复用到）的 per-agent ops 行纳入凭据下发。
+			if refreshed, err := s.queries.ListRongCloudNodesByMachineID(ctx, machineID); err == nil {
+				nodes = refreshed
+			}
+		}
+	}
 	creds := make([]MachineAgentCredential, 0, len(nodes))
 	for _, n := range nodes {
 		if n.ID == machineNode.ID {
@@ -1490,14 +1588,18 @@ func (s *NodeService) MachineAgentCredentials(ctx context.Context, machineNodeID
 		if err != nil {
 			continue
 		}
-		creds = append(creds, MachineAgentCredential{
+		cred := MachineAgentCredential{
 			Agent:         n.AiType.String,
 			NodeID:        n.NodeID,
 			RongCloudUser: n.RongcloudUserID,
 			Token:         string(token),
 			CredentialID:  device.CredentialID.String,
 			DeviceSecret:  string(deviceSecret),
-		})
+		}
+		if n.AiType.String == OpsAgentType && isPerAgentOpsRCUser(n.RongcloudUserID) {
+			cred.OpsFor = strings.TrimSuffix(n.RongcloudUserID, "_ops")
+		}
+		creds = append(creds, cred)
 	}
 	return creds, nil
 }

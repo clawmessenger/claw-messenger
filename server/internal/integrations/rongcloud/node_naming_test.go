@@ -192,3 +192,26 @@ func TestMachineDisplayName(t *testing.T) {
 		}
 	}
 }
+
+func TestPerAgentOpsRCUserID(t *testing.T) {
+	if got := perAgentOpsRCUserID("hermes_1234567890"); got != "hermes_1234567890_ops" {
+		t.Errorf("perAgentOpsRCUserID = %q", got)
+	}
+	// 机器级 ops 账号（ops_<key>）不能被误判为 per-agent，否则
+	// om_rongcloud_id（机器级兼容入口）会被 per-agent 行抢掉。
+	cases := []struct {
+		rc   string
+		want bool
+	}{
+		{"hermes_1234567890_ops", true},
+		{"opencode_oc5yj7nusm_ops", true},
+		{"ops_1234567890", false},     // 机器级 ops
+		{"hermes_1234567890", false},  // 普通 agent
+		{"rc_node_1234567890", false}, // 机器节点
+	}
+	for _, tc := range cases {
+		if got := isPerAgentOpsRCUser(tc.rc); got != tc.want {
+			t.Errorf("isPerAgentOpsRCUser(%q) = %v, want %v", tc.rc, got, tc.want)
+		}
+	}
+}
