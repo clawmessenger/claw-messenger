@@ -28,6 +28,11 @@ func (h *systemHandler) handleNodeMessage(ctx context.Context, msg NormalizedMes
 	case objectNameCommand:
 		h.handleCommandResult(ctx, msg)
 	case objectNameStream:
+		// 流帧心跳：当前轮成员的每一帧都给中继轮次续期，长思考轮不再被
+		// 固定超时掐断（见 chatroom_relay.go NotifyStreamActivity）。
+		if h.relayHub != nil {
+			h.relayHub.NotifyStreamActivity(msg.FromUserID)
+		}
 		h.handleStreamMessage(ctx, msg)
 	case objectNameText:
 		h.handleTextResponse(ctx, msg)
@@ -58,6 +63,10 @@ func (h *systemHandler) handleCommandResult(ctx context.Context, msg NormalizedM
 			return
 		}
 		// 讨论组闲聊中继：relay_ 前缀的 your_turn 回包在这里消化，不进旧协调器。
+		// 流式心跳（relay_ping_ 前缀）只续期不当回包，必须先于 AcceptResponse。
+		if h.relayHub != nil && h.relayHub.NotifyStreamActivity(result.RequestID) {
+			return
+		}
 		if h.relayHub != nil && h.relayHub.AcceptResponse(ctx, msg.FromUserID, result.RequestID,
 			content, kind == "error", errMsg) {
 			return

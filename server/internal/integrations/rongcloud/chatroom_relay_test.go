@@ -890,3 +890,54 @@ func TestBuildPrompt_DialogueStaysUnderArgvCap(t *testing.T) {
 		t.Fatal("the opening line must never be squeezed out")
 	}
 }
+
+func TestRelayHub_StreamPingExtendsTurn(t *testing.T) {
+	hub := &chatroomRelayHub{sessions: map[string]*relaySession{}, rt: nilRelayRuntime()}
+	s := &relaySession{
+		chatroomRCID: "room3",
+		members:      []relayMember{{rcID: "rc_a", roleName: "A", order: 0}},
+		index:        0,
+		requestID:    "relay_9_0",
+		senderRCID:   "rc_a",
+		currentDone:  make(chan struct{}),
+		turnExt:      &turnExtension{deadline: time.Now().Add(10 * time.Millisecond)},
+	}
+	hub.sessions["room3"] = s
+	ctx := context.Background()
+
+	// 心跳（relay_ping_ 前缀）被消化且续期：deadline 被推到未来远处。
+	before := s.turnExt.deadline
+	if !hub.NotifyStreamActivity("relay_ping_relay_9_0") {
+		t.Fatal("ping must be consumed as heartbeat")
+	}
+	if !s.turnExt.deadline.After(before.Add(time.Second)) {
+		t.Fatalf("deadline should be pushed far out, got delta=%v", s.turnExt.deadline.Sub(before))
+	}
+	// 心跳绝不能当完成回包：done 保持开着。
+	select {
+	case <-s.currentDone:
+		t.Fatal("ping must not close done")
+	default:
+	}
+	// 真正的回包照常推进。
+	if !hub.AcceptResponse(ctx, "rc_a", "relay_9_0", "ok", false, "") {
+		t.Fatal("real response accepted")
+	}
+	select {
+	case <-s.currentDone:
+	default:
+		t.Fatal("real response should close done")
+	}
+}
+
+func TestRelayHub_StreamPingUnknownTurnConsumed(t *testing.T) {
+	hub := &chatroomRelayHub{sessions: map[string]*relaySession{}, rt: nilRelayRuntime()}
+	// 未知/已作废轮次的心跳：同样按心跳消化（返回 true），绝不漏给旧协调器。
+	if !hub.NotifyStreamActivity("relay_ping_relay_gone") {
+		t.Fatal("stale ping must still be consumed")
+	}
+	// 非 relay_ping_ 前缀：不消化，让调用方继续走回包路径。
+	if hub.NotifyStreamActivity("relay_1_0") {
+		t.Fatal("non-ping request id must not be consumed by the ping path")
+	}
+}

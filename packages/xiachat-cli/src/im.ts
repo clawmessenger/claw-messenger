@@ -267,6 +267,9 @@ const STALE_RUNTIME_RECOVERY_REQUEST_MS = 60_000;
 // SEND_FREQUENCY_TOO_FAST），逐 token 发帧必然触发；快照帧按此间隔节流，
 // 攒下的内容由下一帧或终帧补全（快照语义使丢帧无害）。
 const STREAM_FRAME_INTERVAL_MS = 500;
+// 流式心跳间隔：比服务端轮次超时（默认 60s）短一个量级，服务端每收到一次
+// 心跳就把该轮 deadline 重置成完整超时 —— 只要流还在动就永不超时。
+const STREAM_PING_INTERVAL_MS = 15_000;
 
 export class MessageDispatcher {
   // cardId -> latest html for cards this bridge produced, so card_action
@@ -428,6 +431,8 @@ export class MessageDispatcher {
         // 不会顺着 agent 的共享会话爬进普通群聊。
         sessionKey: turnSessionKey(venue, replyTo),
         turns,
+        // 流式心跳收件人 = 轮次派发者（服务端系统节点私聊下发 your_turn）。
+        yourTurnFrom: msg.fromUserId,
         fallback: async (out) => {
           await this.deps.send(
             replyTo,
@@ -466,6 +471,8 @@ export class MessageDispatcher {
     turns: TurnRunner;
     /** 见 turnSessionKey：把这一轮绑到本会话独立的 agent 会话上。 */
     sessionKey?: string;
+    /** your_turn 轮的派发者（服务端系统节点）：流式心跳的收件人。 */
+    yourTurnFrom?: string;
     fallback: (out: string) => Promise<void>;
     onError?: (errMsg: string) => Promise<void>;
   }): Promise<void> {
@@ -537,6 +544,8 @@ export class MessageDispatcher {
     this.activeStreams.set(ctx.streamId, controller);
     // 过程流的补偿帧定时器：声明在 try 之外，finally 才能把它撤掉（见文件末尾）。
     let pendingActivityFlush: ReturnType<typeof setTimeout> | null = null;
+    // 流式心跳定时器：同理，finally 撤。
+    let pingTimer: ReturnType<typeof setInterval> | null = null;
     try {
       if (!canStream) {
         // Degraded path (tests, or an agent without streamed stdout): the
@@ -575,6 +584,25 @@ export class MessageDispatcher {
         return last && last[0] === "r" ? timeline.length - 1 : null;
       };
       let lastSent = 0;
+      // 流式心跳：your_turn 轮流式期间每隔 STREAM_PING_INTERVAL_MS 私聊回
+      // 轮次派发者（= 服务端系统节点）一条 command 心跳（request_id =
+      // relay_ping_<轮次id>）。流帧是群/聊天室广播、不经服务端 webhook，
+      // 服务端只能靠心跳知道「成员还在产出」，否则轮次超时一到就放行下一位
+      // —— 长思考轮必然被掐。服务端对非中继轮次的心跳是 no-op，老服务端
+      // 不识别前缀时也只是找不到会话后丢弃，协议安全。（pingTimer 声明在
+      // try 之外，这里只赋值。）
+      if (ctx.requestMessageId.startsWith("relay_") && opts.yourTurnFrom && this.deps.send) {
+        const pingRequestId = `relay_ping_${ctx.requestMessageId}`;
+        const pingTarget = opts.yourTurnFrom;
+        pingTimer = setInterval(() => {
+          if (controller.signal.aborted) return;
+          void this.deps.send!(
+            pingTarget,
+            "command",
+            encodeCommandResult(pingRequestId, "text", { content: "" }),
+          ).catch(() => {});
+        }, STREAM_PING_INTERVAL_MS);
+      }
       // 节流窗口内到达的过程流更新需要一次补偿帧：长工具阶段正文久久不来，
       // 若完全等下一个 chunk，用户就看不到「正在联网搜索」这一步。
       const emitStreamingFrame = async () => {
@@ -661,6 +689,11 @@ export class MessageDispatcher {
       await opts.fallback(visibleText);
       await this.sendArtifactMessages(ctx, uploaded);
     } finally {
+      // 心跳随轮次结束：终帧/取消/失败之后都不再发。
+      if (pingTimer !== null) {
+        clearInterval(pingTimer);
+        pingTimer = null;
+      }
       // 补偿帧还在等就别再发了：这一轮已经收尾，晚到的帧只会顶掉终帧。
       if (pendingActivityFlush !== null) {
         clearTimeout(pendingActivityFlush);

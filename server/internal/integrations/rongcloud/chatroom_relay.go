@@ -121,6 +121,25 @@ type relaySession struct {
 	// allReplies 是本次中继累计的全部发言（跨轮），只用于收尾时并入滚动
 	// 缓存；s.replies 仍是「本轮」发言，每轮开始清空。
 	allReplies []relayReply
+	// turnExt 从派发起每次成员发言流帧都会触碰的续期句柄：流还在动 = 成员
+	// 还活着，pump 的等待计时就该重置，不能按固定超时把长思考轮掐了
+	// （hermes 长思考 90~120s，默认 60s 超时一到下一位就开跑，用户看到的
+	// 「上一位还在流式下一位已开跑」就是它）。nil 表示当前无轮可续。
+	turnExt *turnExtension
+}
+
+// turnExtension 是当前轮的可重置计时：NotifyStreamActivity 收到心跳时把
+// deadline 重置，pump 的等待循环每次醒来都看它。互斥量就是 relayHub 的 h.mu。
+type turnExtension struct {
+	deadline time.Time
+}
+
+// minDuration 返回较小者，pump 等待循环用它限制单次睡眠。
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // relayRound 是一轮已完成的对话：一条用户消息 + 该轮各位 AI 的回应。
@@ -355,31 +374,66 @@ func (h *chatroomRelayHub) pump(ctx context.Context, s *relaySession) {
 			s.requestID = requestID
 			s.senderRCID = member.rcID
 			s.currentDone = done
+			// 新一轮派发：从现在起计时；流帧续期从此句柄进入。
+			ext := &turnExtension{deadline: time.Now().Add(timeout)}
+			s.turnExt = ext
 			h.mu.Unlock()
 			if err := h.dispatchTurn(ctx, s, member, requestID); err != nil {
 				h.rt.logger.Warn("relay: dispatch failed",
 					"chatroom", s.chatroomRCID, "target", member.rcID,
 					"round", s.roundIndex+1, "error", err)
 				// 派发失败视同该成员本轮跳过，继续下一位。
+				h.mu.Lock()
+				if s.turnExt == ext {
+					s.turnExt = nil
+				}
+				h.mu.Unlock()
 				s.index++
 				continue
 			}
-			select {
-			case <-done:
-				// 回包已处理（broadcast 已在 AcceptResponse 里完成），前进。
-			case <-time.After(timeout):
-				h.rt.logger.Warn("relay: turn timed out",
-					"chatroom", s.chatroomRCID, "target", member.rcID,
-					"round", s.roundIndex+1)
-				// 超时后作废当前轮：迟到的回包因 requestID 已不匹配被丢弃。
+			// 可重置的等待：成员每发一个流帧就把 deadline 往后推 —— 流还在
+			// 动说明它还在产出，绝不能按固定超时把长思考轮掐掉。轮询间隔
+			// 500ms，与派发粒度同量级；「deadline 后仍无回执」才判超时。
+		waitLoop:
+			for {
 				h.mu.Lock()
-				if s.requestID == requestID {
-					s.requestID = ""
+				now := time.Now()
+				remaining := ext.deadline.Sub(now)
+				if s.turnExt != ext || s.requestID != requestID {
+					h.mu.Unlock()
+					break waitLoop // 轮已被作废/推进，别再等
+				}
+				if remaining <= 0 {
+					h.mu.Unlock()
+					// 超时后作废当前轮：迟到的回包因 requestID 已不匹配被丢弃。
+					h.rt.logger.Warn("relay: turn timed out",
+						"chatroom", s.chatroomRCID, "target", member.rcID,
+						"round", s.roundIndex+1)
+					h.mu.Lock()
+					if s.requestID == requestID {
+						s.requestID = ""
+					}
+					if s.turnExt == ext {
+						s.turnExt = nil
+					}
+					h.mu.Unlock()
+					break waitLoop
 				}
 				h.mu.Unlock()
-			case <-ctx.Done():
-				return
+				select {
+				case <-done:
+					break waitLoop // 回包已处理（broadcast 在 AcceptResponse 里完成），前进。
+				case <-ctx.Done():
+					return
+				case <-time.After(minDuration(remaining, 500*time.Millisecond)):
+					// 回头重新检查 deadline（可能已被流帧推后）。
+				}
 			}
+			h.mu.Lock()
+			if s.turnExt == ext {
+				s.turnExt = nil
+			}
+			h.mu.Unlock()
 			s.index++
 		}
 		// 本轮全员发言结束：把这一轮并进历史，供下一轮的提示词使用。
@@ -717,6 +771,32 @@ func renderRelayRound(round relayRound) string {
 		fmt.Fprintf(&b, "\n- %s：%s", reply.roleName, clipRelayText(reply.content, relayHistoryReplyClip))
 	}
 	return b.String()
+}
+
+// relayPingPrefix 是设备端流式心跳 command_result 的 request_id 前缀：
+// `relay_ping_<原轮次 request_id>`。CLI 在流式期间每隔 15s 发一条心跳（复用
+// command 通道，不加新消息类型）；服务端拦下它只做续期，绝不当成完成回包。
+// 流帧本身是群/聊天室广播、不经服务端 webhook —— 这是服务端唯一能感知
+// 「成员还在产出」的信号。老设备不发心跳 → 行为与从前一致（纯固定超时）。
+const relayPingPrefix = "relay_ping_"
+
+// NotifyStreamActivity 心跳入口：按前缀还原真实轮次 request_id 并续期。
+// 返回 true 表示这条消息被当作心跳消化（调用方不要再当回包处理）。
+func (h *chatroomRelayHub) NotifyStreamActivity(requestID string) bool {
+	if !strings.HasPrefix(requestID, relayPingPrefix) {
+		return false
+	}
+	turnID := strings.TrimPrefix(requestID, relayPingPrefix)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, s := range h.sessions {
+		if s.requestID == turnID && s.turnExt != nil {
+			s.turnExt.deadline = time.Now().Add(h.rt.interactiveTurnTimeout())
+			return true
+		}
+	}
+	// 心跳晚到（轮已推进/超时作废）：同样按心跳消化，别往下漏。
+	return true
 }
 
 // AcceptResponse 处理设备对 relay your_turn 的回包。返回 false 表示这条
