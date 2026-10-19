@@ -548,6 +548,8 @@ export class MessageDispatcher {
     let pingTimer: ReturnType<typeof setInterval> | null = null;
     /** 本轮心跳失败次数（0 = 链路健康），用于收尾时汇总。 */
     let pingFailures = 0;
+    /** 轮次开始时刻：日志里打 elapsed，用来回答「这一轮到底跑了多久」。 */
+    const turnStartedAt = Date.now();
     try {
       // 流式心跳：relay_ 轮**从轮次一开始**就发，不分区分流式/降级路径 ——
       // openclaw 这类不流式的运行时全程沉默、只在结束时发一帧，若只挂在
@@ -563,19 +565,24 @@ export class MessageDispatcher {
         pingFailures = 0;
         pingTimer = setInterval(() => {
           if (controller.signal.aborted) return;
-          void this.deps.send!(
+          const beat = () => this.deps.send!(
             pingTarget,
             "command",
             encodeCommandResult(pingRequestId, "text", { content: "" }),
-          ).catch((err) => {
-            pingFailures += 1;
-            if (pingFailures === 1 || pingFailures % 8 === 0) {
-              console.error(
-                `relay ping failed (${pingFailures}) req=${ctx.requestMessageId}:`,
-                err instanceof Error ? err.message : err,
-              );
-            }
-          });
+          );
+          // 心跳是服务端唯一的「还在产出」信号：单次失败（融云限流/抖动）就
+          // 立刻补一次，别让 120s 的空闲窗口被一次丢包吃掉。
+          void beat().catch(() => setTimeout(() => {
+            void beat().catch((err) => {
+              pingFailures += 1;
+              if (pingFailures === 1 || pingFailures % 8 === 0) {
+                console.error(
+                  `relay ping failed (${pingFailures}) req=${ctx.requestMessageId}:`,
+                  err instanceof Error ? err.message : err,
+                );
+              }
+            });
+          }, 1_000));
         }, STREAM_PING_INTERVAL_MS);
       }
       if (!canStream) {
@@ -695,7 +702,11 @@ export class MessageDispatcher {
       console.log(
         `stream: conv=${ctx.conversationType}/${ctx.conversationId} req=${ctx.requestMessageId}`
         + ` text=${visibleText.length} reasoning=${reasoningSnapshot.length}`
-        + ` activity=${activitySnapshot.length} frames=${seq}`,
+        + ` activity=${activitySnapshot.length} frames=${seq}`
+        // 这一轮的真实墙钟耗时。群聊越序排查时先看它：超过服务端空闲窗口
+        // （120s）而心跳全绿 → 服务端在等，是 agent 本身慢；耗时正常却越序
+        // → 心跳断了（见 relay ping 日志）。
+        + ` elapsed=${Math.round((Date.now() - turnStartedAt) / 1000)}s`,
       );
       await emit(seq, "completed", visibleText, reasoningSnapshot || undefined, undefined, activitySnapshot, timeline);
       await opts.fallback(visibleText);
