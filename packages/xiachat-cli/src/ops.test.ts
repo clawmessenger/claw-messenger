@@ -130,6 +130,23 @@ describe("setupOpsWorkdir", () => {
     }
   });
 
+  // 现场（2026-10-20 13:07）：模型把 PowerShell 的 Get-Content 塞进 bash，报
+  // command not found 之后一声不吭，这一轮被判「没有正常收尾」。提示词得先说清
+  // 命令工具是 git-bash，并给出等价写法。
+  it("tells the ops agent which shell its command tool really is", async () => {
+    const dir = path.join(os.tmpdir(), `clawmessenger-ops-test-${Date.now()}`);
+    try {
+      await setupOpsWorkdir(dir, { opsFor: "rc_node_3300776275_openclaw", agentName: "openclaw" });
+      const md = await readFile(path.join(dir, "AGENTS.md"), "utf8");
+      expect(md).toContain("git-bash");
+      expect(md).toContain("Get-Content");
+      expect(md).toContain("$env:USERPROFILE");
+      expect(md).toContain("必须先用一句话说明失败原因");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("rewrites AGENTS.md idempotently", async () => {
     const dir = path.join(os.tmpdir(), `clawmessenger-ops-test-${Date.now()}`);
     try {

@@ -1012,10 +1012,17 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
             const steps = activity?.snapshot() ?? [];
             const lastStep = steps[steps.length - 1];
             if (lastStep && lastStep.status === "failed" && !textAfterLastTool) {
+              // 把「哪条命令、错在哪」一起写进日志：2026-10-20 13:07 现场就是
+              // 模型把 PowerShell 的 Get-Content 塞进 bash，报 command not found
+              // 之后一声不吭，只看 label「执行命令」根本查不出是 shell 不匹配。
+              const failedCmd = (lastStep.detail ?? "").replace(/\s+/g, " ").trim().slice(0, 120);
+              const failedOut = (lastStep.outputDetail ?? "").replace(/\s+/g, " ").trim().slice(0, 160);
               reject(new TurnIncompleteError(
                 "agent_incomplete",
                 streamedText,
-                `turn ended on a failed ${lastStep.label} with no follow-up text`,
+                `turn ended on a failed ${lastStep.label} with no follow-up text`
+                  + (failedCmd ? ` [cmd: ${failedCmd}]` : "")
+                  + (failedOut ? ` [output: ${failedOut}]` : ""),
               ));
               return;
             }

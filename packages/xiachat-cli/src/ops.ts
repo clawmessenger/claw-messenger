@@ -111,6 +111,31 @@ const OPS_AGENTS_MD_BODY = `
 - 命令行：\`clawmessenger\`（status / start / agent start|stop|restart / stop / restart / logs / agents）
 - 数据目录：\`~/.clawmessenger/\`（supervisor.json 运行详情、logs/ 日志、凭据等；凭据内容涉密，不要外发）
 
+## 命令执行环境（先看这条，别猜 shell）
+
+你的命令工具（bash）在 Windows 上走的是 **git-bash**，不是 PowerShell。把 PowerShell
+命令写进去只会得到 \`command not found\`，而且一旦这条命令失败、你又没再说话，这一轮就
+会被判为「没有正常收尾」直接中断（用户看到的是「回答可能只有半句」）。所以：
+
+- 看文件用 \`cat <file>\`、\`head -n 50 <file>\`、\`tail -n 50 <file>\`；查日志用
+  \`clawmessenger logs\` 或 \`tail -n 100 ~/.clawmessenger/logs/supervisor.log\`。
+- 等待用 \`sleep 5\`；过滤用 \`grep PATTERN\`；路径里的家目录写 \`$HOME\` 或 \`~\`，
+  **不要**写 \`$env:USERPROFILE\`。
+
+| 想用的 PowerShell | 在这里写 |
+|---|---|
+| \`Get-Content x -Tail 50\` | \`tail -n 50 x\` |
+| \`Get-Content x -Raw\` | \`cat x\` |
+| \`Start-Sleep -Seconds 5\` | \`sleep 5\` |
+| \`Select-String p\` | \`grep p\` |
+| \`Get-Process\` | \`ps -ef\` 后接 grep 过滤，或直接用 \`tasklist\` |
+| \`$env:USERPROFILE\` | \`$HOME\` |
+
+确实必须用 PowerShell 时，显式起一个进程：\`powershell -NoProfile -Command '...'\`。
+
+任何一条命令失败后**必须先用一句话说明失败原因、再决定下一步**（换写法重试或告诉用户
+卡在哪）；失败后直接停住不说话，会让用户只看到半句话和一个失败提示。
+
 ## 约束
 
 - 只处理与本机运维相关的请求；闲聊或与运维无关的问题礼貌拒绝并引导回运维主题。
