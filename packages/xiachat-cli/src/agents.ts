@@ -1023,6 +1023,9 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
                 `turn ended on a failed ${lastStep.label} with no follow-up text`
                   + (failedCmd ? ` [cmd: ${failedCmd}]` : "")
                   + (failedOut ? ` [output: ${failedOut}]` : ""),
+                // 结构化带上失败步骤：im.ts 据此自动补跑一轮（把命令与错误
+                // 回喂给 agent 让它换写法继续），而不是直接把半句话丢给用户。
+                { label: lastStep.label, command: failedCmd || undefined, output: failedOut || undefined },
               ));
               return;
             }

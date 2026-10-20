@@ -1274,6 +1274,89 @@ describe("MessageDispatcher chat_stream streaming", () => {
     expect(last.error_code).toBe("output_truncated")
     expect(String(last.text)).toContain("拉取模型列表：")
   })
+
+  // 2026-10-20 运维现场：opencode 把 PowerShell 塞进 git-bash，command not found
+  // 之后一声不吭，用户看到半句话。现在设备端自动补跑一轮（把失败原因回喂），
+  // 用户应看到一次完整回答，而不是手动重发。
+  it("撞失败工具没下文时自动补跑一轮：补跑成功则发 completed，不发 failed", async () => {
+    const { deps, streams } = buildDeps()
+    const dispatcher = new MessageDispatcher(deps)
+    const prompts: string[] = []
+    await dispatcher.handle({
+      objectName: "RC:TxtMsg", fromUserId: "user_a", toUserId: "", targetId: "node_self",
+      conversationType: 1, content: JSON.stringify({ content: "设备上线" }),
+    }, {
+      runTurn: async () => { throw new Error("unused") },
+      runTurnStreamed: async (prompt: string, _m: string | undefined, onDelta: (d: string) => void) => {
+        prompts.push(prompt)
+        if (prompts.length === 1) {
+          onDelta("……")
+          throw new TurnIncompleteError(
+            "agent_incomplete", "……",
+            "turn ended on a failed 执行命令 with no follow-up text",
+            { label: "执行命令", command: "Get-Content x -Tail 50", output: "Get-Content: command not found" },
+          )
+        }
+        onDelta("刚才读日志的命令写法不兼容，已换写法。")
+        return "刚才读日志的命令写法不兼容，已换写法。本账号已上线。"
+      },
+    })
+
+    // 补跑过一次，且补跑提示词带着失败命令与错误。
+    expect(prompts).toHaveLength(2)
+    expect(prompts[1]).toContain("设备上线")
+    expect(prompts[1]).toContain("Get-Content x -Tail 50")
+    expect(prompts[1]).toContain("command not found")
+    const frames = streams.map((s) => parseFrame(s.content))
+    expect(frames.filter((f) => f.status === "failed")).toHaveLength(0)
+    const completed = frames.at(-1)!
+    expect(completed.status).toBe("completed")
+    expect(String(completed.text)).toContain("已上线")
+  })
+
+  it("补跑仍失败才发 failed 终帧，且只补一次", async () => {
+    const { deps, streams } = buildDeps()
+    const dispatcher = new MessageDispatcher(deps)
+    let calls = 0
+    await dispatcher.handle({
+      objectName: "RC:TxtMsg", fromUserId: "user_a", toUserId: "", targetId: "node_self",
+      conversationType: 1, content: JSON.stringify({ content: "hi" }),
+    }, {
+      runTurn: async () => { throw new Error("unused") },
+      runTurnStreamed: async () => {
+        calls += 1
+        throw new TurnIncompleteError(
+          "agent_incomplete", "半句", "turn ended on a failed 执行命令 with no follow-up text",
+          { label: "执行命令", command: "bad-cmd", output: "command not found" },
+        )
+      },
+    })
+
+    expect(calls).toBe(2) // 首轮 + 一次补跑，不再多
+    const failed = streams.map((s) => parseFrame(s.content)).filter((f) => f.status === "failed")
+    expect(failed.length).toBeGreaterThanOrEqual(1)
+    expect(failed.at(-1)!.error_code).toBe("agent_incomplete")
+  })
+
+  it("openclaw 运行时自己 abort（无 failedStep）不补跑，直接报 failed", async () => {
+    const { deps, streams } = buildDeps()
+    const dispatcher = new MessageDispatcher(deps)
+    let calls = 0
+    await dispatcher.handle({
+      objectName: "RC:TxtMsg", fromUserId: "user_a", toUserId: "", targetId: "node_self",
+      conversationType: 1, content: JSON.stringify({ content: "hi" }),
+    }, {
+      runTurn: async () => { throw new Error("unused") },
+      runTurnStreamed: async () => {
+        calls += 1
+        throw new TurnIncompleteError("agent_incomplete", "半句", "openclaw turn did not finish: aborted")
+      },
+    })
+
+    expect(calls).toBe(1)
+    const failed = streams.map((s) => parseFrame(s.content)).filter((f) => f.status === "failed")
+    expect(failed.at(-1)!.error_code).toBe("agent_incomplete")
+  })
 })
 
 describe("chat_stream timeline（思考段与工具调用交错）", () => {

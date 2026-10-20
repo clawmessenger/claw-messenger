@@ -664,6 +664,8 @@ describe("runAgentTurn", () => {
       })).rejects.toMatchObject({
         code: "agent_incomplete",
         partialText: "已登录。拉取模型列表：",
+        // failedStep 结构化带出失败命令：im.ts 靠它自动补跑一轮。
+        failedStep: { label: "执行命令", command: "arkcli models list" },
       });
     } finally {
       fixture.cleanup();

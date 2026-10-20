@@ -126,6 +126,20 @@ export function describeTurnError(code: TurnErrorCode): string {
 }
 
 /**
+ * 「没答完」时最后撞上的那步失败工具：自动补跑（buildAutoContinuationPrompt）
+ * 靠它告诉 agent 上一轮卡在哪、错在哪。字段已在抛出点截断（cmd≤120、
+ * output≤160 字符），不会再膨胀。
+ */
+export interface TurnFailedStep {
+  /** 步骤名（如「执行命令」）。 */
+  label: string;
+  /** 失败的命令/入参摘要。 */
+  command?: string;
+  /** 工具的错误输出摘要。 */
+  output?: string;
+}
+
+/**
  * 「这一轮没答完」的失败：进程可能 exit 0，但我们知道它不是一次完整的回答。
  *
  * 与普通 Error 的区别是带着**已经产出的正文**（partialText）——终帧必须把它
@@ -138,11 +152,40 @@ export function describeTurnError(code: TurnErrorCode): string {
 export class TurnIncompleteError extends Error {
   readonly code: TurnErrorCode;
   readonly partialText: string;
+  /** 仅 agent_incomplete 的「撞失败工具没下文」场景携带：供自动补跑。 */
+  readonly failedStep?: TurnFailedStep;
 
-  constructor(code: TurnErrorCode, partialText: string, detail?: string) {
+  constructor(code: TurnErrorCode, partialText: string, detail?: string, failedStep?: TurnFailedStep) {
     super(detail ?? `turn incomplete: ${code}`);
     this.name = "TurnIncompleteError";
     this.code = code;
     this.partialText = partialText;
+    if (failedStep) this.failedStep = failedStep;
   }
+}
+
+/**
+ * 自动补跑的提示词：agent 上一轮「撞在失败的工具上就没下文」时，把失败原因
+ * 回喂，让它先向用户交代一句、再换个写法把原来的请求办完。
+ *
+ * 为什么不续会话而是自包含提示词：opencode 每轮 `opencode run` 是新会话，
+ * 续不上；自包含提示词对所有运行时（opencode/openclaw/hermes）一视同仁。
+ * 原请求全文带上，失败的命令与错误输出带上，模型不需要任何上一轮的记忆。
+ */
+export function buildAutoContinuationPrompt(originalPrompt: string, incomplete: TurnIncompleteError): string {
+  const step = incomplete.failedStep;
+  const lines = [
+    originalPrompt,
+    "",
+    "---",
+    `系统提示（不要原样复述给用户）：你上一轮处理这个请求时没有答完——最后一步「${step?.label ?? "工具调用"}」失败了，之后你就停住了，用户只看到了半句话。`,
+  ];
+  if (step?.command) lines.push(`失败命令：${step.command}`);
+  if (step?.output) lines.push(`错误输出：${step.output}`);
+  lines.push(
+    "请先用一句话向用户说明刚才那步为什么失败，然后换一种可行的写法"
+      + "（注意：命令工具在 Windows 上是 git-bash，不是 PowerShell，"
+      + "比如用 tail -n 100 读日志末尾、用 grep 过滤）继续把用户上面的请求办完。",
+  );
+  return lines.join("\n");
 }

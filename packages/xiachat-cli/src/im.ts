@@ -7,7 +7,7 @@ import type { ActivityStep } from "./agent-activity.js";
 import { decodeCommandContent, encodeCommandResult } from "./protocol.js";
 import { buildChatStreamFrame, encodeChatStreamWireFrames, parseChatStopRequest, type ChatStreamStatus, type ChatStreamTimelineEntry } from "./chat-stream.js";
 import { buildHtmlCard, extractHtmlFence, htmlReviseFromFilePrompt, htmlRevisePrompt } from "./cards.js";
-import { classifyTurnError, describeTurnError, TurnIncompleteError } from "./turn-error.js";
+import { buildAutoContinuationPrompt, classifyTurnError, describeTurnError, TurnIncompleteError } from "./turn-error.js";
 import {
   buildModelCatalogResponse,
   EMPTY_MODEL_CATALOG,
@@ -688,21 +688,40 @@ export class MessageDispatcher {
         await emitStreamingFrame();
       };
       let finalText = "";
-      try {
-        finalText = await opts.turns.runTurnStreamed!(
-          opts.prompt,
-          opts.model,
-          sendDelta,
-          controller.signal,
-          opts.sessionKey,
-        );
-      } catch (err) {
+      // 自动补跑：「撞在失败的工具上就没下文」（agent_incomplete + failedStep）
+      // 时把失败原因回喂，让 agent 换写法接着答完 —— 用户看到它继续干活，而不是
+      // 半句话加一行错误。只补一次：补跑仍失败就按原样发 failed 终帧。
+      // （2026-10-20 现场：运维助手把 PowerShell 塞进 git-bash，command not found
+      // 之后一声不吭，用户每问一句运维都要手动重发一次。）
+      let continuationUsed = false;
+      let turnPrompt = opts.prompt;
+      for (;;) {
+        try {
+          finalText = await opts.turns.runTurnStreamed!(
+            turnPrompt,
+            opts.model,
+            sendDelta,
+            controller.signal,
+            opts.sessionKey,
+          );
+          break;
+        } catch (err) {
         if (controller.signal.aborted) {
           await emit(seq, "cancelled", snapshot, reasoningSnapshot || undefined, undefined, activitySnapshot, timeline);
           return;
         }
-        const errMsg = err instanceof Error ? err.message : String(err);
         const incomplete = err instanceof TurnIncompleteError ? err : undefined;
+        if (!continuationUsed && incomplete?.code === "agent_incomplete" && incomplete.failedStep) {
+          continuationUsed = true;
+          console.warn(
+            `auto-continue: conv=${ctx.conversationType}/${ctx.conversationId}`
+            + ` req=${ctx.requestMessageId} step=${incomplete.failedStep.label}`
+            + (incomplete.failedStep.command ? ` cmd=${incomplete.failedStep.command}` : ""),
+          );
+          turnPrompt = buildAutoContinuationPrompt(opts.prompt, incomplete);
+          continue;
+        }
+        const errMsg = err instanceof Error ? err.message : String(err);
         const errorCode = incomplete ? incomplete.code : classifyTurnError(errMsg);
         // 「没答完」这一类失败带着已经产出的正文：终帧必须把它带上，否则用户
         // 刚在气泡里看到的半句话会凭空消失，只剩一行错误提示。
@@ -722,6 +741,7 @@ export class MessageDispatcher {
           return;
         }
         throw err;
+        }
       }
       // 已被 chat_stop 中止：不再发任何终帧（cancelled 帧只在 agent 轮
       // 因 abort 抛错时由 catch 分支发出；这里 turn 已正常返回，沉默即止）。

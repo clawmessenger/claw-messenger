@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
-import { classifyTurnError, describeTurnError } from "./turn-error.js";
+import { buildAutoContinuationPrompt, classifyTurnError, describeTurnError, TurnIncompleteError } from "./turn-error.js";
 
 /** web 端 validChatIdentifier 的同款约束：无控制/格式字符、首尾无空白、≤256。 */
 function isWireSafe(code: string): boolean {
@@ -67,5 +67,31 @@ describe("classifyTurnError", () => {
       expect(isWireSafe(code)).toBe(true);
       expect(describeTurnError(code).length).toBeGreaterThan(0);
     }
+  });
+});
+
+describe("buildAutoContinuationPrompt（撞失败工具后的自动补跑提示词）", () => {
+  const err = new TurnIncompleteError(
+    "agent_incomplete",
+    "……",
+    "turn ended on a failed 执行命令 with no follow-up text",
+    { label: "执行命令", command: "Get-Content x -Tail 50", output: "Get-Content: command not found" },
+  );
+
+  it("带上原请求、失败步骤、命令与错误输出", () => {
+    const prompt = buildAutoContinuationPrompt("设备上线", err);
+    expect(prompt).toContain("设备上线");
+    expect(prompt).toContain("执行命令");
+    expect(prompt).toContain("Get-Content x -Tail 50");
+    expect(prompt).toContain("command not found");
+    // 必须提醒 shell 是 git-bash —— 否则补跑会再犯同一个错。
+    expect(prompt).toContain("git-bash");
+  });
+
+  it("没有 failedStep 时也能给出通用提示（不崩）", () => {
+    const bare = new TurnIncompleteError("agent_incomplete", "半句", "aborted");
+    const prompt = buildAutoContinuationPrompt("原问题", bare);
+    expect(prompt).toContain("原问题");
+    expect(prompt).toContain("没有答完");
   });
 });
