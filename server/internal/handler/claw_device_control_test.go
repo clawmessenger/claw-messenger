@@ -193,3 +193,28 @@ func TestApplyDeviceControlOverridesEmptyInput(t *testing.T) {
 		t.Fatalf("want empty, got %d", len(got))
 	}
 }
+
+// 老设备兜底：0.2.45 及更早的 CLI 会把融云 id 当 target 发上来（它从
+// <machineRC>_<agent> 里取 agent 名时算错）。三种写法都要能落到同一个节点。
+func TestMatchControlTargetAcceptsNameNodeIDAndRcUserID(t *testing.T) {
+	refs := machineRefs()
+
+	for _, target := range []string{"hermes", "node_hermes", "hermes_330076275"} {
+		got := matchControlTarget(refs, target)
+		if got == nil {
+			t.Fatalf("target %q: want a match, got nil", target)
+		}
+		if got.Agent != "hermes" {
+			t.Errorf("target %q: want hermes, got %s", target, got.Agent)
+		}
+	}
+}
+
+func TestMatchControlTargetRejectsUnknownAndEmpty(t *testing.T) {
+	refs := machineRefs()
+	for _, target := range []string{"", "   ", "rc_node_3300776275", "codex"} {
+		if got := matchControlTarget(refs, target); got != nil {
+			t.Errorf("target %q: want nil, got %s", target, got.Agent)
+		}
+	}
+}

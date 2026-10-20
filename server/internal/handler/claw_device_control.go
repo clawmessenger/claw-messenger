@@ -181,6 +181,27 @@ func controlTargetAllowed(actor controlActor, refs []rongcloud.AgentNodeRef, tar
 	return actor.NodeID != "" && actor.NodeID == target.NodeID
 }
 
+// matchControlTarget 在本机 agent 清单里找 req.Target 指向的那一个。
+//
+// 三种写法都认：agent 名（hermes）、节点 uuid、融云 id（rc_node_<key>_hermes）。
+//
+// 认融云 id 是给老设备的兜底：0.2.45 及更早的 CLI 从 <machineRC>_<agent> 里
+// 取 agent 名时算错，会把 rc_node_<key> 当 target 发上来。只认名字的话它们一律
+// 404「本机没有这个智能体」，而 CLI 又把 404 译成「接口还没上线」——用户看到
+// 的是「服务端要升级」，实际是名字算错了（2026-10-20 12:43 的现场）。
+// 认了 rc id，这些设备不升级也能按账号启停；权限仍由 controlTargetAllowed 判。
+func matchControlTarget(refs []rongcloud.AgentNodeRef, target string) *rongcloud.AgentNodeRef {
+	if target == "" {
+		return nil
+	}
+	for i := range refs {
+		if refs[i].NodeID == target || refs[i].Agent == target || refs[i].RongcloudUserID == target {
+			return &refs[i]
+		}
+	}
+	return nil
+}
+
 // perAgentOpsOwner 判定 rc 是否 per-agent 运维账号，并返回它服务的 agent rc。
 //
 // 旧机器级 ops 也叫 "rc_node_<key>_ops"，同样以 "_ops" 结尾，所以不能只看
@@ -262,13 +283,7 @@ func (h *Handler) ClawDeviceControlSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var target *rongcloud.AgentNodeRef
-	for i := range refs {
-		if refs[i].NodeID == req.Target || refs[i].Agent == req.Target {
-			target = &refs[i]
-			break
-		}
-	}
+	target := matchControlTarget(refs, req.Target)
 	if target == nil {
 		clawJSON(w, 404, 404, "本机没有这个智能体", nil)
 		return
