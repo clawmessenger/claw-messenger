@@ -162,7 +162,7 @@ export function buildProgram(opts: BuildProgramOpts): Command {
   program
     .name("clawmessenger")
     .description("User-device agent CLI over RongCloud IM")
-    .version("0.2.45")
+    .version("0.2.46")
     // Tests parse this program in-process; commander would otherwise
     // process.exit on missing options and kill the vitest runner.
     .exitOverride();
@@ -355,11 +355,25 @@ export function buildProgram(opts: BuildProgramOpts): Command {
         );
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        if (message.includes("HTTP 404")) {
+        // 404 有两种，别混成一句话：
+        //   1) 路由根本不存在（旧服务端 / nginx），响应体不是 JSON，我们拿不到
+        //      message，报错里只有 "HTTP 404"；
+        //   2) 路由在，但服务端按名字找不到这个智能体（「本机没有这个智能体」），
+        //      响应体带 message，报错里是 "HTTP 404: ..."。
+        // 以前一律按 (1) 播报「接口未上线」，2026-10-20 12:43 那次运维就把
+        // 「target 名字算错了」当成「服务端要升级」，白等了一轮。
+        const serverSaid = /HTTP \d{3}: /.test(message);
+        if (message.includes("HTTP 404") && !serverSaid) {
           // 服务端还没上 control/set：别让运维助手退回整机 stop（会连坐别的账号）。
           opts.stdout.write(
             "服务端还不支持按账号启停（/api/claw/device/control/set 未上线）。"
               + "请先升级服务端；临时恢复本账号在线可用 `clawmessenger start`，不要用整机 stop。\n",
+          );
+        } else if (message.includes("HTTP 404")) {
+          opts.stdout.write(
+            `服务端没有找到智能体 \`${target}\`（它不在本机已绑定的清单里）。`
+              + `本账号对应的名字是 \`${scopeAgent || "?"}\`；`
+              + "可先用 `clawmessenger agents` 核对可用名字。\n",
           );
         } else {
           opts.stdout.write(`${message}\n`);

@@ -4,7 +4,7 @@ import { readFile, rm } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { EventEmitter } from "node:events";
-import { ensureOpencodeInstalled, setupOpsWorkdir } from "./ops.js";
+import { agentNameFromRcUser, ensureOpencodeInstalled, setupOpsWorkdir } from "./ops.js";
 import type { AgentInfo } from "./agents.js";
 
 function agent(pathOverride: string): AgentInfo {
@@ -140,5 +140,32 @@ describe("setupOpsWorkdir", () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("agentNameFromRcUser", () => {
+  it("reads the agent out of the current <agent>_<machineKey> scheme", () => {
+    expect(agentNameFromRcUser("opencode_330076275")).toBe("opencode");
+    expect(agentNameFromRcUser("hermes_330076275")).toBe("hermes");
+  });
+
+  // 旧方案 rc_node_<machineKey>_<agent> 的节点还在服务端跑着，设备上经常新旧混着。
+  // 只按新方案切尾巴会返回 rc_node_<machineKey>，拿它当 agent 名去启停就成了
+  // 「服务端没有这个智能体」。
+  it("reads the agent out of the legacy rc_node_<machineKey>_<agent> scheme", () => {
+    expect(agentNameFromRcUser("rc_node_3300776275_hermes")).toBe("hermes");
+    expect(agentNameFromRcUser("rc_node_3300776275_opencode")).toBe("opencode");
+  });
+
+  it("strips the _ops suffix before parsing", () => {
+    expect(agentNameFromRcUser("rc_node_3300776275_hermes_ops")).toBe("hermes");
+    expect(agentNameFromRcUser("hermes_330076275_ops")).toBe("hermes");
+  });
+
+  it("returns empty for a machine node, which has no agent segment", () => {
+    expect(agentNameFromRcUser("rc_node_3300776275")).toBe("");
+    expect(agentNameFromRcUser("rc_node_3300776275_ops")).toBe("");
+    expect(agentNameFromRcUser("")).toBe("");
+    expect(agentNameFromRcUser("   ")).toBe("");
   });
 });

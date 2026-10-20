@@ -125,10 +125,35 @@ export interface OpsWorkdirOptions {
   agentName?: string;
 }
 
-/** `"<agent>_<machineKey>"` → `"<agent>"`；解析不出来时返回空串。 */
+/**
+ * 从融云 id 里取出 agent 名，两种命名方案都要认：
+ *
+ *   - 新：`<agent>_<machineKey>`          → `opencode_330076275`      → opencode
+ *   - 旧：`rc_node_<machineKey>_<agent>`  → `rc_node_3300776275_hermes` → hermes
+ *
+ * 旧方案的节点是 0.2.39 之前绑定的，服务端至今仍在服务它们（见
+ * node_service.go 里「rc_node_<key>_<agent> 必须复用而不是重建」那段），所以
+ * 设备上经常是新旧混着。只按新方案切尾巴的话，旧方案会返回 `rc_node_<key>`
+ * —— 拿这个当 agent 名，`clawmessenger agent stop` 的 target 就是个不存在的
+ * 名字，服务端回 404「本机没有这个智能体」（2026-10-20 12:43 运维话术里的
+ * 「服务端尚未上线按账号启停的接口」其实是这么来的）。
+ *
+ * 运维账号 `<agentRC>_ops` 先剥掉 `_ops` 再判；机器主节点没有 agent 段，返回空串。
+ */
 export function agentNameFromRcUser(rcUser: string): string {
-  const match = /^(.+)_[^_]+$/.exec(rcUser.trim());
-  return match ? match[1] : "";
+  let base = rcUser.trim();
+  if (!base) return "";
+  if (base.endsWith("_ops")) base = base.slice(0, -"_ops".length);
+  if (base.startsWith("rc_node_")) {
+    // 旧：rc_node_<machineKey>[_<agent>]。machineKey 不含下划线，第一个下划线
+    // 之后全是 agent 名；没有下划线说明是机器主节点本身。
+    const rest = base.slice("rc_node_".length);
+    const idx = rest.indexOf("_");
+    return idx >= 0 ? rest.slice(idx + 1) : "";
+  }
+  // 新：<agent>_<machineKey>
+  const idx = base.lastIndexOf("_");
+  return idx > 0 ? base.slice(0, idx) : "";
 }
 
 export function buildOpsAgentsMd(options: OpsWorkdirOptions = {}): string {

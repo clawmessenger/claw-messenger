@@ -489,6 +489,89 @@ describe("clawmessenger agent", () => {
       restore();
     }
   });
+
+  // 现场回归（2026-10-20 12:43）：这台设备的节点是旧方案
+  // rc_node_<key>_<agent>，按名字切尾巴曾切出 rc_node_<key>，拿它当 target
+  // 去启停 → 服务端 404「本机没有这个智能体」。
+  it("defaults to the scoped agent under the legacy rc_node_<key>_<agent> id", async () => {
+    const restore = setScope("rc_node_3300776275_hermes");
+    try {
+      const lines: string[] = [];
+      const setDeviceControl = vi.fn(async () => ({
+        agent: "hermes",
+        nodeId: "node_hermes",
+        desiredState: "stopped" as const,
+        version: 3,
+        restart: false,
+      }));
+      const program = buildProgram({
+        keystore: credsKeystore(),
+        apiFactory: () => ({ setDeviceControl } as unknown as XiachatApi),
+        stdout: { write: (s: string) => { lines.push(s); return true; } } as unknown as NodeJS.WriteStream,
+        daemonPaths: defaultDaemonPaths(),
+      });
+
+      await program.parseAsync(["node", "clawmessenger", "agent", "stop"]);
+
+      expect(setDeviceControl).toHaveBeenCalledWith("node_machine", "dc", "sec", "hermes", "stop");
+      expect(lines.join("")).toContain("停止指令已下发");
+    } finally {
+      restore();
+    }
+  });
+
+  it("reports a missing agent when the server 404s with a message", async () => {
+    const restore = setScope("rc_node_3300776275_hermes");
+    const previousExitCode = process.exitCode;
+    try {
+      const lines: string[] = [];
+      const setDeviceControl = vi.fn(async () => {
+        throw new Error("POST /api/claw/device/control/set: HTTP 404: 本机没有这个智能体");
+      });
+      const program = buildProgram({
+        keystore: credsKeystore(),
+        apiFactory: () => ({ setDeviceControl } as unknown as XiachatApi),
+        stdout: { write: (s: string) => { lines.push(s); return true; } } as unknown as NodeJS.WriteStream,
+        daemonPaths: defaultDaemonPaths(),
+      });
+
+      await program.parseAsync(["node", "clawmessenger", "agent", "stop"]);
+
+      const out = lines.join("");
+      expect(out).toContain("没有找到智能体");
+      // 接口是有的，别再把「名字不对」说成「服务端没上线」。
+      expect(out).not.toContain("未上线");
+      expect(process.exitCode).toBe(1);
+    } finally {
+      process.exitCode = previousExitCode;
+      restore();
+    }
+  });
+
+  it("still reports the endpoint as missing for a bare 404 (old server)", async () => {
+    const restore = setScope(undefined);
+    const previousExitCode = process.exitCode;
+    try {
+      const lines: string[] = [];
+      const setDeviceControl = vi.fn(async () => {
+        throw new Error("POST /api/claw/device/control/set: HTTP 404");
+      });
+      const program = buildProgram({
+        keystore: credsKeystore(),
+        apiFactory: () => ({ setDeviceControl } as unknown as XiachatApi),
+        stdout: { write: (s: string) => { lines.push(s); return true; } } as unknown as NodeJS.WriteStream,
+        daemonPaths: defaultDaemonPaths(),
+      });
+
+      await program.parseAsync(["node", "clawmessenger", "agent", "stop", "opencode"]);
+
+      expect(lines.join("")).toContain("未上线");
+      expect(process.exitCode).toBe(1);
+    } finally {
+      process.exitCode = previousExitCode;
+      restore();
+    }
+  });
 });
 
 describe("ops scope guard", () => {
