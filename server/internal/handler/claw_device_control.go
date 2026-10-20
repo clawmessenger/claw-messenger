@@ -7,6 +7,9 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
+
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/multica-ai/multica/server/internal/integrations/rongcloud"
 )
@@ -136,4 +139,201 @@ func applyDeviceControlOverrides(refs []rongcloud.AgentNodeRef, overrides map[st
 		states = append(states, state)
 	}
 	return states
+}
+
+// ---- 按账号启停（设备端 / 运维助手） ---------------------------------------
+//
+// 管理端一直是按节点启停（/api/admin/nodes/{id}/start|stop），但设备侧的运维
+// 助手只有整机级的 `clawmessenger stop/restart` —— 一句话就能把同机其他账号
+// 的智能体一起拉下来。这条接口把「启停某一个智能体」的能力下放到设备凭据，
+// 让运维助手（以及后台）用同一张 control 表、同一套收敛逻辑，粒度收窄到账号。
+
+// controlActor 是发起启停的节点身份。
+type controlActor struct {
+	NodeID          string
+	RongcloudUserID string
+	AIType          string
+	// IsMachine 真 = 机器主节点（supervisor 的凭据）。它代表整台设备，可以
+	// 操作本机任意 agent —— 与后台管理端同一语义。
+	IsMachine bool
+}
+
+// controlTargetAllowed 决定 actor 能不能启停 target。规则按优先级：
+//
+//  1. 机器主节点：本机任意 agent（supervisor / 后台语义）；
+//  2. per-agent 运维节点（"<ownerRC>_ops"）：只允许它服务的那个账号 ——
+//     「每个设备的运维助手只准操作本账号」在服务端的落点。CLI 的
+//     CLAWMESSENGER_OPS_SCOPE 是第一道，绕不过这里这一道；
+//  3. 机器级 ops（旧 CLI，去掉 "_ops" 不命中本机任何 agent）：全机兼容；
+//  4. 其他 agent 节点：只允许操作自己。
+//
+// 纯函数，便于单测（不碰 DB / IM）。
+func controlTargetAllowed(actor controlActor, refs []rongcloud.AgentNodeRef, target rongcloud.AgentNodeRef) bool {
+	if actor.IsMachine {
+		return true
+	}
+	if owner, perAgent := perAgentOpsOwner(actor.RongcloudUserID, refs); perAgent {
+		return target.RongcloudUserID != "" && target.RongcloudUserID == owner
+	}
+	if actor.AIType == rongcloud.OpsAgentType {
+		return true
+	}
+	return actor.NodeID != "" && actor.NodeID == target.NodeID
+}
+
+// perAgentOpsOwner 判定 rc 是否 per-agent 运维账号，并返回它服务的 agent rc。
+//
+// 旧机器级 ops 也叫 "rc_node_<key>_ops"，同样以 "_ops" 结尾，所以不能只看
+// 后缀：去掉后缀后必须命中本机某个 agent 的融云 id，才算 per-agent。
+func perAgentOpsOwner(rcUserID string, refs []rongcloud.AgentNodeRef) (string, bool) {
+	if !strings.HasSuffix(rcUserID, "_ops") {
+		return "", false
+	}
+	owner := strings.TrimSuffix(rcUserID, "_ops")
+	for _, ref := range refs {
+		if ref.RongcloudUserID == owner {
+			return owner, true
+		}
+	}
+	return "", false
+}
+
+// ClawDeviceControlSet POST /api/claw/device/control/set —— 设备端按账号启停。
+//
+// 认证与 device/control 一致（设备凭据）。action: start | stop | restart。
+// restart 复用 running 状态，但把 desired_version 强制 +1；supervisor 看到
+// 「状态没变、版本变了」就杀进程重拉 —— 只重启这一个 agent，不碰别人。
+func (h *Handler) ClawDeviceControlSet(w http.ResponseWriter, r *http.Request) {
+	if h.RongCloudNode == nil {
+		clawJSON(w, 503, 503, "RongCloud 集成未配置", nil)
+		return
+	}
+	if h.DB == nil {
+		clawJSON(w, 503, 503, "数据库不可用", nil)
+		return
+	}
+	var req struct {
+		NodeID       string `json:"nodeId"`
+		CredentialID string `json:"credentialId"`
+		Secret       string `json:"secret"`
+		Target       string `json:"target"`
+		Action       string `json:"action"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil ||
+		req.NodeID == "" || req.CredentialID == "" || req.Secret == "" || req.Target == "" {
+		clawJSON(w, 400, 400, "缺少设备凭据或目标智能体", nil)
+		return
+	}
+
+	desired := rongcloud.NodeDesiredRunning
+	forceRestart := false
+	switch strings.ToLower(strings.TrimSpace(req.Action)) {
+	case "", "start":
+		desired = rongcloud.NodeDesiredRunning
+	case "stop":
+		desired = rongcloud.NodeDesiredStopped
+	case "restart":
+		desired = rongcloud.NodeDesiredRunning
+		forceRestart = true
+	default:
+		clawJSON(w, 400, 400, "action 只能是 start / stop / restart", nil)
+		return
+	}
+
+	ctx := r.Context()
+	actorNode, err := h.RongCloudNode.AuthorizeDevice(ctx, req.NodeID, req.CredentialID, req.Secret)
+	if err != nil {
+		if errors.Is(err, rongcloud.ErrInvalidDeviceCredential) {
+			clawJSON(w, 401, 401, "设备凭据无效", nil)
+			return
+		}
+		slog.Warn("claw: device control actor lookup failed", "nodeId", req.NodeID, "error", err)
+		clawJSON(w, 500, 500, "校验设备凭据失败", nil)
+		return
+	}
+	refs, err := h.RongCloudNode.AgentNodesForDevice(ctx, req.NodeID, req.CredentialID, req.Secret)
+	if err != nil {
+		if errors.Is(err, rongcloud.ErrInvalidDeviceCredential) {
+			clawJSON(w, 401, 401, "设备凭据无效", nil)
+			return
+		}
+		slog.Warn("claw: device control refs failed", "nodeId", req.NodeID, "error", err)
+		clawJSON(w, 500, 500, "查询本机智能体失败", nil)
+		return
+	}
+
+	var target *rongcloud.AgentNodeRef
+	for i := range refs {
+		if refs[i].NodeID == req.Target || refs[i].Agent == req.Target {
+			target = &refs[i]
+			break
+		}
+	}
+	if target == nil {
+		clawJSON(w, 404, 404, "本机没有这个智能体", nil)
+		return
+	}
+	if !target.ID.Valid {
+		clawJSON(w, 409, 409, "该智能体还没有可控制的节点记录", nil)
+		return
+	}
+
+	actorIsMachine := true
+	for _, ref := range refs {
+		if ref.ID == actorNode.ID {
+			actorIsMachine = false
+			break
+		}
+	}
+	actor := controlActor{
+		NodeID:          actorNode.NodeID,
+		RongcloudUserID: actorNode.RongcloudUserID,
+		AIType:          actorNode.AiType.String,
+		IsMachine:       actorIsMachine,
+	}
+	if !controlTargetAllowed(actor, refs, *target) {
+		clawJSON(w, 403, 403, "只能操作本账号的智能体", nil)
+		return
+	}
+
+	version, err := h.clawDeviceSetNodeControl(ctx, target.ID, desired, "device:"+actorNode.NodeID, forceRestart)
+	if err != nil {
+		slog.Warn("claw: device control write failed",
+			"nodeId", req.NodeID, "target", target.NodeID, "error", err)
+		clawJSON(w, 500, 500, "下发启停指令失败", nil)
+		return
+	}
+	clawJSON(w, 200, 200, "", map[string]interface{}{
+		"agent":        target.Agent,
+		"nodeId":       target.NodeID,
+		"desiredState": desired,
+		"version":      version,
+		"restart":      forceRestart,
+	})
+}
+
+// clawDeviceSetNodeControl writes operator intent. forceVersion=true 时无论
+// 状态是否变化都推进版本（restart 的语义：状态仍是 running，但要求重拉）。
+func (h *Handler) clawDeviceSetNodeControl(
+	ctx context.Context,
+	nodeUUID pgtype.UUID,
+	state, actor string,
+	forceVersion bool,
+) (int64, error) {
+	var version int64
+	err := h.DB.QueryRow(ctx, `
+		INSERT INTO rongcloud_node_control (node_id, workspace_id, desired_state, desired_version, changed_by)
+		SELECT n.id, n.workspace_id, $2, 1, $3
+		  FROM rongcloud_node n
+		 WHERE n.id = $1
+		ON CONFLICT (node_id) DO UPDATE
+		   SET desired_state = EXCLUDED.desired_state,
+		       desired_version = rongcloud_node_control.desired_version
+		                         + CASE WHEN $4 OR rongcloud_node_control.desired_state IS DISTINCT FROM EXCLUDED.desired_state
+		                                THEN 1 ELSE 0 END,
+		       changed_by = EXCLUDED.changed_by,
+		       updated_at = now()
+		RETURNING desired_version`,
+		nodeUUID, state, pgtype.Text{String: actor, Valid: actor != ""}, forceVersion).Scan(&version)
+	return version, err
 }

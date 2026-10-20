@@ -69,6 +69,10 @@ type AgentNodeRef struct {
 	Agent  string      `json:"agent"`
 	NodeID string      `json:"nodeId"`
 	ID     pgtype.UUID `json:"-"`
+	// RongcloudUserID is the agent's IM account. The control endpoint needs it to
+	// tell a per-agent ops node ("<agentRC>_ops") from the machine-level one, and
+	// to resolve which single agent that ops node is allowed to start or stop.
+	RongcloudUserID string `json:"-"`
 }
 
 // AgentNodesForDevice authenticates a machine device credential and returns the
@@ -101,7 +105,12 @@ func (s *NodeService) AgentNodesForDevice(ctx context.Context, machineNodeIDText
 		if !n.AiType.Valid || n.AiType.String == "" {
 			continue
 		}
-		out = append(out, AgentNodeRef{Agent: n.AiType.String, NodeID: n.NodeID, ID: n.ID})
+		out = append(out, AgentNodeRef{
+			Agent:           n.AiType.String,
+			NodeID:          n.NodeID,
+			ID:              n.ID,
+			RongcloudUserID: n.RongcloudUserID,
+		})
 	}
 	return out, nil
 }

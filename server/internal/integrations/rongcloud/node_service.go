@@ -120,6 +120,10 @@ func (s *NodeService) GetNodeByNodeID(ctx context.Context, nodeIDText string) (d
 // agent 节点上；而 ops agent 进程和其他 agent 一样按自己的 nodeId 心跳，所以
 // 它的在线状态可以直接从心跳表读。没有 MachineID（未绑定机器）或机器上没有
 // ops 节点时 found=false，调用方据此省略字段，让前端回退到节点自身状态。
+//
+// online 的语义是「运维端能不能干活」，不是「ops 进程最近 90s 有没有打卡」：
+// ops 子进程由宿主 supervisor 托管，宿主有心跳就一定会被拉起来，所以 ops
+// 心跳空窗时回退宿主心跳（见下方 hostAlive）。
 func (s *NodeService) OmStatusForNode(ctx context.Context, node db.RongcloudNode) (omRongcloudID string, online bool, found bool, err error) {
 	if node.MachineID == "" {
 		return "", false, false, nil
@@ -139,13 +143,19 @@ func (s *NodeService) OmStatusForNode(ctx context.Context, node db.RongcloudNode
 		}
 	}
 	perAgentRC := perAgentOpsRCUserID(node.RongcloudUserID)
+	// 宿主节点有心跳 = 这台机器的 supervisor 还活着。ops 子进程是 supervisor
+	// 拉起的、和它服务的 agent 同生共死，所以「宿主在线」已经足够说明运维端
+	// 在跑 —— ops 自己的心跳只是 30s 一拍，服务端重启后心跳表是空的，头 90s
+	// 读到的一定是离线。运维是随设备常驻的能力，不能因为一拍空窗就报离线，
+	// 否则用户每次重启服务都会看到「运维助手离线」。
+	hostAlive := s.IsOnline(node.ID)
 	var machineLevel *db.RongcloudNode
 	for _, n := range nodes {
 		if n.MachineID != node.MachineID || n.AiType.String != OpsAgentType {
 			continue
 		}
 		if n.RongcloudUserID == perAgentRC {
-			return n.RongcloudUserID, s.IsOnline(n.ID), true, nil
+			return n.RongcloudUserID, s.IsOnline(n.ID) || hostAlive, true, nil
 		}
 		if _, perAgent := classifyOpsRCUser(n.RongcloudUserID, agentRCs); !perAgent {
 			copied := n
@@ -153,7 +163,7 @@ func (s *NodeService) OmStatusForNode(ctx context.Context, node db.RongcloudNode
 		}
 	}
 	if machineLevel != nil {
-		return machineLevel.RongcloudUserID, s.IsOnline(machineLevel.ID), true, nil
+		return machineLevel.RongcloudUserID, s.IsOnline(machineLevel.ID) || hostAlive, true, nil
 	}
 	return "", false, false, nil
 }

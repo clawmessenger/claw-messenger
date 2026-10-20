@@ -18,6 +18,94 @@ func testNodeRef(agent, nodeID, uuid string) rongcloud.AgentNodeRef {
 	return rongcloud.AgentNodeRef{Agent: agent, NodeID: nodeID, ID: id}
 }
 
+func testNodeRefRC(agent, nodeID, uuid, rcUserID string) rongcloud.AgentNodeRef {
+	ref := testNodeRef(agent, nodeID, uuid)
+	ref.RongcloudUserID = rcUserID
+	return ref
+}
+
+// machineRefs 是一台机器的节点视图：两个业务 agent + 各自的 per-agent 运维
+// 账号 + 一个机器级 ops（旧 CLI）。
+func machineRefs() []rongcloud.AgentNodeRef {
+	return []rongcloud.AgentNodeRef{
+		testNodeRefRC("opencode", "node_open", "5e88b789-55ef-4a7e-b090-9f4e3ff208d1", "opencode_330076275"),
+		testNodeRefRC("ops", "node_ops_open", "9e5bff58-97d0-43e8-8e88-f1c2b468c456", "opencode_330076275_ops"),
+		testNodeRefRC("hermes", "node_hermes", "0b0f6b3e-1111-4a7e-b090-000000000001", "hermes_330076275"),
+		testNodeRefRC("ops", "node_ops_hermes", "0b0f6b3e-2222-4a7e-b090-000000000002", "hermes_330076275_ops"),
+		testNodeRefRC("ops", "node_ops_legacy", "0b0f6b3e-3333-4a7e-b090-000000000003", "rc_node_330076275_ops"),
+	}
+}
+
+func TestControlTargetAllowedMachineNodeManagesEveryAgent(t *testing.T) {
+	refs := machineRefs()
+	actor := controlActor{NodeID: "node_machine", IsMachine: true}
+	for _, ref := range refs {
+		if !controlTargetAllowed(actor, refs, ref) {
+			t.Errorf("machine node must be able to control %s", ref.Agent)
+		}
+	}
+}
+
+func TestControlTargetAllowedPerAgentOpsOnlyOwnsItsAccount(t *testing.T) {
+	refs := machineRefs()
+	actor := controlActor{
+		NodeID:          "node_ops_open",
+		RongcloudUserID: "opencode_330076275_ops",
+		AIType:          rongcloud.OpsAgentType,
+	}
+
+	if !controlTargetAllowed(actor, refs, refs[0]) {
+		t.Error("per-agent ops must be able to control the agent it serves")
+	}
+	if controlTargetAllowed(actor, refs, refs[2]) {
+		t.Error("per-agent ops must NOT be able to control another account's agent")
+	}
+	// 运维子进程停自己等于自杀，不属于「本账号」的智能体。
+	if controlTargetAllowed(actor, refs, refs[1]) {
+		t.Error("per-agent ops must not be able to control its own ops node")
+	}
+}
+
+func TestControlTargetAllowedMachineLevelOpsKeepsLegacyReach(t *testing.T) {
+	refs := machineRefs()
+	actor := controlActor{
+		NodeID:          "node_ops_legacy",
+		RongcloudUserID: "rc_node_330076275_ops",
+		AIType:          rongcloud.OpsAgentType,
+	}
+	if !controlTargetAllowed(actor, refs, refs[2]) {
+		t.Error("machine-level ops (old CLI) keeps whole-machine reach")
+	}
+}
+
+func TestControlTargetAllowedPlainAgentOnlyControlsItself(t *testing.T) {
+	refs := machineRefs()
+	actor := controlActor{
+		NodeID:          "node_open",
+		RongcloudUserID: "opencode_330076275",
+		AIType:          "opencode",
+	}
+	if !controlTargetAllowed(actor, refs, refs[0]) {
+		t.Error("an agent must be able to control itself")
+	}
+	if controlTargetAllowed(actor, refs, refs[2]) {
+		t.Error("an agent must not control another agent")
+	}
+}
+
+func TestPerAgentOpsOwnerIgnoresLegacyMachineOps(t *testing.T) {
+	refs := machineRefs()
+	if _, ok := perAgentOpsOwner("rc_node_330076275_ops", refs); ok {
+		t.Error("legacy machine-level ops must not be classified as per-agent")
+	}
+	if owner, ok := perAgentOpsOwner("hermes_330076275_ops", refs); !ok || owner != "hermes_330076275" {
+		t.Errorf("want hermes owner, got %q/%v", owner, ok)
+	}
+	if _, ok := perAgentOpsOwner("opencode_330076275", refs); ok {
+		t.Error("a plain agent rc is not an ops account")
+	}
+}
+
 func TestApplyDeviceControlOverridesDefaultsToRunning(t *testing.T) {
 	refs := []rongcloud.AgentNodeRef{
 		testNodeRef("opencode", "node_a", "5e88b789-55ef-4a7e-b090-9f4e3ff208d1"),

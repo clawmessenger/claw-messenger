@@ -1635,6 +1635,9 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// IM：能真正拉起/杀掉 agent 的 supervisor 主进程不持有融云连接，且被停掉的子进程
 	// 没有任何进程能收到「启动」。详见 internal/handler/claw_device_control.go。
 	r.Post("/api/claw/device/control", h.ClawDeviceControl)
+	// 按账号启停（运维助手 / 后台共用同一张 control 表）。per-agent 运维账号
+	// 只能操作自己服务的那个 agent，越界直接 403。
+	r.Post("/api/claw/device/control/set", h.ClawDeviceControlSet)
 	r.Get("/api/claw/nodes/{nodeId}/status", h.ClawNodeStatus)
 	r.Post("/api/claw/nodes/{nodeId}", h.ClawUpdateNode)
 	r.Delete("/api/claw/nodes/{nodeId}", h.ClawDeleteNode)
