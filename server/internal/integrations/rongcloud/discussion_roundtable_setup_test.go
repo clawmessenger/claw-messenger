@@ -406,6 +406,62 @@ func TestSetupUserCancelReclaimsRoom(t *testing.T) {
 	}
 }
 
+// TestSetupActionsNotInterceptedByLifecycleGuard 回归：引导链路自身的动作
+// （getActive / resumeSetup / touchSetup / submitSetupTopic …）不能被 v3 生命周期
+// 守卫认领。system_handler 对所有 service=discussion 命令都会先过
+// interactiveLifecycleAction，若守卫不按动作收口，configuring 守卫会把读取半成品
+// 快照也 409 掉 —— 空讨论组一建完前端就拉不到快照，引导向导永远不出现
+// （线上缺陷：「讨论组仍在配置中，仅支持取消」）。
+func TestSetupActionsNotInterceptedByLifecycleGuard(t *testing.T) {
+	f := setupSetupFixture(t)
+	ctx := context.Background()
+	chatroomID, discussionID := f.createShell(t, "req-"+uniqueID("t"))
+
+	for _, action := range []string{
+		"getActive", "resumeSetup", "touchSetup",
+		"submitSetupTopic", "requestRoleRecommend", "confirmRoundtableSetup",
+	} {
+		r, handled := f.rt.interactiveLifecycleAction(ctx, action, CommandContent{
+			Service: "discussion", Action: action,
+			Params: map[string]interface{}{"chatroom_id": chatroomID},
+		}, f.actor)
+		if handled {
+			t.Fatalf("%s 被生命周期守卫认领: %d %s", action, r.code, r.message)
+		}
+	}
+
+	// getActive 必须能读到半成品快照（前端向导的唯一数据源）。
+	active := f.rt.actionGetActive(ctx, CommandContent{
+		Service: "discussion", Action: "getActive",
+		Params: map[string]interface{}{"chatroom_id": chatroomID},
+	}, f.actor)
+	if active.code != 200 {
+		t.Fatalf("configuring 下 getActive = %d %s", active.code, active.message)
+	}
+	data, _ := active.data.(map[string]interface{})
+	if data == nil {
+		t.Fatalf("getActive 回包为空")
+	}
+	if data["status"] != DiscussionStatusConfiguring {
+		t.Fatalf("status = %v, want configuring", data["status"])
+	}
+	if data["discussionId"] != discussionID {
+		t.Fatalf("discussionId = %v, want %s", data["discussionId"], discussionID)
+	}
+	if data["roundPolicy"] != RoundPolicyUserConfirmed {
+		t.Fatalf("roundPolicy = %v, want user_confirmed", data["roundPolicy"])
+	}
+
+	// resumeSetup 放行后能真正执行（向导挂载即断点续引）。
+	resumed := f.rt.actionResumeSetup(ctx, CommandContent{
+		Service: "discussion", Action: "resumeSetup",
+		Params: map[string]interface{}{"chatroom_id": chatroomID},
+	}, f.actor)
+	if resumed.code != 200 {
+		t.Fatalf("resumeSetup = %d %s", resumed.code, resumed.message)
+	}
+}
+
 func TestSetupGCReclaimsAbandoned(t *testing.T) {
 	f := setupSetupFixture(t)
 	ctx := context.Background()

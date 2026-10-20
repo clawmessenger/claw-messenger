@@ -1985,6 +1985,18 @@ func (rt *discussionRuntime) interactiveSettleActive(ctx context.Context, discus
 	}
 }
 
+// interactiveLifecycleActions 是本函数认领的用户动作全集。
+//
+// system_handler 对所有 service=discussion 命令都会先调 interactiveLifecycleAction
+// （早于 action 分发），所以这里必须自己收口：只有下面六个真正的生命周期动作归 v3
+// 引擎，其余命令一律放行到分发层。否则 configuring 守卫会把「读快照 / 断点续引 /
+// 提交议题」这些**引导链路自己的动作**一并拦成 409 —— 空讨论组一建完，前端
+// getActive 就失败，拿不到半成品快照，引导向导永远不出现（历史缺陷）。
+var interactiveLifecycleActions = map[string]bool{
+	"continue": true, "finish": true, "cancel": true,
+	"interject": true, "retry": true, "stop": true,
+}
+
 // interactiveLifecycleAction 是用户动作（continue/finish/cancel/interject/retry/
 // stop）的 v3 入口。仅当该聊天室当前讨论是 user_confirmed 且引擎就绪时接管；
 // handled=false 时 system_handler 回落到 P4 的 legacy 实现。
@@ -1993,6 +2005,9 @@ func (rt *discussionRuntime) interactiveSettleActive(ctx context.Context, discus
 // 状态机互斥（v3 的 continue 是「等用户确认再开下一轮」，legacy 是「按 max_rounds
 // 计数」），绝不能同时套上。
 func (rt *discussionRuntime) interactiveLifecycleAction(ctx context.Context, action string, cmd CommandContent, actor discussionActor) (commandResult, bool) {
+	if !interactiveLifecycleActions[action] {
+		return commandResult{}, false
+	}
 	d, ok := rt.activeInteractiveDiscussion(ctx, cmd)
 	if !ok {
 		return commandResult{}, false
