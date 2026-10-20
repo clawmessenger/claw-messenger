@@ -831,9 +831,14 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
     let hardStopped = false;
     /** 已经交给 UI 的正文累积：缓冲被截断时以它为准（它才是完整的）。 */
     let streamedText = "";
+    /** 最近一个工具步骤的 id：用来判断「正文是否发生在这步之后」。 */
+    let lastToolId: string | null = null;
+    /** 最后一个工具步骤之后是否还产出过正文（收尾判据，见 close 处理）。 */
+    let textAfterLastTool = false;
     const pushText = (delta: string): void => {
       if (!delta) return;
       streamedText += delta;
+      textAfterLastTool = true;
       opts.onChunk?.(delta);
     };
     let settled = false;
@@ -900,7 +905,17 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
       // 工具事件先消化：同一个 JSONL 行里 tool 事件与正文不会共存（claude 的
       // tool_use 走 content_block_*，codex 走 item.*），但收尾事件的顺序不能
       // 依赖 —— 先更新步骤再发正文，用户才不会看到「正文已出、步骤还没出」。
-      if (activity && activity.push(flushed)) emitActivity();
+      if (activity && activity.push(flushed)) {
+        emitActivity();
+        // 只在**新步骤**出现时重置：同一步从 running 变 finished/error 不算
+        // 「又调了一次工具」，否则正文与步骤的先后关系会被收尾事件抹掉。
+        const snap = activity.snapshot();
+        const newest = snap[snap.length - 1];
+        if (newest && newest.id !== lastToolId) {
+          lastToolId = newest.id;
+          textAfterLastTool = false;
+        }
+      }
       const delta = parseStreamJsonLine(flushed);
       if (!delta) return;
       if (delta.replace && delta.partId) {
@@ -984,6 +999,26 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
             // 收尾：异常退出/事件流缺失都不会有 content_block_stop，悬着的
             // 「进行中」步骤必须在这里结掉，否则气泡里永远转圈。
             if (activity && activity.finish()) emitActivity();
+            // 这一轮是不是「撞在失败的工具上就没下文了」。
+            //
+            // 现场（2026-10-20 10:54 运维助手）：opencode 跑到第 7 步 bash 报错，
+            // 进程 exit 0，之后再没吐过一个字 —— 气泡里只剩「…拉取模型列表：」
+            // 这半句前言，而我们把 exit 0 当成了「答完了」。opencode 自己的会话库
+            // 可以确认：该轮最后一条 part 是 bash(error)，之后既无文本也无 step。
+            //
+            // 判据只认**确定的事实**：最后一步是 failed，且它之后再没出现正文。
+            // （最后一步成功、或失败后模型解释了原因，都不算 —— 那两种情况用户
+            // 至少拿到了交代。）
+            const steps = activity?.snapshot() ?? [];
+            const lastStep = steps[steps.length - 1];
+            if (lastStep && lastStep.status === "failed" && !textAfterLastTool) {
+              reject(new TurnIncompleteError(
+                "agent_incomplete",
+                streamedText,
+                `turn ended on a failed ${lastStep.label} with no follow-up text`,
+              ));
+              return;
+            }
             // 缓冲被截断时原始 stdout 只是前缀，以流式正文为准（它才是全的）。
             resolve(capped ? streamedText : (extractStreamJsonFinalText(stdout) ?? stdout));
           } else {

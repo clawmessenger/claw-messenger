@@ -643,6 +643,75 @@ describe("runAgentTurn", () => {
     }
   });
 
+  // 现场（2026-10-20 10:54，运维助手 opencode）：问「列出可用模型列表」，模型先
+  // 说「已登录。拉取模型列表：」，接着 bash 报错、进程 exit 0，之后再没吐过一个
+  // 字。opencode 自己的会话库可确认：该轮最后一条 part 是 bash(error)，其后既无
+  // 文本也无新步骤。我们把 exit 0 当成「答完了」，前端就把这半句前言当完整回答。
+  it("撞在失败的工具上就没下文时判 agent_incomplete", async () => {
+    const lines = [
+      JSON.stringify({ type: "text", part: { id: "p1", type: "text", text: "已登录。拉取模型列表：" } }),
+      JSON.stringify({ type: "tool_use", part: { type: "tool", tool: "bash", callID: "c1", state: { status: "error", input: { command: "arkcli models list" } } } }),
+    ].join("\n") + "\n";
+    const fixture = createEchoAgentScript("opencode", { stdoutText: lines });
+    try {
+      await expect(runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "opencode",
+        prompt: "列出可用模型列表",
+        timeoutMs: 30_000,
+        onReasoningChunk: () => {},
+        onActivity: () => {},
+      })).rejects.toMatchObject({
+        code: "agent_incomplete",
+        partialText: "已登录。拉取模型列表：",
+      });
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("工具失败之后模型补了说明，就不算没答完", async () => {
+    const lines = [
+      JSON.stringify({ type: "tool_use", part: { type: "tool", tool: "bash", callID: "c1", state: { status: "error" } } }),
+      JSON.stringify({ type: "text", part: { id: "p2", type: "text", text: "命令报了 ENOENT，这机器上没装 arkcli。" } }),
+    ].join("\n") + "\n";
+    const fixture = createEchoAgentScript("opencode", { stdoutText: lines });
+    try {
+      const out = await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "opencode",
+        prompt: "列出可用模型列表",
+        timeoutMs: 30_000,
+        onReasoningChunk: () => {},
+        onActivity: () => {},
+      });
+      expect(out).toContain("没装 arkcli");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("最后一步成功但没写结尾时不算没答完（不误报）", async () => {
+    const lines = [
+      JSON.stringify({ type: "text", part: { id: "p1", type: "text", text: "已重启。" } }),
+      JSON.stringify({ type: "tool_use", part: { type: "tool", tool: "bash", callID: "c1", state: { status: "completed" } } }),
+    ].join("\n") + "\n";
+    const fixture = createEchoAgentScript("opencode", { stdoutText: lines });
+    try {
+      const out = await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "opencode",
+        prompt: "重启",
+        timeoutMs: 30_000,
+        onReasoningChunk: () => {},
+        onActivity: () => {},
+      });
+      expect(out).toContain("已重启");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
   it("rejects immediately when the signal is already aborted", async () => {    const fixture = createEchoAgentScript("claude");
     try {
       const controller = new AbortController();
