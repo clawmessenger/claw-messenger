@@ -32,6 +32,12 @@ export type TurnErrorCode =
   /** 会话队列满（1 在执行 + 1 排队），这条消息被直接丢弃。
    *  由 run.ts 的 SessionQueue 在忙碌时发出，不经过 classifyTurnError。 */
   | "agent_busy"
+  /** 设备端读到的 stdout 超出硬上限，后半轮（含最终回答）没拿到：
+   *  这不是「模型答完了」，必须让用户知道还要重试。 */
+  | "output_truncated"
+  /** agent 进程正常退出，但这一轮没有正常收尾（运行时自己 abort、
+   *  finishReason 是 length/content_filter/error）：正文只有半句话。 */
+  | "agent_incomplete"
   /** 其余一切失败（进程崩溃、输出解析失败、未知错误）。 */
   | "agent_failed";
 
@@ -113,6 +119,30 @@ export function describeTurnError(code: TurnErrorCode): string {
     case "model_rate_limited": return "模型请求被限流";
     case "turn_timeout": return "本轮执行超时";
     case "agent_busy": return "上一个任务还在执行，本条消息被丢弃";
+    case "output_truncated": return "设备端输出超出上限被截断，本轮没有答完";
+    case "agent_incomplete": return "运行时没有正常收尾，本轮没有答完";
     case "agent_failed": return "agent 执行失败";
+  }
+}
+
+/**
+ * 「这一轮没答完」的失败：进程可能 exit 0，但我们知道它不是一次完整的回答。
+ *
+ * 与普通 Error 的区别是带着**已经产出的正文**（partialText）——终帧必须把它
+ * 一并带上，否则用户刚在气泡里看到的半句话会凭空消失，只剩一句「生成失败」。
+ *
+ * 什么时候抛它（都必须是**确定的不完整**，不能靠猜）：
+ *   - stdout 超出硬上限，后半轮没读进来（output_truncated）；
+ *   - 运行时自己说 abort / finishReason=length|content_filter|error（agent_incomplete）。
+ */
+export class TurnIncompleteError extends Error {
+  readonly code: TurnErrorCode;
+  readonly partialText: string;
+
+  constructor(code: TurnErrorCode, partialText: string, detail?: string) {
+    super(detail ?? `turn incomplete: ${code}`);
+    this.name = "TurnIncompleteError";
+    this.code = code;
+    this.partialText = partialText;
   }
 }

@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import { ARGV_PROMPT_MAX_CHARS } from "./agents.js";
 import type { ActivityStep } from "./agent-activity.js";
 import { MessageDispatcher, planReadReceipt, resolveTurnVenue, turnSessionKey } from "./im.js";
+import { TurnIncompleteError } from "./turn-error.js";
 
 function makeDeps() {
   const sent: Array<{ to: string; objectName: string; content: string }> = [];
@@ -1244,6 +1245,34 @@ describe("MessageDispatcher chat_stream streaming", () => {
     expect((code as string).trim()).toBe(code)
     expect(/[\p{Cc}\p{Cf}]/u.test(code as string)).toBe(false)
     expect((code as string).length).toBeLessThanOrEqual(256)
+  })
+
+  // 「话说一半就结束了」的现场：运维助手（opencode）跑到第 7 个工具时输出超了
+  // 设备端缓冲，后半轮（含最终回答）没读到，前端却收到一个 completed 终帧，
+  // 气泡里只剩「…拉取模型列表：」。这类失败必须走 failed，并且**保住已产出的
+  // 正文**——否则用户刚看到的那半句话会凭空消失，只剩一句错误提示。
+  it("本轮没答完时发 failed 终帧，并保住已经产出的半截正文", async () => {
+    const { deps, streams } = buildDeps()
+    const dispatcher = new MessageDispatcher(deps)
+    const partial = "使用 arkcli-models 技能来列出可用模型。先检查认证状态，再拉取模型列表。已登录。拉取模型列表："
+    await dispatcher.handle({
+      objectName: "RC:TxtMsg", fromUserId: "user_a", toUserId: "", targetId: "node_self",
+      conversationType: 1, content: JSON.stringify({ content: "列出可用模型列表" }),
+    }, {
+      runTurn: async () => { throw new Error("unused") },
+      runTurnStreamed: async (
+        _p: string, _m: string | undefined, onDelta: (d: string, r?: string) => void,
+      ) => {
+        onDelta(partial)
+        throw new TurnIncompleteError("output_truncated", partial)
+      },
+    })
+
+    const failed = streams.map((s) => parseFrame(s.content)).filter((f) => f.status === "failed")
+    expect(failed.length).toBeGreaterThanOrEqual(1)
+    const last = failed.at(-1)!
+    expect(last.error_code).toBe("output_truncated")
+    expect(String(last.text)).toContain("拉取模型列表：")
   })
 })
 

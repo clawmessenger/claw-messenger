@@ -10,6 +10,7 @@ import {
   extractOpenclawReply,
   KNOWN_AGENT_CLIS,
   normalizeOpenclawOutput,
+  openclawTurnHealth,
   parseOpenclawJsonOutput,
   resolveWindowsShim,
   runAgentTurn,
@@ -294,6 +295,33 @@ describe("emitsJsonEnvelope", () => {
   });
 });
 
+describe("openclawTurnHealth", () => {
+  const envelope = (meta: unknown): string => JSON.stringify({ payloads: [], meta });
+
+  it("把 aborted 判成没答完", () => {
+    expect(openclawTurnHealth(envelope({ aborted: true })).incomplete).toBe(true);
+  });
+
+  it("把 finishReason=length 判成没答完（回答被截断）", () => {
+    const health = openclawTurnHealth(envelope({ completion: { finishReason: "length" } }));
+    expect(health.incomplete).toBe(true);
+    expect(health.detail).toContain("length");
+  });
+
+  it("老信封没有 completion 时退到 stopReason", () => {
+    expect(openclawTurnHealth(envelope({ stopReason: "content_filter" })).incomplete).toBe(true);
+  });
+
+  it("正常 stop 不算没答完", () => {
+    expect(openclawTurnHealth(envelope({ aborted: false, completion: { finishReason: "stop" } })).incomplete).toBe(false);
+  });
+
+  it("非信封输出不做判断（绝不拿日志行猜结论）", () => {
+    expect(openclawTurnHealth("plain stdout").incomplete).toBe(false);
+    expect(openclawTurnHealth("{}").incomplete).toBe(false);
+  });
+});
+
 describe("discoverAgents", () => {
   it("scans only extraPath when provided", async () => {
     const fixture = createEchoAgentScript("claude");
@@ -533,8 +561,89 @@ describe("runAgentTurn", () => {
     }
   });
 
-  it("rejects immediately when the signal is already aborted", async () => {
-    const fixture = createEchoAgentScript("claude");
+  // 线上现场（2026-10-20 10:54，运维助手 opencode）：跑到第 7 个工具时 stdout
+  // 超过缓冲上限，旧实现在超限处直接 return —— 后半轮（含最终回答）整段丢掉，
+  // 却仍然 resolve 出一个「completed」，前端于是把半句话当完整回答展示。
+  // 现在缓冲满了只停止攒原始字节，解析继续，正文照样能拿到结尾。
+  it("缓冲被截断后仍把后半轮的正文交出来，而不是只交前缀", async () => {
+    const pad = JSON.stringify({ type: "reasoning", part: { id: "r1", type: "reasoning", text: "x".repeat(3_000) } });
+    const answer = JSON.stringify({ type: "text", part: { id: "p1", type: "text", text: "最终答案：模型列表已拉到。" } });
+    const fixture = createEchoAgentScript("opencode", { stdoutText: `${pad}\n${pad}\n${answer}\n` });
+    try {
+      const out = await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "opencode",
+        prompt: "列出可用模型列表",
+        timeoutMs: 30_000,
+        maxOutputBytes: 1024,
+        onReasoningChunk: () => {},
+      });
+      expect(out).toBe("最终答案：模型列表已拉到。");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  // 缓冲截断可以继续解析；但输出到硬上限就是这一轮已经不可信（agent 在喷日志），
+  // 这时必须**失败**收尾，并把已产出的正文带出去，绝不能假装答完。
+  it("输出超过硬上限时以 output_truncated 失败收尾，并带上已产出的正文", async () => {
+    const pad = JSON.stringify({ type: "text", part: { id: "p1", type: "text", text: "半句话" } });
+    const fixture = createEchoAgentScript("opencode", { stdoutText: pad.repeat(400) });
+    try {
+      await expect(runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "opencode",
+        prompt: "p",
+        timeoutMs: 30_000,
+        maxOutputBytes: 512,
+        hardOutputBytes: 2_048,
+        onReasoningChunk: () => {},
+      })).rejects.toMatchObject({ code: "output_truncated" });
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  // openclaw 信封自己说「这轮被中止 / 被截断」时，正文通常只剩半句前言。
+  // 必须判失败（agent_incomplete），否则前端把它当完整回答展示。
+  it("openclaw 信封说本轮被中止时判失败，并保留半截正文", async () => {
+    const envelope = JSON.stringify({
+      payloads: [{ text: "我先看看有哪些技能：", isReasoning: false }],
+      meta: { aborted: true, completion: { finishReason: "aborted" }, finalAssistantVisibleText: "我先看看有哪些技能：" },
+    });
+    const fixture = createEchoAgentScript("openclaw", { stdoutText: envelope });
+    try {
+      await expect(runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "openclaw",
+        prompt: "列出可用模型列表",
+        timeoutMs: 30_000,
+      })).rejects.toMatchObject({ code: "agent_incomplete", partialText: "我先看看有哪些技能：" });
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("openclaw 正常收尾（finishReason=stop）仍然算完成", async () => {
+    const envelope = JSON.stringify({
+      payloads: [{ text: "已经重启完成。" }],
+      meta: { aborted: false, completion: { finishReason: "stop" }, finalAssistantVisibleText: "已经重启完成。" },
+    });
+    const fixture = createEchoAgentScript("openclaw", { stdoutText: envelope });
+    try {
+      const out = await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "openclaw",
+        prompt: "重启一下",
+        timeoutMs: 30_000,
+      });
+      expect(out).toBe("已经重启完成。");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("rejects immediately when the signal is already aborted", async () => {    const fixture = createEchoAgentScript("claude");
     try {
       const controller = new AbortController();
       controller.abort();

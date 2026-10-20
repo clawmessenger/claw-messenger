@@ -9,6 +9,7 @@ import {
   classifyTool,
   createActivityTracker,
 } from "./agent-activity.js";
+import { TurnIncompleteError } from "./turn-error.js";
 
 // Mirrors knownAgentCLIs in server/internal/integrations/rongcloud/
 // discussion_bridge.go — keep both lists in sync.
@@ -32,7 +33,11 @@ export interface RunAgentTurnOpts {
   prompt: string;
   model?: string;
   timeoutMs?: number;
+  // 原始缓冲上限（只影响「留不留原始 stdout」，不影响解析）。
   maxOutputBytes?: number;
+  // 真止损：读到这个量级就掐进程并以 output_truncated 失败收尾。
+  // 默认 HARD_OUTPUT_BYTES；测试用它把阈值调到可复现的规模。
+  hardOutputBytes?: number;
   // Working directory for the agent CLI process. The ops agent sets this to
   // its workdir so `opencode run` picks up the ops AGENTS.md system prompt.
   cwd?: string;
@@ -180,9 +185,21 @@ export function buildAgentArgs(
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 65_536;
-// stream-json（claude/codex）的事件流含元数据行与思考流，同回答体积约为
-// 纯文本 2-3 倍；上限放到 512KB 与 runAgentCommand 的默认一致量级。
+// stream-json（claude/codex/opencode/hermes）的事件流含元数据行与思考流，同回答
+// 体积约为纯文本 2-3 倍；opencode 还是「整段 part 全文」重复上报，一次带工具的
+// 长回合轻松几十万字节。
+//
+// ⚠️ 这个上限现在只是**原始缓冲**的上限，不再是「这一轮到此为止」：超出后我们
+// 停止攒原始字节，但**继续解析**事件流（正文照样上屏，最终正文由解析累积给出）。
+// 过去在超限处直接 return，工具输出一洪峰，后半轮（含最终回答）就整段丢了，
+// 前端却拿到一个 completed 终帧 —— 用户看到的就是「话说一半就结束了」。
 const STREAM_JSON_MAX_OUTPUT_BYTES = 512 * 1024;
+// openclaw 这类「一次性 JSON 信封」必须整份留存才能解析，没有流式正文可退，
+// 所以给足额度（以前的 64KB 连一份带思考 payload 的正常回答都装不下）。
+const ENVELOPE_MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
+// 真止损：读到这个量级说明 agent 在喷日志/输出结果，这一轮不可能再有用，
+// 直接掐进程并以 output_truncated 失败收尾（绝不假装答完）。
+const HARD_OUTPUT_BYTES = 16 * 1024 * 1024;
 
 function isWindowsScript(execPath: string): boolean {
   return process.platform === "win32" && /\.(cmd|bat)$/i.test(execPath);
@@ -361,12 +378,56 @@ export function parseOpenclawJsonOutput(raw: string): string | undefined {
   return undefined;
 }
 
+/**
+ * openclaw 信封里的「这一轮到底有没有正常收尾」。
+ *
+ * 只看信封自己给出的权威字段，不做文案猜测：
+ *   - meta.aborted === true            → 运行时把这轮掐了；
+ *   - completion.finishReason（缺省取 stopReason）为 length / max_tokens /
+ *     content_filter / error / tool_error → 回答被截断或被上游判废。
+ * 这两种情况下正文通常只剩「我这就去查…：」这半句，绝不能当完整回答上屏。
+ */
+export interface OpenclawTurnHealth {
+  incomplete: boolean;
+  detail?: string;
+}
+
+const INCOMPLETE_FINISH_REASONS: ReadonlySet<string> = new Set([
+  "length", "max_tokens", "max_output_tokens", "content_filter", "error", "tool_error",
+]);
+
+export function openclawTurnHealth(raw: string): OpenclawTurnHealth {
+  const text = stripAnsiCodes(raw).trim();
+  if (!text.startsWith("{")) return { incomplete: false };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return { incomplete: false };
+  }
+  if (typeof parsed !== "object" || parsed === null) return { incomplete: false };
+  const meta = (parsed as { meta?: unknown }).meta;
+  if (typeof meta !== "object" || meta === null) return { incomplete: false };
+  const m = meta as {
+    aborted?: unknown;
+    stopReason?: unknown;
+    completion?: { stopReason?: unknown; finishReason?: unknown } | null;
+  };
+  if (m.aborted === true) return { incomplete: true, detail: "aborted" };
+  const finish = m.completion?.finishReason
+    ?? m.completion?.stopReason
+    ?? m.stopReason;
+  if (typeof finish === "string" && INCOMPLETE_FINISH_REASONS.has(finish.trim().toLowerCase())) {
+    return { incomplete: true, detail: `finishReason=${finish}` };
+  }
+  return { incomplete: false };
+}
+
 // Extracts the clean reply from an openclaw agent turn: the --json
 // envelope when present, otherwise the ANSI/log-stripped plain stdout.
 // Falls back to the raw trimmed text when both extractions come up empty
 // so a turn never yields a blank reply.
-export function extractOpenclawReply(raw: string): string {
-  const fromJson = parseOpenclawJsonOutput(raw);
+export function extractOpenclawReply(raw: string): string {  const fromJson = parseOpenclawJsonOutput(raw);
   if (fromJson !== undefined && fromJson.trim().length > 0) return fromJson.trim();
   const normalized = normalizeOpenclawOutput(raw);
   if (normalized.length > 0) return normalized;
@@ -726,9 +787,12 @@ export function extractStreamJsonFinalText(raw: string): string | undefined {
 
 export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const hardLimit = opts.hardOutputBytes ?? HARD_OUTPUT_BYTES;
   // stream-json 的 JSONL 冗余大（事件元数据 + 思考流），64KB 会截断长回答。
   const streamJsonTurn = opts.onReasoningChunk !== undefined || agentSupportsReasoning(opts.agentName);
-  const maxBytes = opts.maxOutputBytes ?? (streamJsonTurn ? STREAM_JSON_MAX_OUTPUT_BYTES : DEFAULT_MAX_OUTPUT_BYTES);
+  const bufferLimit = opts.maxOutputBytes ?? (streamJsonTurn
+    ? STREAM_JSON_MAX_OUTPUT_BYTES
+    : emitsJsonEnvelope(opts.agentName) ? ENVELOPE_MAX_OUTPUT_BYTES : DEFAULT_MAX_OUTPUT_BYTES);
 
   return new Promise<string>((resolve, reject) => {
     if (opts.signal?.aborted) {
@@ -758,9 +822,20 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
     // and truncation caps BYTES and backs off to a code-point boundary.
     const chunks: Buffer[] = [];
     let totalBytes = 0;
+    let bufferedBytes = 0;
     let decoder = new StringDecoder("utf8");
     let stderr = "";
-    let truncated = false;
+    /** 原始缓冲已满（只影响 chunks，不影响解析）。 */
+    let capped = false;
+    /** 超出硬上限，这一轮已不可信：收尾按 output_truncated 失败。 */
+    let hardStopped = false;
+    /** 已经交给 UI 的正文累积：缓冲被截断时以它为准（它才是完整的）。 */
+    let streamedText = "";
+    const pushText = (delta: string): void => {
+      if (!delta) return;
+      streamedText += delta;
+      opts.onChunk?.(delta);
+    };
     let settled = false;
 
     const settle = (fn: () => void) => {
@@ -819,7 +894,7 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
       partSent.set(key, full.length);
       const suffix = full.slice(prev);
       if (kind === "reasoning") deliverReasoning(suffix);
-      else opts.onChunk?.(suffix);
+      else pushText(suffix);
     };
     const emitStreamJson = (flushed: string) => {
       // 工具事件先消化：同一个 JSONL 行里 tool 事件与正文不会共存（claude 的
@@ -834,25 +909,39 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
         return;
       }
       if (delta.reasoning !== undefined) deliverReasoning(delta.reasoning);
-      if (delta.text !== undefined) opts.onChunk?.(delta.text);
+      if (delta.text !== undefined) pushText(delta.text);
     };
     child.stdout.on("data", (buf: Buffer) => {
-      if (truncated) return;
-      if (totalBytes + buf.length > maxBytes) {
-        const remaining = Math.max(0, maxBytes - totalBytes);
-        const tail = trimIncompleteUtf8Tail(buf.subarray(0, remaining));
-        if (tail.length > 0) {
-          chunks.push(tail);
-          totalBytes += tail.length;
-          const delta = decoder.write(tail);
-          if (!streamJsonMode && delta && streamRawStdout) opts.onChunk?.(delta);
-        }
-        decoder = new StringDecoder("utf8"); // drop any held partial sequence
-        truncated = true;
+      totalBytes += buf.length;
+      // 硬上限：agent 在喷日志/打印超大结果，这一轮已经不可能再有用。掐掉进程，
+      // 收尾按 output_truncated 失败 —— 绝不能像过去那样「读到一半就 resolve」，
+      // 那等于把半句话当完整回答发给用户。
+      if (totalBytes > hardLimit) {
+        hardStopped = true;
+        killProcessTree(child);
         return;
       }
-      chunks.push(buf);
-      totalBytes += buf.length;
+      // 缓冲满了只停止攒原始字节（内存保护），解析照旧继续：工具输出的洪峰之后
+      // 往往还有最终回答，这里过去直接 return，后半轮就被整段丢掉了。
+      if (!capped) {
+        const room = bufferLimit - bufferedBytes;
+        if (buf.length <= room) {
+          chunks.push(buf);
+          bufferedBytes += buf.length;
+        } else {
+          if (room > 0) {
+            const tail = trimIncompleteUtf8Tail(buf.subarray(0, room));
+            if (tail.length > 0) {
+              chunks.push(tail);
+              bufferedBytes += tail.length;
+            }
+          }
+          capped = true;
+          console.warn(
+            `agent stdout exceeded ${bufferLimit} bytes; raw buffer capped (turn keeps parsing)`,
+          );
+        }
+      }
       const delta = decoder.write(buf);
       if (streamJsonMode) {
         // 按行切分：完整行立即解析，残行留在 lineBuf 等下一个 chunk。
@@ -865,7 +954,7 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
           emitStreamJson(line);
         }
       } else if (delta && streamRawStdout) {
-        opts.onChunk?.(delta);
+        pushText(delta);
       }
     });
     child.stderr.on("data", (buf: Buffer) => {
@@ -877,6 +966,17 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
     child.on("close", (code) => {
       settle(() => {
         const stdout = Buffer.concat(chunks).toString("utf8");
+        if (hardStopped) {
+          // 硬上限触发：后半轮没读到，已产出的正文一并带出去（终帧还能显示
+          // 用户刚才看到的那半句），但终态必须是失败。
+          if (activity && activity.finish()) emitActivity();
+          reject(new TurnIncompleteError(
+            "output_truncated",
+            streamedText.trim() || stdout,
+            `agent stdout exceeded ${hardLimit} bytes`,
+          ));
+          return;
+        }
         if (code === 0) {
           if (streamJsonMode) {
             // 冲刷残行后提取权威正文；提取失败（非标准输出）兜底原文。
@@ -884,12 +984,24 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
             // 收尾：异常退出/事件流缺失都不会有 content_block_stop，悬着的
             // 「进行中」步骤必须在这里结掉，否则气泡里永远转圈。
             if (activity && activity.finish()) emitActivity();
-            resolve(extractStreamJsonFinalText(stdout) ?? stdout);
+            // 缓冲被截断时原始 stdout 只是前缀，以流式正文为准（它才是全的）。
+            resolve(capped ? streamedText : (extractStreamJsonFinalText(stdout) ?? stdout));
           } else {
             // JSON 信封型 agent（openclaw）：正文之外还能从信封里拿到本轮的
             // 思考与工具汇总。只能在一轮结束时整段补上（信封是一次性的），
             // 但足以让群聊/讨论组里的气泡有过程可展开。
             if (emitsJsonEnvelope(opts.agentName)) {
+              if (capped) {
+                // 信封是一次性 JSON：缓冲被截断就等于这份结果拿不全，解析出来
+                // 的只会是半截对象或日志行。判失败，别把残片当回答。
+                if (activity && activity.finish()) emitActivity();
+                reject(new TurnIncompleteError(
+                  "output_truncated",
+                  "",
+                  `${opts.agentName} envelope exceeded ${bufferLimit} bytes`,
+                ));
+                return;
+              }
               const details = extractOpenclawEnvelopeDetails(stdout);
               if (details.reasoning) deliverReasoning(details.reasoning);
               if (details.tools && details.tools.length > 0 && opts.onActivity) {
@@ -904,6 +1016,19 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
                   } satisfies ActivityStep;
                 }));
               }
+              // 信封自己说了「这一轮没正常收尾」时（aborted / length /
+              // content_filter / error），正文往往只有半句话 —— 必须如实报失败，
+              // 否则前端会把它当一次完整回答展示（「话说一半就结束了」）。
+              const health = openclawTurnHealth(stdout);
+              if (health.incomplete) {
+                if (activity && activity.finish()) emitActivity();
+                reject(new TurnIncompleteError(
+                  "agent_incomplete",
+                  extractOpenclawReply(stdout),
+                  `openclaw turn did not finish: ${health.detail ?? "unknown"}`,
+                ));
+                return;
+              }
             }
             if (opts.agentName === "hermes" && reasoningChunks === 0) {
               console.warn(
@@ -911,6 +1036,9 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
                 + "跑一次 scripts/patch-hermes-reasoning.py（hermes 升级会被覆盖）",
               );
             }
+            // 非流式路径：stdout 本身就是回答（信封型另有上面那条分支），缓冲
+            // 上限即回答长度上限，保持「按字节截断」的老语义；流式路径的正文
+            // 是解析出来的，所以缓冲满了也照样给出完整正文（见上一条分支）。
             resolve(opts.agentName === "openclaw" ? extractOpenclawReply(stdout) : stdout);
           }
         } else {
