@@ -363,6 +363,57 @@ func TestClawAdminListChatRoomsRejectsUnknownStage(t *testing.T) {
 	}
 }
 
+func TestClawAdminListChatRoomsConversationKindFilter(t *testing.T) {
+	newHandler := func() (*Handler, *convFakeDB) {
+		fake := &convFakeDB{}
+		h := newConvHandler(fake, convReadOnly)
+		// newConvHandler 会覆盖 queryRow，必须在它之后再 stub。
+		fake.queryRow = func(sql string, _ []any) pgx.Row {
+			if strings.Contains(sql, "FROM claw_admin_users") {
+				return &convStubRow{values: []any{convAdminID, "boss", "老板", "role-1", "active", "超级管理员", []byte(`["group:read"]`)}}
+			}
+			return &convStubRow{values: []any{0}}
+		}
+		fake.query = func(string, []any) (pgx.Rows, error) { return &convStubRows{}, nil }
+		return h, fake
+	}
+
+	// discussion=讨论组房间：走参数化的 conversation_kind = $n。
+	h, fake := newHandler()
+	rr := httptest.NewRecorder()
+	h.ClawAdminListChatRooms(rr, convRequest(t, http.MethodGet, "/api/admin/chatrooms?conversation_kind=discussion", "", convReadOnly))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("discussion filter status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	if !sawStatementContaining(fake, "conversation_kind = $") {
+		t.Fatalf("discussion filter missing parameterized kind clause; statements: %v", fake.stmts)
+	}
+
+	// normal=普通聊天室：投影里 kind 是空串，只能写成 = ''，不能参数化空串
+	// （空串在 handler 里表示「不过滤」）。
+	h, fake = newHandler()
+	rr = httptest.NewRecorder()
+	h.ClawAdminListChatRooms(rr, convRequest(t, http.MethodGet, "/api/admin/chatrooms?conversation_kind=normal", "", convReadOnly))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("normal filter status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	if !sawStatementContaining(fake, "conversation_kind = ''") {
+		t.Fatalf("normal filter should match empty kind literally; statements: %v", fake.stmts)
+	}
+
+	// 其他取值一律 400，与 stage 的口径一致。
+	h, _ = newHandler()
+	rr = httptest.NewRecorder()
+	h.ClawAdminListChatRooms(rr, convRequest(t, http.MethodGet, "/api/admin/chatrooms?conversation_kind=bogus", "", convReadOnly))
+	body := decodeConv(t, rr)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("bogus kind status = %d, want 400 (body %s)", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(body["message"].(string), "conversation_kind") {
+		t.Fatalf("message = %v, want it to mention conversation_kind", body["message"])
+	}
+}
+
 func TestClawAdminListChatRoomsKeywordEscapesForLike(t *testing.T) {
 	fake := &convFakeDB{}
 	h := newConvHandler(fake, convReadOnly)

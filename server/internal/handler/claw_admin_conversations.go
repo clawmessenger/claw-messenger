@@ -171,6 +171,13 @@ func (h *Handler) ClawAdminListChatRooms(w http.ResponseWriter, r *http.Request)
 		clawAdminFail(w, 400, "stage has an unsupported value")
 		return
 	}
+	// conversation_kind 三个取值：discussion=讨论组房间；normal=普通聊天室
+	// （投影里 COALESCE 成空串，只能用 = '' 表达，直接传空串又会被当成
+	// 「不过滤」，所以用 normal 这个字面量）；缺省/空 = 全部。
+	if kind != "" && kind != "normal" && kind != "discussion" {
+		clawAdminFail(w, 400, "conversation_kind has an unsupported value")
+		return
+	}
 
 	where := []string{}
 	args := []interface{}{}
@@ -190,7 +197,10 @@ func (h *Handler) ClawAdminListChatRooms(w http.ResponseWriter, r *http.Request)
 		args = append(args, stage)
 		where = append(where, "stage = $"+strconv.Itoa(len(args)))
 	}
-	if kind != "" {
+	switch kind {
+	case "normal":
+		where = append(where, "conversation_kind = ''")
+	case "discussion":
 		args = append(args, kind)
 		where = append(where, "conversation_kind = $"+strconv.Itoa(len(args)))
 	}
