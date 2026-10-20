@@ -12,14 +12,26 @@ import (
 // TestInteractiveV3EventWhitelist 钉住前端 discussion-v3.ts 的 eventData 键集合。
 // 白名单多一个键，前端就会把整段 events 尾读解析失败；少一个键，我们就得把一条
 // 本可以正常展示的事件降级掉。两边必须逐字一致。
+//
+// 人工核对清单（17 既有 + 3 引导式新增 = 20）——改白名单时同步核对该注释与
+// web src/lib/discussion-v3.ts 的 eventData 校验器：
+//
+//	既有 17：round_started / round_summary_started / round_summary_completed /
+//	  round_checkpoint / contribution_delta / contribution_completed /
+//	  user_interjection / member_retry_scheduled / member_skipped /
+//	  request_interrupted / interjection_applied / interruption_failed /
+//	  discussion_started / discussion_completed / discussion_cancelled /
+//	  discussion_failed / discussion_progress
+//	引导式 3：setup_prompt / setup_step_completed / setup_recommend_failed
 func TestInteractiveV3EventWhitelist(t *testing.T) {
 	want := []string{
-		"round_started", "round_summary_started", "round_summary_completed",
+		"round_started", "round_summary_started", "round_summary_completed", "round_checkpoint",
 		"contribution_delta", "contribution_completed", "user_interjection",
 		"member_retry_scheduled", "member_skipped", "request_interrupted",
 		"interjection_applied", "interruption_failed", "discussion_started",
 		"discussion_completed", "discussion_cancelled", "discussion_failed",
 		"discussion_progress",
+		"setup_prompt", "setup_step_completed", "setup_recommend_failed",
 	}
 	if len(interactiveV3EventTypes) != len(want) {
 		t.Fatalf("whitelist size = %d, want %d", len(interactiveV3EventTypes), len(want))
@@ -61,6 +73,7 @@ func TestDiscussionEventViewDowngradesControlEvents(t *testing.T) {
 		{"retry_accepted", "discussion_progress", false},
 		{"round_started", "round_started", true},
 		{"round_summary_completed", "round_summary_completed", true},
+		{"round_checkpoint", "round_checkpoint", true},
 		{"discussion_progress", "discussion_progress", true},
 	}
 	for _, tc := range cases {

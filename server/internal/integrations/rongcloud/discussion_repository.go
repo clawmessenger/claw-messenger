@@ -21,6 +21,9 @@ import (
 // 直接出现在 REST 快照与事件 payload 里 —— 前后端以字面量为契约，加一层枚举只会
 // 多一次转译。
 const (
+	// DiscussionStatusConfiguring 引导配置中（draft 语义，迁移 595 新增）：
+	// 引导式创建先落这个态，确认开始后 CAS 推进到 planning。
+	DiscussionStatusConfiguring  = "configuring"
 	DiscussionStatusPlanning     = "planning"
 	DiscussionStatusRunning      = "running"
 	DiscussionStatusSummarizing  = "summarizing"
@@ -35,6 +38,7 @@ const (
 // uq_rongcloud_discussion_one_active（迁移 589）所覆盖的集合。**改这里必须同步改迁移**，
 // 否则索引与代码对「活跃」的定义会漂移。
 var discussionLiveStatuses = map[string]struct{}{
+	DiscussionStatusConfiguring:  {},
 	DiscussionStatusPlanning:     {},
 	DiscussionStatusRunning:      {},
 	DiscussionStatusSummarizing:  {},

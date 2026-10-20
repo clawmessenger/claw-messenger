@@ -103,10 +103,10 @@ func (s *InstallService) CreateInstallation(ctx context.Context, workspaceID, ag
 		return channel.Config{}, err
 	}
 	inst, err := s.queries.UpsertChannelInstallation(ctx, db.UpsertChannelInstallationParams{
-		WorkspaceID:    workspaceID,
-		AgentID:        agentID,
-		ChannelType:    string(TypeRongCloud),
-		Config:         configJSON,
+		WorkspaceID:     workspaceID,
+		AgentID:         agentID,
+		ChannelType:     string(TypeRongCloud),
+		Config:          configJSON,
 		InstallerUserID: installerUserID,
 	})
 	if err != nil {
@@ -128,7 +128,7 @@ func (s *InstallService) RevokeInstallation(ctx context.Context, instID pgtype.U
 
 func (s *InstallService) UpsertSystemConfig(ctx context.Context, workspaceID pgtype.UUID, configKey string, nodeID pgtype.UUID, config json.RawMessage) (db.RongcloudSystemConfig, error) {
 	return s.queries.UpsertRongCloudSystemConfig(ctx, db.UpsertRongCloudSystemConfigParams{
-		WorkspaceID:  workspaceID,
+		WorkspaceID:   workspaceID,
 		ConfigKey:     configKey,
 		NodeID:        nodeID,
 		Config:        config,

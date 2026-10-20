@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/quota"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
@@ -45,6 +46,9 @@ type discussionRuntime struct {
 	// registration 置为 true。它是 getWorkflowCapabilities 翻面的唯一依据：
 	// 只有引擎真能推进时才对 C 端宣告 protocol_versions=[2,3]。
 	interactiveEnabled bool
+	// quota 是用户级创建配额（讨论组/群聊/聊天室三入口统一硬校验）。
+	// nil 时放行（未装配数据库的部署不引入新失败面）。
+	quota *quota.Service
 }
 
 // DiscussionSystemHostConfig 是管理端 system_host 配置的运行时视图（P4）。

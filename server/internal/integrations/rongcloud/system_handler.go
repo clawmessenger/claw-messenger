@@ -7,6 +7,7 @@ import (
 	"log/slog"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/quota"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
@@ -436,6 +437,9 @@ func (h *systemHandler) handleDiscussionCommand(ctx context.Context, msg Normali
 		"cancel": true, "interject": true, "retry": true, "stop": true,
 		"recommendRoles": true, "createRoundtable": true, "resumeRoundtable": true, "restartRoundtable": true,
 		"relayMessage": true, "relayGroupMessage": true,
+		// 引导式创建（configuring 链路）六个 action，与旧五阶段并行（uniapp 仍走旧链路）。
+		"createRoundtableShell": true, "submitSetupTopic": true, "requestRoleRecommend": true,
+		"confirmRoundtableSetup": true, "resumeSetup": true, "touchSetup": true,
 	}
 	if !known[cmd.Action] {
 		return h.replyErr(ctx, msg, cmd, 404, unknownServiceOrActionMessage(cmd))
@@ -522,6 +526,18 @@ func (h *systemHandler) handleDiscussionCommand(ctx context.Context, msg Normali
 		result = h.discussionRuntime.actionResumeRoundtable(ctx, cmd, actor)
 	case "restartRoundtable":
 		result = h.discussionRuntime.actionRestartRoundtable(ctx, cmd, actor)
+	case "createRoundtableShell":
+		result = h.discussionRuntime.actionCreateRoundtableShell(ctx, cmd, actor)
+	case "submitSetupTopic":
+		result = h.discussionRuntime.actionSubmitSetupTopic(ctx, cmd, actor)
+	case "requestRoleRecommend":
+		result = h.discussionRuntime.actionRequestRoleRecommend(ctx, cmd, actor)
+	case "confirmRoundtableSetup":
+		result = h.discussionRuntime.actionConfirmRoundtableSetup(ctx, cmd, actor)
+	case "resumeSetup":
+		result = h.discussionRuntime.actionResumeSetup(ctx, cmd, actor)
+	case "touchSetup":
+		result = h.discussionRuntime.actionTouchSetup(ctx, cmd, actor)
 	default:
 		return h.replyErr(ctx, msg, cmd, 404, unknownServiceOrActionMessage(cmd))
 	}
@@ -589,4 +605,20 @@ func (h *systemHandler) replyErr(ctx context.Context, msg NormalizedMessage, cmd
 		"ok":    false,
 		"error": errMsg,
 	})
+}
+
+// quotaCheck 创建配额硬校验（group/chatroom 入口共用；shell 入口走
+// discussionRuntime.quotaExceededResult）。未装配配额服务时放行（不引入新失败面）。
+func (h *systemHandler) quotaCheck(ctx context.Context, userID string, kind quota.Kind) *quota.Error {
+	if h == nil || h.discussionRuntime == nil || h.discussionRuntime.quota == nil {
+		return nil
+	}
+	return h.discussionRuntime.quota.Check(ctx, userID, kind)
+}
+
+// sendWebQuotaExceeded 按 QUOTA_EXCEEDED 契约回包：code 429 + data={kind,limit,used}，
+// 与 shell 入口（commandResult 通道）及 REST（HTTP 429）同一契约。
+func (h *systemHandler) sendWebQuotaExceeded(ctx context.Context, msg NormalizedMessage, cmd CommandContent, qErr *quota.Error) error {
+	return h.client.sendWebCommandResult(ctx, h.nodeID, msg.FromUserID, cmd.RequestID,
+		cmd.Service, cmd.Action, "error", 429, qErr.Data(), quota.CodeQuotaExceeded)
 }

@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/quota"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
@@ -46,7 +47,7 @@ type commandResult struct {
 	message string
 }
 
-func okResult(data interface{}) commandResult    { return commandResult{data: data, code: 200} }
+func okResult(data interface{}) commandResult      { return commandResult{data: data, code: 200} }
 func errResult(code int, msg string) commandResult { return commandResult{code: code, message: msg} }
 
 // resolveActor maps the IM sender (a RongCloud user id) to the rongcloud_user
@@ -188,15 +189,15 @@ func chatroomMemberView(m db.ListRongCloudChatroomMembersWithNodeRow) map[string
 		nodeID = m.BusinessNodeID.String
 	}
 	rec := map[string]interface{}{
-		"userId":       memberID,
-		"memberType":   m.MemberType,
-		"nodeId":       nodeID,
-		"nickname":     m.Nickname,
-		"portraitUri":  m.PortraitUri,
-		"roleName":     textStr(m.RoleName),
+		"userId":           memberID,
+		"memberType":       m.MemberType,
+		"nodeId":           nodeID,
+		"nickname":         m.Nickname,
+		"portraitUri":      m.PortraitUri,
+		"roleName":         textStr(m.RoleName),
 		"roleInstructions": textStr(m.RoleInstructions),
-		"capabilities": capsToInterface(m.Capabilities),
-		"enabled":      m.Enabled,
+		"capabilities":     capsToInterface(m.Capabilities),
+		"enabled":          m.Enabled,
 	}
 	if m.DiscussionModel.Valid {
 		rec["model"] = m.DiscussionModel.String
@@ -236,14 +237,14 @@ func capsToInterface(caps []byte) interface{} {
 // that already carries owner_rc_user_id / host_business_node_id via JOIN).
 func chatroomViewData(room chatroomView, members []map[string]interface{}, includeMembers bool) map[string]interface{} {
 	rec := map[string]interface{}{
-		"chatroomId":       room.rcChatroomID(),
-		"chatroomName":     room.name(),
-		"portraitUri":      room.portraitUri(),
-		"ownerId":          room.ownerRCID(),
-		"hostNodeId":       room.hostBusinessNodeID(),
+		"chatroomId":        room.rcChatroomID(),
+		"chatroomName":      room.name(),
+		"portraitUri":       room.portraitUri(),
+		"ownerId":           room.ownerRCID(),
+		"hostNodeId":        room.hostBusinessNodeID(),
 		"openclawMaxRounds": room.maxRounds(),
-		"createTime":       room.createdAt(),
-		"updateTime":       room.updatedAt(),
+		"createTime":        room.createdAt(),
+		"updateTime":        room.updatedAt(),
 	}
 	if k := room.conversationKind(); k != "" {
 		rec["conversationKind"] = k
@@ -280,9 +281,9 @@ type viewRow struct {
 	db.GetActiveRongCloudChatroomViewByRongCloudIDRow
 }
 
-func (v viewRow) rcChatroomID() string       { return v.RongcloudChatroomID }
-func (v viewRow) name() string                { return v.Name }
-func (v viewRow) portraitUri() string         { return v.PortraitUri }
+func (v viewRow) rcChatroomID() string { return v.RongcloudChatroomID }
+func (v viewRow) name() string         { return v.Name }
+func (v viewRow) portraitUri() string  { return v.PortraitUri }
 func (v viewRow) ownerRCID() string {
 	if v.OwnerRcUserID.Valid {
 		return v.OwnerRcUserID.String
@@ -295,7 +296,7 @@ func (v viewRow) hostBusinessNodeID() interface{} {
 	}
 	return nil
 }
-func (v viewRow) maxRounds() int32      { return v.MaxRounds }
+func (v viewRow) maxRounds() int32       { return v.MaxRounds }
 func (v viewRow) createdAt() interface{} { return v.CreatedAt }
 func (v viewRow) updatedAt() interface{} { return v.UpdatedAt }
 func (v viewRow) conversationKind() string {
@@ -309,9 +310,9 @@ type listViewRow struct {
 	db.ListRongCloudChatroomViewsForUserRow
 }
 
-func (v listViewRow) rcChatroomID() string       { return v.RongcloudChatroomID }
-func (v listViewRow) name() string                { return v.Name }
-func (v listViewRow) portraitUri() string         { return v.PortraitUri }
+func (v listViewRow) rcChatroomID() string { return v.RongcloudChatroomID }
+func (v listViewRow) name() string         { return v.Name }
+func (v listViewRow) portraitUri() string  { return v.PortraitUri }
 func (v listViewRow) ownerRCID() string {
 	if v.OwnerRcUserID.Valid {
 		return v.OwnerRcUserID.String
@@ -324,7 +325,7 @@ func (v listViewRow) hostBusinessNodeID() interface{} {
 	}
 	return nil
 }
-func (v listViewRow) maxRounds() int32      { return v.MaxRounds }
+func (v listViewRow) maxRounds() int32       { return v.MaxRounds }
 func (v listViewRow) createdAt() interface{} { return v.CreatedAt }
 func (v listViewRow) updatedAt() interface{} { return v.UpdatedAt }
 func (v listViewRow) conversationKind() string {
@@ -369,7 +370,7 @@ func (h *systemHandler) actionChatroomGetList(ctx context.Context, cmd CommandCo
 	memberID := actor.RongcloudUserID
 	rooms, err := h.queries.ListRongCloudChatroomViewsForUser(ctx, db.ListRongCloudChatroomViewsForUserParams{
 		OwnerUserID: actor.ID,
-		MemberID:   pgtype.Text{String: memberID, Valid: memberID != ""},
+		MemberID:    pgtype.Text{String: memberID, Valid: memberID != ""},
 	})
 	if err != nil {
 		h.logger.Error("rongcloud: chatroom getList", "error", err)
@@ -520,13 +521,13 @@ func (h *systemHandler) actionChatroomJoin(ctx context.Context, cmd CommandConte
 	}
 	portrait := actor.PortraitUri.String
 	_, _ = h.queries.UpsertRongCloudChatroomMemberByMemberID(ctx, db.UpsertRongCloudChatroomMemberByMemberIDParams{
-		ChatroomID: room.ID,
-		MemberType: "user",
+		ChatroomID:   room.ID,
+		MemberType:   "user",
 		Capabilities: []byte("[]"),
-		Enabled:   true,
-		MemberID:  pgtype.Text{String: actor.RongcloudUserID, Valid: true},
-		Nickname:  nickname,
-		PortraitUri: portrait,
+		Enabled:      true,
+		MemberID:     pgtype.Text{String: actor.RongcloudUserID, Valid: true},
+		Nickname:     nickname,
+		PortraitUri:  portrait,
 	})
 	return okResult(map[string]interface{}{"ok": true})
 }
@@ -690,7 +691,7 @@ func (h *systemHandler) actionChatroomCreate(ctx context.Context, cmd CommandCon
 	name := strings.TrimSpace(getStringAny(cmd.Params, "chatroom_name", "chatroomName"))
 	portrait := strings.TrimSpace(getStringAny(cmd.Params, "portrait_uri", "portraitUri"))
 	hostNodeID := strings.TrimSpace(getStringAny(cmd.Params, "host_node_id", "hostNodeId"))
-	aiMembers := parseAIMembers(cmd.Params["aiMembers"] )
+	aiMembers := parseAIMembers(cmd.Params["aiMembers"])
 	maxRounds := int32(20)
 	if v, ok := cmd.Params["openclawMaxRounds"]; ok {
 		switch t := v.(type) {
@@ -732,6 +733,10 @@ func (h *systemHandler) actionChatroomCreate(ctx context.Context, cmd CommandCon
 	if existing, err := h.queries.GetActiveRongCloudChatroomViewByRongCloudID(ctx, rcID); err == nil && existing.ID.Valid {
 		return errResult(409, "聊天室 ID 已存在")
 	}
+	// 创建配额硬校验（普通聊天室口径；超限：429 QUOTA_EXCEEDED{kind,limit,used}）。
+	if qErr := h.quotaCheck(ctx, actor.RongcloudUserID, quota.KindChatroom); qErr != nil {
+		return commandResult{code: 429, message: quota.CodeQuotaExceeded, data: qErr.Data()}
+	}
 	// Resolve host node.
 	hostNode, err := h.resolveNode(ctx, hostNodeID)
 	if err != nil {
@@ -743,16 +748,16 @@ func (h *systemHandler) actionChatroomCreate(ctx context.Context, cmd CommandCon
 		return errResult(422, "主持人节点必须在线")
 	}
 	if missing := missingCapabilities(hostNode.Capabilities, roundtableHostCaps); len(missing) > 0 {
-		return errResult(422, "主持人节点缺少能力: " + strings.Join(missing, ", "))
+		return errResult(422, "主持人节点缺少能力: "+strings.Join(missing, ", "))
 	}
 	// Resolve ordinary members.
 	seen := map[string]bool{hostNodeID: true}
 	type resolvedMember struct {
-		node   db.RongcloudNode
-		role   string
-		instr  string
-		model  string
-		order  int32
+		node  db.RongcloudNode
+		role  string
+		instr string
+		model string
+		order int32
 	}
 	resolved := make([]resolvedMember, 0, len(ordinary))
 	seenMemberIDs := map[string]bool{hostNode.RongcloudUserID: true}
@@ -797,15 +802,15 @@ func (h *systemHandler) actionChatroomCreate(ctx context.Context, cmd CommandCon
 	// Insert the chatroom row.
 	room, err := h.queries.CreateRongCloudChatroom(ctx, db.CreateRongCloudChatroomParams{
 		WorkspaceID:         actor.WorkspaceID,
-		RongcloudChatroomID:  rcID,
-		OwnerUserID:          actor.ID,
-		HostNodeID:           hostNode.ID,
-		MaxRounds:            maxRounds,
-		ConversationKind:     pgtype.Text{String: "chatroom", Valid: true},
-		Config:               []byte("{}"),
-		Status:               "active",
-		Name:                 name,
-		PortraitUri:          portrait,
+		RongcloudChatroomID: rcID,
+		OwnerUserID:         actor.ID,
+		HostNodeID:          hostNode.ID,
+		MaxRounds:           maxRounds,
+		ConversationKind:    pgtype.Text{String: "chatroom", Valid: true},
+		Config:              []byte("{}"),
+		Status:              "active",
+		Name:                name,
+		PortraitUri:         portrait,
 	})
 	if err != nil {
 		// Roll back the RongCloud room.

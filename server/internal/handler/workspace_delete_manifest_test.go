@@ -57,6 +57,10 @@ var workspaceDeletionManifest = map[string]workspaceDeleteAction{
 	"claw_admin_audit_logs":              workspaceDeleteKeep,
 	"claw_admin_roles":                   workspaceDeleteKeep,
 	"claw_admin_users":                   workspaceDeleteKeep,
+	// 配额体系（讨论组引导式创建）：套餐与按用户覆盖都是 installation 级
+	// （挂在 claw_im_users，无 workspace_id），workspace 拆除不得触碰。
+	"claw_im_plan":                       workspaceDeleteKeep,
+	"claw_im_user_quota":                 workspaceDeleteKeep,
 	"claw_im_users":                      workspaceDeleteKeep,
 	"client_usage_daily":                 workspaceDeleteDetach,
 	"comment":                            workspaceDelete,

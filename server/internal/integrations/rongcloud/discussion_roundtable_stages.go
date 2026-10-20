@@ -232,7 +232,17 @@ func (s *roundtableCreationService) ensureMembers(ctx context.Context, chatroomI
 }
 
 // ensureDiscussion 对齐 _ensure_started：落讨论实例（幂等 by discussion_id）。
-func (s *roundtableCreationService) ensureDiscussion(ctx context.Context, request db.RongcloudRoundtableCreateRequest, chatroomID, discussionID string, canonical roundtableCanonical, validated roundtableValidated, userID string) (string, *RoundtableError) {
+// initialStatus 允许引导式链路落 configuring（draft 语义）；旧五阶段链路恒传
+// planning，行为与改造前逐字一致。
+func (s *roundtableCreationService) ensureDiscussion(ctx context.Context, request db.RongcloudRoundtableCreateRequest, chatroomID, discussionID string, canonical roundtableCanonical, validated roundtableValidated, userID string, initialStatus string) (string, *RoundtableError) {
+	if initialStatus != DiscussionStatusConfiguring {
+		initialStatus = DiscussionStatusPlanning
+	}
+	// 引导式链路的断点从 topic 起步；旧链路恒为空（列默认语义）。
+	setupStep := ""
+	if initialStatus == DiscussionStatusConfiguring {
+		setupStep = setupStepTopic
+	}
 	room, err := s.queries.GetRongCloudChatroomViewByRongCloudID(ctx, chatroomID)
 	if err != nil {
 		return "", roundtableErr("CREATE_ROUNDTABLE_RECOVERABLE")
@@ -298,12 +308,13 @@ func (s *roundtableCreationService) ensureDiscussion(ctx context.Context, reques
 		Goal:               canonical.Goal,
 		MaxRounds:          maxRounds,
 		Mode:               "roundtable",
-		Status:             "planning",
+		Status:             initialStatus,
 		RoleSnapshot:       roleJSON,
 		HostConfigSnapshot: hostSnapshot,
 		RecommendationID:   textOrNull(canonical.RecommendationID),
 		ClientRequestID:    textOrNull(canonical.ClientRequestID),
 		RoundPolicy:        canonical.RoundPolicy,
+		SetupStep:          setupStep,
 	})
 	if err != nil {
 		// 并发/重放：行已存在 → 幂等接受。

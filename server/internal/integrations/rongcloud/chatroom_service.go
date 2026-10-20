@@ -74,13 +74,13 @@ func (s *ChatroomService) CreateChatroom(ctx context.Context, params ChatroomCre
 	}
 	return s.queries.CreateRongCloudChatroom(ctx, db.CreateRongCloudChatroomParams{
 		WorkspaceID:         params.WorkspaceID,
-		RongcloudChatroomID:  params.RongcloudChatroomID,
-		OwnerUserID:          params.OwnerUserID,
-		HostNodeID:           params.HostNodeID,
-		MaxRounds:            params.MaxRounds,
-		ConversationKind:     pgtype.Text{String: params.ConversationKind, Valid: params.ConversationKind != ""},
-		Config:               params.Config,
-		Status:               "active",
+		RongcloudChatroomID: params.RongcloudChatroomID,
+		OwnerUserID:         params.OwnerUserID,
+		HostNodeID:          params.HostNodeID,
+		MaxRounds:           params.MaxRounds,
+		ConversationKind:    pgtype.Text{String: params.ConversationKind, Valid: params.ConversationKind != ""},
+		Config:              params.Config,
+		Status:              "active",
 	})
 }
 

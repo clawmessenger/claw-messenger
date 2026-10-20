@@ -37,6 +37,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/integrations/wecom"
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
 	"github.com/multica-ai/multica/server/internal/middleware"
+	"github.com/multica-ai/multica/server/internal/quota"
 	"github.com/multica-ai/multica/server/internal/realtime"
 	"github.com/multica-ai/multica/server/internal/seatcapacity"
 	"github.com/multica-ai/multica/server/internal/service"
@@ -1253,6 +1254,10 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 			// One broker, two users: the channel binds the sender and routes
 			// device answers in, the admin API starts requests.
 			rcNodeRequests := rongcloud.NewNodeRequestBroker(slog.Default())
+			// T01 配额服务：空组直建 / 群创建 / 聊天室创建三入口共用同一实例；
+			// REST（/api/quota/me）与 admin 配额 API 也挂它。
+			rcQuota := quota.New(pool)
+			h.ClawQuota = rcQuota
 			rongcloud.RegisterRongCloud(channelRegistry, rongcloud.ChannelDeps{
 				Registrar:    rcDispatcher,
 				Decrypt:      rcBox.Open,
@@ -1260,6 +1265,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				Queries:      queries,
 				Registry:     rcRegistry,
 				NodeRequests: rcNodeRequests,
+				Quota:        rcQuota,
 				// GroupMirror 的 callbacks 懒查 h.RongCloudNode（构造完才赋值），
 				// 所以这里可以安全地先挂上去。
 				GroupMirror: h.ClawGroupMirror(),
@@ -1666,6 +1672,9 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	r.Post("/api/user/update", h.ClawUserUpdate)
 	r.Get("/api/config/user-guide", h.ClawUserGuide)
 	r.Post("/api/im/refresh-token", h.ClawImRefreshToken)
+	// 配额与半成品列表（讨论组引导式创建与配额）：C 端预检 / 会话列表合并。
+	r.Get("/api/quota/me", h.ClawGetMyQuota)
+	r.Get("/api/my/discussions", h.ClawListMyDiscussions)
 
 	// ClawMessenger admin (虾说后台) compatibility API — /api/admin/*
 	r.Post("/api/admin/auth/login", h.ClawAdminLogin)
@@ -1678,6 +1687,9 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	r.Put("/api/admin/users/{id}/status", h.ClawAdminUpdateUserStatus)
 	r.Get("/api/admin/users/{id}/nodes", h.ClawAdminUserNodes)
 	r.Get("/api/admin/users/{id}/groups", h.ClawAdminUserGroups)
+	// 用户配额（保存即生效；updated_by 记管理员账号）。
+	r.Get("/api/admin/users/{id}/quota", h.ClawAdminGetUserQuota)
+	r.Put("/api/admin/users/{id}/quota", h.ClawAdminPutUserQuota)
 	r.Get("/api/admin/stats", h.ClawAdminStats)
 	r.Get("/api/admin/audit-logs", h.ClawAdminAuditLogs)
 	r.Get("/api/admin/system/config", h.ClawAdminSystemConfigList)

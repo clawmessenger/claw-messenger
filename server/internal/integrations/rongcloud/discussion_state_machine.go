@@ -9,25 +9,25 @@ import (
 )
 
 const (
-	EventDiscussionStarted  = "discussion_started"
-	EventRoundStarted       = "round_started"
-	EventTurnStarted        = "turn_started"
-	EventTurnCompleted      = "turn_completed"
-	EventTurnSkipped        = "turn_skipped"
-	EventRoundCompleted     = "round_completed"
-	EventDiscussionEnded    = "discussion_ended"
-	EventDiscussionPaused   = "discussion_paused"
-	EventDiscussionResumed  = "discussion_resumed"
-	EventHostChanged        = "host_changed"
-	EventError              = "error"
+	EventDiscussionStarted = "discussion_started"
+	EventRoundStarted      = "round_started"
+	EventTurnStarted       = "turn_started"
+	EventTurnCompleted     = "turn_completed"
+	EventTurnSkipped       = "turn_skipped"
+	EventRoundCompleted    = "round_completed"
+	EventDiscussionEnded   = "discussion_ended"
+	EventDiscussionPaused  = "discussion_paused"
+	EventDiscussionResumed = "discussion_resumed"
+	EventHostChanged       = "host_changed"
+	EventError             = "error"
 )
 
 const (
-	StatusIdle        = "idle"
-	StatusStarting    = "starting"
-	StatusInProgress  = "in_progress"
-	StatusPaused      = "paused"
-	StatusEnded       = "ended"
+	StatusIdle       = "idle"
+	StatusStarting   = "starting"
+	StatusInProgress = "in_progress"
+	StatusPaused     = "paused"
+	StatusEnded      = "ended"
 )
 
 func ReplayState(events []DiscussionEvent) (DiscussionState, error) {
@@ -94,9 +94,9 @@ func ValidateTransition(currentStatus, eventType string) (string, error) {
 			EventDiscussionStarted: StatusStarting,
 		},
 		StatusStarting: {
-			EventRoundStarted:     StatusInProgress,
-			EventDiscussionEnded:  StatusEnded,
-			EventError:            StatusEnded,
+			EventRoundStarted:    StatusInProgress,
+			EventDiscussionEnded: StatusEnded,
+			EventError:           StatusEnded,
 		},
 		StatusInProgress: {
 			EventDiscussionPaused: StatusPaused,

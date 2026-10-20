@@ -578,6 +578,18 @@ type ClawAdminUser struct {
 	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
 }
 
+type ClawImPlan struct {
+	ID              int32              `json:"id"`
+	Name            string             `json:"name"`
+	DiscussionLimit int32              `json:"discussion_limit"`
+	GroupLimit      int32              `json:"group_limit"`
+	ChatroomLimit   int32              `json:"chatroom_limit"`
+	IsDefault       bool               `json:"is_default"`
+	Status          string             `json:"status"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+}
+
 type ClawImUser struct {
 	UserID         string             `json:"user_id"`
 	Username       string             `json:"username"`
@@ -593,6 +605,16 @@ type ClawImUser struct {
 	Status         string             `json:"status"`
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
+	PlanID         pgtype.Int4        `json:"plan_id"`
+}
+
+type ClawImUserQuotum struct {
+	UserID          string             `json:"user_id"`
+	DiscussionLimit pgtype.Int4        `json:"discussion_limit"`
+	GroupLimit      pgtype.Int4        `json:"group_limit"`
+	ChatroomLimit   pgtype.Int4        `json:"chatroom_limit"`
+	UpdatedBy       string             `json:"updated_by"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
 }
 
 type ClientUsageDaily struct {
@@ -1477,6 +1499,9 @@ type RongcloudDiscussion struct {
 	RoundRevision      int32              `json:"round_revision"`
 	CreatedAt          pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
+	SetupStep          string             `json:"setup_step"`
+	LastInteractionAt  pgtype.Timestamptz `json:"last_interaction_at"`
+	CancelReason       string             `json:"cancel_reason"`
 }
 
 type RongcloudDiscussionCommand struct {

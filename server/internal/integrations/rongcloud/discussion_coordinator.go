@@ -128,9 +128,9 @@ func (c *DiscussionCoordinator) handleResponse(ctx context.Context, resp NodeRes
 	switch resp.MsgType {
 	case "command_result", "text":
 		content, _ := json.Marshal(map[string]string{
-			"node_id":  resp.NodeID,
-			"content":  resp.Content,
-			"turn_id":  resp.TurnID,
+			"node_id": resp.NodeID,
+			"content": resp.Content,
+			"turn_id": resp.TurnID,
 		})
 		c.emitEvent(ctx, EventTurnCompleted, int32(round), speakingOrder, c.state.CurrentSpeaker, content)
 
@@ -159,9 +159,9 @@ func (c *DiscussionCoordinator) handleStreamResponse(ctx context.Context, resp N
 			return
 		}
 		content, _ := json.Marshal(map[string]string{
-			"node_id":  resp.NodeID,
-			"content":  fullText,
-			"turn_id":  resp.TurnID,
+			"node_id": resp.NodeID,
+			"content": fullText,
+			"turn_id": resp.TurnID,
 		})
 		c.emitEvent(ctx, EventTurnCompleted, int32(round), speakingOrder, c.state.CurrentSpeaker, content)
 

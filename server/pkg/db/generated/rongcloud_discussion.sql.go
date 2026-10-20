@@ -72,12 +72,12 @@ const createRongCloudDiscussion = `-- name: CreateRongCloudDiscussion :one
 INSERT INTO rongcloud_discussion (
     discussion_id, chatroom_id, workspace_id, created_by, topic, goal, max_rounds,
     mode, status, role_snapshot, host_config_snapshot, recommendation_id,
-    client_request_id, round_policy, round_revision
+    client_request_id, round_policy, round_revision, setup_step
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7,
     $8, $9, $10, $11, $12,
-    $13, $14, $15
-) RETURNING discussion_id, chatroom_id, workspace_id, created_by, topic, goal, max_rounds, mode, status, current_round, version, role_snapshot, host_config_snapshot, recommendation_id, client_request_id, round_policy, round_revision, created_at, updated_at
+    $13, $14, $15, $16
+) RETURNING discussion_id, chatroom_id, workspace_id, created_by, topic, goal, max_rounds, mode, status, current_round, version, role_snapshot, host_config_snapshot, recommendation_id, client_request_id, round_policy, round_revision, created_at, updated_at, setup_step, last_interaction_at, cancel_reason
 `
 
 type CreateRongCloudDiscussionParams struct {
@@ -96,6 +96,7 @@ type CreateRongCloudDiscussionParams struct {
 	ClientRequestID    pgtype.Text `json:"client_request_id"`
 	RoundPolicy        string      `json:"round_policy"`
 	RoundRevision      int32       `json:"round_revision"`
+	SetupStep          string      `json:"setup_step"`
 }
 
 // =====================
@@ -104,6 +105,7 @@ type CreateRongCloudDiscussionParams struct {
 // 对应迁移 589_rongcloud_discussion_core。这里只放 P4（讨论生命周期）立刻要用的三张
 // 表；逐轮文档、命令 outbox、节点请求、角色推荐、共享投递的查询随各自的消费方
 // （P5/P7）一起加，避免无消费者的空转代码。
+// setup_step 仅引导式链路写 'topic'（draft 断点）；旧链路恒传 ”（列默认）。
 func (q *Queries) CreateRongCloudDiscussion(ctx context.Context, arg CreateRongCloudDiscussionParams) (RongcloudDiscussion, error) {
 	row := q.db.QueryRow(ctx, createRongCloudDiscussion,
 		arg.DiscussionID,
@@ -121,6 +123,7 @@ func (q *Queries) CreateRongCloudDiscussion(ctx context.Context, arg CreateRongC
 		arg.ClientRequestID,
 		arg.RoundPolicy,
 		arg.RoundRevision,
+		arg.SetupStep,
 	)
 	var i RongcloudDiscussion
 	err := row.Scan(
@@ -143,6 +146,9 @@ func (q *Queries) CreateRongCloudDiscussion(ctx context.Context, arg CreateRongC
 		&i.RoundRevision,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.SetupStep,
+		&i.LastInteractionAt,
+		&i.CancelReason,
 	)
 	return i, err
 }
@@ -157,13 +163,15 @@ func (q *Queries) DeleteRongCloudDiscussion(ctx context.Context, discussionID st
 }
 
 const getActiveRongCloudDiscussionByChatroom = `-- name: GetActiveRongCloudDiscussionByChatroom :one
-SELECT discussion_id, chatroom_id, workspace_id, created_by, topic, goal, max_rounds, mode, status, current_round, version, role_snapshot, host_config_snapshot, recommendation_id, client_request_id, round_policy, round_revision, created_at, updated_at FROM rongcloud_discussion
+SELECT discussion_id, chatroom_id, workspace_id, created_by, topic, goal, max_rounds, mode, status, current_round, version, role_snapshot, host_config_snapshot, recommendation_id, client_request_id, round_policy, round_revision, created_at, updated_at, setup_step, last_interaction_at, cancel_reason FROM rongcloud_discussion
 WHERE chatroom_id = $1
-  AND status IN ('planning', 'running', 'summarizing', 'awaiting_user', 'synthesizing')
+  AND status IN ('configuring', 'planning', 'running', 'summarizing', 'awaiting_user', 'synthesizing')
 ORDER BY created_at DESC
 LIMIT 1
 `
 
+// configuring 半成品同样视为活跃：与 discussionLiveStatuses / 迁移 595 唯一索引口径一致，
+// 保证同一聊天室「空组直建半成品 + 旧链路 start」互斥，且 cancel action 可作用于半成品。
 func (q *Queries) GetActiveRongCloudDiscussionByChatroom(ctx context.Context, chatroomID string) (RongcloudDiscussion, error) {
 	row := q.db.QueryRow(ctx, getActiveRongCloudDiscussionByChatroom, chatroomID)
 	var i RongcloudDiscussion
@@ -187,6 +195,9 @@ func (q *Queries) GetActiveRongCloudDiscussionByChatroom(ctx context.Context, ch
 		&i.RoundRevision,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.SetupStep,
+		&i.LastInteractionAt,
+		&i.CancelReason,
 	)
 	return i, err
 }
@@ -360,7 +371,7 @@ func (q *Queries) GetRongCloudChatroomViewByRongCloudID(ctx context.Context, ron
 }
 
 const getRongCloudDiscussion = `-- name: GetRongCloudDiscussion :one
-SELECT discussion_id, chatroom_id, workspace_id, created_by, topic, goal, max_rounds, mode, status, current_round, version, role_snapshot, host_config_snapshot, recommendation_id, client_request_id, round_policy, round_revision, created_at, updated_at FROM rongcloud_discussion WHERE discussion_id = $1
+SELECT discussion_id, chatroom_id, workspace_id, created_by, topic, goal, max_rounds, mode, status, current_round, version, role_snapshot, host_config_snapshot, recommendation_id, client_request_id, round_policy, round_revision, created_at, updated_at, setup_step, last_interaction_at, cancel_reason FROM rongcloud_discussion WHERE discussion_id = $1
 `
 
 func (q *Queries) GetRongCloudDiscussion(ctx context.Context, discussionID string) (RongcloudDiscussion, error) {
@@ -386,6 +397,9 @@ func (q *Queries) GetRongCloudDiscussion(ctx context.Context, discussionID strin
 		&i.RoundRevision,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.SetupStep,
+		&i.LastInteractionAt,
+		&i.CancelReason,
 	)
 	return i, err
 }
@@ -901,7 +915,7 @@ func (q *Queries) ListActiveRongCloudDiscussionTargets(ctx context.Context, rong
 }
 
 const listActiveRongCloudDiscussions = `-- name: ListActiveRongCloudDiscussions :many
-SELECT discussion_id, chatroom_id, workspace_id, created_by, topic, goal, max_rounds, mode, status, current_round, version, role_snapshot, host_config_snapshot, recommendation_id, client_request_id, round_policy, round_revision, created_at, updated_at FROM rongcloud_discussion
+SELECT discussion_id, chatroom_id, workspace_id, created_by, topic, goal, max_rounds, mode, status, current_round, version, role_snapshot, host_config_snapshot, recommendation_id, client_request_id, round_policy, round_revision, created_at, updated_at, setup_step, last_interaction_at, cancel_reason FROM rongcloud_discussion
 WHERE status IN ('planning', 'running', 'summarizing', 'awaiting_user', 'synthesizing')
 ORDER BY updated_at ASC
 `
@@ -935,6 +949,9 @@ func (q *Queries) ListActiveRongCloudDiscussions(ctx context.Context) ([]Rongclo
 			&i.RoundRevision,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.SetupStep,
+			&i.LastInteractionAt,
+			&i.CancelReason,
 		); err != nil {
 			return nil, err
 		}
@@ -1076,7 +1093,7 @@ func (q *Queries) ListRongCloudDiscussionEventsAfterSeq(ctx context.Context, arg
 }
 
 const listRongCloudDiscussionsByChatroom = `-- name: ListRongCloudDiscussionsByChatroom :many
-SELECT discussion_id, chatroom_id, workspace_id, created_by, topic, goal, max_rounds, mode, status, current_round, version, role_snapshot, host_config_snapshot, recommendation_id, client_request_id, round_policy, round_revision, created_at, updated_at FROM rongcloud_discussion
+SELECT discussion_id, chatroom_id, workspace_id, created_by, topic, goal, max_rounds, mode, status, current_round, version, role_snapshot, host_config_snapshot, recommendation_id, client_request_id, round_policy, round_revision, created_at, updated_at, setup_step, last_interaction_at, cancel_reason FROM rongcloud_discussion
 WHERE chatroom_id = $1
 ORDER BY created_at DESC
 `
@@ -1110,6 +1127,9 @@ func (q *Queries) ListRongCloudDiscussionsByChatroom(ctx context.Context, chatro
 			&i.RoundRevision,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.SetupStep,
+			&i.LastInteractionAt,
+			&i.CancelReason,
 		); err != nil {
 			return nil, err
 		}
@@ -1227,7 +1247,7 @@ SET status         = $1,
     updated_at     = now()
 WHERE discussion_id = $4
   AND version = $5
-RETURNING discussion_id, chatroom_id, workspace_id, created_by, topic, goal, max_rounds, mode, status, current_round, version, role_snapshot, host_config_snapshot, recommendation_id, client_request_id, round_policy, round_revision, created_at, updated_at
+RETURNING discussion_id, chatroom_id, workspace_id, created_by, topic, goal, max_rounds, mode, status, current_round, version, role_snapshot, host_config_snapshot, recommendation_id, client_request_id, round_policy, round_revision, created_at, updated_at, setup_step, last_interaction_at, cancel_reason
 `
 
 type UpdateRongCloudDiscussionStateParams struct {
@@ -1269,6 +1289,9 @@ func (q *Queries) UpdateRongCloudDiscussionState(ctx context.Context, arg Update
 		&i.RoundRevision,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.SetupStep,
+		&i.LastInteractionAt,
+		&i.CancelReason,
 	)
 	return i, err
 }

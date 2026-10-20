@@ -203,8 +203,8 @@ func TestClassifyOpsRCUser(t *testing.T) {
 	// 同机 agent 集合：新命名（<agent>_<key>）与旧命名（rc_node_<key>_<agent>）
 	// 两种方案的机器都要能正确分类。
 	agentRCs := map[string]bool{
-		"hermes_1234567890":          true,
-		"opencode_oc5yj7nusm":        true,
+		"hermes_1234567890":           true,
+		"opencode_oc5yj7nusm":         true,
 		"rc_node_3300776275_opencode": true,
 		"rc_node_3300776275_hermes":   true,
 	}

@@ -6,23 +6,26 @@
 -- （P5/P7）一起加，避免无消费者的空转代码。
 
 -- name: CreateRongCloudDiscussion :one
+-- setup_step 仅引导式链路写 'topic'（draft 断点）；旧链路恒传 ''（列默认）。
 INSERT INTO rongcloud_discussion (
     discussion_id, chatroom_id, workspace_id, created_by, topic, goal, max_rounds,
     mode, status, role_snapshot, host_config_snapshot, recommendation_id,
-    client_request_id, round_policy, round_revision
+    client_request_id, round_policy, round_revision, setup_step
 ) VALUES (
     @discussion_id, @chatroom_id, @workspace_id, @created_by, @topic, @goal, @max_rounds,
     @mode, @status, @role_snapshot, @host_config_snapshot, @recommendation_id,
-    @client_request_id, @round_policy, @round_revision
+    @client_request_id, @round_policy, @round_revision, @setup_step
 ) RETURNING *;
 
 -- name: GetRongCloudDiscussion :one
 SELECT * FROM rongcloud_discussion WHERE discussion_id = $1;
 
 -- name: GetActiveRongCloudDiscussionByChatroom :one
+-- configuring 半成品同样视为活跃：与 discussionLiveStatuses / 迁移 595 唯一索引口径一致，
+-- 保证同一聊天室「空组直建半成品 + 旧链路 start」互斥，且 cancel action 可作用于半成品。
 SELECT * FROM rongcloud_discussion
 WHERE chatroom_id = $1
-  AND status IN ('planning', 'running', 'summarizing', 'awaiting_user', 'synthesizing')
+  AND status IN ('configuring', 'planning', 'running', 'summarizing', 'awaiting_user', 'synthesizing')
 ORDER BY created_at DESC
 LIMIT 1;
 

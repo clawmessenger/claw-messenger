@@ -12,14 +12,14 @@ import (
 
 // chatroomFixture bundles everything a test needs after setup.
 type chatroomFixture struct {
-	h         *systemHandler
-	pool      *pgxpool.Pool
-	queries   *db.Queries
-	wsID      pgtype.UUID
-	owner     db.RongcloudUser
-	hostNode  db.RongcloudNode
+	h          *systemHandler
+	pool       *pgxpool.Pool
+	queries    *db.Queries
+	wsID       pgtype.UUID
+	owner      db.RongcloudUser
+	hostNode   db.RongcloudNode
 	memberNode db.RongcloudNode
-	roomRCID  string
+	roomRCID   string
 }
 
 func setupChatroomFixtureFull(t *testing.T) *chatroomFixture {
@@ -111,7 +111,7 @@ func seedWorkspaceRow(t *testing.T, pool *pgxpool.Pool) pgtype.UUID {
 func seedUser(t *testing.T, q *db.Queries, ws pgtype.UUID, rcID string) db.RongcloudUser {
 	t.Helper()
 	u, err := q.CreateRongCloudUser(context.Background(), db.CreateRongCloudUserParams{
-		WorkspaceID:    ws,
+		WorkspaceID:     ws,
 		RongcloudUserID: rcID,
 		Name:            pgtype.Text{String: "u-" + rcID, Valid: true},
 		NodeType:        "human",
@@ -339,7 +339,7 @@ func TestChatroomCommandGetList(t *testing.T) {
 	ctx := context.Background()
 	r := f.h.actionChatroomGetList(ctx, CommandContent{
 		Service: "chatroom", Action: "getList",
-		Params:  map[string]interface{}{"page": 1, "pageSize": 100},
+		Params: map[string]interface{}{"page": 1, "pageSize": 100},
 	}, f.owner)
 	if r.code != 200 {
 		t.Fatalf("getList failed: %d %s", r.code, r.message)

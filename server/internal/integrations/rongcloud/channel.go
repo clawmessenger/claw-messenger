@@ -48,6 +48,7 @@ func (c *rongcloudChannel) Connect(ctx context.Context) error {
 	// outbox 上的扫描，因此进程重启后也能接着推进，不需要内存态。
 	if rt := c.systemHandler.discussionRuntime; rt != nil {
 		go c.runInteractiveSweep(ctx, rt)
+		go c.runDiscussionSetupGC(ctx, rt)
 	}
 	<-ctx.Done()
 	c.registrar.Unregister(installationID)
@@ -65,6 +66,21 @@ func (c *rongcloudChannel) runInteractiveSweep(ctx context.Context, rt *discussi
 			return
 		case <-ticker.C:
 			rt.interactiveSweep(ctx)
+		}
+	}
+}
+
+// runDiscussionSetupGC 周期回收超时的 configuring 半成品讨论组（拍板：5 分钟扫一次，
+// 超 10 分钟无交互即回收）。扫描是持久表查询，进程重启安全，无内存态。
+func (c *rongcloudChannel) runDiscussionSetupGC(ctx context.Context, rt *discussionRuntime) {
+	ticker := time.NewTicker(discussionSetupGCInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			rt.sweepAbandonedSetups(ctx)
 		}
 	}
 }

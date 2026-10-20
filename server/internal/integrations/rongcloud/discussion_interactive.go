@@ -95,11 +95,18 @@ const (
 // 降级成 discussion_progress —— 见 discussionEventView。
 var interactiveV3EventTypes = map[string]struct{}{
 	"round_started": {}, "round_summary_started": {}, "round_summary_completed": {},
+	// round_checkpoint 是主持人纪要的结构化版本（成员立场/共识/分歧/下一轮聚焦）。
+	// 前端一直有它的卡片与状态机分支，但引擎此前只发过 round_summary_completed，
+	// 于是检查点卡片在线上从未出现。现在由 interactiveCompleteSummary 生产。
+	"round_checkpoint":   {},
 	"contribution_delta": {}, "contribution_completed": {}, "user_interjection": {},
 	"member_retry_scheduled": {}, "member_skipped": {}, "request_interrupted": {},
 	"interjection_applied": {}, "interruption_failed": {}, "discussion_started": {},
 	"discussion_completed": {}, "discussion_cancelled": {}, "discussion_failed": {},
 	"discussion_progress": {},
+	// 引导式创建（configuring 链路）的三类系统卡片事件。与 web
+	// lib/discussion-v3.ts 的 eventData 白名单同步登记，两侧漂移会被前端静默丢弃。
+	"setup_prompt": {}, "setup_step_completed": {}, "setup_recommend_failed": {},
 }
 
 // isInteractiveV3EventType 报告某个事件类型是否被前端 v3 校验接受。
@@ -641,6 +648,11 @@ func (rt *discussionRuntime) interactiveBuildPrompt(d DiscussionRecord, role int
 	if d.Goal != "" {
 		core = append(core, "讨论目标："+d.Goal)
 	}
+	// 上一轮纪元点出的「下一轮聚焦」显式抬到本轮要求里。此前它只存在于上一轮纪要
+	// 的正文深处（还要看上下文预算给没给到），主持人写了也等于没传下去。
+	if focus := history.focusForRound(d.CurrentRound); focus != "" {
+		core = append(core, "本轮聚焦（上一轮纪要点出的问题，先回应它）："+focus)
+	}
 	if len(opinions) > 0 {
 		lines := []string{"本轮用户插话（必须纳入你的发言）："}
 		for _, opinion := range opinions {
@@ -675,7 +687,132 @@ func (rt *discussionRuntime) interactiveBuildPrompt(d DiscussionRecord, role int
 		}
 		parts = append(parts, "[本轮上下文]\n"+block)
 	}
+	// 成员名册放在预算之外：它是主持人才用得上的对照表，不该跟前序发言抢额度
+	// （主持人手里那几条发言是写纪要的唯一素材）。排在上下文之后，也不会被
+	// 上下文截断切掉。
+	if role.IsHost {
+		if ordinary, _, ok := interactiveRoles(d); ok {
+			if roster := interactiveCheckpointRoster(ordinary); roster != "" {
+				parts = append(parts, roster)
+			}
+		}
+	}
 	return strings.Join(parts, "\n\n")
+}
+
+// interactiveRoundTask 是派给普通成员的「本轮任务」，按轮次给三种不同的发言协议：
+//
+//	第 1 轮        独立立论（先给结论与依据，再自曝最可能被推翻的一点）
+//	第 2 轮起      交叉质询（点名回应具体论点 → 说明自己改了什么 → 说明自己坚持什么）
+//	判定停滞时     只走两条路之一（带新事实，或直接收口）
+//
+// 为什么要把一句话拆成协议：讨论质量主要由「每轮要求成员做什么」决定，而不是由
+// 轮次数量决定。只写「请给出你的分析」时，模型会输出五份互不相干的独白，第二轮
+// 起又开始互相附和 —— 这是多智能体讨论最常见的失效形态。
+func interactiveRoundTask(round int, stalled bool, similarity float64) string {
+	if round <= 1 {
+		return "这是第 1 轮（立论）。请按顺序写三件事，不要写客套话：\n" +
+			"1. 结论：一句话说清你主张什么；\n" +
+			"2. 依据：给出可核查的来源、数据、文件、约束条件或亲身经验；写不出具体来源就直说这是你的判断；\n" +
+			"3. 最可能被推翻的一点：你最没把握、最希望别人来攻的地方。"
+	}
+	if stalled {
+		return fmt.Sprintf("这是第 %d 轮（讨论已停滞）。上一轮与本轮的发言高度重复（相似度约 %.0f%%），"+
+			"换一种说法不会产生新信息。本轮只能走下面两条路之一：\n"+
+			"1. 带来上一轮没有的新材料：具体数据、文件、约束条件、真实案例；\n"+
+			"2. 直接收口：给出你能接受的最终方案，并写明你放弃了哪些条件、为什么。\n"+
+			"仍然要点名回应至少一位成员的具体论点，但不要再复述已达成的共识。",
+			round, similarity*100)
+	}
+	return fmt.Sprintf("这是第 %d 轮（交叉质询）。按顺序写三件事，不要重述上一轮已经说过的内容：\n"+
+		"1. 点名回应：从[前序发言]里挑至少一位成员，用角色名指出来，针对他具体哪一句话、哪个论据提出反驳或补充；"+
+		"只说「有人提到」不算回应；\n"+
+		"2. 你改变了什么：哪一点你被说服了、为什么被说服；\n"+
+		"3. 你坚持什么：哪一点你仍然不同意，理由是什么。\n"+
+		"如果[上一轮主持纪要]里写了「下一轮聚焦」，先回答那个问题，再展开自己的部分。", round)
+}
+
+// interactiveHostTask 是派给主持人的本轮纪要任务。四段结构对齐讨论类产品通行的
+// 会议纪要：共识、分歧、未决、下一步。分歧段刻意排在共识之后、并明确要求「不要
+// 磨平异议」—— 把分歧压成一句「大家基本同意」是最容易发生、也最难被用户发现的失真。
+func interactiveHostTask(round int, stalled bool, similarity float64) string {
+	task := fmt.Sprintf("本轮（第 %d 轮）所有成员已发言完毕，请输出本轮纪要。严格按下面四段写，标题照抄：\n"+
+		"【已达成的共识】逐条写，一条一句，写清成立的前提；没有就写「暂无」。\n"+
+		"【仍存在的分歧】写清谁坚持什么、他的理由是什么。分歧比共识更重要：不要为了好看把异议磨平，"+
+		"也不要替成员编造他没说过的立场。\n"+
+		"【未解决的问题】本轮没谈透、需要补材料或需要用户拍板的事。\n"+
+		"【下一轮聚焦】一句话，写成可以直接当成下一轮议题的句子；如果你建议结束，就写「建议结束，可以出纪要」。\n"+
+		"最后一行单独写「建议：继续」或「建议：结束」，只写这两个之一。\n"+
+		"成员发言已在上文[前序发言]中逐条给出，请直接据此撰写；即便信息不完整，也请基于现有"+
+		"发言给出纪要与待确认项，不要向我索要材料。", round)
+	if stalled {
+		task += fmt.Sprintf("\n另外：本轮发言与上一轮高度重复（相似度约 %.0f%%），没有产生新信息。"+
+			"请在【仍存在的分歧】里直接点明这一点，并把【下一轮聚焦】写成一个换角度的具体问题；"+
+			"如果连续两轮如此，最后一行写「建议：结束」。", similarity*100)
+	}
+	// 机器可读检查点：正文仍然是给人读的四段纪要，末尾多一段给系统读的 JSON。
+	// 前端「成员立场 / 共识 / 分歧 / 下一轮聚焦」那套卡片就靠它落地。
+	return task + "\n" + interactiveCheckpointContract()
+}
+
+// interactiveStallThreshold 是判定「讨论停滞」的相似度阈值。取 0.85 与业界同类
+// 实现（opencode-roundtable 的 loopSimilarityThreshold）一致：低于它时两轮发言
+// 仍有实质差异，高于它基本只是换词重述。
+const interactiveStallThreshold = 0.85
+
+// interactiveRoundStalled 判断第 round 轮是否在重述第 round-1 轮。
+//
+// 规则是确定性的：把两轮的成员发言各自拼成一个字符串，取字符二元组集合，
+// 算 Jaccard 相似度（交集 / 并集）；两轮都有发言才算，任一为空一律判否
+// （空轮由空轮守卫处理，不能在这里当成停滞）。
+func interactiveRoundStalled(h interactiveHistory, round int) (bool, float64) {
+	if round <= 1 {
+		return false, 0
+	}
+	current := renderStatementsText(h.roundStatements(round))
+	previous := renderStatementsText(h.roundStatements(round - 1))
+	similarity := bigramJaccard(current, previous)
+	return similarity >= interactiveStallThreshold, similarity
+}
+
+// renderStatementsText 把一组发言拼成纯文本（不带署名），用于相似度计算。
+func renderStatementsText(statements []interactiveStatement) string {
+	var b strings.Builder
+	for _, statement := range statements {
+		b.WriteString(statement.Content)
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// bigramJaccard 用字符二元组集合的 Jaccard 系数衡量两段文本的重复度：
+// 返回 0（毫无重叠）到 1（二元组集合完全一致）。按 rune 切分，中文不会被切坏。
+func bigramJaccard(a, b string) float64 {
+	setA := bigramSet(a)
+	setB := bigramSet(b)
+	if len(setA) == 0 || len(setB) == 0 {
+		return 0
+	}
+	intersection := 0
+	for gram := range setA {
+		if _, ok := setB[gram]; ok {
+			intersection++
+		}
+	}
+	union := len(setA) + len(setB) - intersection
+	if union == 0 {
+		return 0
+	}
+	return float64(intersection) / float64(union)
+}
+
+func bigramSet(text string) map[string]struct{} {
+	runes := []rune(strings.TrimSpace(text))
+	set := make(map[string]struct{}, len(runes))
+	for i := 0; i+1 < len(runes); i++ {
+		set[string(runes[i:i+2])] = struct{}{}
+	}
+	return set
 }
 
 // interactiveOpinion 是一条被本轮消费的用户插话：messageUID 用于回执（interjection_applied）
@@ -708,6 +845,17 @@ type interactiveHistory struct {
 	contributions []interactiveStatement
 	// summaries 是各轮主持纪要（事件顺序；同轮只留最后一次）。
 	summaries []interactiveStatement
+	// focus 是各轮检查点里「下一轮聚焦」的取值（轮次 → 聚焦句）。第 N 轮的检查点
+	// 描述的是第 N+1 轮该谈什么，所以第 R 轮的聚焦取 focus[R-1]。
+	focus map[int]string
+}
+
+// focusForRound 返回第 round 轮该聚焦的问题（来自上一轮检查点）；没有就返回空串。
+func (h interactiveHistory) focusForRound(round int) string {
+	if round <= 1 || h.focus == nil {
+		return ""
+	}
+	return strings.TrimSpace(h.focus[round-1])
 }
 
 // roundStatements 返回某一轮已完成的成员发言（保持发言顺序）。
@@ -801,6 +949,18 @@ func (rt *discussionRuntime) interactivePromptInputs(d DiscussionRecord) ([]inte
 			}
 			summaryAt[statement.Round] = len(history.summaries)
 			history.summaries = append(history.summaries, statement)
+		case "round_checkpoint":
+			// 检查点里的「下一轮聚焦」要传回下一轮，否则主持人写的那句话只停在
+			// 卡片上，下一轮成员（和主持自己）看不到它。
+			round, _ := payload["round"].(float64)
+			focus, _ := payload["nextFocus"].(string)
+			if int(round) <= 0 || strings.TrimSpace(focus) == "" {
+				continue
+			}
+			if history.focus == nil {
+				history.focus = map[int]string{}
+			}
+			history.focus[int(round)] = focus
 		}
 	}
 	return opinions, history
@@ -999,20 +1159,15 @@ func (rt *discussionRuntime) interactiveDispatch(ctx context.Context, d Discussi
 	opinions, history := rt.interactivePromptInputs(d)
 	action := "assignment"
 	eventType := "assignment_created"
-	extra := "请针对当前轮次给出你的分析。"
-	if d.CurrentRound > 1 {
-		// 第二轮起：没有这句抬头时，成员会把本轮当成一次全新讨论，从零重开（线上
-		// 2026-10-15 的现象）。前序发言由 interactiveHistoryBlock 一并注入。
-		extra = fmt.Sprintf("这是第 %d 轮：请承接上文[前序发言]继续推进（补充、质疑、收敛都行），"+
-			"不要从头重来，也不要重复自己已经说过的内容。", d.CurrentRound)
-	}
+	// 本轮任务按阶段协议生成，而不是一句「请给出你的分析」：首轮立论、中段交叉
+	// 质询、停滞时收口。第二轮起必须有轮次抬头，否则成员会把本轮当成一次全新讨论
+	// 从零重开（线上 2026-10-15 的现象）。
+	stalled, similarity := interactiveRoundStalled(history, d.CurrentRound)
+	extra := interactiveRoundTask(d.CurrentRound, stalled, similarity)
 	if role.IsHost {
 		action = "summary"
 		eventType = "host_turn_requested"
-		extra = fmt.Sprintf("本轮（第 %d 轮）所有成员已发言完毕，请输出本轮纪要："+
-			"成员立场、已达成的共识、仍存在的分歧、以及下一轮建议聚焦的问题。\n"+
-			"成员发言已在上文[前序发言]中逐条给出，请直接据此撰写；即便信息不完整，也请基于现有"+
-			"发言给出纪要与待确认项，不要向我索要材料。", d.CurrentRound)
+		extra = interactiveHostTask(d.CurrentRound, stalled, similarity)
 		if len(history.roundStatements(d.CurrentRound)) == 0 {
 			// 兜底：正常路径下空轮不会再派发主持人（见 interactiveNext 的空轮守卫），
 			// 只有用户在失败态手动「重试主持任务」才会走到这里。别让它编造纪要。
@@ -1074,7 +1229,7 @@ func (rt *discussionRuntime) interactiveDispatch(ctx context.Context, d Discussi
 			"roleInstructions": role.RoleInstructions,
 		},
 		"speakingOrder": role.SpeakingOrder,
-		"roundFocus":    "",
+		"roundFocus":    history.focusForRound(d.CurrentRound),
 		"task":          extra,
 		"attempt":       attempt,
 	}
@@ -1270,6 +1425,12 @@ func (rt *discussionRuntime) interactiveCompleteSummary(ctx context.Context, d D
 		rt.interactiveTurnFailed(ctx, d, task, "empty summary")
 		return
 	}
+	// 主持人按任务要求在正文末尾追加一段机器可读检查点。先摘出来：正文存成给用户
+	// 读的纪要（不含 JSON），结构化数据另发一条 round_checkpoint 事件供卡片渲染。
+	checkpointWire, markdown, hasCheckpoint := parseInteractiveCheckpoint(trimmed)
+	if hasCheckpoint && strings.TrimSpace(markdown) != "" {
+		trimmed = strings.TrimSpace(markdown)
+	}
 	if len(trimmed) > interactiveMaxSummaryBytes {
 		trimmed = trimmed[:interactiveMaxSummaryBytes]
 	}
@@ -1324,6 +1485,9 @@ func (rt *discussionRuntime) interactiveCompleteSummary(ctx context.Context, d D
 		return
 	}
 	rt.interactiveBroadcast(ctx, advanced, event)
+	if hasCheckpoint {
+		rt.interactiveRecordCheckpoint(ctx, advanced, task, checkpointWire)
+	}
 }
 
 // interactiveTurnFailed 处理一次派发失败（设备回错 / 超时）：
@@ -1616,7 +1780,7 @@ func (rt *discussionRuntime) interactiveControl(ctx context.Context, cmd Command
 
 	roundStarted, _, err := rt.interactiveEmit(ctx, advanced, interactiveEvent{
 		EventType: "round_started", ActorID: actorRCID,
-		Payload:   map[string]interface{}{"round": nextRound, "roundFocus": ""},
+		Payload:   map[string]interface{}{"round": nextRound, "roundFocus": rt.interactiveFocusForRound(ctx, d.DiscussionID, nextRound)},
 		Key:       key + ":round",
 		RequestID: requestID,
 		StateVer:  advanced.Version,
@@ -1836,6 +2000,23 @@ func (rt *discussionRuntime) interactiveLifecycleAction(ctx context.Context, act
 	ownerRCID, roomID, err := rt.roomOwner(ctx, d.ChatroomID)
 	if err != nil {
 		return errResult(500, "查询聊天室失败"), true
+	}
+	// configuring 半成品：只允许 cancel（用户主动放弃，cancel_reason='user_abandoned'，
+	// 同时回收房间释放配额，与 GC 路径同一套幂等回收逻辑）；continue/finish/interject/
+	// retry/stop 对尚未确认开始的讨论无意义，一律 409。
+	if d.Status == DiscussionStatusConfiguring {
+		if action != "cancel" {
+			return errResult(409, "讨论组仍在配置中，仅支持取消"), true
+		}
+		if !canControl(d, ownerRCID, actor.RcID) {
+			return errResult(403, "only the discussion owner may cancel"), true
+		}
+		rt.reclaimSetup(ctx, d.DiscussionID, setupUserAbandonReason, actor.RcID, "user-abandon:"+d.DiscussionID)
+		d2, err := rt.repo.Get(ctx, d.DiscussionID)
+		if err != nil {
+			return okResult(nil), true
+		}
+		return okResult(discussionSnapshotView(d2, nil)), true
 	}
 	switch action {
 	case "continue":

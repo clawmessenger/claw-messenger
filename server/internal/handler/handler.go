@@ -37,6 +37,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/issuestatus"
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
 	"github.com/multica-ai/multica/server/internal/middleware"
+	"github.com/multica-ai/multica/server/internal/quota"
 	"github.com/multica-ai/multica/server/internal/realtime"
 	"github.com/multica-ai/multica/server/internal/seatcapacity"
 	"github.com/multica-ai/multica/server/internal/service"
@@ -384,6 +385,9 @@ type Handler struct {
 	RongCloudDiscussionRepo *rongcloud.DiscussionRepository
 	// RongCloudDiscussionAccess 校验 C 端用户对聊天室的成员资格（P4 REST 用）。
 	RongCloudDiscussionAccess *rongcloud.DiscussionRoomAccess
+	// ClawQuota 是讨论组/群/聊天室的创建配额服务（T01 internal/quota）。
+	// REST（/api/quota/me）与 admin 配额 API 读它；nil 表示配额未启用。
+	ClawQuota *quota.Service
 
 	// channelFileDelivery names the channel types that can, IN THIS
 	// DEPLOYMENT, carry a file the agent produced the last hop into the

@@ -7,9 +7,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
-	"github.com/google/uuid"
 )
 
 // 圆桌创建/推荐 action（P5）。挂在 discussionRuntime 上，由 system_handler 的
@@ -214,7 +214,7 @@ func payloadRoles(payload map[string]interface{}) []map[string]interface{} {
 //
 // C 端的校验是「每个角色的 node_id 互不相同，且都在用户所选设备内」，缺一个字段
 // 就整份判无效（ROLE_RECOMMENDATION_INVALID）。Python 里这一步由设备端模型完成
-//（严格模式下设备拿得到 candidates，逐角色回 node_id/model）；Go 侧还没有把这套
+// （严格模式下设备拿得到 candidates，逐角色回 node_id/model）；Go 侧还没有把这套
 // 候选清单下发到设备，于是服务端按候选顺序确定性补齐 —— 设备端将来若自己回了合法
 // 且未重复的分配，这里会尊重它，只补它没选到的角色。
 func assignRoleNodes(roles []map[string]interface{}, candidates []string) {
@@ -264,7 +264,7 @@ func assignRoleNodes(roles []map[string]interface{}, candidates []string) {
 
 // roundtablePolicyAvailable 判定 round_policy 是否已开放。legacy_capped 由 P5
 // 提供；user_confirmed（v3 交互轮次）自 P7 起随引擎装配一起开放 —— 引擎未装配
-//（interactiveReady=false）时仍诚实返回 false，避免前端走一条死路。
+// （interactiveReady=false）时仍诚实返回 false，避免前端走一条死路。
 func (rt *discussionRuntime) roundtablePolicyAvailable(policy string) bool {
 	switch policy {
 	case RoundPolicyLegacyCapped:
@@ -443,7 +443,6 @@ func (rt *discussionRuntime) actionRestartRoundtable(ctx context.Context, cmd Co
 		"status":        "planning",
 	})
 }
-
 
 // closeDiscussionForRestart 把等待重开的旧讨论收尾为 completed（幂等：已终态直接过）。
 // awaiting_user 是用户主动放弃旧局，语义上等同于「就此结束并保留纪要」。

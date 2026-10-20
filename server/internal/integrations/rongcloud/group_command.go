@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/multica-ai/multica/server/internal/quota"
 )
 
 // 群组系统命令（service=group）。
@@ -164,6 +166,12 @@ func (h *systemHandler) handleGroupCreate(ctx context.Context, msg NormalizedMes
 	}
 	if h.groupMirror.AllocateID == nil || h.groupMirror.SaveGroup == nil {
 		return h.sendWebError(ctx, msg, cmd, 503, "group service is unavailable")
+	}
+	// 创建配额硬校验（超限：429 QUOTA_EXCEEDED{kind,limit,used}；未装配放行）。
+	if qErr := h.quotaCheck(ctx, ownerID, quota.KindGroup); qErr != nil {
+		h.logger.Info("rongcloud: group create blocked by quota",
+			"owner_id", ownerID, "limit", qErr.Limit, "used", qErr.Used)
+		return h.sendWebQuotaExceeded(ctx, msg, cmd, qErr)
 	}
 
 	memberIDs := getStringSlice(cmd.Params, "memberIds")

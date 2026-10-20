@@ -149,14 +149,14 @@ type groupMirrorStub struct {
 	members  map[string]map[string]string
 	profiles map[string]GroupProfile
 
-	isMemberErr error
-	addErr      error
-	removeErr   error
-	listErr     error
+	isMemberErr   error
+	addErr        error
+	removeErr     error
+	listErr       error
 	listByUserErr error
-	profilesErr error
-	setOwnerErr error
-	deleteErr   error
+	profilesErr   error
+	setOwnerErr   error
+	deleteErr     error
 
 	added     []string
 	removed   []string

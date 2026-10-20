@@ -321,7 +321,9 @@ func (s *roundtableCreationService) create(ctx context.Context, userID string, p
 		request = s.advance(ctx, userID, canonical, request, "members_ready", chatroomID, "")
 	}
 	if request.Status == "members_ready" {
-		discussionID, cerr = s.ensureDiscussion(ctx, request, chatroomID, discussionID, canonical, validated, userID)
+		// 旧五阶段链路恒以 planning 落讨论（引导式链路的 configuring 由
+		// createRoundtableShell 单独调 ensureDiscussion）。
+		discussionID, cerr = s.ensureDiscussion(ctx, request, chatroomID, discussionID, canonical, validated, userID, DiscussionStatusPlanning)
 		if cerr != nil {
 			return nil, s.recordError(ctx, userID, canonical.ClientRequestID, request, cerr, chatroomID, discussionID)
 		}
