@@ -4,8 +4,8 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { allowDuplicateSupervisor, buildProgram } from "./main.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { allowDuplicateSupervisor, buildProgram, OPS_SCOPE_ENV, scopeDaemonReport, wholeMachineActionRejection } from "./main.js";
 import { Keystore } from "./keystore.js";
 import type { XiachatApi } from "./api.js";
 import { defaultDaemonPaths, type Daemon } from "./daemon.js";
@@ -408,6 +408,136 @@ describe("allowDuplicateSupervisor", () => {
   it("accepts the documented truthy spellings, whitespace and case included", () => {
     for (const v of ["1", "true", "TRUE", "yes", "on", " on "]) {
       expect(allowDuplicateSupervisor({ CLAWMESSENGER_ALLOW_DUPLICATE_SUPERVISOR: v })).toBe(true);
+    }
+  });
+});
+
+describe("clawmessenger agent", () => {
+  const credsKeystore = () => {
+    const keystore = tempKeystore();
+    keystore.save({
+      nodeId: "node_machine",
+      token: "t",
+      credentialId: "dc",
+      deviceSecret: "sec",
+      serverUrl: "http://unused.local",
+    });
+    return keystore;
+  };
+
+  function setScope(value: string | undefined): () => void {
+    const previousScope = process.env[OPS_SCOPE_ENV];
+    const previousCreds = process.env.CLAWMESSENGER_AGENT_CREDS;
+    if (value === undefined) delete process.env[OPS_SCOPE_ENV];
+    else process.env[OPS_SCOPE_ENV] = value;
+    delete process.env.CLAWMESSENGER_AGENT_CREDS;
+    return () => {
+      if (previousScope === undefined) delete process.env[OPS_SCOPE_ENV];
+      else process.env[OPS_SCOPE_ENV] = previousScope;
+      if (previousCreds === undefined) delete process.env.CLAWMESSENGER_AGENT_CREDS;
+      else process.env.CLAWMESSENGER_AGENT_CREDS = previousCreds;
+    };
+  }
+
+  it("defaults to the scoped agent and forwards the action", async () => {
+    const restore = setScope("opencode_330076275");
+    try {
+      const lines: string[] = [];
+      const setDeviceControl = vi.fn(async () => ({
+        agent: "opencode",
+        nodeId: "node_open",
+        desiredState: "running" as const,
+        version: 2,
+        restart: true,
+      }));
+      const program = buildProgram({
+        keystore: credsKeystore(),
+        apiFactory: () => ({ setDeviceControl } as unknown as XiachatApi),
+        stdout: { write: (s: string) => { lines.push(s); return true; } } as unknown as NodeJS.WriteStream,
+        daemonPaths: defaultDaemonPaths(),
+      });
+
+      await program.parseAsync(["node", "clawmessenger", "agent", "restart"]);
+
+      expect(setDeviceControl).toHaveBeenCalledWith("node_machine", "dc", "sec", "opencode", "restart");
+      expect(lines.join("")).toContain("重启指令已下发");
+    } finally {
+      restore();
+    }
+  });
+
+  it("refuses another account's agent without calling the server", async () => {
+    const restore = setScope("opencode_330076275");
+    const previousExitCode = process.exitCode;
+    try {
+      const lines: string[] = [];
+      const setDeviceControl = vi.fn();
+      const program = buildProgram({
+        keystore: credsKeystore(),
+        apiFactory: () => ({ setDeviceControl } as unknown as XiachatApi),
+        stdout: { write: (s: string) => { lines.push(s); return true; } } as unknown as NodeJS.WriteStream,
+        daemonPaths: defaultDaemonPaths(),
+      });
+
+      await program.parseAsync(["node", "clawmessenger", "agent", "stop", "hermes"]);
+
+      expect(setDeviceControl).not.toHaveBeenCalled();
+      expect(lines.join("")).toContain("只负责 opencode");
+      expect(process.exitCode).toBe(1);
+    } finally {
+      process.exitCode = previousExitCode;
+      restore();
+    }
+  });
+});
+
+describe("ops scope guard", () => {
+  it("leaves whole-machine actions alone outside an ops scope", () => {
+    expect(wholeMachineActionRejection("stop", {})).toBeNull();
+    expect(wholeMachineActionRejection("restart", {})).toBeNull();
+  });
+
+  it("refuses to stop or restart the whole machine from a per-agent ops child", () => {
+    const env = { [OPS_SCOPE_ENV]: "opencode_330076275" };
+    const stop = wholeMachineActionRejection("stop", env) ?? "";
+    expect(stop).toContain("只负责本账号");
+    expect(stop).toContain("clawmessenger start");
+    expect(wholeMachineActionRejection("restart", env) ?? "").toContain("--all-agents");
+  });
+
+  it("hides other agents from status inside an ops scope", () => {
+    const report = {
+      agents: ["opencode", "hermes", "openclaw", "ops@opencode_330076275", "ops@hermes_111"],
+    };
+    expect(scopeDaemonReport(report, "opencode_330076275").agents)
+      .toEqual(["opencode", "ops@opencode_330076275"]);
+    expect(scopeDaemonReport(report, "").agents).toEqual(report.agents);
+  });
+
+  it("blocks `clawmessenger stop` before it reaches the daemon", async () => {
+    const previous = process.env[OPS_SCOPE_ENV];
+    const previousExitCode = process.exitCode;
+    process.env[OPS_SCOPE_ENV] = "opencode_330076275";
+    try {
+      const lines: string[] = [];
+      const stopDaemon = vi.fn(async () => {});
+      const program = buildProgram({
+        keystore: tempKeystore(),
+        apiFactory: () => ({}) as unknown as XiachatApi,
+        stdout: { write: (s: string) => { lines.push(s); return true; } } as unknown as NodeJS.WriteStream,
+        daemon: { stop: stopDaemon } as unknown as Daemon,
+        daemonPaths: defaultDaemonPaths(),
+      });
+
+      await program.parseAsync(["node", "clawmessenger", "stop"]);
+
+      expect(stopDaemon).not.toHaveBeenCalled();
+      expect(lines.join("")).toContain("只负责本账号");
+      expect(process.exitCode).toBe(1);
+    } finally {
+      process.exitCode = previousExitCode;
+      if (previous === undefined) delete process.env[OPS_SCOPE_ENV];
+      else process.env[OPS_SCOPE_ENV] = previous;
     }
   });
 });

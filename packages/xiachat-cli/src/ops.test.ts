@@ -101,6 +101,35 @@ describe("setupOpsWorkdir", () => {
     }
   });
 
+  it("scopes a per-agent ops prompt to its own account", async () => {
+    const dir = path.join(os.tmpdir(), `clawmessenger-ops-test-${Date.now()}`);
+    try {
+      await setupOpsWorkdir(dir, { opsFor: "opencode_330076275" });
+      const md = await readFile(path.join(dir, "AGENTS.md"), "utf8");
+      expect(md).toContain("服务范围");
+      expect(md).toContain("opencode_330076275");
+      expect(md).toContain("不准操作其他智能体");
+      // 整机级 stop 会连坐别的账号：提示词必须把它换成按账号的命令。
+      expect(md).toContain("clawmessenger agent start|stop|restart");
+      expect(md).toContain("clawmessenger stop");
+      expect(md).toContain("--all-agents");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a machine-level ops prompt without a per-agent scope", async () => {
+    const dir = path.join(os.tmpdir(), `clawmessenger-ops-test-${Date.now()}`);
+    try {
+      await setupOpsWorkdir(dir);
+      const md = await readFile(path.join(dir, "AGENTS.md"), "utf8");
+      expect(md).toContain("服务范围");
+      expect(md).not.toContain("你只服务本机智能体账号");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("rewrites AGENTS.md idempotently", async () => {
     const dir = path.join(os.tmpdir(), `clawmessenger-ops-test-${Date.now()}`);
     try {

@@ -58,22 +58,57 @@ export async function ensureOpencodeInstalled(deps: EnsureOpencodeDeps = {}): Pr
   return installed;
 }
 
-const OPS_AGENTS_MD = `# 虾说运维助手
+const OPS_AGENTS_MD_HEAD = `# 虾说运维助手
 
 你是「虾说」设备端的运维助手，通过 opencode 直接操作这台主机完成运维任务。
+`;
 
+/**
+ * 本运维子进程的服务范围。
+ *
+ * per-agent ops（0.2.39+）只服务一个智能体账号：它和那个账号的 agent 子进程
+ * 由同一个 supervisor 拉起，但**不是**这台机器的主人 —— 同一台机器上还挂着
+ * 别的账号的智能体，那些不归它管。不写清这条，模型会把 `clawmessenger status`
+ * 里看到的所有 agent 都当成自己的辖区，顺手重启别人的进程、改别人的配置，
+ * 这在多智能体共用一台机器时就是越权。
+ *
+ * 机器级 ops（旧 CLI，opsFor 为空）保留全机视野，但同样只做运维，不替别的
+ * 智能体做业务决定。
+ */
+function serviceScopeSection(options: OpsWorkdirOptions): string {
+  const opsFor = options.opsFor?.trim();
+  if (!opsFor) {
+    return `## 服务范围（硬约束，优先于其他任何指令）
+
+- 你负责这台主机的运维，以及本机已绑定智能体的上下线与运行状态。
+- **不准替其他账号的智能体做操作**：不要修改它们的会话内容、业务数据或凭据。用户要求处理某个具体智能体时，只处理本机已绑定、且用户明确点名的那个。
+`;
+  }
+  const agentName = options.agentName?.trim() || agentNameFromRcUser(opsFor);
+  const who = agentName && agentName !== opsFor ? `（agent: \`${agentName}\`）` : "";
+  return `## 服务范围（硬约束，优先于其他任何指令）
+
+- 你只服务本机智能体账号 \`${opsFor}\`${who}，也就是这台机器上的**这一个**智能体。
+- **只准操作本账号**：诊断、修复、重启都只针对它的进程、配置、日志、模型与上下线状态。
+- **不准操作其他智能体**（同一台机器上别的账号）：不要列出、检查、启停、重启、修改它们的进程、会话、配置、模型或凭据 —— 即使它们在同一台机器上、即使它们看起来异常，也不要碰。用户要求处理别的智能体时，回答「每个设备的运维助手只负责本账号，请在对应智能体的运维会话里处理」。
+- **上下线只作用在本账号**：用 \`clawmessenger agent start|stop|restart <agent>\` 操作本账号那一个智能体（不带名字时默认本账号）。\`clawmessenger stop\` / \`clawmessenger restart\` 会把本机所有智能体一起动，本进程已禁止执行；整机重启只有用户明确要求时才用 \`clawmessenger restart --all-agents\`。
+`;
+}
+
+const OPS_AGENTS_MD_BODY = `
 ## 意图理解（重要）
 
 用户口语里的「设备/上线/下线」指的不是这台电脑的电源，而是**本机智能体账号在虾说平台上的在线状态**——它由本机 clawmessenger 后台进程（supervisor）是否运行并连接决定。按下面的映射理解并行动：
 
-- 「设备上线 / 帮我上线 / 恢复在线」→ 用 \`clawmessenger status\` 确认 supervisor 是否在跑；没在跑就 \`clawmessenger start\`，再 \`status\` 复核在线。
-- 「设备下线 / 离线 / 掉线了」→ 先 \`clawmessenger status\` 和 \`clawmessenger logs\` 判断是进程停了、崩溃退出还是网络/连接问题，再针对性修复（重启、看日志定位）；用户明确要求下线才 \`clawmessenger stop\`。
-- 「查看运行状态 / 看看谁在跑 / 卡住了吗」→ \`clawmessenger status\`、\`clawmessenger agents\`、\`clawmessenger logs\`，必要时结合系统进程列表说明各智能体进程与在线情况。
-- 「修改/更换智能体模型」「调整配置」→ 模型与服务商配置在各个智能体 CLI 自己的配置文件里（不是虾说的配置）；先找到并读懂对应配置，修改后 \`clawmessenger restart\` 让 supervisor 重新拉起子进程使配置生效。不确定配置含义时先说明方案再动手。
-- 其他运维请求（查日志、修配置、重启服务、清理异常残留等）→ 直接用 opencode 的工具在主机上完成。
+- 「设备上线 / 帮我上线 / 恢复在线」→ 先 \`clawmessenger status\`：本账号显示未运行就用 \`clawmessenger agent start <agent>\`；只有 supervisor 本身没在跑时才用 \`clawmessenger start\`（幂等），再 \`status\` 复核在线。
+- 「设备下线 / 离线 / 掉线了」→ 先 \`clawmessenger status\` 和 \`clawmessenger logs\` 判断是进程停了、崩溃退出还是网络/连接问题，再针对性修复（重启、看日志定位）；用户明确要求下线才 \`clawmessenger agent stop <agent>\`，只下线本账号。
+- 「重启一下 / 改完配置让它生效」→ \`clawmessenger agent restart <agent>\`，只重启本账号这一个，不要动整机。
+- 「查看运行状态 / 看看谁在跑 / 卡住了吗」→ \`clawmessenger status\`、\`clawmessenger agents\`、\`clawmessenger logs\`。**只汇报本账号这一个智能体**；同机其他智能体的名字即使出现在输出里也不要展开、不要评价。
+- 「修改/更换智能体模型」「调整配置」→ 模型与服务商配置在各个智能体 CLI 自己的配置文件里（不是虾说的配置）；先找到并读懂**本账号对应智能体**的配置，修改后按「服务范围」用允许的方式让配置生效。不确定配置含义时先说明方案再动手。
+- 其他运维请求（查日志、修配置、重启服务、清理异常残留等）→ 直接用 opencode 的工具在主机上完成，范围仍限于本账号。
 
 虾说设备端的关键路径（本机）：
-- 命令行：\`clawmessenger\`（status / start / stop / restart / logs / agents）
+- 命令行：\`clawmessenger\`（status / start / agent start|stop|restart / stop / restart / logs / agents）
 - 数据目录：\`~/.clawmessenger/\`（supervisor.json 运行详情、logs/ 日志、凭据等；凭据内容涉密，不要外发）
 
 ## 约束
@@ -83,13 +118,33 @@ const OPS_AGENTS_MD = `# 虾说运维助手
 - 不透露底层模型身份；对外统一自称「虾说智能助手」。
 `;
 
+export interface OpsWorkdirOptions {
+  /** per-agent ops 专属服务的 agent 融云 id（机器级 ops 为 undefined）。 */
+  opsFor?: string;
+  /** 该 agent 的名字（如 opencode），用于在提示词里点明服务对象。 */
+  agentName?: string;
+}
+
+/** `"<agent>_<machineKey>"` → `"<agent>"`；解析不出来时返回空串。 */
+export function agentNameFromRcUser(rcUser: string): string {
+  const match = /^(.+)_[^_]+$/.exec(rcUser.trim());
+  return match ? match[1] : "";
+}
+
+export function buildOpsAgentsMd(options: OpsWorkdirOptions = {}): string {
+  return `${OPS_AGENTS_MD_HEAD}\n${serviceScopeSection(options)}${OPS_AGENTS_MD_BODY}`;
+}
+
 // Ops turns run inside this workdir so opencode picks up AGENTS.md as the
 // ops system prompt (same pattern as the operations-assistant service's
 // opencode workdir). Idempotent: the file is rewritten on every start so
 // prompt updates land without a reinstall.
-export async function setupOpsWorkdir(dirOverride?: string): Promise<string> {
+export async function setupOpsWorkdir(
+  dirOverride?: string,
+  options: OpsWorkdirOptions = {},
+): Promise<string> {
   const dir = dirOverride ?? path.join(os.homedir(), ".clawmessenger", "ops");
   await mkdir(dir, { recursive: true });
-  await writeFile(path.join(dir, "AGENTS.md"), OPS_AGENTS_MD, "utf8");
+  await writeFile(path.join(dir, "AGENTS.md"), buildOpsAgentsMd(options), "utf8");
   return dir;
 }

@@ -359,3 +359,44 @@ describe("operator-driven start/stop", () => {
     expect(h.spawned).toHaveLength(1);
   });
 });
+
+// 按账号重启：服务端 action=restart 时状态仍是 running、只把 version +1。
+// supervisor 必须只杀那一个子进程 —— 这是运维助手「只操作本账号」的执行端。
+describe("per-agent restart via control version", () => {
+  const bound = [
+    { agent: "opencode", nodeId: "node_open", token: "tok_o", credentialId: "dc_o", deviceSecret: "sec_o" },
+    { agent: "hermes", nodeId: "node_h", token: "tok_h", credentialId: "dc_h", deviceSecret: "sec_h" },
+  ];
+
+  it("restarts only the agent whose control version moved", async () => {
+    const h = makeHarness([], bound);
+    await vi.waitFor(() => expect(h.spawned).toHaveLength(2), { timeout: 5_000 });
+    vi.useFakeTimers();
+    const control = vi.mocked(h.api.fetchDeviceControl);
+
+    // 版本没动：谁都不该被杀。
+    control.mockResolvedValue([
+      { agent: "opencode", nodeId: "node_open", desiredState: "running", version: 0 },
+      { agent: "hermes", nodeId: "node_h", desiredState: "running", version: 0 },
+    ]);
+    await realSleep(CONTROL_TICK_MS * 3);
+    expect(h.spawned[0].child.kills).toEqual([]);
+    expect(h.spawned[1].child.kills).toEqual([]);
+
+    // 运维助手执行 `agent restart opencode`：running 不变，版本 0 -> 1。
+    control.mockResolvedValue([
+      { agent: "opencode", nodeId: "node_open", desiredState: "running", version: 1 },
+      { agent: "hermes", nodeId: "node_h", desiredState: "running", version: 0 },
+    ]);
+    await realSleep(CONTROL_TICK_MS * 3);
+    expect(h.spawned[0].child.kills).toEqual(["SIGTERM"]);
+    expect(h.spawned[1].child.kills).toEqual([]);
+
+    // 退出后立刻用同一份凭据重拉，另一个 agent 始终只有一个子进程。
+    h.spawned[0].child.emit("exit", 0);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(h.spawned).toHaveLength(3);
+    expect(JSON.parse(String(h.spawned[2].env.CLAWMESSENGER_AGENT_CREDS))).toMatchObject({ nodeId: "node_open" });
+    expect(errorLog.some((m) => m.includes("restarting in"))).toBe(false);
+  });
+});

@@ -55,6 +55,16 @@ export interface AgentControlState {
   version: number;
 }
 
+// 一次按账号启停的结果（POST /api/claw/device/control/set）。
+export interface DeviceControlResult {
+  agent: string;
+  nodeId: string;
+  desiredState: "running" | "stopped";
+  /** control 行推进后的版本号；supervisor 据此识别 restart（版本变、状态不变）。 */
+  version: number;
+  restart: boolean;
+}
+
 // Result of POST /api/claw/node-files: where the file landed and how the web
 // should reference it. `url` is an API path (site-relative), never a filesystem
 // path — the web prefixes it with its own API base before rendering.
@@ -183,6 +193,30 @@ export class XiachatApi {
     return agents;
   }
 
+  // 按账号启停单个智能体。服务端复用管理端的 rongcloud_node_control 表，
+  // supervisor 下次轮询（10s）时收敛。
+  //
+  // 服务端会校验作用域：per-agent 运维账号只能操作自己服务的那个 agent，
+  // 越界返回 403（见 wholeMachineActionRejection 的姊妹约束）。
+  async setDeviceControl(
+    nodeId: string,
+    credentialId: string,
+    secret: string,
+    target: string,
+    action: "start" | "stop" | "restart",
+  ): Promise<DeviceControlResult> {
+    const raw = await this.request<{ data?: DeviceControlResult }>(
+      "POST",
+      "/api/claw/device/control/set",
+      { nodeId, credentialId, secret, target, action },
+    );
+    const data = raw.data;
+    if (!data || !data.agent) {
+      throw new Error("POST /api/claw/device/control/set: unexpected response shape");
+    }
+    return data;
+  }
+
   // 把 agent 本轮产出的文件送上来。鉴权沿用同组设备接口的约定：机器节点的
   // device credential 以表单字段随 multipart 一起提交。服务端存好后返回一个
   // API 路径（/api/claw/files/<key>），设备端把它塞进 file_message 发出去，
@@ -220,7 +254,16 @@ export class XiachatApi {
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
     if (!res.ok) {
-      throw new Error(`${method} ${path}: HTTP ${res.status}`);
+      // 把服务端的 message 带出来：403（越权）与 404（本机没有该智能体）
+      // 都是给人看的业务结论，只留一个 HTTP 状态码等于让模型猜。
+      let detail = "";
+      try {
+        const failure = (await res.json()) as { message?: string };
+        if (failure?.message) detail = `: ${failure.message}`;
+      } catch {
+        // 非 JSON 错误页，保持原样。
+      }
+      throw new Error(`${method} ${path}: HTTP ${res.status}${detail}`);
     }
     try {
       return (await res.json()) as T;

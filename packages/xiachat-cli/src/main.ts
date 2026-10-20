@@ -7,7 +7,7 @@ import { Keystore, type StoredCredentials } from "./keystore.js";
 import { XiachatApi, type MachineAgentCredential } from "./api.js";
 import { discoverAgents } from "./agents.js";
 import { DEFAULT_SERVER_URL, machineId, defaultProcessedUidsPath } from "./config.js";
-import { ensureOpencodeInstalled, OPS_AGENT_NAME, OPS_TURN_TIMEOUT_MS, setupOpsWorkdir } from "./ops.js";
+import { agentNameFromRcUser, ensureOpencodeInstalled, OPS_AGENT_NAME, OPS_TURN_TIMEOUT_MS, setupOpsWorkdir } from "./ops.js";
 import {
   ALLOW_DUPLICATE_SUPERVISOR_ENV,
   clearSupervisorState,
@@ -36,6 +36,64 @@ export function pairIdempotencyKey(ticket: string, mid: string): string {
 export function allowDuplicateSupervisor(env: NodeJS.ProcessEnv = process.env): boolean {
   const raw = (env[ALLOW_DUPLICATE_SUPERVISOR_ENV] ?? "").trim().toLowerCase();
   return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+}
+
+/**
+ * per-agent 运维子进程的作用域（supervisor 拉起 ops@<agentRC> 时注入）。
+ *
+ * 为什么要有它：运维子进程和它服务的 agent 由同一个 supervisor 拉起，但它
+ * **不是**这台机器的主人 —— 同一台机器上还挂着别的账号的智能体。运维助手
+ * 通过 `clawmessenger` 命令操作设备，如果允许它跑整机级的 stop/restart，
+ * 一次「帮我上下线」就会把别人的智能体一起拉下来。作用域存在即代表「只准
+ * 动自己那一个账号」，CLI 因此在命令层直接拒绝连坐整机的动作。
+ */
+export const OPS_SCOPE_ENV = "CLAWMESSENGER_OPS_SCOPE";
+
+export function opsScope(env: NodeJS.ProcessEnv = process.env): string {
+  return (env[OPS_SCOPE_ENV] ?? "").trim();
+}
+
+/**
+ * 整机级动作（stop / restart）在运维作用域内要给的拒绝文案；不在作用域内
+ * 返回 null（普通用户与管理员不受影响）。
+ */
+export function wholeMachineActionRejection(
+  action: "stop" | "restart",
+  env: NodeJS.ProcessEnv = process.env,
+): string | null {
+  const scope = opsScope(env);
+  if (!scope) return null;
+  if (action === "stop") {
+    return `运维助手只负责本账号（${scope}），不能整机下线：\`clawmessenger stop\` 会把本机所有智能体一起停掉。\n`
+      + "恢复本账号在线请用 `clawmessenger start`（幂等，不会动已运行的智能体）；确实要整机下线，请在虾说设备页操作。";
+  }
+  return `运维助手只负责本账号（${scope}），不能整机重启：\`clawmessenger restart\` 会连本机其他智能体一起重启。\n`
+    + "确实需要整机重启时，先用 `clawmessenger restart --all-agents`，并先向用户确认影响范围。";
+}
+
+/** 运维作用域内要求操作别的智能体时的拒绝文案（本地拦一道，服务端还有一道）。 */
+export function opsScopeTargetRejection(scopeAgent: string, target: string): string {
+  return `运维助手只负责 ${scopeAgent} 这一个账号，不能操作 ${target}。\n`
+    + "其他智能体的启停请在对应账号的运维会话里处理。";
+}
+
+/**
+ * 运维作用域内的 `status` 只暴露本账号那一条。
+ *
+ * 模型的回复常常是直接抄命令输出 —— 只要它看得见别的 agent，就迟早会顺着
+ * 名单去「顺手检查/修一下」。这台机器上还有谁的智能体在跑，不归它知道，
+ * 所以清单在命令层就砍掉，而不是靠提示词劝。
+ */
+export function scopeDaemonReport<T extends { agents: string[] }>(report: T, scope: string): T {
+  const scopedId = scope.trim();
+  if (!scopedId) return report;
+  const agentName = agentNameFromRcUser(scopedId);
+  const own = new Set<string>([`ops@${scopedId}`]);
+  if (agentName) {
+    own.add(agentName);
+    own.add(`ops@${agentName}`);
+  }
+  return { ...report, agents: report.agents.filter((agent) => own.has(agent)) };
 }
 
 export interface BuildProgramOpts {
@@ -69,7 +127,7 @@ export function buildProgram(opts: BuildProgramOpts): Command {
   program
     .name("clawmessenger")
     .description("User-device agent CLI over RongCloud IM")
-    .version("0.2.41")
+    .version("0.2.42")
     // Tests parse this program in-process; commander would otherwise
     // process.exit on missing options and kill the vitest runner.
     .exitOverride();
@@ -193,11 +251,86 @@ export function buildProgram(opts: BuildProgramOpts): Command {
     .description("List agent CLIs discoverable on this machine's PATH")
     .action(async () => {
       const found = await discoverAgents({});
-      if (found.length === 0) {
-        opts.stdout.write("no agent CLIs found on PATH\n");
+      // 运维作用域内只看得到自己那一个智能体：同一台机器上还有谁装了 CLI，
+      // 不归它知道（见 scopeDaemonReport 的注释）。
+      const scope = opsScope();
+      const visible = scope ? found.filter((a) => a.name === agentNameFromRcUser(scope)) : found;
+      if (visible.length === 0) {
+        opts.stdout.write(scope
+          ? `no agent CLI found for this ops scope (${scope})\n`
+          : "no agent CLIs found on PATH\n");
         return;
       }
-      for (const a of found) opts.stdout.write(`${a.name}\t${a.path}\n`);
+      for (const a of visible) opts.stdout.write(`${a.name}\t${a.path}\n`);
+    });
+
+  // 按账号启停：运维助手唯一需要的「上下线」动作，不影响同机其他智能体。
+  // 服务端写进与管理端同一张 control 表，supervisor 下一次轮询收敛。
+  program
+    .command("agent <action> [name]")
+    .description("Start / stop / restart ONE agent on this device, leaving the others alone")
+    .action(async (action: string, name?: string) => {
+      const normalized = action.trim().toLowerCase();
+      if (normalized !== "start" && normalized !== "stop" && normalized !== "restart") {
+        opts.stdout.write(`unknown action '${action}'; try: start | stop | restart\n`);
+        process.exitCode = 1;
+        return;
+      }
+      // 运维子进程带着自己的节点凭据（CLAWMESSENGER_AGENT_CREDS），普通用户
+      // 走 keystore；两者都能过服务端的设备凭据校验。
+      const envCreds = process.env.CLAWMESSENGER_AGENT_CREDS;
+      const creds = (envCreds ? (JSON.parse(envCreds) as StoredCredentials) : undefined) ?? opts.keystore.load();
+      if (!creds) {
+        opts.stdout.write("not registered; run clawmessenger pair first\n");
+        process.exitCode = 1;
+        return;
+      }
+      if (!creds.credentialId || !creds.deviceSecret) {
+        opts.stdout.write("no device credential; run clawmessenger pair on this device first\n");
+        process.exitCode = 1;
+        return;
+      }
+      const scope = opsScope();
+      const scopeAgent = scope ? agentNameFromRcUser(scope) : "";
+      const target = (name ?? scopeAgent).trim();
+      if (!target) {
+        opts.stdout.write("which agent? e.g. clawmessenger agent restart opencode\n");
+        process.exitCode = 1;
+        return;
+      }
+      // 本地先拦一道（服务端还会再校验一次）：per-agent 运维只能动自己那一个。
+      if (scopeAgent && target !== scopeAgent) {
+        opts.stdout.write(opsScopeTargetRejection(scopeAgent, target));
+        process.exitCode = 1;
+        return;
+      }
+      const api = opts.apiFactory(creds.serverUrl);
+      try {
+        const result = await api.setDeviceControl(
+          creds.nodeId ?? "",
+          creds.credentialId,
+          creds.deviceSecret,
+          target,
+          normalized,
+        );
+        const verb = normalized === "stop" ? "停止" : normalized === "restart" ? "重启" : "启动";
+        opts.stdout.write(
+          `${result.agent}：${verb}指令已下发（version ${result.version}）。`
+            + "supervisor 每 10 秒同步一次，可用 `clawmessenger status` 复核。\n",
+        );
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (message.includes("HTTP 404")) {
+          // 服务端还没上 control/set：别让运维助手退回整机 stop（会连坐别的账号）。
+          opts.stdout.write(
+            "服务端还不支持按账号启停（/api/claw/device/control/set 未上线）。"
+              + "请先升级服务端；临时恢复本账号在线可用 `clawmessenger start`，不要用整机 stop。\n",
+          );
+        } else {
+          opts.stdout.write(`${message}\n`);
+        }
+        process.exitCode = 1;
+      }
     });
 
   program
@@ -286,7 +419,12 @@ export function buildProgram(opts: BuildProgramOpts): Command {
           }
           workdirOverride = path.join(os.homedir(), ".clawmessenger", "ops", cmdOpts.opsSuffix);
         }
-        const workdir = await setupOpsWorkdir(workdirOverride);
+        const workdir = await setupOpsWorkdir(
+          workdirOverride,
+          cmdOpts.opsSuffix
+            ? { opsFor: cmdOpts.opsSuffix, agentName: agentNameFromRcUser(cmdOpts.opsSuffix) }
+            : {},
+        );
         agentExecPath = opencode.path;
         agentName = "opencode";
         turnTimeoutMs = OPS_TURN_TIMEOUT_MS;
@@ -340,7 +478,9 @@ export function buildProgram(opts: BuildProgramOpts): Command {
       } else {
         opts.stdout.write(`node: ${creds.nodeId}\nserver: ${creds.serverUrl}\ntoken: ${creds.token ? "present" : "missing"}\n`);
       }
-      opts.stdout.write(formatDaemonStatus(daemon.status(), daemonPaths));
+      const report = daemon.status();
+      const scope = opsScope();
+      opts.stdout.write(formatDaemonStatus(scope ? scopeDaemonReport(report, scope) : report, daemonPaths));
     });
 
   // --- 后台常驻 -------------------------------------------------------------
@@ -364,13 +504,29 @@ export function buildProgram(opts: BuildProgramOpts): Command {
     .command("stop")
     .description("Stop the background supervisor and the agent processes it started")
     .action(async () => {
+      // per-agent 运维子进程：整机 stop 会连其他账号的智能体一起下线，越权。
+      const rejection = wholeMachineActionRejection("stop");
+      if (rejection) {
+        opts.stdout.write(`${rejection}\n`);
+        process.exitCode = 1;
+        return;
+      }
       await daemon.stop();
     });
 
   daemonOpts(
-    program.command("restart").description("Stop the background supervisor, then start it again"),
-  ).action(async (cmdOpts: { model?: string; workdir?: string }) => {
-    await daemon.restart(cmdOpts);
+    program
+      .command("restart")
+      .description("Stop the background supervisor, then start it again")
+      .option("--all-agents", "整机重启：连同本机其他智能体一起重启（仅用户明确要求时使用）"),
+  ).action(async (cmdOpts: { model?: string; workdir?: string; allAgents?: boolean }) => {
+    const rejection = wholeMachineActionRejection("restart");
+    if (rejection && !cmdOpts.allAgents) {
+      opts.stdout.write(`${rejection}\n`);
+      process.exitCode = 1;
+      return;
+    }
+    await daemon.restart({ model: cmdOpts.model, workdir: cmdOpts.workdir });
   });
 
   program
@@ -404,22 +560,40 @@ export function buildProgram(opts: BuildProgramOpts): Command {
     .option("--model <model>", "model override passed through to the agent CLI")
     .option("--workdir <dir>", "working directory for agent turns (default: your home directory)")
     .option("--lines <n>", "lines to show for `daemon logs`", "40")
-    .action(async (action: string, cmdOpts: { model?: string; workdir?: string; lines: string }) => {
+    .option("--all-agents", "整机重启：连同本机其他智能体一起重启（仅用户明确要求时使用）")
+    .action(async (action: string, cmdOpts: { model?: string; workdir?: string; lines: string; allAgents?: boolean }) => {
       // --lines 只在 logs 有意义，别把它混进 start / restart / install-service 的选项里。
       const passthrough = { model: cmdOpts.model, workdir: cmdOpts.workdir };
       switch (action) {
         case "start":
           await daemon.start(passthrough);
           return;
-        case "stop":
+        case "stop": {
+          const rejection = wholeMachineActionRejection("stop");
+          if (rejection) {
+            opts.stdout.write(`${rejection}\n`);
+            process.exitCode = 1;
+            return;
+          }
           await daemon.stop();
           return;
-        case "restart":
+        }
+        case "restart": {
+          const rejection = wholeMachineActionRejection("restart");
+          if (rejection && !cmdOpts.allAgents) {
+            opts.stdout.write(`${rejection}\n`);
+            process.exitCode = 1;
+            return;
+          }
           await daemon.restart(passthrough);
           return;
-        case "status":
-          opts.stdout.write(formatDaemonStatus(daemon.status(), daemonPaths));
+        }
+        case "status": {
+          const report = daemon.status();
+          const scope = opsScope();
+          opts.stdout.write(formatDaemonStatus(scope ? scopeDaemonReport(report, scope) : report, daemonPaths));
           return;
+        }
         case "logs": {
           const n = Number.parseInt(cmdOpts.lines, 10);
           daemon.logs({ lines: Number.isFinite(n) && n > 0 ? n : 40 });
@@ -486,6 +660,9 @@ export function supervisorRestartDelayMs(restarts: number): number {
   return Math.min(SUPERVISOR_RESTART_MAX_MS, SUPERVISOR_RESTART_BASE_MS * 2 ** (Math.max(1, restarts) - 1));
 }
 
+/** 服务端下发的期望状态；version 用来区分「保持运行」与「重启一次」。 */
+type ControlIntent = { state: "running" | "stopped"; version: number };
+
 interface SupervisedAgent {
   agent: string;
   runArgs: string[];
@@ -499,6 +676,15 @@ interface SupervisedAgent {
   /** Operator intent, as last seen from the server. A child that exits while
    * this is "stopped" was stopped on purpose and must not be resurrected. */
   desired: "running" | "stopped";
+  /** per-agent 运维子进程专属服务的 agent 融云 id；机器级 agent 为 undefined。 */
+  opsScope?: string;
+  /**
+   * 上次看到的 control 版本号。版本变了但状态仍是 running = 明确要求「重启
+   * 这一个 agent」（服务端 action=restart 时强制推进版本，见 control/set）。
+   */
+  seenVersion?: number;
+  /** restart 已发起、正等子进程退出；exit 回调据此直接重拉而不是走退避。 */
+  pendingRestart?: boolean;
   timer?: NodeJS.Timeout;
 }
 
@@ -560,7 +746,13 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
       process.execPath,
       [...spawnArgvPrefix, ...entry.runArgs],
       {
-        env: { ...process.env, CLAWMESSENGER_AGENT_CREDS: JSON.stringify(entry.childCreds) },
+        env: {
+          ...process.env,
+          CLAWMESSENGER_AGENT_CREDS: JSON.stringify(entry.childCreds),
+          // per-agent 运维子进程带上服务范围：CLI 据此拒绝整机级 stop/restart，
+          // 也把同一个值写进 AGENTS.md 的「服务范围」，让模型自己守住边界。
+          ...(entry.opsScope ? { [OPS_SCOPE_ENV]: entry.opsScope } : {}),
+        },
         // supervisor 是 detached + windowsHide 拉起的，自己没有控制台；这里的子进程
         // 若不带 windowsHide，Windows 会为每个 console 子进程**新分配一个可见的
         // 控制台窗口**——绑了几个 agent 就弹几个黑窗。用户点 X 关窗只杀掉该 agent
@@ -575,7 +767,20 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
     child.stdout?.on("data", (chunk: Buffer) => opts.stdout.write(`[${entry.agent}] ${chunk}`));
     child.stderr?.on("data", (chunk: Buffer) => process.stderr.write(`[${entry.agent}] ${chunk}`));
     child.on("exit", (code) => {
+      entry.child = undefined;
       entry.lastExitCode = code;
+      // restart：这次退出是计划内的，立刻用全新预算重拉 —— 不进退避、不累计失败。
+      if (entry.pendingRestart) {
+        entry.pendingRestart = false;
+        entry.state = "stopped";
+        if (!stopping) {
+          entry.timer = setTimeout(() => {
+            entry.timer = undefined;
+            launch(entry);
+          }, SUPERVISOR_RESTART_BASE_MS);
+        }
+        return;
+      }
       // `desired === "stopped"` covers a child the operator stopped: its exit is
       // the point, not a crash, so it must not enter the backoff path.
       if (stopping || entry.desired === "stopped") {
@@ -605,15 +810,19 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
   const credentialID = creds.credentialId ?? "";
   const deviceSecret = creds.deviceSecret ?? "";
 
-  /** Last-known desired state per agent. Failures yield an empty map, which
-   * applyControlStates reads as "change nothing" — a server blip must never
-   * stop agents that the operator left running. */
-  const fetchControlStates = async (): Promise<Map<string, "running" | "stopped">> => {
-    const desired = new Map<string, "running" | "stopped">();
+  /** 上次看到的期望状态与版本。失败时返回空 Map，applyControlStates 读作
+   * 「什么都别改」—— 服务端抖动绝不能把操作员留着运行的 agent 停掉。 */
+  const fetchControlStates = async (): Promise<Map<string, ControlIntent>> => {
+    const desired = new Map<string, ControlIntent>();
     try {
       const states = await api.fetchDeviceControl(nodeID, credentialID, deviceSecret);
       for (const state of states) {
-        if (state.agent) desired.set(state.agent, state.desiredState === "stopped" ? "stopped" : "running");
+        if (state.agent) {
+          desired.set(state.agent, {
+            state: state.desiredState === "stopped" ? "stopped" : "running",
+            version: typeof state.version === "number" ? state.version : 0,
+          });
+        }
       }
     } catch (err) {
       console.error("supervisor: control poll failed:", err instanceof Error ? err.message : String(err));
@@ -645,15 +854,45 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
     launch(entry);
   };
 
-  const applyControlStates = (desired: Map<string, "running" | "stopped">): void => {
+  /**
+   * 只重启这一个 agent（服务端 restart 指令）。杀进程 → exit 回调里立刻重拉，
+   * 同机其他 agent 不受影响 —— 这正是它相对 `clawmessenger restart` 的意义。
+   */
+  const restartAgent = (entry: SupervisedAgent): void => {
+    entry.restarts = 0;
+    entry.desired = "running";
+    if (entry.timer) {
+      clearTimeout(entry.timer);
+      entry.timer = undefined;
+    }
+    if (!entry.child) {
+      launch(entry);
+      return;
+    }
+    entry.pendingRestart = true;
+    entry.child.kill("SIGTERM");
+  };
+
+  const applyControlStates = (desired: Map<string, ControlIntent>): void => {
     for (const [key, entry] of managed) {
       // per-agent 运维子进程（ops@<agentRC>）共享 "ops" 的控制状态。
-      const state = desired.get(controlKeyFor(key));
+      const intent = desired.get(controlKeyFor(key));
       // An agent the supervisor never started (its CLI is not on PATH) is not
       // ours to converge; the server still lists it because the node is bound.
-      if (!entry || !state) continue;
-      if (state === "stopped") stopAgent(entry);
-      else startAgent(entry);
+      if (!entry || !intent) continue;
+      // 第一次同步只记录版本，不当成「刚被要求重启」—— 否则每次 supervisor
+      // 启动都会把已经在跑的 agent 停一遍。
+      const versionChanged = entry.seenVersion !== undefined && entry.seenVersion !== intent.version;
+      entry.seenVersion = intent.version;
+      if (intent.state === "stopped") {
+        stopAgent(entry);
+        continue;
+      }
+      if (versionChanged && entry.desired === "running" && entry.state === "running") {
+        restartAgent(entry);
+        continue;
+      }
+      startAgent(entry);
     }
   };
 
@@ -680,7 +919,8 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
     if (agent.agent === OPS_AGENT_NAME && agent.opsFor) {
       runArgs.push("--ops-suffix", agent.opsFor);
     }
-    const desired = initialDesired.get(agent.agent) ?? "running";
+    const intent = initialDesired.get(agent.agent);
+    const desired = intent?.state ?? "running";
     const entry: SupervisedAgent = {
       agent: key,
       runArgs,
@@ -696,6 +936,8 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
       lastExitCode: null,
       state: desired === "running" ? "running" : "stopped",
       desired,
+      ...(intent ? { seenVersion: intent.version } : {}),
+      ...(agent.agent === OPS_AGENT_NAME && agent.opsFor ? { opsScope: agent.opsFor } : {}),
     };
     managed.set(key, entry);
     if (desired === "running") {
