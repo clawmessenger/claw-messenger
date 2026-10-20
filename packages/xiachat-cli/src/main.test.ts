@@ -5,7 +5,7 @@ import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { allowDuplicateSupervisor, buildProgram, OPS_SCOPE_ENV, scopeDaemonReport, wholeMachineActionRejection } from "./main.js";
+import { allowDuplicateSupervisor, buildProgram, OPS_SCOPE_ENV, scopeDaemonReport, SUPERVISED_ENV, supervisedSelfKillRejection, wholeMachineActionRejection } from "./main.js";
 import { Keystore } from "./keystore.js";
 import type { XiachatApi } from "./api.js";
 import { defaultDaemonPaths, type Daemon } from "./daemon.js";
@@ -538,6 +538,79 @@ describe("ops scope guard", () => {
       process.exitCode = previousExitCode;
       if (previous === undefined) delete process.env[OPS_SCOPE_ENV];
       else process.env[OPS_SCOPE_ENV] = previous;
+    }
+  });
+});
+
+// 2026-10-20 11:33 的现场：运维助手在会话里执行 `clawmessenger stop`，把拉起它的
+// supervisor 连同自己一起杀掉 —— 失败/取消终帧没机会发，前端气泡永远停在
+// 「正在思考 3m42s」，整台设备的智能体也全部下线。
+// 这条守卫与 ops 作用域无关：**任何**由 supervisor 拉起的子进程都不许停整机。
+describe("supervised self-kill guard", () => {
+  it("leaves the commands alone outside a supervised child", () => {
+    expect(supervisedSelfKillRejection("stop", {})).toBeNull();
+    expect(supervisedSelfKillRejection("restart", {})).toBeNull();
+  });
+
+  it("refuses whole-machine stop/restart inside a supervised child", () => {
+    const env = { [SUPERVISED_ENV]: "1" };
+    const stop = supervisedSelfKillRejection("stop", env) ?? "";
+    expect(stop).toContain("supervisor");
+    expect(stop).toContain("clawmessenger agent stop|start");
+    expect(supervisedSelfKillRejection("restart", env) ?? "").toContain("supervisor");
+  });
+
+  it("blocks `clawmessenger stop` before it reaches the daemon", async () => {
+    const previous = process.env[SUPERVISED_ENV];
+    const previousExitCode = process.exitCode;
+    process.env[SUPERVISED_ENV] = "1";
+    try {
+      const lines: string[] = [];
+      const stopDaemon = vi.fn(async () => {});
+      const program = buildProgram({
+        keystore: tempKeystore(),
+        apiFactory: () => ({}) as unknown as XiachatApi,
+        stdout: { write: (s: string) => { lines.push(s); return true; } } as unknown as NodeJS.WriteStream,
+        daemon: { stop: stopDaemon } as unknown as Daemon,
+        daemonPaths: defaultDaemonPaths(),
+      });
+
+      await program.parseAsync(["node", "clawmessenger", "stop"]);
+
+      expect(stopDaemon).not.toHaveBeenCalled();
+      expect(lines.join("")).toContain("supervisor");
+      expect(process.exitCode).toBe(1);
+    } finally {
+      process.exitCode = previousExitCode;
+      if (previous === undefined) delete process.env[SUPERVISED_ENV];
+      else process.env[SUPERVISED_ENV] = previous;
+    }
+  });
+
+  it("blocks whole-machine restart even with --all-agents", async () => {
+    const previous = process.env[SUPERVISED_ENV];
+    const previousExitCode = process.exitCode;
+    process.env[SUPERVISED_ENV] = "1";
+    try {
+      const lines: string[] = [];
+      const restartDaemon = vi.fn(async () => {});
+      const program = buildProgram({
+        keystore: tempKeystore(),
+        apiFactory: () => ({}) as unknown as XiachatApi,
+        stdout: { write: (s: string) => { lines.push(s); return true; } } as unknown as NodeJS.WriteStream,
+        daemon: { restart: restartDaemon } as unknown as Daemon,
+        daemonPaths: defaultDaemonPaths(),
+      });
+
+      await program.parseAsync(["node", "clawmessenger", "restart", "--all-agents"]);
+
+      expect(restartDaemon).not.toHaveBeenCalled();
+      expect(lines.join("")).toContain("supervisor");
+      expect(process.exitCode).toBe(1);
+    } finally {
+      process.exitCode = previousExitCode;
+      if (previous === undefined) delete process.env[SUPERVISED_ENV];
+      else process.env[SUPERVISED_ENV] = previous;
     }
   });
 });

@@ -49,6 +49,41 @@ export function allowDuplicateSupervisor(env: NodeJS.ProcessEnv = process.env): 
  */
 export const OPS_SCOPE_ENV = "CLAWMESSENGER_OPS_SCOPE";
 
+/**
+ * 「我是 supervisor 拉起来的子进程」标记（supervisor 的 launch() 注入）。
+ *
+ * 为什么需要：`clawmessenger stop` 停的是 supervisor —— 而 agent 子进程就是
+ * supervisor 的孩子。子进程自己执行 stop，等于当场把自己的父进程连根拔掉：
+ * 命令还没返回，承载这一轮的进程已经没了，于是**失败/取消终帧永远发不出去**，
+ * 前端只看到「正在思考」一直转圈（2026-10-20 11:33 的现场：运维助手执行
+ * `clawmessenger stop`，整台设备的智能体全部下线，气泡卡在 3m42s）。
+ *
+ * 这个标记只在 supervisor 拉起的子进程里存在：用户在终端手敲 stop 不受影响。
+ */
+export const SUPERVISED_ENV = "CLAWMESSENGER_SUPERVISED";
+
+export function isSupervisedChild(env: NodeJS.ProcessEnv = process.env): boolean {
+  return (env[SUPERVISED_ENV] ?? "").trim() === "1";
+}
+
+/**
+ * 托管子进程里执行整机 stop/restart 的拒绝文案。
+ *
+ * 与运维作用域（OPS_SCOPE_ENV）不同，这条**对所有 agent 都成立**：不管是不是
+ * 运维助手，只要这一轮正跑在被 stop 的那个 supervisor 下面，命令一执行就会
+ * 杀掉自己。宁可让模型拿到一句明确的拒绝，也不要让用户对着转圈的气泡等。
+ */
+export function supervisedSelfKillRejection(
+  action: "stop" | "restart",
+  env: NodeJS.ProcessEnv = process.env,
+): string | null {
+  if (!isSupervisedChild(env)) return null;
+  return `\`clawmessenger ${action}\` 不能在智能体自己的进程里执行：它会停掉拉起本轮的 supervisor，`
+    + "把这一轮连同回复一起杀掉（前端将一直停在「正在思考」）。\n"
+    + "要停整台设备，请在设备本机的终端（不在智能体会话里）执行；只想让某个智能体上下线，"
+    + "用 `clawmessenger agent stop|start <name>`。";
+}
+
 export function opsScope(env: NodeJS.ProcessEnv = process.env): string {
   return (env[OPS_SCOPE_ENV] ?? "").trim();
 }
@@ -127,7 +162,7 @@ export function buildProgram(opts: BuildProgramOpts): Command {
   program
     .name("clawmessenger")
     .description("User-device agent CLI over RongCloud IM")
-    .version("0.2.44")
+    .version("0.2.45")
     // Tests parse this program in-process; commander would otherwise
     // process.exit on missing options and kill the vitest runner.
     .exitOverride();
@@ -504,6 +539,14 @@ export function buildProgram(opts: BuildProgramOpts): Command {
     .command("stop")
     .description("Stop the background supervisor and the agent processes it started")
     .action(async () => {
+      // 托管子进程里执行 stop = 杀掉拉起自己的 supervisor，本轮回复永远发不出去：
+      // 失败/取消终帧还没发，承载它的进程已经没了（前端一直转圈）。
+      const selfKill = supervisedSelfKillRejection("stop");
+      if (selfKill) {
+        opts.stdout.write(`${selfKill}\n`);
+        process.exitCode = 1;
+        return;
+      }
       // per-agent 运维子进程：整机 stop 会连其他账号的智能体一起下线，越权。
       const rejection = wholeMachineActionRejection("stop");
       if (rejection) {
@@ -520,6 +563,14 @@ export function buildProgram(opts: BuildProgramOpts): Command {
       .description("Stop the background supervisor, then start it again")
       .option("--all-agents", "整机重启：连同本机其他智能体一起重启（仅用户明确要求时使用）"),
   ).action(async (cmdOpts: { model?: string; workdir?: string; allAgents?: boolean }) => {
+    // 同 stop：在托管子进程里重启整机，等于在命令执行途中把自己换掉。
+    // --all-agents 也不例外 —— 那只是「范围更大」，并没有改变自杀这件事。
+    const selfKill = supervisedSelfKillRejection("restart");
+    if (selfKill) {
+      opts.stdout.write(`${selfKill}\n`);
+      process.exitCode = 1;
+      return;
+    }
     const rejection = wholeMachineActionRejection("restart");
     if (rejection && !cmdOpts.allAgents) {
       opts.stdout.write(`${rejection}\n`);
@@ -749,6 +800,10 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
         env: {
           ...process.env,
           CLAWMESSENGER_AGENT_CREDS: JSON.stringify(entry.childCreds),
+          // 标记「我是 supervisor 的子进程」：这类进程执行整机 stop/restart 会
+          // 把自己的父进程（连同本轮）杀掉，命令层直接拒绝（见
+          // supervisedSelfKillRejection）。
+          [SUPERVISED_ENV]: "1",
           // per-agent 运维子进程带上服务范围：CLI 据此拒绝整机级 stop/restart，
           // 也把同一个值写进 AGENTS.md 的「服务范围」，让模型自己守住边界。
           ...(entry.opsScope ? { [OPS_SCOPE_ENV]: entry.opsScope } : {}),
