@@ -27,6 +27,11 @@ export interface SessionQueueOpts {
 interface PendingTask {
   key: string;
   run: () => Promise<void>;
+  /**
+   * 任务还在排队就被撤掉（chat_stop 清队列）时的回调：给这条从未开跑的
+   * 消息补一个终态帧，否则 web 端的占位气泡会永远「正在思考」。
+   */
+  onDropped?: () => void;
 }
 
 export class SessionQueue {
@@ -42,7 +47,7 @@ export class SessionQueue {
    * 据此给用户一个明确的终态（见 startRunLoop 的 agent_busy 失败帧），
    * 否则 web 端的「正在思考」占位气泡会永远转圈。
    */
-  enqueue(conversationKey: string, task: () => Promise<void>): boolean {
+  enqueue(conversationKey: string, task: () => Promise<void>, onDropped?: () => void): boolean {
     const activeCount = this.active.get(conversationKey) ?? 0;
     const waiting = this.waiting.get(conversationKey) ?? [];
     if (activeCount >= this.opts.concurrencyPerConversation) {
@@ -51,12 +56,33 @@ export class SessionQueue {
         this.opts.onBusy?.(conversationKey);
         return false;
       }
-      waiting.push({ key: conversationKey, run: task });
+      waiting.push({ key: conversationKey, run: task, ...(onDropped ? { onDropped } : {}) });
       this.waiting.set(conversationKey, waiting);
       return true;
     }
     this.start(conversationKey, task);
     return true;
+  }
+
+  /**
+   * 撤掉该会话所有还在排队的任务（chat_stop 用）：被撤任务逐个触发
+   * onDropped 补终态帧。返回撤掉的数量。正在执行的任务不归这里管 ——
+   * 它由 MessageDispatcher 的 activeStreams abort 掉。
+   */
+  dropWaiting(conversationKey: string): number {
+    const waiting = this.waiting.get(conversationKey);
+    if (!waiting || waiting.length === 0) return 0;
+    this.waiting.delete(conversationKey);
+    for (const task of waiting) {
+      try {
+        task.onDropped?.();
+      } catch (err) {
+        console.error("dropped-task notice failed:", err instanceof Error ? err.message : err);
+      }
+    }
+    // 被撤的任务永远不会跑 finish，检查点必须在这里补 —— 否则 idle() 卡住。
+    this.checkIdle();
+    return waiting.length;
   }
 
   private start(conversationKey: string, task: () => Promise<void>): void {
@@ -231,6 +257,35 @@ export function sendBusyDropNotice(
     status: "failed",
     text: "",
     errorCode: "agent_busy",
+  });
+  void transport.sendMessage(msg.fromUserId, "chat_stream", frame).catch(() => {});
+}
+
+/**
+ * 「停止生成」把还在排队的消息撤掉时，给那条消息补的终态帧：cancelled。
+ * 这条消息从未开跑、没有任何流帧，web 端只有一个等替换的占位气泡 ——
+ * 不补这一帧它就永远「正在思考」，看起来像停止没生效（2026-10-20 现场：
+ * 用户连发两条「上线」后点停止，第一条被中止，第二条照常排队开跑，
+ * 用户看到的就是「停止无效、消息重复」）。
+ */
+export function sendStopDropNotice(
+  transport: IMTransport,
+  msg: InboundIMMessage,
+  selfUserId: string | undefined,
+): void {
+  // 同 sendBusyDropNotice：只有私聊有占位气泡；群/聊天室没有排队等待位。
+  if (msg.conversationType !== 1 || !selfUserId) return;
+  const requestMessageId = msg.messageUId || `req-${Date.now()}`;
+  const frame = buildChatStreamFrame({
+    streamId: `stream-${requestMessageId}-stopped`,
+    requestMessageId,
+    requesterId: msg.fromUserId,
+    nodeId: selfUserId,
+    conversationType: 1,
+    conversationId: msg.fromUserId,
+    seq: 0,
+    status: "cancelled",
+    text: "",
   });
   void transport.sendMessage(msg.fromUserId, "chat_stream", frame).catch(() => {});
 }
@@ -455,16 +510,33 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
         return;
       }
     }
-    const accepted = queue.enqueue(key, async () => {
-      try {
-        await dispatcher.handle(msg, turns);
-      } catch (err) {
-        // Carried fix from Task 7 review: dispatcher.handle rejections
-        // (including error-path send failures that escape) must never crash
-        // the process from inside the queue's task.
+    // chat_stop 是即时动作，必须绕过会话队列：排在进行中的轮次后面意味着
+    // 等轮次跑完才处理停止 —— 用户看到的就是「停止无效」（2026-10-20 现场）。
+    // 同时把同会话还在排队的消息一起撤掉：停止的意图是「这个话题到此为止」，
+    // 排队的旧消息再开跑就是用户眼里的「消息重复」。
+    if (msg.objectName === "chat_stop") {
+      const dropped = queue.dropWaiting(key);
+      if (dropped > 0) console.log(`chat_stop: dropped ${dropped} queued message(s) for ${key}`);
+      void dispatcher.handle(msg, turns).catch((err: unknown) => {
         console.error("dispatch failed:", err instanceof Error ? err.message : err);
-      }
-    });
+      });
+      return;
+    }
+    const accepted = queue.enqueue(
+      key,
+      async () => {
+        try {
+          await dispatcher.handle(msg, turns);
+        } catch (err) {
+          // Carried fix from Task 7 review: dispatcher.handle rejections
+          // (including error-path send failures that escape) must never crash
+          // the process from inside the queue's task.
+          console.error("dispatch failed:", err instanceof Error ? err.message : err);
+        }
+      },
+      // 这条消息若在排队时被 chat_stop 撤掉，给它的占位气泡补 cancelled 终帧。
+      () => sendStopDropNotice(opts.transport, msg, selfUserId),
+    );
     if (!accepted) {
       // 队列满（1 在执行 + 1 排队），这条消息被丢弃。必须给用户一个明确的
       // 终态：旧实现回纯文本「正在思考中…」，web 端会拿它原位替换占位气泡，

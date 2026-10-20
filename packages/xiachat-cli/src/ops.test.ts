@@ -4,7 +4,7 @@ import { readFile, rm } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { EventEmitter } from "node:events";
-import { agentNameFromRcUser, ensureOpencodeInstalled, setupOpsWorkdir } from "./ops.js";
+import { agentNameFromRcUser, detectOpsShell, ensureOpencodeInstalled, setupOpsWorkdir } from "./ops.js";
 import type { AgentInfo } from "./agents.js";
 
 function agent(pathOverride: string): AgentInfo {
@@ -132,16 +132,64 @@ describe("setupOpsWorkdir", () => {
 
   // 现场（2026-10-20 13:07）：模型把 PowerShell 的 Get-Content 塞进 bash，报
   // command not found 之后一声不吭，这一轮被判「没有正常收尾」。提示词得先说清
-  // 命令工具是 git-bash，并给出等价写法。
-  it("tells the ops agent which shell its command tool really is", async () => {
+  // 命令工具是什么 shell，并给出等价写法。
+  // 0.2.47 的教训：提示词写死 git-bash 是猜的，opencode 在 Windows 上默认用
+  // PowerShell —— 提示词必须按探测结果生成，两种形态各自自洽。
+  it("tells the ops agent which shell its command tool really is (git-bash)", async () => {
     const dir = path.join(os.tmpdir(), `clawmessenger-ops-test-${Date.now()}`);
     try {
-      await setupOpsWorkdir(dir, { opsFor: "rc_node_3300776275_openclaw", agentName: "openclaw" });
+      await setupOpsWorkdir(dir, {
+        opsFor: "rc_node_3300776275_openclaw",
+        agentName: "openclaw",
+        shell: { kind: "git-bash", bashPath: "C:\\Program Files\\Git\\bin\\bash.exe" },
+      });
       const md = await readFile(path.join(dir, "AGENTS.md"), "utf8");
       expect(md).toContain("git-bash");
       expect(md).toContain("Get-Content");
       expect(md).toContain("$env:USERPROFILE");
       expect(md).toContain("必须先用一句话说明失败原因");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("tells the ops agent the truth when the shell is PowerShell", async () => {
+    const dir = path.join(os.tmpdir(), `clawmessenger-ops-test-${Date.now()}`);
+    try {
+      await setupOpsWorkdir(dir, { shell: { kind: "powershell" } });
+      const md = await readFile(path.join(dir, "AGENTS.md"), "utf8");
+      expect(md).toContain("Windows PowerShell");
+      expect(md).toContain("Get-Content");
+      expect(md).toContain("Select-String");
+      expect(md).toContain("必须先用一句话说明失败原因");
+      // PowerShell 形态下绝不能再出现「已被固定为 git-bash」的说法。
+      expect(md).not.toContain("已被固定为 **git-bash**");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("pins git-bash into opencode.json when detected, preserving other keys", async () => {
+    const dir = path.join(os.tmpdir(), `clawmessenger-ops-test-${Date.now()}`);
+    try {
+      await setupOpsWorkdir(dir);
+      const { writeFile } = await import("node:fs/promises");
+      await writeFile(path.join(dir, "opencode.json"), JSON.stringify({ model: "quukk/glm-5.2" }), "utf8");
+      await setupOpsWorkdir(dir, { shell: { kind: "git-bash", bashPath: "C:\\Program Files\\Git\\bin\\bash.exe" } });
+      const cfg = JSON.parse(await readFile(path.join(dir, "opencode.json"), "utf8")) as Record<string, unknown>;
+      expect(cfg.shell).toBe("C:\\Program Files\\Git\\bin\\bash.exe");
+      expect(cfg.model).toBe("quukk/glm-5.2");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not write opencode.json when no git-bash is available", async () => {
+    const dir = path.join(os.tmpdir(), `clawmessenger-ops-test-${Date.now()}`);
+    try {
+      await setupOpsWorkdir(dir, { shell: { kind: "powershell" } });
+      const { existsSync } = await import("node:fs");
+      expect(existsSync(path.join(dir, "opencode.json"))).toBe(false);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -184,5 +232,34 @@ describe("agentNameFromRcUser", () => {
     expect(agentNameFromRcUser("rc_node_3300776275_ops")).toBe("");
     expect(agentNameFromRcUser("")).toBe("");
     expect(agentNameFromRcUser("   ")).toBe("");
+  });
+});
+
+describe("detectOpsShell", () => {
+  it("returns posix off Windows", () => {
+    expect(detectOpsShell({ platform: "linux", exists: () => false }).kind).toBe("posix");
+    expect(detectOpsShell({ platform: "darwin", exists: () => false }).kind).toBe("posix");
+  });
+
+  it("pins git-bash when a known Git for Windows bash exists", () => {
+    const shell = detectOpsShell({
+      platform: "win32",
+      env: {},
+      exists: (p) => p === "C:\\Program Files\\Git\\bin\\bash.exe",
+    });
+    expect(shell).toEqual({ kind: "git-bash", bashPath: "C:\\Program Files\\Git\\bin\\bash.exe" });
+  });
+
+  it("honours the CLAWMESSENGER_OPS_BASH override first", () => {
+    const shell = detectOpsShell({
+      platform: "win32",
+      env: { CLAWMESSENGER_OPS_BASH: "D:\\tools\\bash.exe" },
+      exists: (p) => p === "D:\\tools\\bash.exe",
+    });
+    expect(shell).toEqual({ kind: "git-bash", bashPath: "D:\\tools\\bash.exe" });
+  });
+
+  it("falls back to the truth (powershell) when no git-bash is found", () => {
+    expect(detectOpsShell({ platform: "win32", env: {}, exists: () => false }).kind).toBe("powershell");
   });
 });

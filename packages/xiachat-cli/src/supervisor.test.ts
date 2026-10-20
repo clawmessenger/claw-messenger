@@ -103,6 +103,9 @@ function makeHarness(initialControl: AgentControlState[] = [], bound: unknown[] 
     //   · 更要命的是 onStopped 会 clearSupervisorState(真实路径)，把线上的
     //     supervisor.pid 删掉 —— 下次 `run` / 开机自启就以为没人跑而多起一份。
     daemonPaths: defaultDaemonPaths(join(dir, ".clawmessenger")),
+    // 单例端口锁同理：测试里必须用假锁，否则会在真实 127.0.0.1:41307 上
+    // 和其他并发测试进程（或本机活着的 supervisor）抢同一个端口。
+    acquireLock: () => Promise.resolve({ release: () => {} }),
   });
 
   const run = program.parseAsync(["node", "clawmessenger", "run"]);

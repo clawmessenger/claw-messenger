@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -394,6 +395,69 @@ describe("clawmessenger run (supervisor mode)", () => {
       process.exitCode = previousExitCode;
       sleeper.kill();
     }
+  });
+
+  // pid 文件防线拦不住孤儿 supervisor：pid 文件指向死进程、真身还活着（强杀、
+  // 沙箱回收拉起方等）。端口锁与进程同生死，兜这道缝（2026-10-20 现场两套
+  // 进程树并存两小时，同一条私聊被各答一遍）。
+  it("refuses via the singleton port lock when no live pid file exists", async () => {
+    const keystore = tempKeystore();
+    keystore.save({ nodeId: "node_9", token: "t", serverUrl: "http://srv" });
+    const stateDir = mkdtempSync(join(tmpdir(), "clawmessenger-supervisor-lock-"));
+    dirs.push(stateDir);
+    const paths = defaultDaemonPaths(stateDir);
+    // 不写任何 pid/state 文件 —— findLiveSupervisor 返回 null，走端口锁。
+
+    const lines: string[] = [];
+    const program = buildProgram({
+      keystore,
+      apiFactory: () => ({}) as unknown as XiachatApi,
+      stdout: { write: (s: string) => { lines.push(s); return true; } } as unknown as NodeJS.WriteStream,
+      daemonPaths: paths,
+      // 假锁：直接回 null 模拟「端口已被别人占着」。
+      acquireLock: () => Promise.resolve(null),
+    });
+    const previousExitCode = process.exitCode;
+    try {
+      await program.parseAsync(["node", "clawmessenger", "run"]);
+      const text = lines.join("");
+      expect(text).toContain("singleton lock held, no live pid file");
+      expect(text).toContain("CLAWMESSENGER_ALLOW_DUPLICATE_SUPERVISOR=1");
+      expect(process.exitCode).toBe(1);
+    } finally {
+      process.exitCode = previousExitCode;
+    }
+  });
+
+  it("starts normally when the singleton lock is acquired", async () => {
+    const keystore = tempKeystore();
+    keystore.save({ nodeId: "node_9", token: "t", serverUrl: "http://srv" });
+    const stateDir = mkdtempSync(join(tmpdir(), "clawmessenger-supervisor-lock-ok-"));
+    dirs.push(stateDir);
+    const paths = defaultDaemonPaths(stateDir);
+
+    const lines: string[] = [];
+    let lockReleased = false;
+    const program = buildProgram({
+      keystore,
+      apiFactory: () => ({}) as unknown as XiachatApi,
+      stdout: { write: (s: string) => { lines.push(s); return true; } } as unknown as NodeJS.WriteStream,
+      daemonPaths: paths,
+      acquireLock: () => Promise.resolve({ release: () => { lockReleased = true; } }),
+      // runSupervisor 会拉子进程 —— 用一个会立即失败的 spawn 断掉即可，
+      // 本测试只验证锁获取不挡正常启动路径。
+      spawnChild: (() => {
+        const child = new EventEmitter() as ChildProcess & { pid: number };
+        child.pid = 424242;
+        setTimeout(() => (child as unknown as EventEmitter).emit("exit", 1), 5);
+        return child as unknown as ChildProcess;
+      }) as unknown as typeof spawn,
+    });
+    await program.parseAsync(["node", "clawmessenger", "run"]).catch(() => {});
+    // 启动路径走到了 runSupervisor（锁没拦），无论后续怎么失败都行。
+    expect(lockReleased).toBe(false); // 失败路径由 runSupervisor 的清理负责释放；这里只验证没被锁拒绝
+    const text = lines.join("");
+    expect(text).not.toContain("singleton lock held");
   });
 });
 

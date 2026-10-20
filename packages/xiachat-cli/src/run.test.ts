@@ -9,6 +9,7 @@ import {
   connectTransport,
   createInboundReplayDedupe,
   sendBusyDropNotice,
+  sendStopDropNotice,
   startRunLoop,
 } from "./run.js";
 import type { IMTransport, InboundIMMessage } from "./im.js";
@@ -130,6 +131,59 @@ describe("sendBusyDropNotice (queue-full terminal frame)", () => {
   });
 });
 
+describe("sendStopDropNotice (chat_stop dropped a queued message)", () => {
+  const msg: InboundIMMessage = {
+    objectName: "RC:TxtMsg",
+    fromUserId: "user_1",
+    targetId: "ops_1",
+    conversationType: 1,
+    content: "{}",
+    messageUId: "uid-10",
+  } as unknown as InboundIMMessage;
+
+  function fakeTransport() {
+    const sent: Array<{ to: string; objectName: string; content: string }> = [];
+    const transport = {
+      sent,
+      sendMessage(to: string, objectName: string, content: string): Promise<void> {
+        sent.push({ to, objectName, content });
+        return Promise.resolve();
+      },
+    };
+    return transport as unknown as IMTransport & { sent: typeof sent };
+  }
+
+  it("sends a chat_stream cancelled terminal frame so the placeholder stops spinning", async () => {
+    const transport = fakeTransport();
+    sendStopDropNotice(transport, msg, "ops_1");
+    await new Promise((r) => setTimeout(r, 0));
+    expect(transport.sent).toHaveLength(1);
+    const { to, objectName, content } = transport.sent[0];
+    expect(to).toBe("user_1");
+    expect(objectName).toBe("chat_stream");
+    const frame = JSON.parse(content);
+    expect(frame).toMatchObject({
+      msg_type: "chat_stream",
+      protocol_version: 1,
+      status: "cancelled",
+      text: "",
+      seq: 0,
+      node_id: "ops_1",
+      conversation_type: 1,
+      conversation_id: "user_1",
+      requester_id: "user_1",
+      request_message_id: "uid-10",
+    });
+  });
+
+  it("stays silent for non-private conversations or unknown self id", () => {
+    const transport = fakeTransport();
+    sendStopDropNotice(transport, { ...msg, conversationType: 4 } as InboundIMMessage, "ops_1");
+    sendStopDropNotice(transport, msg, undefined);
+    expect(transport.sent).toHaveLength(0);
+  });
+});
+
 describe("SessionQueue", () => {
   it("serializes messages within one conversation", async () => {
     const q = new SessionQueue({ concurrencyPerConversation: 1 });
@@ -200,6 +254,43 @@ describe("SessionQueue", () => {
     q.enqueue("conv-1", async () => { ranAfter = true; });
     await q.idle();
     expect(ranAfter).toBe(true);
+  });
+
+  it("dropWaiting cancels queued tasks, fires onDropped, and unblocks idle()", async () => {
+    const q = new SessionQueue({ concurrencyPerConversation: 1, queueDepth: 2 });
+    let ran = 0;
+    const running = new Promise<void>((resolve) => {
+      q.enqueue("conv-1", async () => {
+        ran++;
+        await new Promise((r) => setTimeout(r, 30));
+        resolve();
+      });
+    });
+    const droppedFor: string[] = [];
+    q.enqueue("conv-1", async () => { ran++; }, () => { droppedFor.push("second"); });
+    q.enqueue("conv-1", async () => { ran++; }, () => { droppedFor.push("third"); });
+    expect(q.dropWaiting("conv-1")).toBe(2);
+    expect(droppedFor).toEqual(["second", "third"]);
+    // idle 不能被卡死：撤掉的等待任务永远不会跑 finish，dropWaiting 必须补检查。
+    await q.idle();
+    await running;
+    expect(ran).toBe(1); // 只有正在执行的那个跑完，排队的两个被撤
+    // 撤空之后队列还能正常接活。
+    let ranAfter = false;
+    q.enqueue("conv-1", async () => { ranAfter = true; });
+    await q.idle();
+    expect(ranAfter).toBe(true);
+  });
+
+  it("dropWaiting returns 0 and is a no-op when nothing is queued", async () => {
+    const q = new SessionQueue({ concurrencyPerConversation: 1 });
+    let ran = 0;
+    const onDropped = vi.fn();
+    q.enqueue("conv-1", async () => { ran++; });
+    expect(q.dropWaiting("conv-1")).toBe(0);
+    expect(onDropped).not.toHaveBeenCalled();
+    await q.idle();
+    expect(ran).toBe(1);
   });
 });
 

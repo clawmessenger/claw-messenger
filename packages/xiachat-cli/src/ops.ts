@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
-import { mkdir, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { discoverAgents, type AgentInfo } from "./agents.js";
@@ -100,7 +101,7 @@ const OPS_AGENTS_MD_BODY = `
 
 用户口语里的「设备/上线/下线」指的不是这台电脑的电源，而是**本机智能体账号在虾说平台上的在线状态**——它由本机 clawmessenger 后台进程（supervisor）是否运行并连接决定。按下面的映射理解并行动：
 
-- 「设备上线 / 帮我上线 / 恢复在线」→ 先 \`clawmessenger status\`：本账号显示未运行就用 \`clawmessenger agent start <agent>\`；只有 supervisor 本身没在跑时才用 \`clawmessenger start\`（幂等），再 \`status\` 复核在线。
+- 「设备上线 / 帮我上线 / 恢复在线」→ **就是一条命令**：直接 \`clawmessenger agent start <agent>\`（幂等，已在跑会如实告知），然后 \`clawmessenger status\` 复核并把在线结果告诉用户。不要先绕一圈查日志再决定；只有 status 显示 supervisor 本身没在跑时，才先 \`clawmessenger start\` 再 \`agent start\`。
 - 「设备下线 / 离线 / 掉线了」→ 先 \`clawmessenger status\` 和 \`clawmessenger logs\` 判断是进程停了、崩溃退出还是网络/连接问题，再针对性修复（重启、看日志定位）；用户明确要求下线才 \`clawmessenger agent stop <agent>\`，只下线本账号。
 - 「重启一下 / 改完配置让它生效」→ \`clawmessenger agent restart <agent>\`，只重启本账号这一个，不要动整机。
 - 「查看运行状态 / 看看谁在跑 / 卡住了吗」→ \`clawmessenger status\`、\`clawmessenger agents\`、\`clawmessenger logs\`。**只汇报本账号这一个智能体**；同机其他智能体的名字即使出现在输出里也不要展开、不要评价。
@@ -110,12 +111,30 @@ const OPS_AGENTS_MD_BODY = `
 虾说设备端的关键路径（本机）：
 - 命令行：\`clawmessenger\`（status / start / agent start|stop|restart / stop / restart / logs / agents）
 - 数据目录：\`~/.clawmessenger/\`（supervisor.json 运行详情、logs/ 日志、凭据等；凭据内容涉密，不要外发）
+`;
 
+/**
+ * 命令执行环境这一段按**真实探测结果**生成，不再写死。
+ *
+ * 0.2.47 曾直接告诉模型「命令工具是 git-bash」——但那是猜的：opencode 在
+ * Windows 上默认用 PowerShell（现场日志 shell=powershell.EXE），模型照提示词
+ * 写 cat/head/2>/dev/null 全部失败，轮次以「没有正常收尾」中断。现在
+ * setupOpsWorkdir 检测到 git-bash 时会在 workdir 写 opencode.json 把 shell
+ * 钉死成 git-bash（opencode 的 shell 配置对工具调用生效），提示词才敢说
+ * git-bash；检测不到就说 PowerShell。两边必须永远一致。
+ */
+function shellGuidanceSection(shell: OpsShellInfo): string {
+  const failureRule = `
+任何一条命令失败后**必须先用一句话说明失败原因、再决定下一步**（换写法重试或告诉用户
+卡在哪）；失败后直接停住不说话，会让用户只看到半句话和一个失败提示。
+`;
+  if (shell.kind === "git-bash") {
+    return `
 ## 命令执行环境（先看这条，别猜 shell）
 
-你的命令工具（bash）在 Windows 上走的是 **git-bash**，不是 PowerShell。把 PowerShell
-命令写进去只会得到 \`command not found\`，而且一旦这条命令失败、你又没再说话，这一轮就
-会被判为「没有正常收尾」直接中断（用户看到的是「回答可能只有半句」）。所以：
+你的命令工具（bash）在本机已被固定为 **git-bash**（${shell.bashPath}），不是 PowerShell。
+把 PowerShell 命令写进去只会得到 \`command not found\`，而且一旦命令失败、你又没再说话，
+这一轮就会被判为「没有正常收尾」直接中断（用户看到的是「回答可能只有半句」）。所以：
 
 - 看文件用 \`cat <file>\`、\`head -n 50 <file>\`、\`tail -n 50 <file>\`；查日志用
   \`clawmessenger logs\` 或 \`tail -n 100 ~/.clawmessenger/logs/supervisor.log\`。
@@ -132,10 +151,34 @@ const OPS_AGENTS_MD_BODY = `
 | \`$env:USERPROFILE\` | \`$HOME\` |
 
 确实必须用 PowerShell 时，显式起一个进程：\`powershell -NoProfile -Command '...'\`。
+${failureRule}`;
+  }
+  if (shell.kind === "powershell") {
+    return `
+## 命令执行环境（先看这条，别猜 shell）
 
-任何一条命令失败后**必须先用一句话说明失败原因、再决定下一步**（换写法重试或告诉用户
-卡在哪）；失败后直接停住不说话，会让用户只看到半句话和一个失败提示。
+你的命令工具（bash）在本机走的是 **Windows PowerShell**，不是 bash/git-bash。把
+\`cat | head\`、\`tail -n\`、\`2>/dev/null\`、\`sleep 5\` 这类 bash 写法写进去只会报错，
+而且一旦命令失败、你又没再说话，这一轮就会被判为「没有正常收尾」直接中断（用户看到的
+是「回答可能只有半句」）。所以：
 
+- 运维动作一律优先 \`clawmessenger\` 子命令（status / logs / agent start|stop|restart），
+  它们在任何 shell 下都能跑。
+- 读文件优先用内置文件读取工具，不要走 shell；必须用 shell 时写 PowerShell 语法：
+  看日志末尾 \`Get-Content "$HOME\\.clawmessenger\\logs\\supervisor.log" -Tail 100\`，
+  过滤用 \`Select-String\`，等待用 \`Start-Sleep -Seconds 5\`，家目录写 \`$HOME\`。
+- **不要**写 \`&&\`（PowerShell 5.1 不支持）；多条命令用 \`;\` 分隔或分次执行。
+${failureRule}`;
+  }
+  return `
+## 命令执行环境
+
+你的命令工具是 POSIX shell（bash/zsh）：\`cat\`、\`tail -n 100\`、\`grep\`、\`sleep 5\`
+都可用；查日志用 \`clawmessenger logs\` 或 \`tail -n 100 ~/.clawmessenger/logs/supervisor.log\`。
+${failureRule}`;
+}
+
+const OPS_AGENTS_MD_CONSTRAINTS = `
 ## 约束
 
 - 只处理与本机运维相关的请求；闲聊或与运维无关的问题礼貌拒绝并引导回运维主题。
@@ -148,6 +191,52 @@ export interface OpsWorkdirOptions {
   opsFor?: string;
   /** 该 agent 的名字（如 opencode），用于在提示词里点明服务对象。 */
   agentName?: string;
+  /** 命令工具的 shell 形态；缺省按主机探测（detectOpsShell）。 */
+  shell?: OpsShellInfo;
+}
+
+/**
+ * 运维轮次命令工具实际使用的 shell。
+ *
+ * opencode 的 bash 工具在 Windows 上默认用 PowerShell，除非配置里把 shell
+ * 钉成别的（opencode.json 的 shell 键对工具调用同样生效）。提示词里关于
+ * shell 的每一句话都必须和这个探测结果一致，否则模型按提示词写的命令
+ * 会在真实 shell 里语法报错（0.2.47 的教训：写死 git-bash，实际是
+ * PowerShell，运维轮次集体「没有正常收尾」）。
+ */
+export interface OpsShellInfo {
+  kind: "git-bash" | "powershell" | "posix";
+  /** kind=git-bash 时 bash.exe 的绝对路径（写进 opencode.json 钉死用）。 */
+  bashPath?: string;
+}
+
+export interface DetectOpsShellDeps {
+  platform?: NodeJS.Platform;
+  env?: NodeJS.ProcessEnv;
+  exists?: (p: string) => boolean;
+}
+
+/**
+ * 探测本机运维轮次可用的 shell。Windows 上优先找 git-bash（找到就在
+ * setupOpsWorkdir 里把它写进 opencode.json 钉死，提示词与执行环境同时
+ * 确定）；找不到就如实按 PowerShell 生成提示词。CLAWMESSENGER_OPS_BASH
+ * 可显式指定 bash 路径。绝不把 WSL 的 bash（System32 下）当 git-bash —
+ * 它的路径语义（/mnt/c/…）和主机文件系统不一致，用来运维只会更乱。
+ */
+export function detectOpsShell(deps: DetectOpsShellDeps = {}): OpsShellInfo {
+  const platform = deps.platform ?? process.platform;
+  if (platform !== "win32") return { kind: "posix" };
+  const env = deps.env ?? process.env;
+  const exists = deps.exists ?? existsSync;
+  const candidates = [
+    env.CLAWMESSENGER_OPS_BASH,
+    "C:\\Program Files\\Git\\bin\\bash.exe",
+    "C:\\Program Files (x86)\\Git\\bin\\bash.exe",
+  ];
+  for (const candidate of candidates) {
+    if (candidate && exists(candidate)) return { kind: "git-bash", bashPath: candidate };
+  }
+  return { kind: "powershell" };
 }
 
 /**
@@ -182,7 +271,38 @@ export function agentNameFromRcUser(rcUser: string): string {
 }
 
 export function buildOpsAgentsMd(options: OpsWorkdirOptions = {}): string {
-  return `${OPS_AGENTS_MD_HEAD}\n${serviceScopeSection(options)}${OPS_AGENTS_MD_BODY}`;
+  const shell = options.shell ?? detectOpsShell();
+  return (
+    `${OPS_AGENTS_MD_HEAD}\n${serviceScopeSection(options)}${OPS_AGENTS_MD_BODY}`
+    + `${shellGuidanceSection(shell)}\n${OPS_AGENTS_MD_CONSTRAINTS}`
+  );
+}
+
+/**
+ * 把命令 shell 钉死在 workdir 的 opencode.json 里（opencode 的 shell 配置
+ * 对 bash 工具调用同样生效）。只有探测到 git-bash 才写 —— 钉死之后提示词
+ * 里的 git-bash 说法才成立；探测不到就保持 opencode 默认（Windows 上是
+ * PowerShell），提示词也按 PowerShell 生成，两边一致。
+ *
+ * 已有 opencode.json 时只合并 shell 键，不丢用户/旧版写入的其他键；解析
+ * 失败就整体重写（这个文件本来就由我们管理）。
+ */
+async function pinOpsShell(dir: string, shell: OpsShellInfo): Promise<void> {
+  if (shell.kind !== "git-bash" || !shell.bashPath) return;
+  const file = path.join(dir, "opencode.json");
+  let config: Record<string, unknown> = {};
+  try {
+    const parsed: unknown = JSON.parse(await readFile(file, "utf8"));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      config = parsed as Record<string, unknown>;
+    }
+  } catch {
+    // 不存在或损坏：按新文件写。
+  }
+  if (config.shell === shell.bashPath) return;
+  config.$schema = "https://opencode.ai/config.json";
+  config.shell = shell.bashPath;
+  await writeFile(file, `${JSON.stringify(config, null, 2)}\n`, "utf8");
 }
 
 // Ops turns run inside this workdir so opencode picks up AGENTS.md as the
@@ -195,6 +315,8 @@ export async function setupOpsWorkdir(
 ): Promise<string> {
   const dir = dirOverride ?? path.join(os.homedir(), ".clawmessenger", "ops");
   await mkdir(dir, { recursive: true });
-  await writeFile(path.join(dir, "AGENTS.md"), buildOpsAgentsMd(options), "utf8");
+  const shell = options.shell ?? detectOpsShell();
+  await writeFile(path.join(dir, "AGENTS.md"), buildOpsAgentsMd({ ...options, shell }), "utf8");
+  await pinOpsShell(dir, shell);
   return dir;
 }

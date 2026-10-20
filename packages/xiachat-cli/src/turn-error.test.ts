@@ -84,8 +84,10 @@ describe("buildAutoContinuationPrompt（撞失败工具后的自动补跑提示�
     expect(prompt).toContain("执行命令");
     expect(prompt).toContain("Get-Content x -Tail 50");
     expect(prompt).toContain("command not found");
-    // 必须提醒 shell 是 git-bash —— 否则补跑会再犯同一个错。
-    expect(prompt).toContain("git-bash");
+    // 必须提醒「别再猜 shell 种类」—— 0.2.47 写死 git-bash 的教训：真实 shell
+    // 可能是 PowerShell，提示词只能给 shell 无关的通用指引。
+    expect(prompt).toContain("shell 语法不兼容");
+    expect(prompt).toContain("clawmessenger 子命令");
   });
 
   it("没有 failedStep 时也能给出通用提示（不崩）", () => {

@@ -1,6 +1,7 @@
 import { Command } from "commander";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
+import { createServer as createNetServer } from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Keystore, type StoredCredentials } from "./keystore.js";
@@ -155,6 +156,50 @@ export interface BuildProgramOpts {
   // Injectable for tests; the state/pid files the supervisor writes about itself
   // (default: ~/.clawmessenger). Must agree with whatever `daemon` above uses.
   daemonPaths?: DaemonPaths;
+  // Injectable for tests; defaults to acquireSupervisorLock (loopback port
+  // singleton). Tests substitute an in-memory fake so parallel test processes
+  // don't collide on the real port.
+  acquireLock?: (port: number) => Promise<SupervisorLock | null>;
+}
+
+/**
+ * supervisor 单例锁：一个监听中的回环端口，随进程生死由 OS 释放。
+ */
+export interface SupervisorLock {
+  release(): void;
+}
+
+/**
+ * 第二道单例防线（第一道是 daemon 的 pid 文件检查 findLiveSupervisor）。
+ *
+ * pid 文件防线拦不住「活着但没登记」的孤儿 supervisor：强杀、沙箱回收
+ * 拉起方进程等场景会让 pid 文件指向死进程，而真正的旧 supervisor 还活着
+ * （2026-10-20 现场：13:23 的后台树与 18:38 的前台 `run` 并存两小时，同一
+ * 条私聊被两套 ops 子进程各答一遍，chat_stop 只能停掉其中一套）。端口锁
+ * 不依赖任何文件状态的准确性：绑不上 127.0.0.1:port 就是有另一份在跑。
+ *
+ * 只在 supervisor 模式（不带 --agent）获取；agent 子进程由 supervisor
+ * 拉起，天然共享租约。EADDRINUSE 之外的绑定失败（如权限）只告警不放行
+ * 拦截 —— 可用性优先，pid 文件防线仍在。
+ */
+export const SUPERVISOR_LOCK_PORT = 41307;
+
+export async function acquireSupervisorLock(port: number = SUPERVISOR_LOCK_PORT): Promise<SupervisorLock | null> {
+  const server = createNetServer();
+  return await new Promise<SupervisorLock | null>((resolve, reject) => {
+    server.once("error", (err: NodeJS.ErrnoException) => {
+      if (err.code === "EADDRINUSE") {
+        resolve(null);
+        return;
+      }
+      reject(err);
+    });
+    server.listen(port, "127.0.0.1", () => {
+      server.removeAllListeners("error");
+      // 监听 socket 只作租约，不接收连接。
+      resolve({ release: () => server.close() });
+    });
+  });
 }
 
 export function buildProgram(opts: BuildProgramOpts): Command {
@@ -162,7 +207,7 @@ export function buildProgram(opts: BuildProgramOpts): Command {
   program
     .name("clawmessenger")
     .description("User-device agent CLI over RongCloud IM")
-    .version("0.2.48")
+    .version("0.2.49")
     // Tests parse this program in-process; commander would otherwise
     // process.exit on missing options and kill the vitest runner.
     .exitOverride();
@@ -419,6 +464,32 @@ export function buildProgram(opts: BuildProgramOpts): Command {
           );
           process.exitCode = 1;
           return;
+        }
+        // pid 文件查不到不等于没有：孤儿 supervisor（pid 文件被后来者覆盖指向
+        // 死进程）还活着时会放行出第二套进程树。端口锁与进程同生死，兜底这道缝。
+        if (!allowDuplicateSupervisor()) {
+          const acquire = opts.acquireLock ?? acquireSupervisorLock;
+          let lock: SupervisorLock | null = null;
+          let lockCheckError = false;
+          try {
+            lock = await acquire(SUPERVISOR_LOCK_PORT);
+          } catch (err) {
+            // 非 EADDRINUSE 的绑定失败（如权限）不误伤正常启动：告警后放行，
+            // pid 文件防线仍在。
+            lockCheckError = true;
+            console.warn("supervisor lock check failed:", err instanceof Error ? err.message : String(err));
+          }
+          if (!lock && !lockCheckError) {
+            opts.stdout.write(
+              "another clawmessenger supervisor is already running (singleton lock held, no live pid file —\n" +
+                "an orphaned supervisor from an earlier start is still alive). Refusing a second one: both\n" +
+                "would log in as the same RongCloud nodes and answer every private message twice.\n\n" +
+                "  find and stop it: clawmessenger stop (or kill the stale clawmessenger.exe processes)\n" +
+                `  start anyway     : set ${ALLOW_DUPLICATE_SUPERVISOR_ENV}=1\n`,
+            );
+            process.exitCode = 1;
+            return;
+          }
         }
         await runSupervisor({
           opts,
