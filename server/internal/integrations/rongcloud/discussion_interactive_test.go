@@ -417,6 +417,29 @@ func TestInteractiveRetryAcceptsStatus(t *testing.T) {
 // TestInteractiveHistoryBlock_FeedsHostThisRound 钉住主持人拿不到素材的回归：
 // 出本轮纪要的那一次派发必须把本轮成员发言带上，否则主持人只会回
 // 「缺少前序发言记录，无法复述成员立场与分歧。请提供第 N 轮的发言内容」。
+// TestInteractiveHistoryBlock_HostRevisionCarriesFullPriorDocument 修订模式下主持人
+// 必须拿到上一版产物全文（按剩余预算尽量完整），而不是旧逻辑的 1500 字截断 ——
+// 任务要求「在上一版基础上修订」，底稿缺席就只能重写。
+func TestInteractiveHistoryBlock_HostRevisionCarriesFullPriorDocument(t *testing.T) {
+	doc := strings.Repeat("产", 2600) // 超过旧 interactiveSummaryClip(1500)
+	history := interactiveHistory{
+		contributions: []interactiveStatement{{Round: 2, MemberID: "m1", RoleName: "甲", Content: "本轮新观点"}},
+		summaries:     []interactiveStatement{{Round: 1, MemberID: "h", RoleName: "主持", Content: doc}},
+	}
+	block := interactiveHistoryBlock(history, 2, true, interactivePromptContextLimit)
+	if !strings.Contains(block, "[上一版产物]") {
+		t.Fatalf("host revision context must carry prior document: %q", block[:200])
+	}
+	// 底稿长度 ~2600 + 头尾标注 ≤ 预算 4000：必须整段给到，不能按 1500 截断。
+	if !strings.Contains(block, strings.Repeat("产", 2600)) {
+		t.Errorf("prior document was clipped; revision mode needs the full text, got %d runes of it",
+			strings.Count(block, "产"))
+	}
+	if !strings.Contains(block, "本轮新观点") {
+		t.Errorf("this-round statements must still be included: %q", block[:200])
+	}
+}
+
 func TestInteractiveHistoryBlock_FeedsHostThisRound(t *testing.T) {
 	history := interactiveHistory{contributions: []interactiveStatement{
 		{Round: 1, MemberID: "m1", RoleName: "观看着", Content: "我认为应该先做 A。"},

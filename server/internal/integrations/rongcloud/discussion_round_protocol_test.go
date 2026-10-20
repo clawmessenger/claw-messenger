@@ -52,9 +52,10 @@ func TestInteractiveRoundTaskStalledBranchDropsRestating(t *testing.T) {
 
 func TestInteractiveHostTaskKeepsDissentSection(t *testing.T) {
 	task := interactiveHostTask(2, false, 0)
+	// 第 2 轮起是修订模式：在上一版产物基础上修订，四段结构与「建议」行保持不变。
 	for _, want := range []string{
-		"【已达成的共识】", "【仍存在的分歧】", "【未解决的问题】", "【下一轮聚焦】",
-		"不要为了好看把异议磨平", "建议：继续", "建议：结束",
+		"第 2 轮", "在它的基础上修订", "完整的新版全文", "【已达成的共识】", "【仍存在的分歧】",
+		"【未解决的问题】", "【下一轮聚焦】", "建议：继续", "建议：结束",
 	} {
 		if !strings.Contains(task, want) {
 			t.Errorf("主持人任务缺少 %q：\n%s", want, task)
@@ -67,6 +68,17 @@ func TestInteractiveHostTaskKeepsDissentSection(t *testing.T) {
 	stalledTask := interactiveHostTask(2, true, 0.9)
 	if !strings.Contains(stalledTask, "90%") || !strings.Contains(stalledTask, "没有产生新信息") {
 		t.Errorf("停滞时纪要任务必须点明无新信息：\n%s", stalledTask)
+	}
+
+	// 第 1 轮仍是起草模式（没有上一版可修订），但同样要有四段结构与 dissent 底线。
+	firstTask := interactiveHostTask(1, false, 0)
+	for _, want := range []string{
+		"第 1 轮", "第一版", "【已达成的共识】", "【仍存在的分歧】",
+		"不要为了好看把异议磨平", "建议：继续", "建议：结束",
+	} {
+		if !strings.Contains(firstTask, want) {
+			t.Errorf("第 1 轮主持任务缺少 %q：\n%s", want, firstTask)
+		}
 	}
 }
 
