@@ -138,9 +138,17 @@ fi
 cd "$CWD" || die "无法进入工作目录：$CWD"
 
 while IFS= read -r -d '' kv; do
-  case "${kv%%=*}" in
+  key="${kv%%=*}"
+  case "$key" in
     PWD|OLDPWD|SHLVL|_|BASH_EXECUTION_STRING) continue ;;
+    # 交互 shell 会把函数导出成 BASH_FUNC_which%%=() { ... } 塞进环境变量，
+    # 旧进程若从这种 shell 起来，/proc/<pid>/environ 里就带着它。
+    # 键名含 % 与空格，export 会刷一行 "not a valid identifier"。
+    BASH_FUNC_*) continue ;;
   esac
+  # 只导出合法标识符：environ 里可能混着别的不合规键，没有校验就只能靠
+  # export 报错，而报错既难读、又容易被误认为「环境变量没继承」而白查一轮。
+  [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
   export "$kv"
 done < "$ENV_SNAP" || true
 rm -f "$ENV_SNAP"
@@ -161,8 +169,31 @@ if [ -z "$NEWPID" ]; then
   exit 1
 fi
 info "已启动，新 pid=$NEWPID"
+
+# ---------- 7. 健康检查（认 commit，别只看 200） ----------
+# 200 只证明端口上有东西在应答：重启没能绑定端口时，旧实例会继续服务，
+# 于是「重启成功」其实是没换代码。commit 是编译时注入的，只有它等于本次
+# 构建的 commit，才算真的部署上去了。
+BASE_URL="http://127.0.0.1:${PORT_VAL:-5101}"
 info "健康检查："
-curl -s -o /dev/null -w '  http://127.0.0.1:%{remote_port} => http=%{http_code}\n' \
-  "http://127.0.0.1:${PORT_VAL:-5101}/healthz" 2>/dev/null || \
-  warn "curl 不可用，请手动检查 http://127.0.0.1:${PORT_VAL:-5101}/healthz"
+LIVE="$(curl -fsS --max-time 5 "$BASE_URL/health" 2>/dev/null || true)"
+if [ -z "$LIVE" ]; then
+  warn "  $BASE_URL/health 无响应"
+else
+  info "  $BASE_URL/health => $LIVE"
+  LIVE_COMMIT="$(printf '%s' "$LIVE" | sed -n 's/.*"commit":"\([^"]*\)".*/\1/p')"
+  LIVE_PID="$(printf '%s' "$LIVE" | sed -n 's/.*"pid":\([0-9]*\).*/\1/p')"
+  if [ "$SKIP_BUILD" = 0 ] && [ -n "$LIVE_COMMIT" ] && [ "$LIVE_COMMIT" != "${COMMIT:-}" ]; then
+    warn "  commit 不一致：构建=${COMMIT:-?} 运行中=$LIVE_COMMIT（旧实例没退掉，或代码没拉到最新）"
+  fi
+  if [ -n "$LIVE_PID" ] && [ "$LIVE_PID" != "$NEWPID" ]; then
+    warn "  pid 不一致：pgrep 找到 $NEWPID，应答 /health 的是 $LIVE_PID"
+  fi
+fi
+READY_CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$BASE_URL/healthz" 2>/dev/null || true)"
+if [ "${READY_CODE:-000}" = "200" ]; then
+  info "  $BASE_URL/healthz => http=200"
+else
+  warn "  $BASE_URL/healthz => http=${READY_CODE:-无响应}（数据库或迁移未就绪，看日志）"
+fi
 info "完成。"
