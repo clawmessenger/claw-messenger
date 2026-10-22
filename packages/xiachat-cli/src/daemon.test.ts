@@ -638,13 +638,24 @@ describe("daemon install-service (macOS / Windows)", () => {
   it("writes a hidden logon launcher into the Startup folder on Windows", async () => {
     const appData = join(tmpdir(), `clawmessenger-appdata-${Date.now()}`);
     dirs.push(appData);
-    const h = harness({ platform: "win32", env: { APPDATA: appData, PATH: "C:\\bin" } });
+    // 带空格的安装路径是 Windows 常态（C:\Program Files\...），正好压住两层引号：
+    // 内层是 shell 命令行的引号，外层是 VBScript 字符串字面量。0.2.49 及之前漏了
+    // 外层开引号，落盘成 `sh.Run ""C:\...exe"" run` —— VBScript 报语法错误，自启
+    // 从未生效（2026-10-22 重启后运维节点集体离线）。
+    const winExe = "C:\\Program Files\\clawmessenger\\clawmessenger.exe";
+    const h = harness({
+      platform: "win32",
+      env: { APPDATA: appData, PATH: "C:\\bin" },
+      selfArgv: () => ({ exec: winExe, args: [] }),
+    });
     await h.daemon.installService();
 
     const vbs = join(appData, "Microsoft", "Windows", "Start Menu", "Programs", "Startup", "clawmessenger.vbs");
     expect(existsSync(vbs)).toBe(true);
     const body = readFileSync(vbs, "utf8");
-    expect(body).toContain(`sh.Run ""${EXE}"" run, 0, False`);
+    expect(body).toContain(`sh.Run """${winExe}"" run", 0, False`);
+    // cwd 必须钉死：登录自启时 wscript 的 cwd 是 System32，agent 会在那里找配置。
+    expect(body).toContain(`sh.CurrentDirectory = "${h.home}"`);
     expect(h.lines.join("")).toContain("installed logon autostart");
   });
 });
