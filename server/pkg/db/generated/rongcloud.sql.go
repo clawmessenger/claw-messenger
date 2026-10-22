@@ -14,7 +14,7 @@ import (
 const backfillRongCloudPairingSessionCandidates = `-- name: BackfillRongCloudPairingSessionCandidates :one
 UPDATE rongcloud_pairing_session SET candidate_node_ids = $2, updated_at = now()
 WHERE ticket = $1 AND status = 'pending'
-RETURNING id, workspace_id, ticket, status, client_claim_key, idempotency_key, candidate_node_ids, expires_at, created_at, updated_at, reported_agents, bound_agents
+RETURNING id, workspace_id, ticket, status, client_claim_key, idempotency_key, candidate_node_ids, expires_at, created_at, updated_at, reported_agents, bound_agents, user_code, device_info
 `
 
 type BackfillRongCloudPairingSessionCandidatesParams struct {
@@ -38,6 +38,8 @@ func (q *Queries) BackfillRongCloudPairingSessionCandidates(ctx context.Context,
 		&i.UpdatedAt,
 		&i.ReportedAgents,
 		&i.BoundAgents,
+		&i.UserCode,
+		&i.DeviceInfo,
 	)
 	return i, err
 }
@@ -358,11 +360,59 @@ func (q *Queries) CreateRongCloudNodeModelCatalog(ctx context.Context, arg Creat
 	return i, err
 }
 
+const createRongCloudPairingDeviceSession = `-- name: CreateRongCloudPairingDeviceSession :one
+
+INSERT INTO rongcloud_pairing_session (workspace_id, ticket, user_code, status, candidate_node_ids, reported_agents, device_info, expires_at)
+VALUES ($1, $2, $3, 'pending', '[]'::jsonb, $4, $5, $6)
+RETURNING id, workspace_id, ticket, status, client_claim_key, idempotency_key, candidate_node_ids, expires_at, created_at, updated_at, reported_agents, bound_agents, user_code, device_info
+`
+
+type CreateRongCloudPairingDeviceSessionParams struct {
+	WorkspaceID    pgtype.UUID        `json:"workspace_id"`
+	Ticket         string             `json:"ticket"`
+	UserCode       pgtype.Text        `json:"user_code"`
+	ReportedAgents []byte             `json:"reported_agents"`
+	DeviceInfo     []byte             `json:"device_info"`
+	ExpiresAt      pgtype.Timestamptz `json:"expires_at"`
+}
+
+// =====================
+// rongcloud_pairing_session device-code flow (598)
+// =====================
+func (q *Queries) CreateRongCloudPairingDeviceSession(ctx context.Context, arg CreateRongCloudPairingDeviceSessionParams) (RongcloudPairingSession, error) {
+	row := q.db.QueryRow(ctx, createRongCloudPairingDeviceSession,
+		arg.WorkspaceID,
+		arg.Ticket,
+		arg.UserCode,
+		arg.ReportedAgents,
+		arg.DeviceInfo,
+		arg.ExpiresAt,
+	)
+	var i RongcloudPairingSession
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.Ticket,
+		&i.Status,
+		&i.ClientClaimKey,
+		&i.IdempotencyKey,
+		&i.CandidateNodeIds,
+		&i.ExpiresAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.ReportedAgents,
+		&i.BoundAgents,
+		&i.UserCode,
+		&i.DeviceInfo,
+	)
+	return i, err
+}
+
 const createRongCloudPairingSession = `-- name: CreateRongCloudPairingSession :one
 
 INSERT INTO rongcloud_pairing_session (workspace_id, ticket, status, client_claim_key, idempotency_key, candidate_node_ids, expires_at)
 VALUES ($1, $2, $3, $4, $5, $6, $7)
-RETURNING id, workspace_id, ticket, status, client_claim_key, idempotency_key, candidate_node_ids, expires_at, created_at, updated_at, reported_agents, bound_agents
+RETURNING id, workspace_id, ticket, status, client_claim_key, idempotency_key, candidate_node_ids, expires_at, created_at, updated_at, reported_agents, bound_agents, user_code, device_info
 `
 
 type CreateRongCloudPairingSessionParams struct {
@@ -402,6 +452,8 @@ func (q *Queries) CreateRongCloudPairingSession(ctx context.Context, arg CreateR
 		&i.UpdatedAt,
 		&i.ReportedAgents,
 		&i.BoundAgents,
+		&i.UserCode,
+		&i.DeviceInfo,
 	)
 	return i, err
 }
@@ -745,7 +797,7 @@ func (q *Queries) GetRongCloudNodeByRongCloudUserID(ctx context.Context, rongclo
 }
 
 const getRongCloudPairingSessionByTicket = `-- name: GetRongCloudPairingSessionByTicket :one
-SELECT id, workspace_id, ticket, status, client_claim_key, idempotency_key, candidate_node_ids, expires_at, created_at, updated_at, reported_agents, bound_agents FROM rongcloud_pairing_session WHERE ticket = $1
+SELECT id, workspace_id, ticket, status, client_claim_key, idempotency_key, candidate_node_ids, expires_at, created_at, updated_at, reported_agents, bound_agents, user_code, device_info FROM rongcloud_pairing_session WHERE ticket = $1
 `
 
 func (q *Queries) GetRongCloudPairingSessionByTicket(ctx context.Context, ticket string) (RongcloudPairingSession, error) {
@@ -764,6 +816,34 @@ func (q *Queries) GetRongCloudPairingSessionByTicket(ctx context.Context, ticket
 		&i.UpdatedAt,
 		&i.ReportedAgents,
 		&i.BoundAgents,
+		&i.UserCode,
+		&i.DeviceInfo,
+	)
+	return i, err
+}
+
+const getRongCloudPairingSessionByUserCode = `-- name: GetRongCloudPairingSessionByUserCode :one
+SELECT id, workspace_id, ticket, status, client_claim_key, idempotency_key, candidate_node_ids, expires_at, created_at, updated_at, reported_agents, bound_agents, user_code, device_info FROM rongcloud_pairing_session WHERE user_code = $1
+`
+
+func (q *Queries) GetRongCloudPairingSessionByUserCode(ctx context.Context, userCode pgtype.Text) (RongcloudPairingSession, error) {
+	row := q.db.QueryRow(ctx, getRongCloudPairingSessionByUserCode, userCode)
+	var i RongcloudPairingSession
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.Ticket,
+		&i.Status,
+		&i.ClientClaimKey,
+		&i.IdempotencyKey,
+		&i.CandidateNodeIds,
+		&i.ExpiresAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.ReportedAgents,
+		&i.BoundAgents,
+		&i.UserCode,
+		&i.DeviceInfo,
 	)
 	return i, err
 }
@@ -1479,7 +1559,7 @@ func (q *Queries) UpdateRongCloudNodeDeployStatus(ctx context.Context, arg Updat
 const updateRongCloudPairingSessionBoundAgents = `-- name: UpdateRongCloudPairingSessionBoundAgents :one
 UPDATE rongcloud_pairing_session SET bound_agents = $2, updated_at = now()
 WHERE ticket = $1 AND status = 'claimed'
-RETURNING id, workspace_id, ticket, status, client_claim_key, idempotency_key, candidate_node_ids, expires_at, created_at, updated_at, reported_agents, bound_agents
+RETURNING id, workspace_id, ticket, status, client_claim_key, idempotency_key, candidate_node_ids, expires_at, created_at, updated_at, reported_agents, bound_agents, user_code, device_info
 `
 
 type UpdateRongCloudPairingSessionBoundAgentsParams struct {
@@ -1503,12 +1583,14 @@ func (q *Queries) UpdateRongCloudPairingSessionBoundAgents(ctx context.Context, 
 		&i.UpdatedAt,
 		&i.ReportedAgents,
 		&i.BoundAgents,
+		&i.UserCode,
+		&i.DeviceInfo,
 	)
 	return i, err
 }
 
 const updateRongCloudPairingSessionClaim = `-- name: UpdateRongCloudPairingSessionClaim :one
-UPDATE rongcloud_pairing_session SET status = 'claimed', idempotency_key = $2, updated_at = now() WHERE id = $1 RETURNING id, workspace_id, ticket, status, client_claim_key, idempotency_key, candidate_node_ids, expires_at, created_at, updated_at, reported_agents, bound_agents
+UPDATE rongcloud_pairing_session SET status = 'claimed', idempotency_key = $2, updated_at = now() WHERE id = $1 RETURNING id, workspace_id, ticket, status, client_claim_key, idempotency_key, candidate_node_ids, expires_at, created_at, updated_at, reported_agents, bound_agents, user_code, device_info
 `
 
 type UpdateRongCloudPairingSessionClaimParams struct {
@@ -1532,6 +1614,8 @@ func (q *Queries) UpdateRongCloudPairingSessionClaim(ctx context.Context, arg Up
 		&i.UpdatedAt,
 		&i.ReportedAgents,
 		&i.BoundAgents,
+		&i.UserCode,
+		&i.DeviceInfo,
 	)
 	return i, err
 }
@@ -1539,7 +1623,7 @@ func (q *Queries) UpdateRongCloudPairingSessionClaim(ctx context.Context, arg Up
 const updateRongCloudPairingSessionReportedAgents = `-- name: UpdateRongCloudPairingSessionReportedAgents :one
 UPDATE rongcloud_pairing_session SET reported_agents = $2, updated_at = now()
 WHERE ticket = $1 AND status IN ('pending', 'claimed')
-RETURNING id, workspace_id, ticket, status, client_claim_key, idempotency_key, candidate_node_ids, expires_at, created_at, updated_at, reported_agents, bound_agents
+RETURNING id, workspace_id, ticket, status, client_claim_key, idempotency_key, candidate_node_ids, expires_at, created_at, updated_at, reported_agents, bound_agents, user_code, device_info
 `
 
 type UpdateRongCloudPairingSessionReportedAgentsParams struct {
@@ -1563,12 +1647,14 @@ func (q *Queries) UpdateRongCloudPairingSessionReportedAgents(ctx context.Contex
 		&i.UpdatedAt,
 		&i.ReportedAgents,
 		&i.BoundAgents,
+		&i.UserCode,
+		&i.DeviceInfo,
 	)
 	return i, err
 }
 
 const updateRongCloudPairingSessionStatus = `-- name: UpdateRongCloudPairingSessionStatus :one
-UPDATE rongcloud_pairing_session SET status = $2, updated_at = now() WHERE id = $1 RETURNING id, workspace_id, ticket, status, client_claim_key, idempotency_key, candidate_node_ids, expires_at, created_at, updated_at, reported_agents, bound_agents
+UPDATE rongcloud_pairing_session SET status = $2, updated_at = now() WHERE id = $1 RETURNING id, workspace_id, ticket, status, client_claim_key, idempotency_key, candidate_node_ids, expires_at, created_at, updated_at, reported_agents, bound_agents, user_code, device_info
 `
 
 type UpdateRongCloudPairingSessionStatusParams struct {
@@ -1592,6 +1678,8 @@ func (q *Queries) UpdateRongCloudPairingSessionStatus(ctx context.Context, arg U
 		&i.UpdatedAt,
 		&i.ReportedAgents,
 		&i.BoundAgents,
+		&i.UserCode,
+		&i.DeviceInfo,
 	)
 	return i, err
 }

@@ -9,9 +9,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/big"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/util"
 	"github.com/multica-ai/multica/server/internal/util/secretbox"
@@ -244,4 +248,198 @@ func (s *PairingService) ClaimSession(ctx context.Context, ticket, clientClaimKe
 		DeviceSecret:       credSecret,
 		NodeID:             node.NodeID,
 	}, nil
+}
+
+// =============== device-code pairing (browser authorization) ===============
+
+// userCodeAlphabet is a 31-char alphabet with the visually ambiguous
+// characters (I, O, 0, 1) removed, so a user can hand-type the code from a
+// terminal into a browser without mistaking glyphs.
+const userCodeAlphabet = "ABCDEFGHJKMNPQRSTVWXYZ23456789"
+
+const userCodeLen = 8
+
+// generateUserCode returns an 8-char user code drawn from userCodeAlphabet
+// with crypto/rand. Uniqueness is enforced by a partial unique index; the
+// caller retries on collision.
+func generateUserCode() (string, error) {
+	out := make([]byte, userCodeLen)
+	max := big.NewInt(int64(len(userCodeAlphabet)))
+	for i := range out {
+		// 256 % 31 leaves a small modular bias; acceptable for a
+		// non-secret, collision-retried lookup key.
+		idx, err := rand.Int(rand.Reader, max)
+		if err != nil {
+			return "", fmt.Errorf("rongcloud: user code entropy: %w", err)
+		}
+		out[i] = userCodeAlphabet[idx.Int64()]
+	}
+	return string(out), nil
+}
+
+// DeviceSessionParams describes one terminal-initiated pairing session. It is
+type DeviceSessionParams struct {
+	WorkspaceID pgtype.UUID
+	MachineID   string
+	Hostname    string
+	Platform    string
+	Agents      []string
+	ExpiresIn   time.Duration
+}
+
+// CreateDeviceSession starts a pairing session on behalf of a terminal
+// client: the device reports its identity and discovered agent CLIs, and
+// gets back a ticket (opaque to the user) plus an 8-char user code that the
+// human types into the browser verify page. The workspace is resolved by
+// the caller (single-install assumption), matching ClawCreatePairing.
+func (s *PairingService) CreateDeviceSession(ctx context.Context, p DeviceSessionParams) (db.RongcloudPairingSession, error) {
+	if s.queries == nil {
+		return db.RongcloudPairingSession{}, errors.New("rongcloud: database not configured")
+	}
+	if p.ExpiresIn == 0 {
+		p.ExpiresIn = 15 * time.Minute
+	}
+	// Dedupe and cap the reported agent list: it is echoed to the verify
+	// page and bounded JSON, not free-form storage.
+	seen := map[string]bool{}
+	agents := make([]string, 0, len(p.Agents))
+	for _, a := range p.Agents {
+		a = strings.TrimSpace(a)
+		if a == "" || seen[a] || len(agents) >= 64 {
+			continue
+		}
+		seen[a] = true
+		agents = append(agents, a)
+	}
+	agentsJSON, err := json.Marshal(agents)
+	if err != nil {
+		return db.RongcloudPairingSession{}, fmt.Errorf("rongcloud: marshal reported agents: %w", err)
+	}
+	infoJSON, err := json.Marshal(map[string]string{
+		"machine_id": p.MachineID,
+		"hostname":   p.Hostname,
+		"platform":   p.Platform,
+	})
+	if err != nil {
+		return db.RongcloudPairingSession{}, fmt.Errorf("rongcloud: marshal device info: %w", err)
+	}
+
+	const maxAttempts = 5
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		code, err := generateUserCode()
+		if err != nil {
+			return db.RongcloudPairingSession{}, err
+		}
+		session, err := s.queries.CreateRongCloudPairingDeviceSession(ctx, db.CreateRongCloudPairingDeviceSessionParams{
+			WorkspaceID:    p.WorkspaceID,
+			Ticket:         s.generateTicket(),
+			UserCode:       pgText(code),
+			ReportedAgents: agentsJSON,
+			DeviceInfo:     infoJSON,
+			ExpiresAt:      pgtype.Timestamptz{Time: time.Now().Add(p.ExpiresIn), Valid: true},
+		})
+		if err == nil {
+			return session, nil
+		}
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			// user_code collision on the partial unique index; draw again.
+			lastErr = err
+			continue
+		}
+		s.logger.Error("rongcloud: create device pairing session failed", "error", err)
+		return db.RongcloudPairingSession{}, fmt.Errorf("rongcloud: create device session: %w", err)
+	}
+	s.logger.Error("rongcloud: user_code collision retries exhausted", "error", lastErr)
+	return db.RongcloudPairingSession{}, fmt.Errorf("rongcloud: create device session: %w", lastErr)
+}
+
+// GetSessionByUserCode resolves a session by its 8-char user code. The code
+// is normalized (trim + upper) so hand-typed input is forgiving. An unknown
+// code maps to ErrUnknownPairingTicket so handlers share the 404 semantics.
+func (s *PairingService) GetSessionByUserCode(ctx context.Context, code string) (db.RongcloudPairingSession, error) {
+	if s.queries == nil {
+		return db.RongcloudPairingSession{}, errors.New("rongcloud: database not configured")
+	}
+	code = strings.ToUpper(strings.TrimSpace(code))
+	session, err := s.queries.GetRongCloudPairingSessionByUserCode(ctx, pgText(code))
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return db.RongcloudPairingSession{}, ErrUnknownPairingTicket
+		}
+		s.logger.Error("rongcloud: user code lookup failed", "error", err)
+		return db.RongcloudPairingSession{}, fmt.Errorf("rongcloud: get session by user code: %w", err)
+	}
+	return session, nil
+}
+
+// DevicePairLimiter caps how many device-code sessions one machine may open
+// inside a window. It lives with the pairing domain rather than the HTTP
+// layer so the window semantics are testable without a database. Single
+// process scope is enough: the deployment runs one server binary, and a
+// multi-replica rollout only softens the limit, it does not open a hole.
+type DevicePairLimiter struct {
+	mu     sync.Mutex
+	hits   map[string][]time.Time
+	max    int
+	window time.Duration
+}
+
+// NewDevicePairLimiter builds a limiter allowing max sessions per window per
+// key (machine_id).
+func NewDevicePairLimiter(max int, window time.Duration) *DevicePairLimiter {
+	return &DevicePairLimiter{hits: map[string][]time.Time{}, max: max, window: window}
+}
+
+// Allow records one attempt for key and reports whether it is within budget.
+func (l *DevicePairLimiter) Allow(key string) bool {
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	// Periodic pruning so an anonymous endpoint cannot grow the map forever.
+	if len(l.hits) > 500 {
+		for k, ts := range l.hits {
+			if kept := pruneSince(ts, now, l.window); len(kept) == 0 {
+				delete(l.hits, k)
+			} else {
+				l.hits[k] = kept
+			}
+		}
+	}
+	kept := pruneSince(l.hits[key], now, l.window)
+	if len(kept) >= l.max {
+		l.hits[key] = kept
+		return false
+	}
+	l.hits[key] = append(kept, now)
+	return true
+}
+
+func pruneSince(ts []time.Time, now time.Time, window time.Duration) []time.Time {
+	kept := ts[:0]
+	for _, t := range ts {
+		if now.Sub(t) < window {
+			kept = append(kept, t)
+		}
+	}
+	return kept
+}
+
+// SessionEffectiveStatus applies read-time expiry. The database only flips
+// pending→expired when someone attempts a claim, so a poller would otherwise
+// see "pending" forever once ExpiresAt passed.
+//
+// claimed counts as expirable too: expires_at bounds the *authorization
+// window*, not the device's credentials (those are issued at claim and live
+// independently). A claimed session past its window means the browser link is
+// dead — a leaked URL must not stay usable for the rest of the day.
+func SessionEffectiveStatus(session db.RongcloudPairingSession, now time.Time) string {
+	switch session.Status {
+	case "pending", "claimed":
+		if !session.ExpiresAt.Time.After(now) {
+			return "expired"
+		}
+	}
+	return session.Status
 }

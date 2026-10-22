@@ -761,3 +761,132 @@ describe("supervised self-kill guard", () => {
     }
   });
 });
+
+describe("clawmessenger pair — browser authorization (no ticket)", () => {
+  const deviceSession = {
+    ticket: "pt_device",
+    userCode: "ABCD2345",
+    verifyUrl: "https://newsradar.dreamdt.cn/claw-web/pair?code=ABCD2345",
+    expiresAt: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
+    intervalSeconds: 2,
+  };
+
+  it("prints the verify URL, then pairs and starts the supervisor once bound", async () => {
+    const keystore = tempKeystore();
+    const lines: string[] = [];
+    const { daemon, calls: daemonCalls } = fakeDaemon();
+    const fakeApi = {
+      getConfig: async () => ({ appKey: "pk" }),
+      startDevicePairing: async () => deviceSession,
+      register: async () => ({ nodeId: "node_machine", token: "tok_1", deviceCredentialTicket: "dc_t" }),
+      claimPairing: async () => ({ deviceCredentialId: "dc_9", deviceSecret: "secret_9", nodeId: "node_machine" }),
+      pollDevicePairing: async () => ({
+        status: "claimed",
+        expiresAt: deviceSession.expiresAt,
+        boundAgents: [{ agent: "opencode", nodeId: "node_oc" }],
+      }),
+      refreshToken: async () => ({ token: "" }),
+    };
+    const program = buildProgram({
+      keystore,
+      apiFactory: () => fakeApi as unknown as XiachatApi,
+      stdout: { write: (s: string) => { lines.push(s); return true; } } as unknown as NodeJS.WriteStream,
+      machineId: () => "machine-dev",
+      ensureOpencode: async () => ({}),
+      daemon,
+      daemonPaths: defaultDaemonPaths(join(tmpdir(), `cm-pair-${process.pid}`)),
+      sleep: async () => {},
+      devicePollMs: 1,
+    });
+
+    await program.parseAsync(["node", "clawmessenger", "pair"]);
+
+    const output = lines.join("");
+    expect(output).toContain(deviceSession.verifyUrl);
+    expect(output).toContain("ABCD2345");
+    // The ticket is the device's own secret and must never be shown.
+    expect(output).not.toContain("pt_device");
+    expect(output).toContain("授权完成");
+    expect(keystore.load()?.deviceSecret).toBe("secret_9");
+    expect(daemonCalls.some((c) => c.startsWith("start:"))).toBe(true);
+  });
+
+  it("keeps polling while the device is claimed but not yet authorized", async () => {
+    const keystore = tempKeystore();
+    let polls = 0;
+    const fakeApi = {
+      getConfig: async () => ({ appKey: "pk" }),
+      startDevicePairing: async () => deviceSession,
+      register: async () => ({ nodeId: "node_machine", token: "tok_1", deviceCredentialTicket: "dc_t" }),
+      claimPairing: async () => ({ deviceCredentialId: "dc_9", deviceSecret: "secret_9", nodeId: "node_machine" }),
+      pollDevicePairing: async () => {
+        polls += 1;
+        if (polls < 3) return { status: "claimed", expiresAt: deviceSession.expiresAt, boundAgents: [] };
+        return { status: "claimed", expiresAt: deviceSession.expiresAt, boundAgents: [{ agent: "hermes", nodeId: "node_h" }] };
+      },
+      refreshToken: async () => ({ token: "" }),
+    };
+    const program = buildProgram({
+      keystore,
+      apiFactory: () => fakeApi as unknown as XiachatApi,
+      stdout: process.stdout,
+      machineId: () => "machine-dev",
+      ensureOpencode: async () => ({}),
+      daemon: fakeDaemon().daemon,
+      daemonPaths: defaultDaemonPaths(join(tmpdir(), `cm-pair-${process.pid}`)),
+      sleep: async () => {},
+      devicePollMs: 1,
+    });
+
+    await program.parseAsync(["node", "clawmessenger", "pair", "--no-start"]);
+    expect(polls).toBe(3);
+  });
+
+  it("fails with a re-run hint when the session expired before authorization", async () => {
+    const keystore = tempKeystore();
+    const fakeApi = {
+      getConfig: async () => ({ appKey: "pk" }),
+      startDevicePairing: async () => deviceSession,
+      register: async () => ({ nodeId: "node_machine", token: "tok_1", deviceCredentialTicket: "dc_t" }),
+      claimPairing: async () => ({ deviceCredentialId: "dc_9", deviceSecret: "secret_9", nodeId: "node_machine" }),
+      pollDevicePairing: async () => ({ status: "expired", expiresAt: deviceSession.expiresAt, boundAgents: [] }),
+      refreshToken: async () => ({ token: "" }),
+    };
+    const program = buildProgram({
+      keystore,
+      apiFactory: () => fakeApi as unknown as XiachatApi,
+      stdout: process.stdout,
+      machineId: () => "machine-dev",
+      ensureOpencode: async () => ({}),
+      daemon: fakeDaemon().daemon,
+      daemonPaths: defaultDaemonPaths(join(tmpdir(), `cm-pair-${process.pid}`)),
+      sleep: async () => {},
+      devicePollMs: 1,
+    });
+
+    await expect(program.parseAsync(["node", "clawmessenger", "pair"])).rejects.toThrow(/过期/);
+  });
+
+  it("never calls the device-code API when a manual ticket is supplied", async () => {
+    const keystore = tempKeystore();
+    const fakeApi = {
+      getConfig: async () => ({ appKey: "pk" }),
+      register: async () => ({ nodeId: "node_1", token: "tok_1" }),
+      claimPairing: async () => ({ deviceCredentialId: "dc_1", deviceSecret: "s", nodeId: "node_1" }),
+      refreshToken: async () => ({ token: "" }),
+      // startDevicePairing intentionally absent: calling it throws TypeError.
+    };
+    const program = buildProgram({
+      keystore,
+      apiFactory: () => fakeApi as unknown as XiachatApi,
+      stdout: process.stdout,
+      machineId: () => "machine-dev",
+      ensureOpencode: async () => ({}),
+      daemon: fakeDaemon().daemon,
+      daemonPaths: defaultDaemonPaths(join(tmpdir(), `cm-pair-${process.pid}`)),
+    });
+
+    await program.parseAsync(["node", "clawmessenger", "pair", "--ticket", "pt_manual"]);
+    expect(keystore.load()?.nodeId).toBe("node_1");
+  });
+});

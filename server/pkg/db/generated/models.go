@@ -1663,6 +1663,8 @@ type RongcloudPairingSession struct {
 	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
 	ReportedAgents   []byte             `json:"reported_agents"`
 	BoundAgents      []byte             `json:"bound_agents"`
+	UserCode         pgtype.Text        `json:"user_code"`
+	DeviceInfo       []byte             `json:"device_info"`
 }
 
 type RongcloudRoleRecommendation struct {

@@ -1632,6 +1632,16 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	r.Post("/api/claw/pairing", h.ClawCreatePairing)
 	r.Get("/api/claw/pairing/{ticket}", h.ClawGetPairing)
 	r.Post("/api/claw/pairing/{ticket}/bind", h.ClawBindPairing)
+	// Device-code pairing: the terminal creates a session anonymously and
+	// polls it; the human authorizes in the browser via the 8-char user code.
+	// The ticket stays a bearer secret (anonymous poll only, never shown).
+	r.Post("/api/claw/pairing/device", h.ClawCreateDeviceSession)
+	r.Get("/api/claw/pairing/device/{ticket}", h.ClawGetDeviceSession)
+	r.Get("/api/claw/pairing/code/{code}", h.ClawGetPairingByCode)
+	r.Post("/api/claw/pairing/code/{code}/bind", h.ClawBindPairingByCode)
+	// 接入提示词正文。公开读：产品站 /guide 接入附录要展示给每个访客，且正文
+	// 存在后台配置里，改文案不用重新发前端包。
+	r.Get("/api/claw/onboarding-prompt", h.ClawOnboardingPrompt)
 	r.Post("/api/claw/device/nodes", h.ClawDeviceNodes)
 	// clawmessenger supervisor auto-binds its built-in ops agent on the paired
 	// machine via this device-credential-authenticated endpoint.
@@ -1695,6 +1705,10 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	r.Get("/api/admin/system/config", h.ClawAdminSystemConfigList)
 	r.Get("/api/admin/system/config/{key}", h.ClawAdminSystemConfigGet)
 	r.Put("/api/admin/system/config/{key}", h.ClawAdminSystemConfigPut)
+	// 接入提示词的专用读写口：正文是纯文本，走 system/config 会被包一层
+	// {"value": ...}，后台编辑框还得自己拆，这里直接收发 text。
+	r.Get("/api/admin/onboarding-prompt", h.ClawAdminOnboardingPromptGet)
+	r.Put("/api/admin/onboarding-prompt", h.ClawAdminOnboardingPromptPut)
 	// 管理端「融云控制台」内嵌页。Access Key 只落服务端，
 	// 前端拿到的是服务端换回来的访问令牌 URL（见 claw_admin_rongcloud_console.go）。
 	r.Get("/api/admin/rongcloud/console", h.ClawAdminGetRongCloudConsole)

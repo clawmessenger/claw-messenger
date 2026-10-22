@@ -203,10 +203,13 @@ type RuntimeRecoveryNotifier interface {
 }
 
 type Handler struct {
-	Queries                *db.Queries
-	ReadSelector           *dbreader.Selector
-	DB                     dbExecutor
-	TxStarter              txStarter
+	Queries      *db.Queries
+	ReadSelector *dbreader.Selector
+	DB           dbExecutor
+	TxStarter    txStarter
+	// devicePairLimiter rate-limits anonymous device-code pairing creation
+	// per machine_id; see claw_device_auth.go.
+	devicePairLimiter      *rongcloud.DevicePairLimiter
 	Hub                    *realtime.Hub
 	DaemonHub              *daemonws.Hub
 	DaemonProfileRefresh   RuntimeProfileRefreshNotifier
@@ -506,6 +509,7 @@ func New(queries *db.Queries, txStarter txStarter, hub *realtime.Hub, bus *event
 		ReadSelector:                 dbreader.NewPrimaryOnly(queries),
 		DB:                           executor,
 		TxStarter:                    txStarter,
+		devicePairLimiter:            newDevicePairLimiter(),
 		Hub:                          hub,
 		DaemonHub:                    daemonHub,
 		DaemonProfileRefresh:         daemonProfileRefresh,

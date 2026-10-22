@@ -151,6 +151,13 @@ export interface BuildProgramOpts {
   // it short because the interval is registered before they install fake
   // timers, so advancing the fake clock would never fire it.
   supervisorControlPollMs?: number;
+  // Injectable for tests; how long `pair` waits between device-authorization
+  // polls. Defaults to the interval the server returned (2s). Tests must not
+  // wait on a real clock.
+  devicePollMs?: number;
+  // Injectable for tests; defaults to setTimeout-backed sleep. Same reason as
+  // devicePollMs: the device-code poll loop is a real-time wait.
+  sleep?: (ms: number) => Promise<void>;
   // Injectable for tests; defaults to a real cross-platform supervisor daemon.
   daemon?: Daemon;
   // Injectable for tests; the state/pid files the supervisor writes about itself
@@ -207,7 +214,7 @@ export function buildProgram(opts: BuildProgramOpts): Command {
   program
     .name("clawmessenger")
     .description("User-device agent CLI over RongCloud IM")
-    .version("0.2.49")
+    .version("0.2.50")
     // Tests parse this program in-process; commander would otherwise
     // process.exit on missing options and kill the vitest runner.
     .exitOverride();
@@ -251,68 +258,149 @@ export function buildProgram(opts: BuildProgramOpts): Command {
       }
     });
 
+  // Shared by both pairing paths: register the machine node against the
+  // session (the server attributes it to the session's workspace and
+  // backfills the candidate list), then claim it for device credentials. The
+  // reported agent list rides on register so the browser page can offer
+  // exactly what this machine actually has.
+  const registerAndClaim = async (
+    api: XiachatApi,
+    args: { ticket: string; server: string; name?: string; aiType: string; agents: string[] },
+  ): Promise<string> => {
+    try {
+      const reg = await api.register({
+        name: args.name ?? `${os.hostname()} ${args.aiType}`,
+        aiType: args.aiType,
+        nodeType: "ai",
+        macAddress: (opts.machineId ?? machineId)(),
+        pairingTicket: args.ticket,
+        agents: args.agents,
+      });
+      opts.keystore.save({
+        nodeId: reg.nodeId,
+        token: reg.token,
+        credentialId: reg.deviceCredentialTicket,
+        serverUrl: args.server,
+      });
+      opts.stdout.write(`registered ${reg.nodeId}\n`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (message.includes("attribution")) {
+        throw new Error(`${message}\nhint: provide --pairing-ticket (get one from your workspace admin)`);
+      }
+      throw err;
+    }
+    const idemKey = pairIdempotencyKey(args.ticket, (opts.machineId ?? machineId)());
+    const result = await api.claimPairing(args.ticket, "", idemKey);
+    if (result.session?.status === "claimed" && !result.deviceSecret) {
+      throw new Error("ticket already claimed by another device");
+    }
+    opts.keystore.save({
+      nodeId: result.nodeId,
+      token: "",
+      credentialId: result.deviceCredentialId,
+      deviceSecret: result.deviceSecret,
+      serverUrl: args.server,
+    });
+    return result.nodeId;
+  };
+
   program
     .command("pair")
-    .description("Register this device and claim a pairing session with a ticket")
-    .requiredOption("--ticket <ticket>", "pairing ticket (pt_...)")
+    .description(
+      "Pair this device. By default it prints a URL for browser authorization; --ticket keeps the manual ticket flow",
+    )
+    .option("--ticket <ticket>", "manual pairing ticket (pt_...) from the web app instead of browser authorization")
     .option("--server <url>", "Quukk server base URL", DEFAULT_SERVER_URL)
     .option("--name <name>", "node display name")
     .option("--ai-type <type>", "agent platform (claude, codex, opencode, ...)", "opencode")
-    .action(async (cmdOpts: { ticket: string; server: string; name?: string; aiType: string }) => {
-      const api = opts.apiFactory(cmdOpts.server);
-      const ensureOpencode = opts.ensureOpencode ?? ensureOpencodeInstalled;
-      // opencode is the default runtime for the built-in ops (运维) agent and a
-      // common default agent. Install it up front on devices that lack it so it
-      // is available to bind and shows up in the reported agent list. Best
-      // effort: an install failure must not block pairing.
-      try {
-        await ensureOpencode();
-      } catch (err) {
-        console.warn("opencode install failed:", err instanceof Error ? err.message : String(err));
-      }
-      // Register with the ticket first: the server attributes the node to
-      // the ticket's workspace and backfills the session's candidate node
-      // list so the subsequent claim can issue device credentials. The
-      // machine's discoverable agent CLIs are reported alongside so the web
-      // dialog can offer them for checkbox binding.
-      const foundAgents = await discoverAgents({});
-      try {
-        const reg = await api.register({
-          name: cmdOpts.name ?? `${os.hostname()} ${cmdOpts.aiType}`,
-          aiType: cmdOpts.aiType,
-          nodeType: "ai",
-          macAddress: (opts.machineId ?? machineId)(),
-          pairingTicket: cmdOpts.ticket,
-          agents: foundAgents.map((a) => a.name),
-        });
-        opts.keystore.save({
-          nodeId: reg.nodeId,
-          token: reg.token,
-          credentialId: reg.deviceCredentialTicket,
-          serverUrl: cmdOpts.server,
-        });
-        opts.stdout.write(`registered ${reg.nodeId}\n`);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        if (message.includes("attribution")) {
-          throw new Error(`${message}\nhint: provide --pairing-ticket (get one from your workspace admin)`);
+    .option("--no-start", "do not start the background supervisor after authorization")
+    .action(
+      async (cmdOpts: {
+        ticket?: string;
+        server: string;
+        name?: string;
+        aiType: string;
+        start: boolean;
+      }) => {
+        const api = opts.apiFactory(cmdOpts.server);
+        const ensureOpencode = opts.ensureOpencode ?? ensureOpencodeInstalled;
+        // opencode is the default runtime for the built-in ops (运维) agent and
+        // a common default agent. Install it up front on devices that lack it
+        // so it is available to bind and shows up in the reported agent list.
+        // Best effort: an install failure must not block pairing.
+        try {
+          await ensureOpencode();
+        } catch (err) {
+          console.warn("opencode install failed:", err instanceof Error ? err.message : String(err));
         }
-        throw err;
-      }
-      const idemKey = pairIdempotencyKey(cmdOpts.ticket, (opts.machineId ?? machineId)());
-      const result = await api.claimPairing(cmdOpts.ticket, "", idemKey);
-      if (result.session?.status === "claimed" && !result.deviceSecret) {
-        throw new Error("ticket already claimed by another device");
-      }
-      opts.keystore.save({
-        nodeId: result.nodeId,
-        token: "",
-        credentialId: result.deviceCredentialId,
-        deviceSecret: result.deviceSecret,
-        serverUrl: cmdOpts.server,
-      });
-      opts.stdout.write(`paired as ${result.nodeId}\n`);
-    });
+        const foundAgents = await discoverAgents({});
+        const agentNames = foundAgents.map((a) => a.name);
+        const pairing = {
+          server: cmdOpts.server,
+          name: cmdOpts.name,
+          aiType: cmdOpts.aiType,
+          agents: agentNames,
+        };
+
+        // Manual path: a ticket someone copied out of the web app. Unchanged
+        // behaviour, including not starting the supervisor.
+        if (cmdOpts.ticket) {
+          const nodeId = await registerAndClaim(api, { ...pairing, ticket: cmdOpts.ticket });
+          opts.stdout.write(`paired as ${nodeId}\n`);
+          return;
+        }
+
+        // Device-code path: the terminal asks for a one-time session and the
+        // human authorizes it in a browser. No ticket ever reaches the user.
+        const device = await api.startDevicePairing({
+          machineId: (opts.machineId ?? machineId)(),
+          hostname: os.hostname(),
+          platform: process.platform,
+          agents: agentNames,
+        });
+        opts.stdout.write(
+          [
+            "",
+            "请在浏览器打开以下链接，完成这台设备的接入授权：",
+            "",
+            `  ${device.verifyUrl}`,
+            "",
+            `如果页面要求输入配对码，请输入：${device.userCode}`,
+            "（链接 15 分钟内有效，等待授权中…）",
+            "",
+          ].join("\n"),
+        );
+        const nodeId = await registerAndClaim(api, { ...pairing, ticket: device.ticket });
+        opts.stdout.write(`paired as ${nodeId}\n`);
+
+        const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+        const intervalMs = opts.devicePollMs ?? device.intervalSeconds * 1000;
+        const parsedDeadline = Date.parse(device.expiresAt);
+        const deadline = Number.isFinite(parsedDeadline) ? parsedDeadline : Date.now() + 15 * 60 * 1000;
+        let bound: { agent: string; nodeId: string }[] = [];
+        for (;;) {
+          const state = await api.pollDevicePairing(device.ticket);
+          if (state.boundAgents.length > 0) {
+            bound = state.boundAgents;
+            break;
+          }
+          if (state.status === "expired" || state.status === "cancelled") {
+            throw new Error("授权已过期或被拒绝，请重新运行 clawmessenger pair");
+          }
+          if (Date.now() >= deadline) {
+            throw new Error("授权已过期，请重新运行 clawmessenger pair");
+          }
+          await sleep(intervalMs);
+        }
+        opts.stdout.write(`授权完成，已接入：${bound.map((b) => b.agent).join(", ")}\n`);
+        if (cmdOpts.start) {
+          // daemon.start is idempotent: an already-running supervisor only
+          // reports itself, so re-pairing a live device is safe.
+          await daemon.start({});
+        }
+      },
+    );
 
   program
     .command("login")

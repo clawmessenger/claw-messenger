@@ -238,3 +238,15 @@ INSERT INTO rongcloud_discussion_event (
 SELECT * FROM rongcloud_discussion_event
 WHERE chatroom_id = $1
 ORDER BY created_at ASC;
+
+-- =====================
+-- rongcloud_pairing_session device-code flow (598)
+-- =====================
+
+-- name: CreateRongCloudPairingDeviceSession :one
+INSERT INTO rongcloud_pairing_session (workspace_id, ticket, user_code, status, candidate_node_ids, reported_agents, device_info, expires_at)
+VALUES (@workspace_id, @ticket, @user_code, 'pending', '[]'::jsonb, @reported_agents, @device_info, @expires_at)
+RETURNING *;
+
+-- name: GetRongCloudPairingSessionByUserCode :one
+SELECT * FROM rongcloud_pairing_session WHERE user_code = @user_code;

@@ -130,6 +130,74 @@ export class XiachatApi {
     return this.request("POST", `/api/claw/refresh-token/${encodeURIComponent(nodeId)}`);
   }
 
+  // Device-code pairing: the terminal asks the server for a one-time session
+  // and shows the human a verify URL. Anonymous by design — the device has no
+  // identity yet, and possession of the ticket is the only secret.
+  async startDevicePairing(params: {
+    machineId: string;
+    hostname: string;
+    platform: string;
+    agents: string[];
+  }): Promise<{
+    ticket: string;
+    userCode: string;
+    verifyUrl: string;
+    expiresAt: string;
+    intervalSeconds: number;
+  }> {
+    const raw = await this.request<{
+      data?: {
+        ticket?: string;
+        user_code?: string;
+        verify_url?: string;
+        expires_at?: string;
+        interval_seconds?: number;
+      };
+    }>("POST", "/api/claw/pairing/device", {
+      machine_id: params.machineId,
+      hostname: params.hostname,
+      platform: params.platform,
+      agents: params.agents,
+    });
+    const data = raw.data;
+    if (!data?.ticket || !data.user_code || !data.verify_url) {
+      throw new Error("POST /api/claw/pairing/device: unexpected response shape");
+    }
+    return {
+      ticket: data.ticket,
+      userCode: data.user_code,
+      verifyUrl: data.verify_url,
+      expiresAt: data.expires_at ?? "",
+      intervalSeconds: data.interval_seconds && data.interval_seconds > 0 ? data.interval_seconds : 2,
+    };
+  }
+
+  // Poll the device-side view of a pairing session: the human binds agents in
+  // the browser, and the terminal learns about it here. Exposes status and the
+  // bound agents only — never the user code or the workspace.
+  async pollDevicePairing(ticket: string): Promise<{
+    status: string;
+    expiresAt: string;
+    boundAgents: { agent: string; nodeId: string }[];
+  }> {
+    const raw = await this.request<{
+      data?: {
+        status?: string;
+        expires_at?: string;
+        bound_agents?: { agent?: string; node_id?: string }[];
+      };
+    }>("GET", `/api/claw/pairing/device/${encodeURIComponent(ticket)}`);
+    const data = raw.data;
+    if (!data?.status) {
+      throw new Error("GET /api/claw/pairing/device: unexpected response shape");
+    }
+    return {
+      status: data.status,
+      expiresAt: data.expires_at ?? "",
+      boundAgents: (data.bound_agents ?? []).map((b) => ({ agent: b.agent ?? "", nodeId: b.node_id ?? "" })),
+    };
+  }
+
   // Supervisor mode: exchange the machine node's device credential for the
   // credentials of every agent bound to this device. The legacy endpoint
   // answers with the claw envelope {code,message,data:{nodes:[...]}}.
@@ -248,18 +316,34 @@ export class XiachatApi {
     return data;
   }
 
-  private async request<T>(method: string, path: string, body?: unknown): Promise<T> {    const res = await fetch(this.baseUrl + path, {
-      method,
-      headers: body !== undefined ? { "Content-Type": "application/json" } : {},
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-    });
+  private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+    // A hung request would stall `pair` forever while it waits for a human,
+    // so every call gets a bounded wall clock. 15s is well above any server
+    // response this API produces.
+    let res: Response;
+    try {
+      res = await fetch(this.baseUrl + path, {
+        method,
+        headers: body !== undefined ? { "Content-Type": "application/json" } : {},
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+        signal: AbortSignal.timeout(15_000),
+      });
+    } catch (err) {
+      if (err instanceof Error && err.name === "TimeoutError") {
+        throw new Error(`${method} ${path}: timeout after 15000ms`);
+      }
+      throw err;
+    }
     if (!res.ok) {
       // 把服务端的 message 带出来：403（越权）与 404（本机没有该智能体）
       // 都是给人看的业务结论，只留一个 HTTP 状态码等于让模型猜。
+      // 服务端有两套错误形状：claw 信封给 message，writeError 给 error。
+      // 只读 message 会让 409/410 这类结论变成"无原因 400"，两处都要看。
       let detail = "";
       try {
-        const failure = (await res.json()) as { message?: string };
-        if (failure?.message) detail = `: ${failure.message}`;
+        const failure = (await res.json()) as { message?: string; error?: string };
+        const text = failure?.message || failure?.error;
+        if (text) detail = `: ${text}`;
       } catch {
         // 非 JSON 错误页，保持原样。
       }
