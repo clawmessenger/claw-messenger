@@ -267,7 +267,10 @@ const STALE_RUNTIME_RECOVERY_REQUEST_MS = 60_000;
 // chat_stream 帧的最小发送间隔：融云自定义消息有每秒条数限频（20604
 // SEND_FREQUENCY_TOO_FAST），逐 token 发帧必然触发；快照帧按此间隔节流，
 // 攒下的内容由下一帧或终帧补全（快照语义使丢帧无害）。
-const STREAM_FRAME_INTERVAL_MS = 500;
+// ⚠️ 实测：500ms（2 条/秒）在同一账号还发卡片/命令回包时仍被全量 23406 拒绝。
+// 放宽到 900ms，并把失败重试放进 emit —— 帧是全量快照，少发一帧只影响流畅度，
+// 但终帧发不出去前端就会永远停在「正在思考」。
+const STREAM_FRAME_INTERVAL_MS = 900;
 // 流式心跳间隔：比服务端轮次超时（默认 60s）短一个量级，服务端每收到一次
 // 心跳就把该轮 deadline 重置成完整超时 —— 只要流还在动就永不超时。
 const STREAM_PING_INTERVAL_MS = 15_000;
@@ -530,13 +533,32 @@ export class MessageDispatcher {
       if (status === "completed" || status === "failed" || status === "cancelled") {
         terminalSent = true;
       }
+      const isTerminal = status === "completed" || status === "failed" || status === "cancelled";
+      // 退避重试：融云 20604/23406 是发送频率限频，等一会儿再发通常就能过。
+      //
+      // ⚠️ 普通帧只给 1 次短退避：sendDelta 是**同步 await** 的，重试期间
+      // agent 的 token 流会被背压住（模型输出/工具执行都变慢），而帧是全量
+      // 快照 —— 丢一帧下一帧就带全了，不值得为它拖慢整轮。
+      // 终帧不一样：丢了前端永远停在「正在思考…」，所以给足 5 次（最长 ~11s）。
+      const delays = isTerminal ? [400, 900, 1800, 3000, 5000] : [200];
       try {
         for (const wire of frame(seq, status, text, reasoning, errorCode, activity, timeline)) {
-          await sendStream(ctx.conversationType, ctx.conversationId, wire.objectName, wire.content);
+          for (let attempt = 0; ; attempt += 1) {
+            try {
+              await sendStream(ctx.conversationType, ctx.conversationId, wire.objectName, wire.content);
+              break;
+            } catch (sendErr) {
+              if (attempt >= delays.length) throw sendErr;
+              await new Promise<void>((resolve) => setTimeout(resolve, delays[attempt]!));
+            }
+          }
         }
       } catch (err) {
         // 单帧失败不打断回答：流帧只是 UI 加速，权威内容走 fallback。
-        console.error("stream frame send failed:", err instanceof Error ? err.message : err);
+        console.error(
+          `stream frame send failed${isTerminal ? " (terminal)" : ""}:`,
+          err instanceof Error ? err.message : err,
+        );
       }
     };
     const canStream = Boolean(this.deps.sendStream) && Boolean(opts.turns.runTurnStreamed);
