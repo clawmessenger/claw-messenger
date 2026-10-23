@@ -44,6 +44,7 @@ type chatroomLastEventPayload struct {
 	Content string `json:"content"`
 	Title   string `json:"title"`
 	Reason  string `json:"reason"`
+	Round   int32  `json:"round"`
 }
 
 // chatroomLastEventSummary is what getList attaches to a room record.
@@ -52,6 +53,9 @@ type chatroomLastEventSummary struct {
 	Speaker string
 	Text    string
 	At      interface{}
+	// Round 是 1-based 轮次，0 表示事件里没带。客户端用它把「第 N 轮纪要」拼出来：
+	// 同一个组在列表里隔几轮再看，只有正文是分不出这是哪一轮的。
+	Round int32
 }
 
 // applyChatroomLastEvents decorates the paginated room list with their newest
@@ -97,6 +101,9 @@ func (h *systemHandler) applyChatroomLastEvents(
 		rec["lastMessageKind"] = summary.Kind
 		rec["lastSpeaker"] = summary.Speaker
 		rec["lastMessageTime"] = summary.At
+		if summary.Round > 0 {
+			rec["lastMessageRound"] = summary.Round
+		}
 	}
 }
 
@@ -113,9 +120,11 @@ func summarizeChatroomLastEvent(row db.ListRongCloudChatroomLastEventsRow) (chat
 
 	switch row.EventType {
 	case "round_summary_completed":
-		text := condenseLastMessageText(payload.Content)
+		// 纪要以【已达成的共识】这类段落标题开头，和客户端加的「纪要：」前缀语义重复，
+		// 而且列表上每行都是同样的开头 —— 剥掉，让真正的内容露出来。
+		text := stripLeadingSectionLabel(condenseLastMessageText(payload.Content))
 		if text == "" {
-			text = condenseLastMessageText(payload.Title)
+			text = stripLeadingSectionLabel(condenseLastMessageText(payload.Title))
 		}
 		if text == "" {
 			return chatroomLastEventSummary{}, false
@@ -131,6 +140,7 @@ func summarizeChatroomLastEvent(row db.ListRongCloudChatroomLastEventsRow) (chat
 			Speaker: speaker,
 			Text:    text,
 			At:      row.CreatedAt,
+			Round:   eventRound(payload, row),
 		}, true
 
 	case "contribution_completed":
@@ -149,6 +159,7 @@ func summarizeChatroomLastEvent(row db.ListRongCloudChatroomLastEventsRow) (chat
 			Speaker: speaker,
 			Text:    text,
 			At:      row.CreatedAt,
+			Round:   eventRound(payload, row),
 		}, true
 
 	case "user_interjection":
@@ -211,4 +222,37 @@ func condenseLastMessageText(raw string) string {
 	}
 	runes := []rune(line)
 	return strings.TrimSpace(string(runes[:chatroomLastMessageMaxRunes])) + "…"
+}
+
+// stripLeadingSectionLabel 去掉纪要开头的段落标题（【已达成的共识】…）。
+//
+// 主持人产物的固定结构是「【已达成的共识】/【仍存在的分歧】/…」，列表上每行都从
+// 同一个标题开始，一眼看过去全是重复。剥掉之后露出真正的内容；如果剥完什么都不剩
+// （只写了一个标题），保留原文 —— 那也是有信息的。
+func stripLeadingSectionLabel(text string) string {
+	if text == "" || !strings.HasPrefix(text, "【") {
+		return text
+	}
+	end := strings.Index(text, "】")
+	if end < 0 {
+		return text
+	}
+	// 阈值按 rune 算：标题一般 2~8 个汉字，超长的说明这不是标题而是正文。
+	if utf8.RuneCountInString(text[:end]) > 12 {
+		return text
+	}
+	rest := strings.TrimSpace(text[end+len("】"):])
+	if rest == "" {
+		return text
+	}
+	return rest
+}
+
+// eventRound 取 1-based 轮次。payload.round 是业务轮次（1 起）；
+// 行上的 round_number 是库里的计数（0 起），只在 payload 没带时兜底。
+func eventRound(payload chatroomLastEventPayload, row db.ListRongCloudChatroomLastEventsRow) int32 {
+	if payload.Round > 0 {
+		return payload.Round
+	}
+	return row.RoundNumber + 1
 }

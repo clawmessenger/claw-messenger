@@ -51,6 +51,23 @@ func TestCondenseLastMessageText(t *testing.T) {
 	}
 }
 
+func TestStripLeadingSectionLabel(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"【已达成的共识】 1. 事实成立", "1. 事实成立"},
+		{"【仍存在的分歧】执行长坚持原判", "执行长坚持原判"},
+		{"【已达成的共识】", "【已达成的共识】"},        // 剥完为空：保留原文
+		{"【已达成的共识】   ", "【已达成的共识】   "},    // 去掉标题后只剩空白：同样保留原文
+		{"第3轮纪要 成员立场", "第3轮纪要 成员立场"},     // 没有段标题就不动
+		{"【这是一个非常非常长的标题超过了十二个字】正文", "【这是一个非常非常长的标题超过了十二个字】正文"},
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := stripLeadingSectionLabel(c.in); got != c.want {
+			t.Fatalf("stripLeadingSectionLabel(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
 func TestSummarizeChatroomLastEvent(t *testing.T) {
 	at := pgtype.Timestamptz{Time: time.Date(2026, 10, 23, 5, 27, 22, 0, time.UTC), Valid: true}
 	row := func(eventType, payload, role string) db.ListRongCloudChatroomLastEventsRow {
@@ -87,8 +104,12 @@ func TestSummarizeChatroomLastEvent(t *testing.T) {
 		if got.Kind != lastMessageKindSummary || got.Speaker != "中立主持人" {
 			t.Fatalf("unexpected summary: %+v", got)
 		}
-		if got.Text != "【已达成的共识】 暂无。" {
-			t.Fatalf("expected condensed content, got %q", got.Text)
+		// 段标题被剥掉，露出正文；轮次从 payload.round 取
+		if got.Text != "暂无。" {
+			t.Fatalf("expected section label stripped, got %q", got.Text)
+		}
+		if got.Round != 1 {
+			t.Fatalf("expected round 1, got %d", got.Round)
 		}
 	})
 
@@ -213,8 +234,11 @@ func TestChatroomGetListIncludesLastMessage(t *testing.T) {
 	if got := target["lastSpeaker"]; got != "中立主持人" {
 		t.Fatalf("expected speaker from role_name, got %v", got)
 	}
-	if got, _ := target["lastMessage"].(string); got != "【已达成的共识】 暂无。" {
+	if got, _ := target["lastMessage"].(string); got != "暂无。" {
 		t.Fatalf("unexpected lastMessage %q", got)
+	}
+	if got := target["lastMessageRound"]; got != int32(1) {
+		t.Fatalf("expected lastMessageRound 1, got %v", got)
 	}
 	if _, ok := target["lastMessageTime"]; !ok {
 		t.Fatal("expected lastMessageTime in list record")
