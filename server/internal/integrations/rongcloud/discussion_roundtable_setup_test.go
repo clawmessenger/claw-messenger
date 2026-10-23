@@ -316,6 +316,89 @@ func TestSetupSubmitTopicCAS(t *testing.T) {
 	f.waitEvent(t, discussionID, setupEventRecommendFailed)
 }
 
+// 会话列表整排「讨论组」的根因：建房时只有占位名，拿到议题后没人补。
+func TestSetupTopicNamesDiscussionGroup(t *testing.T) {
+	f := setupSetupFixture(t)
+	ctx := context.Background()
+
+	// 与客户端一致：createRoundtableShell **不带 name** → 服务端落占位「讨论组」。
+	r := f.rt.actionCreateRoundtableShell(ctx, CommandContent{
+		Service: "discussion", Action: "createRoundtableShell",
+		Params: map[string]interface{}{"client_request_id": "req-" + uniqueID("t")},
+	}, f.actor)
+	if r.code != 200 {
+		t.Fatalf("createRoundtableShell: %d %s", r.code, r.message)
+	}
+	data, _ := r.data.(map[string]interface{})
+	chatroomID, _ := data["chatroom_id"].(string)
+	discussionID, _ := data["discussion_id"].(string)
+	if chatroomID == "" || discussionID == "" {
+		t.Fatalf("回包缺 id: %#v", data)
+	}
+	t.Cleanup(func() {
+		_, _ = f.pool.Exec(ctx, "DELETE FROM rongcloud_discussion_event WHERE discussion_id=$1", discussionID)
+		_, _ = f.pool.Exec(ctx, "DELETE FROM rongcloud_discussion WHERE discussion_id=$1", discussionID)
+		_, _ = f.pool.Exec(ctx, "DELETE FROM rongcloud_chatroom_member WHERE chatroom_id=(SELECT id FROM rongcloud_chatroom WHERE rongcloud_chatroom_id=$1)", chatroomID)
+		_, _ = f.pool.Exec(ctx, "DELETE FROM rongcloud_chatroom WHERE rongcloud_chatroom_id=$1", chatroomID)
+	})
+
+	nameOf := func() string {
+		view, err := f.queries.GetActiveRongCloudChatroomViewByRongCloudID(ctx, chatroomID)
+		if err != nil {
+			t.Fatalf("读聊天室: %v", err)
+		}
+		return view.Name
+	}
+	submit := func(topic string) commandResult {
+		return f.rt.actionSubmitSetupTopic(ctx, CommandContent{
+			Service: "discussion", Action: "submitSetupTopic",
+			Params: map[string]interface{}{"chatroom_id": chatroomID, "topic": topic},
+		}, f.actor)
+	}
+
+	if got := nameOf(); got != "讨论组" {
+		t.Fatalf("建房后应是占位名，got %q", got)
+	}
+	// S1：议题首行派生成「议题前缀 + 讨论组」（与历史房间同一形态）。
+	if res := submit("AI 能发展到什么程度？\n补充：只看推理能力"); res.code != 200 {
+		t.Fatalf("submitSetupTopic: %d %s", res.code, res.message)
+	}
+	if got, want := nameOf(), "AI 能发展到什么程度讨论组"; got != want {
+		t.Fatalf("议题补名 = %q, want %q", got, want)
+	}
+	// S2 回上一步改题：名字已经不是占位，不能再被改一次（否则每改一次题名字就变）。
+	if res := submit("换个议题继续聊"); res.code != 200 {
+		t.Fatalf("roles 步改题应接受: %d %s", res.code, res.message)
+	}
+	if got, want := nameOf(), "AI 能发展到什么程度讨论组"; got != want {
+		t.Fatalf("已有名字被覆盖: %q, want %q", got, want)
+	}
+}
+
+func TestDiscussionGroupNameFromTopic(t *testing.T) {
+	cases := []struct{ topic, want string }{
+		{"讨论季度规划", "讨论季度规划讨论组"},
+		// 只取首行：整段议题塞标题会把列表撑爆
+		{"Q3 发布计划评审\n背景：预算冻结", "Q3 发布计划评审讨论组"},
+		// 折叠空白 + 削结尾标点
+		{"  AI   能发展到什么程度？  ", "AI 能发展到什么程度讨论组"},
+		// rune 截断（24 个汉字，不是 24 字节）
+		{"一二三四五六七八九十一二三四五六七八九十一二三四五六七八", "一二三四五六七八九十一二三四五六七八九十一二三四讨论组"},
+		// 超长时能在分句处断开就断在分句处（硬截会留下半个词）
+		{"如何让ai自主开发小游戏，并发布到对应平台，不需要用户人工操作", "如何让ai自主开发小游戏，并发布到对应平台讨论组"},
+		// 议题本身已经带后缀就不重复
+		{"周会讨论组", "周会讨论组"},
+		// 只有标点/空白 → 不命名（保持占位）
+		{"，。！", ""},
+		{"   ", ""},
+	}
+	for _, c := range cases {
+		if got := discussionGroupNameFromTopic(c.topic); got != c.want {
+			t.Fatalf("discussionGroupNameFromTopic(%q) = %q, want %q", c.topic, got, c.want)
+		}
+	}
+}
+
 func TestSetupResumeAndTouch(t *testing.T) {
 	f := setupSetupFixture(t)
 	ctx := context.Background()

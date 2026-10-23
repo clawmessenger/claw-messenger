@@ -205,11 +205,16 @@ func (rt *discussionRuntime) actionSubmitSetupTopic(ctx context.Context, cmd Com
 		// CAS 未命中：同 topic 重复提交按幂等成功接受（步骤已在 roles），
 		// 不同 topic 说明已在更后面的步骤，回 409 让前端重同步。
 		if row.SetupStep == setupStepRoles && row.Topic == topic {
+			// 幂等重放也补一次名字：上一次可能在改名那步之前就断了。
+			rt.nameDiscussionGroupFromTopic(ctx, chatroomID, topic)
 			return okResult(map[string]interface{}{"accepted": true})
 		}
 		return errResult(409, "DISCUSSION_SETUP_STEP_CONFLICT")
 	}
 	rt.touchSetup(ctx, row.DiscussionID)
+	// 有了议题才有名字：建房（createRoundtableShell）时还什么都不知道，只能先落
+	// 占位「讨论组」，于是会话列表整排同名、根本分不出哪个是哪个。
+	rt.nameDiscussionGroupFromTopic(ctx, chatroomID, topic)
 	// 异步推荐：detached context（命令回调结束不取消后台管线）。attempt 取
 	// 「已发出的 roles 卡数 + 1」，与换一批同一口径 —— 用户在 S2 回上一步改题
 	// 重提时，新推荐卡的幂等键才不会撞上旧卡（撞键会被当重放丢弃，前端永远
@@ -217,6 +222,83 @@ func (rt *discussionRuntime) actionSubmitSetupTopic(ctx context.Context, cmd Com
 	attempt := rt.setupRecommendAttempt(ctx, row.DiscussionID) + 1
 	go rt.recommendForSetupAsync(context.Background(), row.DiscussionID, attempt)
 	return okResult(map[string]interface{}{"accepted": true})
+}
+
+// ---- 讨论组名字：建房时只能占位，拿到议题后补 ----------------------------
+
+// 占位名 = 建房时唯一能落的值（createRoundtableShell 的默认 name）。这些名字出现在
+// 会话/聊天室列表里是纯噪音：一排「讨论组」，用户认不出哪个对应哪场讨论。
+var discussionGroupPlaceholderNames = map[string]bool{
+	"": true, "讨论组": true, "聊天室": true, "未命名讨论": true,
+}
+
+// discussionGroupNameFromTopic 由议题派生组名，沿用旧链路的既有约定
+// 「议题前缀 + 讨论组」（线上的历史房间全是这个形态，改名不能改成另一种长相）。
+//
+// 只取首行、折叠空白，再按 **rune**（不是字节）截 24 字：能从分句处断开就断在
+// 分句处（「如何让ai自主开发小游戏，并发布到对应平台，不需要…」截成「…对应平台」
+// 读得通），断不开才硬截，然后削掉结尾标点 —— 列表一行放不下整段议题。
+func discussionGroupNameFromTopic(topic string) string {
+	line := strings.TrimSpace(strings.SplitN(topic, "\n", 2)[0])
+	line = strings.Join(strings.Fields(line), " ")
+	if line == "" {
+		return ""
+	}
+	const maxPrefix = 24
+	prefix := line
+	if runes := []rune(prefix); len(runes) > maxPrefix {
+		pool := string(runes[:maxPrefix])
+		// 优先在分句处断：留太短的片段（< 8 字）没有信息量，不如硬截。
+		if idx := strings.LastIndexAny(pool, "，。！？；：、,.;!?: "); idx >= 0 {
+			if head := pool[:idx]; len([]rune(head)) >= 8 {
+				pool = head
+			}
+		}
+		prefix = pool
+	}
+	name := strings.TrimRight(strings.TrimSpace(prefix), "，。！？、；：,.!?;: ")
+	if name == "" {
+		return ""
+	}
+	if strings.HasSuffix(name, "讨论组") {
+		return name
+	}
+	return name + "讨论组"
+}
+
+// nameDiscussionGroupFromTopic 把会话名从占位替换成「议题前缀 + 讨论组」。
+//
+// 只在名字仍是占位时改：用户自己起过名（旧创建链路 / 后台改名）一律不覆盖。
+// 改名失败只记日志 —— 名字是锦上添花，不能让它把建组主流程带崩（此刻讨论行已经
+// CAS 成功，回错误会让前端以为议题没提交、反复重试）。
+func (rt *discussionRuntime) nameDiscussionGroupFromTopic(ctx context.Context, chatroomID, topic string) {
+	if rt == nil || rt.queries == nil || chatroomID == "" {
+		return
+	}
+	view, err := rt.queries.GetActiveRongCloudChatroomViewByRongCloudID(ctx, chatroomID)
+	if err != nil {
+		return
+	}
+	current := strings.TrimSpace(view.Name)
+	if !discussionGroupPlaceholderNames[current] {
+		return
+	}
+	name := discussionGroupNameFromTopic(topic)
+	if name == "" || name == current {
+		return
+	}
+	// 复用现有 profile 更新：需要把头像/轮数原值带回去（该 UPDATE 是整行写）。
+	if _, err := rt.queries.UpdateRongCloudChatroomProfileByRongCloudID(ctx, db.UpdateRongCloudChatroomProfileByRongCloudIDParams{
+		RongcloudChatroomID: chatroomID,
+		Name:                name,
+		PortraitUri:         view.PortraitUri,
+		MaxRounds:           view.MaxRounds,
+	}); err != nil {
+		if rt.logger != nil {
+			rt.logger.Warn("discussion: rename chatroom from topic failed",
+				"chatroomId", chatroomID, "error", err)
+		}
+	}
 }
 
 // ---- requestRoleRecommend --------------------------------------------------
