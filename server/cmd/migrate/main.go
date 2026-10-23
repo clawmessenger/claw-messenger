@@ -19,6 +19,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/logger"
 	"github.com/multica-ai/multica/server/internal/migrations"
 	"github.com/multica-ai/multica/server/internal/taskusagebackfill"
+	"github.com/multica-ai/multica/server/pkg/envfile"
 )
 
 // preMigrationHook runs work that must happen before a specific migration is
@@ -806,6 +807,17 @@ type runOptions struct {
 }
 
 func main() {
+	// Same .env seeding as the server, and for the same reason: `migrate up` is
+	// run on the same box, from either the repo root or server/, and it must
+	// land on the database the server will actually use. Without this, a
+	// DATABASE_URL that only exists in .env makes migrate fall back to the
+	// localhost default below — the one failure mode that silently migrates the
+	// wrong database.
+	if _, err := envfile.LoadFromEnv(); err != nil {
+		fmt.Fprintf(os.Stderr, "refusing to migrate: environment file is invalid: %v (set MULTICA_ENV_SKIP=1 to ignore the file)\n", err)
+		os.Exit(1)
+	}
+
 	logger.Init()
 
 	if len(os.Args) < 2 {

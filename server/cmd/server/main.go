@@ -33,6 +33,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/selfhosttelemetry"
 	"github.com/multica-ai/multica/server/internal/service"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
+	"github.com/multica-ai/multica/server/pkg/envfile"
 	"github.com/multica-ai/multica/server/pkg/featureflag"
 	"github.com/multica-ai/multica/server/pkg/llm"
 	"github.com/redis/go-redis/v9"
@@ -326,7 +327,39 @@ func newMainHTTPServer(addr string, handler http.Handler) *http.Server {
 }
 
 func main() {
+	// Seed the process environment from .env before anything reads it.
+	//
+	// The precedence is "file wins" (see pkg/envfile), so this is the one place
+	// that decides which value an operator's edit replaces. Everything
+	// downstream still reads plain os.Getenv — no config object, no second
+	// source of truth to keep in sync.
+	//
+	// Fail loudly here rather than booting with half a configuration: a
+	// malformed line means the file was being edited, and starting anyway would
+	// apply whatever happened to parse before the typo. MULTICA_ENV_SKIP=1 is
+	// the escape hatch if that ever blocks a restart.
+	envResult, err := envfile.LoadFromEnv()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "refusing to start: environment file is invalid: %v (set MULTICA_ENV_SKIP=1 to ignore the file)\n", err)
+		os.Exit(1)
+	}
+
 	logger.Init()
+	if envResult.Path != "" {
+		slog.Info("environment file loaded", "path", envResult.Path, "keys", len(envResult.Applied))
+	}
+	if len(envResult.Changed) > 0 {
+		// Key names only. This file holds secrets, and a log line that prints
+		// "DATABASE_URL: old -> new" is a credential leak with extra steps. The
+		// names are enough to notice that a restart is about to use a different
+		// database than the last one did.
+		slog.Warn("environment file overrode values inherited from the process environment",
+			"keys", envResult.Changed)
+	}
+	if len(envResult.Skipped) > 0 {
+		slog.Info("environment file left existing process values in place",
+			"keys", envResult.Skipped)
+	}
 	// Read the opt-out before constructing any telemetry dependency. In the
 	// disabled case no collector or HTTP client is ever created.
 	telemetryConfig := selfhosttelemetry.ConfigFromDoNotTrack(os.Getenv("DO_NOT_TRACK"))

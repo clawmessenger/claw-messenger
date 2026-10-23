@@ -2,13 +2,16 @@
 # restart-server.sh — 重新构建并「就地」重启 claw-messenger 的 Go 服务端。
 #
 # 为什么不直接 kill + ./bin/server：
-#   1) 服务端不读取 .env（代码里没有 dotenv），全部配置来自进程环境变量，
-#      其中就包括监听端口 PORT（代码缺省 5101）。凭记忆重敲一遍很容易把
-#      端口 / 数据库地址敲错，所以这里直接从正在运行的进程
-#      /proc/<pid>/environ 原样继承环境。
+#   1) 服务端启动时会先把工作目录下的 .env 读进进程环境（pkg/envfile，
+#      文件中的键优先），其余配置仍全部来自进程环境变量。凭记忆重敲一遍
+#      很容易把端口 / 数据库地址敲错，所以这里直接从正在运行的进程
+#      /proc/<pid>/environ 原样继承环境，作为 .env 没覆盖到的部分的底。
 #   2) Linux 不允许用 go build -o 直接覆盖正在执行的二进制（ETXTBSY），
 #      因此先构建到 bin/server.new，停进程后再覆盖。
 #   3) 用 setsid + nohup 启动，避免终端一关服务跟着退出。
+#
+# 注意：因为 .env 优先，脚本里显示/探测的 PORT 会以 .env 为准，而不是旧进程
+# 快照里的值——否则改过 PORT 的重启会去敲一个已经没人监听的端口。
 #
 # 用法：
 #   bash scripts/restart-server.sh                # 自动识别运行中的实例
@@ -17,9 +20,10 @@
 #   bash scripts/restart-server.sh --fg           # 前台运行（保持原来的终端方式）
 #
 # 可用环境变量覆盖：
-#   VERSION    写入二进制的版本号，默认 0.2.0
-#   LOG_FILE   后台日志文件，默认 /var/log/clawmessenger.log
-#   MATCH      pgrep 匹配的服务名，默认 bin/server
+#   VERSION          写入二进制的版本号，默认 0.2.0
+#   LOG_FILE         后台日志文件，默认 /var/log/clawmessenger.log
+#   MATCH            pgrep 匹配的服务名，默认 bin/server
+#   MULTICA_ENV_FILE 显式指定环境文件（默认按 cwd/.env → ../.env 查找）
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -94,6 +98,51 @@ PORT_VAL="$(env_line PORT)"
 info "  端口 PORT = ${PORT_VAL:-<未设置，代码缺省 5101>}"
 info "  数据库 DATABASE_URL = $(env_line DATABASE_URL | sed -E 's#(://[^:/@]*:)[^@]*@#\1****@#')"
 info "  融云密钥 = $([ -n "$(env_line MULTICA_RONGCLOUD_SECRET_KEY)" ] && echo 已配置 || echo '<未设置：设备绑定/好友列表会失效>')"
+
+# ---------- 2.5 环境文件（.env）----------
+# 服务端启动时会把 cwd 下的 .env 读进环境，且文件里的键优先于继承来的值
+# （server/pkg/envfile）。所以这里必须按同一顺序找一遍，并把 .env 里的 PORT
+# 用作健康检查端口：否则改过 PORT 的重启会去探测旧端口，报「无响应」而误判
+# 重启失败。
+env_file_value() {
+  [ -f "$1" ] || return 0
+  awk -v want="$2" '
+    /^[[:space:]]*#/ { next }
+    {
+      line = $0
+      sub(/^[[:space:]]+/, "", line)
+      sub(/^export[[:space:]]+/, "", line)
+      eq = index(line, "=")
+      if (eq == 0) next
+      key = substr(line, 1, eq - 1)
+      gsub(/[[:space:]]/, "", key)
+      if (key != want) next
+      val = substr(line, eq + 1)
+      sub(/^[[:space:]]+/, "", val)
+      sub(/[[:space:]]+#.*$/, "", val)
+      sub(/[[:space:]]+$/, "", val)
+      gsub(/^["\047]|["\047]$/, "", val)
+      out = val
+    }
+    END { if (out != "") print out }
+  ' "$1"
+}
+
+ENV_FILE_USED=""
+for cand in "${MULTICA_ENV_FILE:-}" "$CWD/.env" "$CWD/../.env"; do
+  [ -n "$cand" ] || continue
+  if [ -f "$cand" ]; then ENV_FILE_USED="$cand"; break; fi
+done
+if [ -n "$ENV_FILE_USED" ]; then
+  info "环境文件 = $ENV_FILE_USED（其中的键会覆盖下面继承来的同名值）"
+  FILE_PORT="$(env_file_value "$ENV_FILE_USED" PORT)"
+  if [ -n "$FILE_PORT" ]; then
+    PORT_VAL="$FILE_PORT"
+    info "  端口 PORT 以环境文件为准 = $PORT_VAL"
+  fi
+else
+  info "环境文件 = <未找到 cwd/.env 或 ../.env：只用进程环境>"
+fi
 
 # ---------- 3. 重新构建 ----------
 NEW_BIN=""
