@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -708,6 +709,54 @@ func TestParseSetupConfirmRoles(t *testing.T) {
 			},
 		}}); rErr == nil {
 			t.Fatalf("非法 role_id 应拒绝")
+		}
+	})
+	// 2026-10-23 线上：三个角色同名「框架师」→ confirm 被笼统 400 拒掉。
+	// 判重口径必须与 canonicalizeRoundtablePayload 一致（NFKC + 小写），
+	// 并给出可定位的错误码（带 role_index），客户端才能说清改哪一个。
+	t.Run("同角色名（含全角/大小写差异）→ ROLE_NAME_DUPLICATED", func(t *testing.T) {
+		for _, name := range []string{"框架师", " 框架师 ", "Ｆｒａｍｅ"} {
+			first := "框架师"
+			if name == "Ｆｒａｍｅ" {
+				first = "frame"
+			}
+			_, rErr := parseSetupConfirmRoles(CommandContent{Params: map[string]interface{}{
+				"roles": []interface{}{
+					map[string]interface{}{"role_id": "r1", "role_name": first, "role_prompt": "p", "node_id": "n1"},
+					map[string]interface{}{"role_id": "r2", "role_name": name, "role_prompt": "p", "node_id": "n2"},
+				},
+			}})
+			if rErr == nil || rErr.Code != "ROLE_NAME_DUPLICATED" {
+				t.Fatalf("name=%q want ROLE_NAME_DUPLICATED, got %+v", name, rErr)
+			}
+			if idx, ok := rErr.Data["role_index"].(int); !ok || idx != 1 {
+				t.Fatalf("name=%q role_index 应为 1, got %#v", name, rErr.Data)
+			}
+		}
+	})
+	// 限长必须按字符计：以前 len(string) 是字节数，80「字」的名字实际只容
+	// 26 个汉字，中文角色名/设定一长就被整单拒绝（用户看到的是笼统 400）。
+	t.Run("中文长名字/长提示词按字符放行（不再被字节数误杀）", func(t *testing.T) {
+		longName := strings.Repeat("框", 40)   // 40 字 = 120 字节
+		longPrompt := strings.Repeat("设定", 3000) // 3000 字 = 18000 字节
+		roles, rErr := parseSetupConfirmRoles(CommandContent{Params: map[string]interface{}{
+			"roles": []interface{}{
+				map[string]interface{}{"role_id": "r1", "role_name": longName, "role_prompt": longPrompt, "node_id": "n1"},
+			},
+		}})
+		if rErr != nil {
+			t.Fatalf("40 字名字 / 3000 字提示词应放行: %+v", rErr)
+		}
+		if len(roles) != 1 || roles[0].RoleName != longName {
+			t.Fatalf("角色名被截断: %+v", roles)
+		}
+		// 仍然要有上限：超过 8000 字拒绝
+		if _, rErr := parseSetupConfirmRoles(CommandContent{Params: map[string]interface{}{
+			"roles": []interface{}{
+				map[string]interface{}{"role_id": "r1", "role_name": "甲", "role_prompt": strings.Repeat("设", 8001), "node_id": "n1"},
+			},
+		}}); rErr == nil {
+			t.Fatalf("8001 字提示词应拒绝")
 		}
 	})
 }

@@ -285,7 +285,7 @@ func roundtableErrorResult(e *RoundtableError) commandResult {
 	switch e.Code {
 	case "INVALID_ROUNDTABLE_REQUEST", "CREATE_ROUNDTABLE_CONFLICT",
 		"ROLE_DEVICE_DUPLICATED", "ROLE_DEVICE_NOT_OWNED", "ROLE_DEVICE_UNAVAILABLE",
-		"MODEL_NOT_AVAILABLE":
+		"ROLE_NAME_DUPLICATED", "MODEL_NOT_AVAILABLE":
 		return commandResult{code: 400, message: e.Code, data: e.Data}
 	case "RECOMMENDATION_EXPIRED":
 		return commandResult{code: 410, message: e.Code, data: e.Data}

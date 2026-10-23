@@ -6,10 +6,12 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/quota"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
+	"golang.org/x/text/unicode/norm"
 )
 
 // 讨论组引导式创建（configuring 链路）的六个 action。
@@ -559,6 +561,14 @@ func setupRoleSnapshots(canonical roundtableCanonical, validated roundtableValid
 
 // parseSetupConfirmRoles 解析确认时提交的勾选角色（snake_case/camelCase 字段双读）。
 // speaking_order 按数组顺序重排（客户端勾选顺序即发言顺序），并做基本限长校验。
+//
+// 两条口径必须和推荐侧（`parseRecommendedRoles`）一致，否则会出现「推荐能过、
+// 确认被拒」的死结，而用户看到的只是一句「请检查角色名称、提示词、设备和模型」：
+//   - 限长按**字符数**（rune）计。以前用 len(string) 即 UTF-8 字节数 ——
+//     「80」实际只够 26 个汉字、「8000」只够 2666 个汉字，中文角色名/设定
+//     一长就整单拒绝；而 broker 解析推荐时用的是 rune，两边差了三倍。
+//   - 角色名判重也要按 NFKC + 小写归一化（与 canonicalizeRoundtablePayload 同口径），
+//     并给出专门的错误码，让客户端能直说「名字重了」而不是笼统的 400。
 func parseSetupConfirmRoles(cmd CommandContent) ([]roundtableRoleInput, *RoundtableError) {
 	raw, ok := cmd.Params["roles"].([]interface{})
 	if !ok || len(raw) < 1 || len(raw) > 8 {
@@ -566,6 +576,7 @@ func parseSetupConfirmRoles(cmd CommandContent) ([]roundtableRoleInput, *Roundta
 	}
 	roles := make([]roundtableRoleInput, 0, len(raw))
 	nodes := map[string]bool{}
+	names := map[string]bool{}
 	for i, item := range raw {
 		m, ok := item.(map[string]interface{})
 		if !ok {
@@ -575,17 +586,24 @@ func parseSetupConfirmRoles(cmd CommandContent) ([]roundtableRoleInput, *Roundta
 		roleName := strings.TrimSpace(getStringAny(m, "role_name", "roleName"))
 		prompt := strings.TrimSpace(getStringAny(m, "role_prompt", "rolePrompt", "role_instructions", "roleInstructions"))
 		nodeID := strings.TrimSpace(getStringAny(m, "node_id", "nodeId"))
-		if roleID == "" || !roundtableSafeID.MatchString(roleID) || roleName == "" || len(roleName) > 80 ||
-			prompt == "" || len(prompt) > 8000 || nodeID == "" || len(nodeID) > 128 {
+		if roleID == "" || !roundtableSafeID.MatchString(roleID) || roleName == "" ||
+			utf8.RuneCountInString(roleName) > 80 ||
+			prompt == "" || utf8.RuneCountInString(prompt) > 8000 ||
+			nodeID == "" || utf8.RuneCountInString(nodeID) > 128 {
 			return nil, roundtableRoleErr("INVALID_ROUNDTABLE_REQUEST", i)
 		}
+		nameKey := strings.ToLower(norm.NFKC.String(roleName))
+		if names[nameKey] {
+			return nil, roundtableRoleErr("ROLE_NAME_DUPLICATED", i)
+		}
+		names[nameKey] = true
 		if nodes[nodeID] {
 			return nil, roundtableRoleErr("ROLE_DEVICE_DUPLICATED", i)
 		}
 		nodes[nodeID] = true
 		var model *string
 		if ms := strings.TrimSpace(getStringAny(m, "model")); ms != "" {
-			if len(ms) > 256 || !strings.Contains(ms, "/") {
+			if utf8.RuneCountInString(ms) > 256 || !strings.Contains(ms, "/") {
 				return nil, roundtableRoleErr("MODEL_NOT_AVAILABLE", i)
 			}
 			model = &ms

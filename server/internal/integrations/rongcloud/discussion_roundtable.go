@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"golang.org/x/text/unicode/norm"
 
@@ -233,13 +234,18 @@ func canonicalizeRoundtablePayload(params map[string]interface{}) (roundtableCan
 }
 
 // roundtableClean 对齐 _clean：字符串、trim、非空、限长。
+//
+// 限长按**字符数**计。以前用 len(s)（UTF-8 字节数），中文一个字算 3 字节，
+// 于是「topic 4000」实际只容 1333 个汉字、「role_name 80」只容 26 个汉字 ——
+// 而推荐侧（parseRecommendedRoles → roleText）用的是 rune，两边差三倍，
+// 表现就是「推荐正常、确认被一句笼统的 400 拒掉」。
 func roundtableClean(v interface{}, limit int) (string, string) {
 	s, ok := v.(string)
 	if !ok {
 		return "", "INVALID_ROUNDTABLE_REQUEST"
 	}
 	s = strings.TrimSpace(s)
-	if s == "" || len(s) > limit {
+	if s == "" || utf8.RuneCountInString(s) > limit {
 		return "", "INVALID_ROUNDTABLE_REQUEST"
 	}
 	return s, ""
