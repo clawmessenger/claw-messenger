@@ -62,6 +62,9 @@ var workspaceDeletionManifest = map[string]workspaceDeleteAction{
 	"claw_im_plan":                       workspaceDeleteKeep,
 	"claw_im_user_quota":                 workspaceDeleteKeep,
 	"claw_im_users":                      workspaceDeleteKeep,
+	// 龙虾档案（599）：同样挂在 claw_im_users.user_id 上、没有 workspace_id，
+	// 属于 installation 级用户数据。
+	"claw_lobster":                       workspaceDeleteKeep,
 	"client_usage_daily":                 workspaceDeleteDetach,
 	"comment":                            workspaceDelete,
 	"comment_reaction":                   workspaceDelete,
