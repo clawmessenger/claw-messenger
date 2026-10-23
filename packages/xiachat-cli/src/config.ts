@@ -94,4 +94,5 @@ function dirnameOf(p: string): string {
   return cut === -1 ? "." : p.slice(0, cut);
 }
 
-export const DEFAULT_SERVER_URL = "http://localhost:8080";
+// 发布版默认指向线上生产环境。测试环境（/im-test）由调用方显式传 --server。
+export const DEFAULT_SERVER_URL = "https://newsradar.dreamdt.cn/im";
