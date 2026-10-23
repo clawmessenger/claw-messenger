@@ -3,8 +3,11 @@ package rongcloud
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"strings"
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/quota"
@@ -23,6 +26,21 @@ type systemHandler struct {
 	discussionRuntime *discussionRuntime
 	// relayHub 仲裁讨论组闲聊的按序发言（chatroom_relay.go）。
 	relayHub *chatroomRelayHub
+	// lobsterStore / friendStore / userStore 是 service=lobster / friend / user
+	// 的本地表读写（见 lobster_command.go / friend_command.go / user_command.go）。
+	// 由 registration.go 按 ChannelDeps.DB 装配；nil 表示该能力未启用（回 503，
+	// 不 panic），这样没有 DB 装配的部署/测试仍能跑通其余 service。
+	lobsterStore *LobsterStore
+	friendStore  *FriendStore
+	userStore    *UserStore
+	// actorResolver 是命令通道的身份解析注入点。nil 时走 resolveActor
+	// （rongcloud_user → claw_im_users 双表兜底，chatroom_commands.go:64-83）。
+	// 只在测试里替换，生产恒为 nil。
+	actorResolver func(ctx context.Context, fromUserID string) (string, error)
+	// wechatAPIBase / wechatHTTPClient 供 service=user 的 wxLogin 调微信
+	// jscode2session；空值走默认域名与 8s 超时客户端（测试注入假服务）。
+	wechatAPIBase    string
+	wechatHTTPClient *http.Client
 }
 
 func newSystemHandler(client *rongcloudAPIClient, nodeID string, logger *slog.Logger, queries *db.Queries, registry *DiscussionRegistry, nodeRequests *NodeRequestBroker, groupMirror *GroupMirror, discussionRuntime *discussionRuntime, relayHub *chatroomRelayHub) *systemHandler {
@@ -74,10 +92,40 @@ func (h *systemHandler) handleCommand(ctx context.Context, msg NormalizedMessage
 		return h.handleAICommand(ctx, msg, cmd)
 	case "group":
 		return h.handleGroupCommand(ctx, msg, cmd)
+	case "user":
+		return h.handleUserCommand(ctx, msg, cmd)
+	case "friend":
+		return h.handleFriendCommand(ctx, msg, cmd)
+	case "lobster":
+		return h.handleLobsterCommand(ctx, msg, cmd)
 	default:
 		h.logger.Warn("rongcloud: unknown service", "service", cmd.Service, "msgUID", msg.MsgUID)
 		return h.replyErr(ctx, msg, cmd, 404, unknownServiceOrActionMessage(cmd))
 	}
+}
+
+// serviceActor 把命令发送者（融云 user id）换算成 service=user/friend/lobster
+// 需要的账号归属键。
+//
+// 默认实现走 resolveActor —— 即「rongcloud_user 先查、claw_im_users 兜底」的
+// 双表解析（chatroom_commands.go:64-83）：C 端真人注册链路只写 claw_im_users，
+// 只查镜像表会把真人一律判成未识别。actorResolver 字段只供测试替换。
+func (h *systemHandler) serviceActor(ctx context.Context, fromUserID string) (string, error) {
+	if h.actorResolver != nil {
+		return h.actorResolver(ctx, fromUserID)
+	}
+	if strings.TrimSpace(fromUserID) == "" {
+		return "", errors.New("missing sender")
+	}
+	if h.queries == nil {
+		return "", errors.New("database not available")
+	}
+	if _, err := h.resolveActor(ctx, fromUserID); err != nil {
+		return "", err
+	}
+	// 返回融云 TEXT id：claw 账号的 user_id 本身就是融云 id，节点/安装账号
+	// 也只有融云 id，所以两条身份域归一后都是它。
+	return fromUserID, nil
 }
 
 func (h *systemHandler) handlePing(ctx context.Context, msg NormalizedMessage, cmd CommandContent) error {

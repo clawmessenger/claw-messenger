@@ -69,6 +69,15 @@ func (c *rongcloudAPIClient) expireToken(ctx context.Context, userID string, tim
 	return err
 }
 
+// RongCloud /friend/add.json optType values. The endpoint carries both
+// behaviours through one parameter: 2 creates the edge immediately, 1 sends a
+// friend *application* that the target has to accept (the edge only exists
+// after that).
+const (
+	friendOptTypeRequest = "1"
+	friendOptTypeDirect  = "2"
+)
+
 // addFriend creates a one-way RongCloud friend relation from userID to
 // friendID with optType=2 (direct add, no approval step). The legacy Python
 // backend used the same call when binding a device so the node user showed up
@@ -76,10 +85,26 @@ func (c *rongcloudAPIClient) expireToken(ctx context.Context, userID string, tim
 // already friends, which is reported as alreadyFriends=true and counts as
 // success so re-binding (and the friend backfill) stays idempotent.
 func (c *rongcloudAPIClient) addFriend(ctx context.Context, userID, friendID, remark string) (alreadyFriends bool, err error) {
+	return c.addFriendWithOptType(ctx, userID, friendID, remark, friendOptTypeDirect)
+}
+
+// addFriendWithOptType is addFriend with the optType spelled out, so the
+// friend command channel can forward the client's choice (1 = ask for
+// approval, 2 = direct add). Callers that don't care keep using addFriend,
+// whose default stays 2 — every existing binding path must keep adding
+// directly, otherwise re-binding suddenly needs an approval nobody can grant.
+//
+// An alreadyFriends result only makes sense for optType=2: with optType=1 the
+// edge is not created by this call, so 25460 can only mean the two are already
+// friends from before.
+func (c *rongcloudAPIClient) addFriendWithOptType(ctx context.Context, userID, friendID, remark, optType string) (alreadyFriends bool, err error) {
+	if optType != friendOptTypeRequest && optType != friendOptTypeDirect {
+		return false, fmt.Errorf("rongcloud: unsupported friend optType %q", optType)
+	}
 	form := url.Values{
 		"userId":   {userID},
 		"targetId": {friendID},
-		"optType":  {"2"},
+		"optType":  {optType},
 	}
 	if remark != "" {
 		form.Set("name", remark)

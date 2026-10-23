@@ -1273,6 +1273,11 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				// system host 展示名/头像从管理端配置行读。
 				DiscussionRepository: rongcloud.NewDiscussionRepository(queries, slog.Default()),
 				SystemHostConfig:     h.ClawDiscussionSystemHostConfig,
+				// service=user/friend/lobster 的本地表读写（claw_lobster、
+				// claw_im_users.wechat_openid、好友边归属反查）。这三块没有现成
+				// 的 sqlc 查询（新表 / 新列），所以直接给集成层一个 DBTX；
+				// *pgxpool.Pool 满足 db.DBTX。为 nil 时这三个 service 回 503。
+				DB: pool,
 			})
 
 			// Phase 2a: construct service-layer dependencies.

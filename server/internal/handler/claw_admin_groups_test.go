@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -127,6 +128,18 @@ func assignGroupScan(dest []any, values []any) error {
 				return fmt.Errorf("column %d: want bool, got %T", i, values[i])
 			}
 			*target = value
+		case *sql.NullString:
+			// clawQueryUser 的最后一列 rongcloud_token 扫进 sql.NullString
+			// （claw_compat.go:218），真 pgx 能直接扫 string；桩这里要显式支持，
+			// 否则整条查询被当成失败，用例会红在与断言无关的回落分支上。
+			switch value := values[i].(type) {
+			case string:
+				*target = sql.NullString{String: value, Valid: true}
+			case nil:
+				*target = sql.NullString{}
+			default:
+				return fmt.Errorf("column %d: want string or nil for sql.NullString, got %T", i, values[i])
+			}
 		default:
 			return fmt.Errorf("column %d: unsupported destination %T", i, dest[i])
 		}

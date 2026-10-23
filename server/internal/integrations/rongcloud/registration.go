@@ -39,6 +39,11 @@ type ChannelDeps struct {
 	// discussionRuntime 上供 createRoundtableShell 硬校验；Nil 表示不启用
 	// 配额（全部放行，不引入新的失败面）。
 	Quota *quota.Service
+	// DB 供 service=lobster / friend / user 的本地表读写（claw_lobster、
+	// claw_im_users.wechat_openid、好友边归属反查）。这三块没有现成的 sqlc
+	// 查询（新表 / 新列），因此直接在集成层用参数化 SQL 走 DBTX。
+	// Nil 时三个 store 保持 nil，对应 service 回 503 而不是 panic。
+	DB db.DBTX
 }
 
 func RegisterRongCloud(reg *channel.Registry, deps ChannelDeps) {
@@ -93,11 +98,26 @@ func newRongCloudFactory(deps ChannelDeps) channel.Factory {
 			relayHub = newChatroomRelayHub(discussionRuntime)
 			relayHub.groupMirror = deps.GroupMirror
 		}
+		// service=user/friend/lobster 的本地表读写（*_command.go 里的 store）。
+		// 没配 DB 时三者保持 nil，对应 service 回 503 —— 与 group/discussion
+		// 「未装配即降级」的语义一致。
+		systemHandler := newSystemHandler(client, creds.SystemNodeID, logger, deps.Queries, deps.Registry, deps.NodeRequests, deps.GroupMirror, discussionRuntime, relayHub)
+		if deps.DB != nil {
+			systemHandler.lobsterStore = NewLobsterStore(deps.DB)
+			systemHandler.friendStore = NewFriendStore(deps.DB, client, logger)
+			systemHandler.userStore = NewUserStore(deps.DB)
+			// 运行时可观测的装配证据：这一行出现，才说明 service=user/friend/
+			// lobster 走的是真表而不是 503 兜底（见 im_service_commands_test.go
+			// 的 TestFactoryAttachesTheLocalStoresOnlyWhenDBIsProvided）。
+			logger.Info("rongcloud: local IM services enabled (service=user/friend/lobster)")
+		} else {
+			logger.Warn("rongcloud: local IM services disabled (ChannelDeps.DB is nil) — service=user/friend/lobster will reply 503")
+		}
 		return &rongcloudChannel{
 			cfg:           cfg,
 			creds:         creds,
 			client:        client,
-			systemHandler: newSystemHandler(client, creds.SystemNodeID, logger, deps.Queries, deps.Registry, deps.NodeRequests, deps.GroupMirror, discussionRuntime, relayHub),
+			systemHandler: systemHandler,
 			registrar:     deps.Registrar,
 			handler:       cfg.Handler,
 			logger:        logger,

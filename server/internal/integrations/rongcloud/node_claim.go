@@ -78,6 +78,43 @@ func (s *NodeService) NodeClaimants(ctx context.Context, imUserIDs []string) (ma
 	return claimants, nil
 }
 
+// NodeOwnedBy reports whether ownerRCUserID has the friend edge to the given
+// node, i.e. whether the node shows up in that account's device list.
+//
+// This is the single-account form of the same 融云好友边 truth NodeClaimants
+// inverts, and it is deliberately not built on top of it: NodeClaimants
+// memoises a whole-account-set map in one shared cache slot, so calling it with
+// a single user id would overwrite the admin device list's mapping with a
+// one-account map for the next claimCacheTTL seconds. One /friend/get.json call
+// is cheap enough for the per-request ownership check this backs.
+//
+// The claw user id doubles as its RongCloud account id (the login flow issues
+// the rc token with user_id as the rc id), and binding writes the edge
+// owner → node (bindAgentsToMachine), so "my friend list contains this rc id"
+// is exactly "I bound this node" — the same rule the old web device list uses.
+// An empty owner or node id is never an ownership, and a missing edge is a
+// plain false, not an error: RongCloud simply doesn't have it.
+func (s *NodeService) NodeOwnedBy(ctx context.Context, ownerRCUserID string, node db.RongcloudNode) (bool, error) {
+	if s.client == nil {
+		return false, errors.New("rongcloud: API client not configured")
+	}
+	owner := strings.TrimSpace(ownerRCUserID)
+	target := strings.TrimSpace(node.RongcloudUserID)
+	if owner == "" || target == "" {
+		return false, nil
+	}
+	friends, err := s.client.FriendIDs(ctx, owner)
+	if err != nil {
+		return false, err
+	}
+	for _, friend := range friends {
+		if strings.TrimSpace(friend) == target {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // InvalidateNodeClaimants drops the memoised friend-edge inversion. Claim
 // changes must call this so the next read reflects the new edges instead of
 // serving the pre-change mapping for up to claimCacheTTL.

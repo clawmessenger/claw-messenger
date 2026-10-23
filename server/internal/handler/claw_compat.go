@@ -30,6 +30,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/integrations/rongcloud"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
 // ---- 响应包装（与 Python 端一致：{code, message, data}） ----
@@ -1085,13 +1086,47 @@ func (h *Handler) ClawNodeStatus(w http.ResponseWriter, r *http.Request) {
 	clawJSON(w, 200, 200, "", resp)
 }
 
+// clawNodeOps 是 ClawUpdateNode / ClawDeleteNode 用到的 NodeService 方法子集。
+//
+// 抽成接口只为了可测：NodeService 带未导出的融云 HTTP 客户端参数，在 handler
+// 包外无法构造（见 claw_device_auth_test.go 的说明），而这两个端点的越权分支
+// 必须能断言「一个写方法都没被调用」。生产路径恒为 h.RongCloudNode。
+type clawNodeOps interface {
+	GetNodeByNodeID(ctx context.Context, nodeIDText string) (db.RongcloudNode, error)
+	NodeOwnedBy(ctx context.Context, ownerRCUserID string, node db.RongcloudNode) (bool, error)
+	GetUserByRongCloudID(ctx context.Context, rcUserID string) (db.RongcloudUser, error)
+	UpdateUserProfile(ctx context.Context, id pgtype.UUID, name, portrait string) error
+	UnbindNode(ctx context.Context, node db.RongcloudNode, ownerRongCloudID string) error
+	UnregisterNode(ctx context.Context, node db.RongcloudNode, ownerRongCloudID string) error
+}
+
+// clawNodeService 返回这两个设备写端点要用的节点服务（nil = 未启用融云渠道）。
+// 先判空再返回，避免把 nil 指针装进接口后接口本身不为 nil。
+func (h *Handler) clawNodeService() clawNodeOps {
+	if h.clawNodeOpsForTest != nil {
+		return h.clawNodeOpsForTest
+	}
+	if h.RongCloudNode == nil {
+		return nil
+	}
+	return h.RongCloudNode
+}
+
+// clawNodeOwnershipMessage 是「节点存在但不属于当前用户」的返回文案，与
+// 「节点不存在」逐字相同：node_id 形如 node_<16hex>，会出现在设备列表响应和
+// 前端 URL 里，不是凭据；一旦归属失败回 403/401，「不存在」与「别人的」就能
+// 靠错误码和文案区分开，node_id 于是成了可枚举的探针。
+const clawNodeOwnershipMessage = "节点不存在"
+
 // ClawUpdateNode POST /api/claw/nodes/{nodeId} 旧站编辑设备资料（昵称/头像）走 HTTP，
 // 替代原 IM 通道 ai/updateNode（Go 兼容层从未实现，旧链路恒报错）。
 func (h *Handler) ClawUpdateNode(w http.ResponseWriter, r *http.Request) {
-	if _, ok := h.clawRequireClawUser(w, r); !ok {
+	clawUserID, ok := h.clawRequireClawUser(w, r)
+	if !ok {
 		return
 	}
-	if h.RongCloudNode == nil {
+	ops := h.clawNodeService()
+	if ops == nil {
 		clawJSON(w, 503, 503, "RongCloud 渠道未安装", nil)
 		return
 	}
@@ -1109,17 +1144,30 @@ func (h *Handler) ClawUpdateNode(w http.ResponseWriter, r *http.Request) {
 		clawJSON(w, 400, 400, "请求体格式错误", nil)
 		return
 	}
-	node, err := h.RongCloudNode.GetNodeByNodeID(r.Context(), nodeID)
+	node, err := ops.GetNodeByNodeID(r.Context(), nodeID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			clawJSON(w, 404, 404, "节点不存在", nil)
+			clawJSON(w, 404, 404, clawNodeOwnershipMessage, nil)
 			return
 		}
 		slog.Warn("claw: node update lookup failed", "nodeId", nodeID, "error", err)
 		clawJSON(w, 500, 500, "查询节点失败", nil)
 		return
 	}
-	user, err := h.RongCloudNode.GetUserByRongCloudID(r.Context(), node.RongcloudUserID)
+	// 归属校验必须挡在任何写之前。口径见 NodeOwnedBy：owner → node 的融云
+	// 好友边，与绑定侧（bindAgentsToMachine）和设备列表同一份真相。
+	owned, err := ops.NodeOwnedBy(r.Context(), clawUserID, node)
+	if err != nil {
+		slog.Warn("claw: node update ownership lookup failed", "nodeId", nodeID, "user", clawUserID, "error", err)
+		clawJSON(w, 500, 500, "查询节点失败", nil)
+		return
+	}
+	if !owned {
+		slog.Warn("claw: node update denied for non-owner", "nodeId", nodeID, "user", clawUserID)
+		clawJSON(w, 404, 404, clawNodeOwnershipMessage, nil)
+		return
+	}
+	user, err := ops.GetUserByRongCloudID(r.Context(), node.RongcloudUserID)
 	if err != nil {
 		slog.Warn("claw: node update user lookup failed", "nodeId", nodeID, "error", err)
 		clawJSON(w, 500, 500, "查询节点用户失败", nil)
@@ -1133,7 +1181,7 @@ func (h *Handler) ClawUpdateNode(w http.ResponseWriter, r *http.Request) {
 	if portrait == "" {
 		portrait = user.PortraitUri.String
 	}
-	if err := h.RongCloudNode.UpdateUserProfile(r.Context(), user.ID, name, portrait); err != nil {
+	if err := ops.UpdateUserProfile(r.Context(), user.ID, name, portrait); err != nil {
 		slog.Warn("claw: node update profile failed", "nodeId", nodeID, "error", err)
 		clawJSON(w, 500, 500, "更新节点资料失败", nil)
 		return
@@ -1152,7 +1200,8 @@ func (h *Handler) ClawDeleteNode(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if h.RongCloudNode == nil {
+	ops := h.clawNodeService()
+	if ops == nil {
 		clawJSON(w, 503, 503, "RongCloud 渠道未安装", nil)
 		return
 	}
@@ -1161,22 +1210,36 @@ func (h *Handler) ClawDeleteNode(w http.ResponseWriter, r *http.Request) {
 		clawJSON(w, 400, 400, "缺少节点ID", nil)
 		return
 	}
-	node, err := h.RongCloudNode.GetNodeByNodeID(r.Context(), nodeID)
+	node, err := ops.GetNodeByNodeID(r.Context(), nodeID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			clawJSON(w, 404, 404, "节点不存在", nil)
+			clawJSON(w, 404, 404, clawNodeOwnershipMessage, nil)
 			return
 		}
 		slog.Warn("claw: node delete lookup failed", "nodeId", nodeID, "error", err)
 		clawJSON(w, 500, 500, "查询节点失败", nil)
 		return
 	}
+	// 归属校验挡在解绑/注销之前：两个分支都会删本地节点行（并尽力删融云好友
+	// 边），unregister=true 还会把 agent 的融云账号永久注销，所以这里不能
+	// 只靠「node_id 拿得到」。口径与 ClawUpdateNode 相同（NodeOwnedBy）。
+	owned, err := ops.NodeOwnedBy(r.Context(), userID, node)
+	if err != nil {
+		slog.Warn("claw: node delete ownership lookup failed", "nodeId", nodeID, "user", userID, "error", err)
+		clawJSON(w, 500, 500, "查询节点失败", nil)
+		return
+	}
+	if !owned {
+		slog.Warn("claw: node delete denied for non-owner", "nodeId", nodeID, "user", userID)
+		clawJSON(w, 404, 404, clawNodeOwnershipMessage, nil)
+		return
+	}
 	// unregister=true：用户在前端确认弹窗里选了「注销 Agent 并解绑」—— 融云
 	// 账号永久注销（不可恢复），必须显式 opt-in；缺省仅解除绑定。
 	if r.URL.Query().Get("unregister") == "true" {
-		err = h.RongCloudNode.UnregisterNode(r.Context(), node, userID)
+		err = ops.UnregisterNode(r.Context(), node, userID)
 	} else {
-		err = h.RongCloudNode.UnbindNode(r.Context(), node, userID)
+		err = ops.UnbindNode(r.Context(), node, userID)
 	}
 	if err != nil {
 		slog.Warn("claw: node unbind failed", "nodeId", nodeID, "unregister", r.URL.Query().Get("unregister"), "error", err)

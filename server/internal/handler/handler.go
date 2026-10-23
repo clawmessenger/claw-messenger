@@ -379,6 +379,12 @@ type Handler struct {
 	RongCloudChatroom   *rongcloud.ChatroomService
 	RongCloudPairing    *rongcloud.PairingService
 	RongCloudDiscussion *rongcloud.DiscussionService
+	// clawNodeOpsForTest replaces the node-service methods ClawUpdateNode /
+	// ClawDeleteNode call. NodeService cannot be constructed outside the
+	// rongcloud package (its API client parameter is unexported), so the
+	// ownership tests need this seam to assert "not one write method was
+	// called". Always nil in production — see clawNodeOps in claw_compat.go.
+	clawNodeOpsForTest clawNodeOps
 	// RongCloudNodeRequests brokers server-initiated device requests over the
 	// command channel; see rongcloud.NodeRequestBroker. Shared with the channel
 	// via ChannelDeps, which is why it lives here rather than inside a service.
