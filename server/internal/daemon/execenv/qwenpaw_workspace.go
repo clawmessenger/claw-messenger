@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -75,6 +76,16 @@ func prepareQwenpawWorkspace(qwenpawWorkspace string, workspaceSkills []SkillCon
 		// Write supporting files.
 		for _, f := range skill.Files {
 			fpath := filepath.Join(skillDir, f.Path)
+			// Containment assertion: the path comes from the database, so
+			// re-check that Join kept it under the skill directory. Join
+			// resolves ".." and lets an absolute or drive-qualified path
+			// replace skillDir entirely on Windows. Skip and warn instead of
+			// failing the whole workspace for one bad row.
+			if rel, relErr := filepath.Rel(skillDir, fpath); relErr != nil ||
+				rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				logger.Warn("skill file escapes skill dir, skipping", "skill", skill.Name, "path", f.Path)
+				continue
+			}
 			if err := os.MkdirAll(filepath.Dir(fpath), 0o755); err != nil {
 				return fmt.Errorf("create dir for skill file %q: %w", f.Path, err)
 			}

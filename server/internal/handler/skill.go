@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -305,19 +306,19 @@ type AddAgentSkillsRequest struct {
 
 // --- Helpers ---
 
-// validateFilePath checks that a file path is safe (no traversal, no absolute paths).
+// validateFilePath checks that a file path is safe (no traversal, no absolute
+// paths). The judgement itself lives in skillpkg.IsSafeBundlePath so the JSON
+// API, the archive importer and the daemon all agree, and so it does not depend
+// on which OS the server runs on. This wrapper only handles the shape the JSON
+// callers send: the desktop client is Windows and transmits native separators,
+// so they are normalized before the path is judged (otherwise "sub\a.md" would
+// be rejected).
 func validateFilePath(p string) bool {
 	if p == "" {
 		return false
 	}
-	if filepath.IsAbs(p) {
-		return false
-	}
-	cleaned := filepath.Clean(p)
-	if strings.HasPrefix(cleaned, "..") {
-		return false
-	}
-	return true
+	norm := strings.ReplaceAll(p, "\\", "/")
+	return skillpkg.IsSafeBundlePath(pathpkg.Clean(norm))
 }
 
 func (h *Handler) loadSkillForUser(w http.ResponseWriter, r *http.Request, id string) (db.Skill, bool) {

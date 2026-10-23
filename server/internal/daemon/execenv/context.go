@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -983,6 +984,19 @@ func writeSkillFiles(skillsDir string, skills []SkillContextForEnv, manifest *si
 				continue
 			}
 			fpath := filepath.Join(dir, f.Path)
+			// Containment assertion: f.Path came from the database, not from
+			// this function, so re-check that Join kept it under the skill
+			// directory. filepath.Join resolves ".." and, on Windows, an
+			// absolute or drive-qualified path replaces dir outright — either
+			// way the written file would land outside the skill. Skip and warn
+			// rather than fail prep, so one bad row cannot break the task.
+			if rel, relErr := filepath.Rel(dir, fpath); relErr != nil ||
+				rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				// Log the offending bundle path only; the absolute directory
+				// would leak the daemon's layout into logs.
+				slog.Warn("skill file escapes skill dir, skipping", "path", f.Path)
+				continue
+			}
 			if err := recordMkdirAll(filepath.Dir(fpath), 0o755, manifest); err != nil {
 				return err
 			}

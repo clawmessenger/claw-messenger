@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"path"
 	"sort"
@@ -111,6 +112,13 @@ func parseSkillArchive(data []byte, filename string) (*importedSkill, error) {
 		if f.FileInfo().IsDir() || strings.HasSuffix(f.Name, `\`) {
 			continue
 		}
+		// A zip stores a symlink's target as its content. Nothing in the import
+		// path follows one, but accepting it would put a file in the bundle
+		// whose meaning depends on a filesystem we do not control. Same rule as
+		// pkg/plugincontract's zipEntryPaths.
+		if f.Mode()&fs.ModeSymlink != 0 {
+			continue
+		}
 		clean := cleanArchiveEntryName(f.Name)
 		if !strings.EqualFold(path.Base(clean), skillpkg.ContentFilename) {
 			continue
@@ -155,6 +163,11 @@ func parseSkillArchive(data []byte, filename string) (*importedSkill, error) {
 	for _, f := range zr.File {
 		// Compress-Archive directory markers may have no directory attributes.
 		if f.FileInfo().IsDir() || strings.HasSuffix(f.Name, `\`) {
+			continue
+		}
+		// Symlinked entries carry a target, not content: skip them here as well
+		// so a link cannot become a supporting file of the bundle.
+		if f.Mode()&fs.ModeSymlink != 0 {
 			continue
 		}
 		clean := cleanArchiveEntryName(f.Name)
@@ -210,22 +223,17 @@ func cleanArchiveEntryName(name string) string {
 	return path.Clean(strings.ReplaceAll(name, "\\", "/"))
 }
 
-// validateArchiveFilePath extends the existing import validation with portable
-// archive constraints. Windows drive syntax is not recognized by filepath.IsAbs
-// on a Unix server, and NUL bytes would be removed before persistence. Neither
-// can safely be passed to the daemon as a bundle path.
+// validateArchiveFilePath keeps the archive-specific guard and delegates the
+// rest of the judgement to the shared bundle-path predicate. The NUL check has
+// to stay here: sanitizeNullBytes strips NUL before persistence, so a path
+// that arrives with one would be laundered into a different — possibly unsafe —
+// path by the time it is stored. cleanArchiveEntryName has already normalized
+// backslashes and cleaned the entry, so the predicate sees a slash path.
 func validateArchiveFilePath(p string) bool {
 	if strings.ContainsRune(p, '\x00') {
 		return false
 	}
-	if len(p) >= 2 && isASCIIAlpha(p[0]) && p[1] == ':' {
-		return false
-	}
-	return validateFilePath(p)
-}
-
-func isASCIIAlpha(c byte) bool {
-	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
+	return skillpkg.IsSafeBundlePath(p)
 }
 
 // archiveEntryPrefix returns the directory prefix (with trailing slash) of a
