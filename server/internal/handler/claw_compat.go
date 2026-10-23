@@ -203,6 +203,35 @@ func (c *clawRongClient) refreshUser(ctx context.Context, userID, name, portrait
 
 // ---- 用户行 ----
 
+// clawRongDisplayName 返回推给融云的用户显示名。
+//
+// 融云 /user/getToken.json 的 name 是必填项（getUserToken 无条件带上它，空值
+// 会让 token mint 失败 → 登录 500），而本地 claw_im_users.nickname 允许为
+// NULL（= 用户没设昵称）。因此**只在融云投影这一层**用账号名兜底：库里的
+// nickname 仍保持 NULL，接口仍照实返回空串。两件事不能混为一谈。
+func clawRongDisplayName(nickname, username string) string {
+	if n := strings.TrimSpace(nickname); n != "" {
+		return n
+	}
+	return username
+}
+
+// clawRegisterRongToken 把新注册用户推给融云并返回 token。
+//
+// best-effort：融云没配 / 调用失败时返回空串，注册本身照常成功（之后登录会
+// 走 mint 重试）。单独抽出来是为了让「昵称为空时推的是账号名」这条契约能被
+// 一个假融云服务直接断言（见 claw_register_nickname_test.go）。
+func clawRegisterRongToken(ctx context.Context, rc *clawRongClient, userID, nickname, username, portrait string) string {
+	if rc == nil {
+		return ""
+	}
+	token, err := rc.getUserToken(ctx, userID, clawRongDisplayName(nickname, username), portrait)
+	if err != nil {
+		return ""
+	}
+	return token
+}
+
 type clawUserRow struct {
 	UserID       string
 	Username     string
@@ -224,7 +253,7 @@ func (h *Handler) clawQueryUser(ctx context.Context, field string, arg string) (
 		return nil, fmt.Errorf("invalid field")
 	}
 	row := h.DB.QueryRow(ctx,
-		"SELECT user_id, username, COALESCE(nickname,username), COALESCE(portrait_uri,''), "+
+		"SELECT user_id, username, COALESCE(nickname,''), COALESCE(portrait_uri,''), "+
 			"COALESCE(email,''), COALESCE(phone,''), COALESCE(signature,''), COALESCE(gender,''), "+
 			"COALESCE(birthday,''), status, password_hash, rongcloud_token "+
 			"FROM claw_im_users WHERE "+field+" = $1", arg)
@@ -328,10 +357,11 @@ func (h *Handler) ClawRegister(w http.ResponseWriter, r *http.Request) {
 	if username == "" {
 		username = userID
 	}
+	// 昵称不再用账号名兜底：claw_im_users.nickname 为 NULL 就表示「用户没设
+	// 昵称」，账号名只属于 username 一列。旧代码在这里写 username，让「显示
+	// 昵称」和「登录名」永久粘连，之后的读路径（COALESCE）与融云投影只能一路
+	// 放大这个污染。空串在下面落库时折成 NULL（NULLIF），两者语义等价。
 	nickname := strings.TrimSpace(req.Nickname)
-	if nickname == "" {
-		nickname = username
-	}
 
 	// 默认头像：注册时即写库 + 推融云 —— 融云会话/好友列表渲染的是融云侧
 	// portraitUri，客户端本地兜底图在「融云已知资料」场景不生效；不推的话
@@ -340,7 +370,7 @@ func (h *Handler) ClawRegister(w http.ResponseWriter, r *http.Request) {
 
 	_, err = h.DB.Exec(ctx, `
 		INSERT INTO claw_im_users (user_id, username, nickname, portrait_uri, password_hash, status, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, 'active', now(), now())`,
+		VALUES ($1, $2, NULLIF($3,''), $4, $5, 'active', now(), now())`,
 		userID, username, nickname, portrait, clawHashPassword(req.Password))
 	if err != nil {
 		clawJSON(w, 500, 500, "注册失败", nil)
@@ -348,8 +378,13 @@ func (h *Handler) ClawRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 同步注册到融云（best-effort，失败不阻塞注册）。
+	//
+	// 融云 /user/getToken.json 的 name 是必填字段（getUserToken 无条件
+	// form.Set("name", …)，code != 200 就拿不到 token，登录会因此 500）。
+	// 所以融云侧仍然要有名字：昵称为空时推账号名。这是**融云展示层的兜底**，
+	// 不是写库的兜底 —— 库里的 nickname 保持 NULL，接口也照实返回空串。
 	if rc := h.clawRong(ctx); rc != nil {
-		if token, err := rc.getUserToken(ctx, userID, nickname, portrait); err == nil {
+		if token := clawRegisterRongToken(ctx, rc, userID, nickname, username, portrait); token != "" {
 			_, _ = h.DB.Exec(ctx, "UPDATE claw_im_users SET rongcloud_token=$1 WHERE user_id=$2", token, userID)
 		}
 	}
@@ -453,7 +488,8 @@ func (h *Handler) ClawLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	token, minted := clawResolveLoginToken(stored, func() (string, error) {
 		if rc := h.clawRong(ctx); rc != nil {
-			return rc.getUserToken(ctx, u.UserID, u.Nickname, u.PortraitURI)
+			// name 必填：昵称为 NULL 的用户推账号名，否则 mint 失败 → 500。
+			return rc.getUserToken(ctx, u.UserID, clawRongDisplayName(u.Nickname, u.Username), u.PortraitURI)
 		}
 		return "", errors.New("rongcloud 未配置")
 	})
@@ -479,7 +515,7 @@ func (h *Handler) ClawUserList(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	exclude := strings.TrimSpace(r.URL.Query().Get("exclude"))
 	rows, err := h.DB.Query(ctx, `
-		SELECT user_id, username, COALESCE(nickname, username), COALESCE(portrait_uri,''),
+		SELECT user_id, username, COALESCE(nickname, ''), COALESCE(portrait_uri,''),
 		       COALESCE(email,''), COALESCE(phone,'')
 		FROM claw_im_users
 		WHERE status = 'active' AND ($1 = '' OR user_id <> $1)
@@ -618,7 +654,7 @@ func (h *Handler) ClawUserUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	_, err = h.DB.Exec(ctx, `
 		UPDATE claw_im_users
-		SET nickname=$1, portrait_uri=$2, phone=$3, email=$4, signature=$5, gender=$6, birthday=$7, updated_at=now()
+		SET nickname=NULLIF($1,''), portrait_uri=$2, phone=$3, email=$4, signature=$5, gender=$6, birthday=$7, updated_at=now()
 		WHERE user_id=$8`,
 		set(req.Nickname, u.Nickname), nextPortrait,
 		set(req.Phone, u.Phone), set(req.Email, u.Email),
