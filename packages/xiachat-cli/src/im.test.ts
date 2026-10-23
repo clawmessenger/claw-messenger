@@ -1090,6 +1090,38 @@ describe("MessageDispatcher chat_stream streaming", () => {
     expect(sent.length).toBeGreaterThanOrEqual(1)
   })
 
+  it("agent 整轮不吐增量时，把全文分片回放成 streaming 帧", async () => {
+    const { deps, streams } = buildDeps()
+    const dispatcher = new MessageDispatcher(deps)
+    // 200 字左右：足够分 4 片，远小于 9000 字节直发上限
+    const answer = "这是一段比较长的回答，用来验证设备端在 agent 一次性吐全文时会把正文分片回放成流式帧，"
+      + "而不是让客户端一直停在空白的加载态、直到最后一刻才一次性蹦出全文。"
+      + "回放必须从第一片就带正文，且每一片都是上一片的延续，客户端才能按 seq 单调覆盖；"
+      + "中途若出现比上一帧更短的正文，气泡里的字会肉眼可见地倒退。"
+    await dispatcher.handle({
+      objectName: "RC:TxtMsg", fromUserId: "user_a", toUserId: "", targetId: "node_self",
+      conversationType: 1, content: JSON.stringify({ content: "hi" }),
+    }, {
+      runTurn: async () => { throw new Error("unused") },
+      // 关键：整轮一次 onDelta 都不调（openclaw / 整段缓冲的 opencode）
+      runTurnStreamed: async () => answer,
+    })
+
+    const frames = streams.map((s) => parseFrame(s.content));
+    const streaming = frames.filter((f) => f.status === "streaming");
+    // 至少 4 片，且正文逐片增长、每片都是上一片的延续
+    expect(streaming.length).toBeGreaterThanOrEqual(4);
+    for (let i = 1; i < streaming.length; i += 1) {
+      expect(String(streaming[i]!.text).length).toBeGreaterThan(String(streaming[i - 1]!.text).length);
+      expect(String(streaming[i]!.text).startsWith(String(streaming[i - 1]!.text))).toBe(true);
+    }
+    // 首片就带正文：客户端气泡的「正在思考」判据是 streaming && !content，
+    // 前几片为空会让它继续停在加载态
+    expect(String(streaming[0]!.text).length).toBeGreaterThan(0);
+    expect(frames.at(-1)!.status).toBe("completed");
+    expect(String(frames.at(-1)!.text)).toBe(answer);
+  });
+
   it("relay your_turn streams into the chatroom conversation", async () => {
     const { deps, streams, sent } = buildDeps()
     const dispatcher = new MessageDispatcher(deps)

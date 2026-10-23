@@ -820,6 +820,45 @@ export class MessageDispatcher {
         // → 心跳断了（见 relay ping 日志）。
         + ` elapsed=${Math.round((Date.now() - turnStartedAt) / 1000)}s`,
       );
+      // 伪流式回放：本轮**几乎没发出正文**时（agent 一次性吐全文），客户端
+      // 全程只收到开头那个空帧，于是「转圈几分钟 → 全文一次性蹦出」。
+      // 已知会这样的：openclaw（`agent --local --json` 只给一次性信封）、
+      // 以及部分 opencode 版本在 `--format json` 下整段缓冲（2026-10-23 实测
+      // 70s 内零字节输出）。正文已经在手上，分片回放成 streaming 帧，观感与
+      // 真流式一致，也比「白等」诚实。
+      //
+      // 只补「客户端还没看到的那一段」：帧是全量快照，客户端按 seq 覆盖，
+      // 回放比当前快照更短的正文会让气泡里的字倒退。snapshot 是单调增长的，
+      // 任何已发出的帧都不超过它，所以从 snapshot.length 开始分片是安全的。
+      const replayFrom = snapshot.length;
+      if (!controller.signal.aborted
+        && visibleText.startsWith(snapshot)
+        && visibleText.length - replayFrom >= 80) {
+        const total = visibleText.length;
+        // 4~24 片；总时长控制在 ~4s 以内（片多则间隔自动缩短）。
+        const slices = Math.min(24, Math.max(4, Math.ceil((total - replayFrom) / 120)));
+        const size = Math.ceil((total - replayFrom) / slices);
+        const gap = Math.min(220, Math.floor(4000 / slices));
+        console.log(
+          `stream replay: conv=${ctx.conversationType}/${ctx.conversationId}`
+          + ` from=${replayFrom} to=${total} frames=${slices}`,
+        );
+        for (let end = replayFrom; end < total; end += size) {
+          if (controller.signal.aborted) break;
+          const sliceEnd = Math.min(total, end + size);
+          await emit(
+            seq,
+            "streaming",
+            visibleText.slice(0, sliceEnd),
+            reasoningSnapshot || undefined,
+            undefined,
+            activitySnapshot,
+            timeline,
+          );
+          seq += 1;
+          if (sliceEnd < total) await new Promise<void>((resolve) => setTimeout(resolve, gap));
+        }
+      }
       await emit(seq, "completed", visibleText, reasoningSnapshot || undefined, undefined, activitySnapshot, timeline);
       await opts.fallback(visibleText);
       await this.sendArtifactMessages(ctx, uploaded);
