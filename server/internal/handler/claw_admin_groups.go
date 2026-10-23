@@ -230,16 +230,18 @@ func clawRecomputeGroupMemberCount(ctx context.Context, tx pgx.Tx, groupID strin
 	return err
 }
 
-// clawGroupListMembers 返回镜像成员，昵称/头像取自 claw_im_users。融云节点成员
-// 没有 IM 账号，两列留空、由调用方回退成 user id。
+// clawGroupListMembers 返回镜像成员，昵称/头像取自 claw_im_users。AI 节点在
+// claw_im_users 里没有行，所以头像再回退到 rongcloud_user 镜像（AI 成员头像此前
+// 恒空，即使 rongcloud_user.portrait_uri 已有值）。
 func (h *Handler) clawGroupListMembers(ctx context.Context, groupID string) ([]rongcloud.GroupMember, error) {
 	rows, err := h.DB.Query(ctx, `
 		SELECT m.user_id,
 		       COALESCE(NULLIF(m.nickname, ''), u.nickname, ''),
-		       COALESCE(u.portrait_uri, ''),
+		       COALESCE(NULLIF(u.portrait_uri, ''), NULLIF(ru.portrait_uri, ''), ''),
 		       m.role
 		FROM rongcloud_group_member m
 		LEFT JOIN claw_im_users u ON u.user_id = m.user_id
+		LEFT JOIN rongcloud_user ru ON ru.rongcloud_user_id = m.user_id
 		WHERE m.group_id = $1
 		ORDER BY m.created_at ASC`, groupID)
 	if err != nil {
@@ -265,10 +267,11 @@ func (h *Handler) clawGroupListAiMembers(ctx context.Context, groupID string) ([
 	rows, err := h.DB.Query(ctx, `
 		SELECT m.user_id,
 		       COALESCE(NULLIF(m.nickname, ''), u.nickname, ''),
-		       COALESCE(u.portrait_uri, ''),
+		       COALESCE(NULLIF(u.portrait_uri, ''), NULLIF(ru.portrait_uri, ''), ''),
 		       m.role
 		FROM rongcloud_group_member m
 		LEFT JOIN claw_im_users u ON u.user_id = m.user_id
+		LEFT JOIN rongcloud_user ru ON ru.rongcloud_user_id = m.user_id
 		WHERE m.group_id = $1
 		  AND EXISTS(SELECT 1 FROM rongcloud_node x
 		             WHERE x.rongcloud_user_id = m.user_id AND NULLIF(x.ai_type, '') IS NOT NULL)

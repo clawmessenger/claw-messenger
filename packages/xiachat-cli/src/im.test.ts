@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { ARGV_PROMPT_MAX_CHARS } from "./agents.js";
 import type { ActivityStep } from "./agent-activity.js";
-import { MessageDispatcher, planReadReceipt, resolveTurnVenue, turnSessionKey } from "./im.js";
+import { MessageDispatcher, planReadReceipt, resolveTurnVenue, turnNeedsHeartbeat, turnSessionKey } from "./im.js";
 import { TurnIncompleteError } from "./turn-error.js";
 
 function makeDeps() {
@@ -1511,6 +1511,22 @@ describe("会话形态判定与隔离（群聊不得被当成讨论组）", () =
     expect(turnSessionKey("private", "user_a")).toBe("cm-private-user_a")
     // 群聊与讨论组永远不共享键 —— 这正是「群聊答成等待主题发布」的病灶
     expect(turnSessionKey("group", "room_rc")).not.toBe(turnSessionKey("discussion", "room_rc"))
+  })
+
+  // 讨论组的轮次 id 是服务端 UUID（不是 relay_ 前缀）。旧心跳判据只看
+  // requestId.startsWith("relay_")，讨论组于是整场不发心跳，服务端只剩派发时
+  // 定死的墙钟：设备还在流式产出也被判「响应超时」→ 跳过 → 主持人汇总超时 →
+  // 整场 summary_failed（线上 2026-10-22）。心跳必须按「是否按序派发」判。
+  it("按序派发的轮次都要心跳：讨论组与群聊/聊天室，私聊不要", () => {
+    expect(turnNeedsHeartbeat("discussion")).toBe(true)
+    expect(turnNeedsHeartbeat("group")).toBe(true)
+    expect(turnNeedsHeartbeat("chatroom")).toBe(true)
+    expect(turnNeedsHeartbeat("private")).toBe(false)
+  })
+
+  it("心跳判据不得回退成 relay_ 前缀判断（源码护栏）", () => {
+    const src = readFileSync(join(__dirname, "im.ts"), "utf8")
+    expect(src).not.toContain('requestMessageId.startsWith("relay_")')
   })
 
   function relayDeps() {

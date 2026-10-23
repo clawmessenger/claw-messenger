@@ -3,6 +3,16 @@
 // nicknames to RongCloud (-sync-names) for devices renamed before the rename
 // flow started pushing to RongCloud.
 //
+// It can also unify default portraits (-sync-portraits): every account whose
+// portrait is empty or exactly one of the known legacy default images is moved
+// to the single platform default (rongcloud.DefaultUserPortrait). Custom
+// portraits are never touched — the match is exact, never a LIKE pattern.
+// Coverage: rongcloud_user + claw_im_users (pushed to RongCloud, because
+// getToken never updates an existing user), rongcloud_group (pushed via
+// /group/refresh.json — group/create takes no portrait), and the local-only
+// portrait columns of rongcloud_chatroom / rongcloud_chatroom_member (the
+// RongCloud chatroom API has no portrait field at all).
+//
 // The web client's 好友列表 (contact list) reads the RongCloud friend list, so a
 // device bound before BindAgents called /friend/add.json never showed up there.
 // This command walks the visible agent nodes of a workspace (the same nodes the
@@ -10,14 +20,17 @@
 // node are skipped) and friends each one to every target claw/IM user.
 //
 // It is safe to rerun: RongCloud answers 25460 for an existing edge, which is
-// reported as "already" and counts as success. Nothing is written unless
-// -commit is passed — the default is a dry run that only prints the plan.
+// reported as "already" and counts as success. Rows already carrying the
+// unified default portrait are skipped, so a rerun costs no RongCloud calls.
+// Nothing is written unless -commit is passed — the default is a dry run that
+// only prints the plan.
 //
 // Typical use (from the server/ directory):
 //
 //	go run ./cmd/backfill-friends -env-file ../.env -commit -all-users
 //	go run ./cmd/backfill-friends -env-file ../.env -commit -user 100123,100456
 //	go run ./cmd/backfill-friends -env-file ../.env -commit -sync-names
+//	go run ./cmd/backfill-friends -env-file ../.env -sync-portraits
 package main
 
 import (
@@ -46,13 +59,14 @@ func main() {
 }
 
 func run() error {
-	userFlag := flag.String("user", "", "comma-separated claw_im_users.user_id values to backfill")
+	userFlag := flag.String("user", "", "comma-separated claw_im_users.user_id values to backfill; also restricts -sync-portraits to these RongCloud user ids (pass rc_node_*/agent_* ids to target those rows)")
 	allUsers := flag.Bool("all-users", false, "backfill every active claw_im_users account")
 	workspaceFlag := flag.String("workspace", "", "workspace UUID to backfill (default: every workspace that has nodes)")
 	commit := flag.Bool("commit", false, "write the friend edges (default is a dry run)")
 	includeOps := flag.Bool("include-ops", false, "also friend the internal ops node (hidden from the friend list by default)")
 	bidirectional := flag.Bool("both", false, "also write the reverse edge (agent -> owner)")
 	syncNames := flag.Bool("sync-names", false, "push every node's database nickname to RongCloud (/user/refresh.json) instead of, or in addition to, friending")
+	syncPortraits := flag.Bool("sync-portraits", false, "unify default portraits (empty or exact legacy default) to the platform default for claw_im_users and rongcloud_user; custom portraits are never overwritten")
 	dsnFlag := flag.String("dsn", "", "postgres DSN (default: $DATABASE_URL, then $MULTICA_DATABASE_URL)")
 	envFile := flag.String("env-file", "", "load KEY=VALUE environment variables from this file before reading configuration")
 	flag.Parse()
@@ -63,8 +77,8 @@ func run() error {
 		}
 	}
 
-	if *userFlag == "" && !*allUsers && !*syncNames {
-		return fmt.Errorf("specify -user <id[,id...]>, -all-users, or -sync-names to choose what to repair")
+	if *userFlag == "" && !*allUsers && !*syncNames && !*syncPortraits {
+		return fmt.Errorf("specify -user <id[,id...]>, -all-users, -sync-names, or -sync-portraits to choose what to repair")
 	}
 
 	dsn := firstNonEmpty(*dsnFlag, os.Getenv("DATABASE_URL"), os.Getenv("MULTICA_DATABASE_URL"))
@@ -105,7 +119,7 @@ func run() error {
 	if len(workspaces) == 0 {
 		return fmt.Errorf("no rongcloud workspace found to backfill")
 	}
-	if len(users) == 0 && !*syncNames {
+	if len(users) == 0 && !*syncNames && !*syncPortraits {
 		return fmt.Errorf("no claw user matched; nothing to do")
 	}
 
@@ -113,12 +127,14 @@ func run() error {
 		IncludeOps:    *includeOps,
 		Bidirectional: *bidirectional,
 		DryRun:        !*commit,
+		// -user 同时约束 -sync-portraits 的 rongcloud_user 那一路（白名单）。
+		OnlyRCUserIDs: users,
 	}
 	if opts.DryRun {
 		fmt.Println("DRY RUN — nothing will be written. Re-run with -commit to apply.")
 	}
-	fmt.Printf("workspaces=%d users=%d include_ops=%v bidirectional=%v sync_names=%v\n\n",
-		len(workspaces), len(users), opts.IncludeOps, opts.Bidirectional, *syncNames)
+	fmt.Printf("workspaces=%d users=%d include_ops=%v bidirectional=%v sync_names=%v sync_portraits=%v\n\n",
+		len(workspaces), len(users), opts.IncludeOps, opts.Bidirectional, *syncNames, *syncPortraits)
 
 	failed := 0
 
@@ -148,6 +164,60 @@ func run() error {
 			}
 		}
 		fmt.Printf("nickname summary: renamed=%d refreshed=%d skipped=%d failed=%d\n", renamed, refreshed, skipped, failed)
+		fmt.Println()
+	}
+
+	if *syncPortraits {
+		var summary portraitSummary
+		// rongcloud_user：AI agent / 机器主节点 / 真人镜像行。
+		// -user 同时是这一路的白名单（opts.OnlyRCUserIDs），否则「只补某个用户」
+		// 会顺手把每个 workspace 的 rongcloud_user 全刷一遍。
+		for _, ws := range workspaces {
+			outcomes, err := svc.SyncUserPortraits(ctx, ws, opts)
+			if err != nil {
+				return fmt.Errorf("sync portraits workspace %s: %w", uuidString(ws), err)
+			}
+			for _, o := range outcomes {
+				summary.add(o.Status)
+				printPortrait(o.Scope, o.Status, o.RCUser, o.From, o.To, o.Error)
+			}
+		}
+		// claw_im_users：真人账号表（融云侧必须 refreshUser，SQL 改不到融云）。
+		clawSummary, err := syncClawUserPortraits(ctx, pool, svc, users, opts.DryRun)
+		if err != nil {
+			return fmt.Errorf("sync claw user portraits: %w", err)
+		}
+		summary.merge(clawSummary)
+		// -user 是严格白名单：群 / 聊天室 / 成员表没有用户维度（群是多人共享的，
+		// 后两张表连 workspace_id 都没有），无法按用户裁剪，所以「只补某个用户」
+		// 时不顺手改全局数据 —— 要补群/房间请单独跑一次不带 -user 的 -sync-portraits。
+		if len(users) > 0 {
+			fmt.Println("skip groups/chatrooms/members: -user 只补该用户（这些表没有用户维度）；需要时请单独跑不带 -user 的 -sync-portraits")
+		} else {
+			// rongcloud_group：群头像只能靠 /group/refresh.json 补写，先推融云再回写本地列。
+			groupSummary, err := syncGroupPortraits(ctx, pool, svc, opts.DryRun)
+			if err != nil {
+				return fmt.Errorf("sync group portraits: %w", err)
+			}
+			summary.merge(groupSummary)
+			// rongcloud_chatroom / rongcloud_chatroom_member：融云聊天室 API 没有头像
+			// 字段，只回写本地列。
+			for _, target := range []struct {
+				table   string
+				display string
+			}{
+				{"rongcloud_chatroom", "rongcloud_chatroom_id"},
+				{"rongcloud_chatroom_member", "member_id"},
+			} {
+				localSummary, err := syncLocalPortraitColumn(ctx, pool, target.table, target.display, opts.DryRun)
+				if err != nil {
+					return fmt.Errorf("sync %s portraits: %w", target.table, err)
+				}
+				summary.merge(localSummary)
+			}
+		}
+		failed += summary.failed
+		fmt.Printf("portrait summary: planned=%d updated=%d skipped=%d failed=%d\n", summary.planned, summary.updated, summary.skipped, summary.failed)
 		fmt.Println()
 	}
 
@@ -186,7 +256,9 @@ func run() error {
 }
 
 // resolveWorkspaces returns the workspace UUIDs to scan: the explicit flag when
-// given, otherwise every workspace that currently has a rongcloud node.
+// given, otherwise every workspace that currently has a rongcloud node or a
+// rongcloud user (a human mirror can exist without any node, and -sync-portraits
+// must reach it).
 func resolveWorkspaces(ctx context.Context, pool *pgxpool.Pool, explicit string) ([]pgtype.UUID, error) {
 	if strings.TrimSpace(explicit) != "" {
 		var wsID pgtype.UUID
@@ -195,7 +267,11 @@ func resolveWorkspaces(ctx context.Context, pool *pgxpool.Pool, explicit string)
 		}
 		return []pgtype.UUID{wsID}, nil
 	}
-	rows, err := pool.Query(ctx, "SELECT DISTINCT workspace_id FROM rongcloud_node ORDER BY 1")
+	rows, err := pool.Query(ctx,
+		`SELECT workspace_id FROM rongcloud_node
+		 UNION
+		 SELECT workspace_id FROM rongcloud_user
+		 ORDER BY 1`)
 	if err != nil {
 		return nil, fmt.Errorf("list workspaces: %w", err)
 	}
@@ -240,6 +316,241 @@ func resolveUsers(ctx context.Context, pool *pgxpool.Pool, userFlag string, all 
 		out = append(out, id)
 	}
 	return out, rows.Err()
+}
+
+// portraitSummary counts -sync-portraits outcomes.
+type portraitSummary struct {
+	planned int
+	updated int
+	skipped int
+	failed  int
+}
+
+func (s *portraitSummary) add(status string) {
+	switch status {
+	case "planned":
+		s.planned++
+	case "updated":
+		s.updated++
+	case "skipped":
+		s.skipped++
+	case "failed":
+		s.failed++
+	}
+}
+
+func (s *portraitSummary) merge(other portraitSummary) {
+	s.planned += other.planned
+	s.updated += other.updated
+	s.skipped += other.skipped
+	s.failed += other.failed
+}
+
+func printPortrait(scope, status, rcUser, from, to, errText string) {
+	line := fmt.Sprintf("%-13s %-8s rc=%-46s from=%q to=%q", scope, status, rcUser, from, to)
+	if errText != "" {
+		line += " error=" + errText
+	}
+	fmt.Println(line)
+}
+
+// syncClawUserPortraits unifies the default portrait of real accounts
+// (claw_im_users). RongCloud only renders the portraitUri it stores, and
+// getToken never updates an existing user, so the RongCloud side must be
+// pushed with /user/refresh.json before the local row is rewritten — pushing
+// first keeps a failed record eligible for the next run instead of leaving a
+// database value that looks "already done".
+//
+// Only empty values and the exact legacy default URLs are matched
+// (rongcloud.NeedsDefaultPortrait); a portrait the user picked is skipped.
+// users limits the scan when -user is given; otherwise every active account is
+// considered.
+func syncClawUserPortraits(ctx context.Context, pool *pgxpool.Pool, svc *rongcloud.NodeService, users []string, dryRun bool) (portraitSummary, error) {
+	var summary portraitSummary
+	query := `SELECT user_id, COALESCE(portrait_uri, '') FROM claw_im_users WHERE status = 'active'`
+	args := []interface{}{}
+	if len(users) > 0 {
+		query += ` AND user_id = ANY($1)`
+		args = append(args, users)
+	}
+	query += ` ORDER BY user_id`
+	rows, err := pool.Query(ctx, query, args...)
+	if err != nil {
+		return summary, fmt.Errorf("list claw users: %w", err)
+	}
+	defer rows.Close()
+
+	target := rongcloud.DefaultUserPortrait()
+	for rows.Next() {
+		var userID, current string
+		if err := rows.Scan(&userID, &current); err != nil {
+			return summary, fmt.Errorf("scan claw user: %w", err)
+		}
+		if !rongcloud.NeedsDefaultPortrait(current) {
+			summary.skipped++
+			printPortrait("claw_im_users", "skipped", userID, current, target, "")
+			continue
+		}
+		if dryRun {
+			summary.planned++
+			printPortrait("claw_im_users", "planned", userID, current, target, "")
+			continue
+		}
+		// name 传空串：融云侧昵称保持原值，只改头像。
+		if err := svc.PushUserPortrait(ctx, userID, "", target); err != nil {
+			summary.failed++
+			printPortrait("claw_im_users", "failed", userID, current, target, err.Error())
+			continue
+		}
+		if _, err := pool.Exec(ctx,
+			`UPDATE claw_im_users SET portrait_uri = $2, updated_at = now() WHERE user_id = $1`,
+			userID, target); err != nil {
+			summary.failed++
+			printPortrait("claw_im_users", "failed", userID, current, target, err.Error())
+			continue
+		}
+		summary.updated++
+		printPortrait("claw_im_users", "updated", userID, current, target, "")
+	}
+	return summary, rows.Err()
+}
+
+// portraitNeedsFixWhere 是存量判定在 SQL 侧的预筛：空值、两个历史常量全等、
+// 或 URL path 精确以旧静态路由结尾（right() 做的是精确后缀，不是 LIKE）。
+// 逐行仍会用 rongcloud.NeedsDefaultPortrait 复核，所以即使预筛放宽也不会误写
+// 用户自定义头像。参数固定为 ($1 legacy URIs, $2 path 长度, $3 path)。
+const portraitNeedsFixWhere = `(portrait_uri IS NULL
+	OR btrim(portrait_uri) = ''
+	OR portrait_uri = ANY($1)
+	OR right(btrim(portrait_uri), $2::int) = $3)`
+
+// portraitFixCandidates 返回预筛参数（历史 URI 列表 / path 长度 / path）。
+func portraitFixCandidates() []interface{} {
+	legacy := rongcloud.LegacyDefaultPortraitURIs()
+	path := rongcloud.LegacyDefaultPortraitPath
+	return []interface{}{legacy, len(path), path}
+}
+
+// syncGroupPortraits 补齐群头像（rongcloud_group）：融云 /group/create.json 不
+// 收 portraitUri，群头像只能事后用 /group/refresh.json 补写 —— 所以这一路必须
+// 真的调融云。顺序是「先推融云成功，再回写本地列」，失败只计数（best-effort），
+// 库内保留旧值以便下次重试。
+//
+// 先把候选行全部读出来再逐条处理：refreshGroupInfo 是外网调用，不能占着连接池
+// 的游标不放。
+func syncGroupPortraits(ctx context.Context, pool *pgxpool.Pool, svc *rongcloud.NodeService, dryRun bool) (portraitSummary, error) {
+	var summary portraitSummary
+	rows, err := pool.Query(ctx, `
+		SELECT id::text, group_id, COALESCE(portrait_uri, '')
+		FROM rongcloud_group
+		WHERE `+portraitNeedsFixWhere+`
+		ORDER BY group_id`, portraitFixCandidates()...)
+	if err != nil {
+		return summary, fmt.Errorf("list groups: %w", err)
+	}
+	type groupRow struct {
+		id       string
+		groupID  string
+		portrait string
+	}
+	var pending []groupRow
+	for rows.Next() {
+		var r groupRow
+		if err := rows.Scan(&r.id, &r.groupID, &r.portrait); err != nil {
+			rows.Close()
+			return summary, fmt.Errorf("scan group: %w", err)
+		}
+		if !rongcloud.NeedsDefaultPortrait(r.portrait) {
+			summary.skipped++
+			continue
+		}
+		pending = append(pending, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return summary, err
+	}
+
+	target := rongcloud.DefaultUserPortrait()
+	for _, r := range pending {
+		if dryRun {
+			summary.planned++
+			printPortrait("rongcloud_group", "planned", r.groupID, r.portrait, target, "")
+			continue
+		}
+		if err := svc.RefreshGroupPortrait(ctx, r.groupID, target); err != nil {
+			summary.failed++
+			printPortrait("rongcloud_group", "failed", r.groupID, r.portrait, target, err.Error())
+			continue
+		}
+		if _, err := pool.Exec(ctx,
+			`UPDATE rongcloud_group SET portrait_uri = $2, updated_at = now() WHERE id = $1::uuid`,
+			r.id, target); err != nil {
+			summary.failed++
+			printPortrait("rongcloud_group", "failed", r.groupID, r.portrait, target, err.Error())
+			continue
+		}
+		summary.updated++
+		printPortrait("rongcloud_group", "updated", r.groupID, r.portrait, target, "")
+	}
+	return summary, nil
+}
+
+// syncLocalPortraitColumn 回写只存在于本地读模型的头像列（rongcloud_chatroom /
+// rongcloud_chatroom_member）：融云聊天室 API 没有头像字段，所以**不推融云**，
+// 只按同一套精确判定逐行改本地库。display 是日志里可读的业务键（成员表用
+// member_id，聊天室用 rongcloud_chatroom_id），table/display 只接受本文件内的常量。
+func syncLocalPortraitColumn(ctx context.Context, pool *pgxpool.Pool, table, display string, dryRun bool) (portraitSummary, error) {
+	var summary portraitSummary
+	rows, err := pool.Query(ctx, fmt.Sprintf(`
+		SELECT id::text, COALESCE(%s, id::text), COALESCE(portrait_uri, '')
+		FROM %s
+		WHERE %s
+		ORDER BY id`, display, table, portraitNeedsFixWhere), portraitFixCandidates()...)
+	if err != nil {
+		return summary, fmt.Errorf("list %s: %w", table, err)
+	}
+	type localRow struct {
+		id       string
+		key      string
+		portrait string
+	}
+	var pending []localRow
+	for rows.Next() {
+		var r localRow
+		if err := rows.Scan(&r.id, &r.key, &r.portrait); err != nil {
+			rows.Close()
+			return summary, fmt.Errorf("scan %s: %w", table, err)
+		}
+		if !rongcloud.NeedsDefaultPortrait(r.portrait) {
+			summary.skipped++
+			continue
+		}
+		pending = append(pending, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return summary, err
+	}
+
+	target := rongcloud.DefaultUserPortrait()
+	for _, r := range pending {
+		if dryRun {
+			summary.planned++
+			printPortrait(table, "planned", r.key, r.portrait, target, "")
+			continue
+		}
+		if _, err := pool.Exec(ctx,
+			fmt.Sprintf(`UPDATE %s SET portrait_uri = $2, updated_at = now() WHERE id = $1::uuid`, table),
+			r.id, target); err != nil {
+			summary.failed++
+			printPortrait(table, "failed", r.key, r.portrait, target, err.Error())
+			continue
+		}
+		summary.updated++
+		printPortrait(table, "updated", r.key, r.portrait, target, "")
+	}
+	return summary, nil
 }
 
 // loadEnvFile sets KEY=VALUE pairs from path into the process environment

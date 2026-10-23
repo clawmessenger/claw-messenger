@@ -509,3 +509,26 @@ describe("SendThrottle（全连接串行发送队列）", () => {
     vi.useRealTimers();
   });
 });
+
+describe("聊天室成员身份（23406 NOT_IN_CHATROOM）", () => {
+  it("只把「不在聊天室 / 聊天室不存在」当作需要重新加入", async () => {
+    const { isChatroomMembershipError } = await import("./run.js");
+    expect(isChatroomMembershipError(23406)).toBe(true);
+    expect(isChatroomMembershipError(23410)).toBe(true);
+    // 限频、禁言、参数错误都不是成员身份问题
+    expect(isChatroomMembershipError(20604)).toBe(false);
+    expect(isChatroomMembershipError(23408)).toBe(false);
+    expect(isChatroomMembershipError(23412)).toBe(false);
+  });
+
+  it("会员身份丢失 → 重新加入后重发；限频 → 退避重发；其余 → 放弃", async () => {
+    const { planSendFailure } = await import("./run.js");
+    expect(planSendFailure(23406, 1)).toBe("rejoin");
+    expect(planSendFailure(23410, 1)).toBe("rejoin");
+    // 重新加入的次数有上限，避免房间彻底不可用时死循环
+    expect(planSendFailure(23406, 2)).toBe("fail");
+    expect(planSendFailure(20604, 1)).toBe("retry");
+    expect(planSendFailure(20604, 9)).toBe("fail");
+    expect(planSendFailure(23408, 1)).toBe("fail");
+  });
+});

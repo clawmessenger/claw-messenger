@@ -156,6 +156,9 @@ func (s *roundtableCreationService) ensureChatroom(ctx context.Context, request 
 		Config:              []byte("{}"),
 		Status:              "active",
 		Name:                canonical.ChatroomName,
+		// 融云聊天室 API 没有头像字段，讨论组头像纯本地数据；不写就会恒为空串，
+		// 各端只能各显各的兜底图。
+		PortraitUri: DefaultUserPortrait(),
 	})
 	if err != nil {
 		// 重复到达（chatroom 行已存在）→ 幂等继续；融云侧房间无需重建。
@@ -179,6 +182,8 @@ func (s *roundtableCreationService) ensureChatroom(ctx context.Context, request 
 		Enabled:      true,
 		MemberID:     pgtype.Text{String: userID, Valid: true},
 		Nickname:     nickname,
+		// 所有者头像取镜像行的实际值，空则统一默认图（成员列表直接读这一列）。
+		PortraitUri: DefaultPortraitIfEmpty(ownerMirror.PortraitUri.String),
 	})
 	hostCapsJSON, _ := json.Marshal(roundtableRequiredHostCaps)
 	_, _ = s.queries.UpsertRongCloudChatroomMemberByMemberID(ctx, db.UpsertRongCloudChatroomMemberByMemberIDParams{
@@ -191,6 +196,7 @@ func (s *roundtableCreationService) ensureChatroom(ctx context.Context, request 
 		Nickname:         validated.host.displayName,
 		RoleName:         pgtype.Text{String: roundtableHostRoleName, Valid: true},
 		RoleInstructions: pgtype.Text{String: roundtableHostInstructions, Valid: true},
+		PortraitUri:      DefaultUserPortrait(),
 	})
 	return nil
 }
@@ -223,6 +229,7 @@ func (s *roundtableCreationService) ensureMembers(ctx context.Context, chatroomI
 			Enabled:          true,
 			DiscussionModel:  model,
 			SpeakingOrder:    pgtype.Int4{Int32: int32(role.SpeakingOrder), Valid: true},
+			PortraitUri:      DefaultUserPortrait(),
 		})
 		if err != nil {
 			return roundtableErr("CREATE_ROUNDTABLE_RECOVERABLE")

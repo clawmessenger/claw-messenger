@@ -101,8 +101,10 @@ func mirrorClawUserToRongCloudUser(ctx context.Context, queries *db.Queries, rcI
 		WorkspaceID:     wsID,
 		RongcloudUserID: rcID,
 		Name:            textOrNull(name),
-		PortraitUri:     textOrNull(portrait),
-		NodeType:        "human",
+		// claw_im_users.portrait_uri 可空：镜像行也绝不能空，否则聊天室成员列表
+		// 头像恒空白（客户端只能各显各的兜底图）。
+		PortraitUri: pgText(DefaultPortraitIfEmpty(portrait)),
+		NodeType:    "human",
 	})
 	if err == nil {
 		return mirror, nil
@@ -439,10 +441,17 @@ func (h *systemHandler) actionChatroomUpdate(ctx context.Context, cmd CommandCon
 			name = t
 		}
 	}
+	// 只有非空 patch 才覆盖，与群设置（COALESCE(NULLIF(...))）语义一致：客户端
+	// 显式传 portraitUri:"" 不能把已有头像清空。两边都为空时落统一默认图。
+	// 注意：聊天室头像**只写本地库** —— 融云聊天室 API 没有头像字段，这里不推融云，
+	// 也不存在「已同步到融云」这回事。
 	portrait := room.PortraitUri
 	if v, ok := cmd.Params["portraitUri"].(string); ok {
-		portrait = strings.TrimSpace(v)
+		if trimmed := strings.TrimSpace(v); trimmed != "" {
+			portrait = trimmed
+		}
 	}
+	portrait = DefaultPortraitIfEmpty(portrait)
 	maxRounds := room.MaxRounds
 	if v, ok := cmd.Params["openclawMaxRounds"]; ok {
 		switch t := v.(type) {
@@ -519,7 +528,7 @@ func (h *systemHandler) actionChatroomJoin(ctx context.Context, cmd CommandConte
 	if !actor.Name.Valid || nickname == "" {
 		nickname = actor.RongcloudUserID
 	}
-	portrait := actor.PortraitUri.String
+	portrait := DefaultPortraitIfEmpty(actor.PortraitUri.String)
 	_, _ = h.queries.UpsertRongCloudChatroomMemberByMemberID(ctx, db.UpsertRongCloudChatroomMemberByMemberIDParams{
 		ChatroomID:   room.ID,
 		MemberType:   "user",
@@ -577,15 +586,29 @@ func (h *systemHandler) actionChatroomInvite(ctx context.Context, cmd CommandCon
 		return errResult(403, "请先加入聊天室再邀请成员")
 	}
 	for _, uid := range userIDs {
-		// Look up the invitee's profile for nickname/portrait.
-		prof, err := h.queries.GetRongCloudUserByRongCloudID(ctx, uid)
+		// Look up the invitee's profile for nickname/portrait. 真人在首次发聊天室
+		// 命令前没有 rongcloud_user 镜像行，AI 节点也可能还没写过资料 —— 所以
+		// 镜像行 miss 时回退 claw_im_users，仍为空才落统一默认图。
 		nickname, portrait := uid, ""
-		if err == nil {
+		if prof, err := h.queries.GetRongCloudUserByRongCloudID(ctx, uid); err == nil {
 			if prof.Name.Valid && prof.Name.String != "" {
 				nickname = prof.Name.String
 			}
-			if prof.PortraitUri.Valid {
-				portrait = prof.PortraitUri.String
+			portrait = strings.TrimSpace(prof.PortraitUri.String)
+		}
+		if portrait == "" {
+			if claw, err := h.queries.GetClawIMUserByUserID(ctx, uid); err == nil {
+				portrait = strings.TrimSpace(stringOrNull(claw.PortraitUri))
+			}
+		}
+		// Upsert 的 ON CONFLICT 无条件写 EXCLUDED.portrait_uri，没有新值时必须沿用
+		// 成员行已有的头像，否则一次「邀请」就会把已设好的头像清空。
+		if portrait == "" {
+			if existing, err := h.queries.GetRongCloudChatroomMemberByChatroomAndMemberID(ctx, db.GetRongCloudChatroomMemberByChatroomAndMemberIDParams{
+				ChatroomID: room.ID,
+				MemberID:   pgtype.Text{String: uid, Valid: true},
+			}); err == nil {
+				portrait = strings.TrimSpace(existing.PortraitUri)
 			}
 		}
 		_, _ = h.queries.UpsertRongCloudChatroomMemberByMemberID(ctx, db.UpsertRongCloudChatroomMemberByMemberIDParams{
@@ -595,7 +618,7 @@ func (h *systemHandler) actionChatroomInvite(ctx context.Context, cmd CommandCon
 			Enabled:      true,
 			MemberID:     pgtype.Text{String: uid, Valid: true},
 			Nickname:     nickname,
-			PortraitUri:  portrait,
+			PortraitUri:  DefaultPortraitIfEmpty(portrait),
 		})
 	}
 	members, _ = h.loadMembers(ctx, room.ID)
@@ -689,7 +712,7 @@ func parseAIMembers(v interface{}) []aiMemberInput {
 func (h *systemHandler) actionChatroomCreate(ctx context.Context, cmd CommandContent, actor db.RongcloudUser) commandResult {
 	rcID := strings.TrimSpace(getStringAny(cmd.Params, "chatroom_id", "chatroomId"))
 	name := strings.TrimSpace(getStringAny(cmd.Params, "chatroom_name", "chatroomName"))
-	portrait := strings.TrimSpace(getStringAny(cmd.Params, "portrait_uri", "portraitUri"))
+	portrait := DefaultPortraitIfEmpty(getStringAny(cmd.Params, "portrait_uri", "portraitUri"))
 	hostNodeID := strings.TrimSpace(getStringAny(cmd.Params, "host_node_id", "hostNodeId"))
 	aiMembers := parseAIMembers(cmd.Params["aiMembers"])
 	maxRounds := int32(20)
@@ -832,7 +855,7 @@ func (h *systemHandler) actionChatroomCreate(ctx context.Context, cmd CommandCon
 		Enabled:      true,
 		MemberID:     pgtype.Text{String: actor.RongcloudUserID, Valid: true},
 		Nickname:     nickname,
-		PortraitUri:  actor.PortraitUri.String,
+		PortraitUri:  DefaultPortraitIfEmpty(actor.PortraitUri.String),
 	})
 	// Host as an AI member.
 	_, _ = h.queries.UpsertRongCloudChatroomMemberByMemberID(ctx, db.UpsertRongCloudChatroomMemberByMemberIDParams{
@@ -845,7 +868,8 @@ func (h *systemHandler) actionChatroomCreate(ctx context.Context, cmd CommandCon
 		Enabled:          true,
 		MemberID:         pgtype.Text{String: hostNode.RongcloudUserID, Valid: true},
 		Nickname:         hostNodeNickname(hostNode),
-		PortraitUri:      "",
+		// AI 成员头像不能写死空串：聊天室成员列表直接读这一列。
+		PortraitUri: DefaultUserPortrait(),
 	})
 	// Ordinary AI members.
 	for _, m := range resolved {
@@ -865,7 +889,7 @@ func (h *systemHandler) actionChatroomCreate(ctx context.Context, cmd CommandCon
 			DiscussionModel:  model,
 			MemberID:         pgtype.Text{String: m.node.RongcloudUserID, Valid: true},
 			Nickname:         hostNodeNickname(m.node),
-			PortraitUri:      "",
+			PortraitUri:      DefaultUserPortrait(),
 		})
 	}
 	// Sync the AI members into the RongCloud room.
@@ -1092,7 +1116,7 @@ func (h *systemHandler) actionChatroomSetDiscussionTeam(ctx context.Context, cmd
 			DiscussionModel:  model,
 			MemberID:         pgtype.Text{String: m.node.RongcloudUserID, Valid: true},
 			Nickname:         hostNodeNickname(m.node),
-			PortraitUri:      "",
+			PortraitUri:      DefaultUserPortrait(),
 		})
 	}
 	// Sync join/quit with RongCloud.

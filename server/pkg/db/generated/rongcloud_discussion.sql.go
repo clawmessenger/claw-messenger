@@ -162,6 +162,31 @@ func (q *Queries) DeleteRongCloudDiscussion(ctx context.Context, discussionID st
 	return err
 }
 
+const extendRongCloudDiscussionCommandDeadline = `-- name: ExtendRongCloudDiscussionCommandDeadline :execrows
+UPDATE rongcloud_discussion_command
+SET available_at = $1
+WHERE command_id = $2
+  AND state IN ('pending', 'leased', 'sent')
+`
+
+type ExtendRongCloudDiscussionCommandDeadlineParams struct {
+	AvailableAt pgtype.Timestamptz `json:"available_at"`
+	CommandID   string             `json:"command_id"`
+}
+
+// 流式心跳续期：设备端在轮次进行中每 15s 发一条 relay_ping_<requestId>，
+// 服务端把这条派发命令的到期时刻往后推。讨论组的单轮此前只有固定墙钟
+// （available_at 在派发时定死），设备明明还在流式产出也照样被判超时 ——
+// 第 N 轮「响应超时」→ 重试 → 跳过 → 主持人汇总同样超时 → summary_failed，
+// 线上 2026-10-22 那次失败就是这条链。只有未终结的命令才需要续期。
+func (q *Queries) ExtendRongCloudDiscussionCommandDeadline(ctx context.Context, arg ExtendRongCloudDiscussionCommandDeadlineParams) (int64, error) {
+	result, err := q.db.Exec(ctx, extendRongCloudDiscussionCommandDeadline, arg.AvailableAt, arg.CommandID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getActiveRongCloudDiscussionByChatroom = `-- name: GetActiveRongCloudDiscussionByChatroom :one
 SELECT discussion_id, chatroom_id, workspace_id, created_by, topic, goal, max_rounds, mode, status, current_round, version, role_snapshot, host_config_snapshot, recommendation_id, client_request_id, round_policy, round_revision, created_at, updated_at, setup_step, last_interaction_at, cancel_reason FROM rongcloud_discussion
 WHERE chatroom_id = $1
@@ -975,6 +1000,54 @@ LIMIT $1
 // P7 恢复扫描：到期的未终结派发命令（available_at 在派发时被置为「超时时刻」）。
 func (q *Queries) ListDueRongCloudDiscussionCommands(ctx context.Context, limit int32) ([]RongcloudDiscussionCommand, error) {
 	rows, err := q.db.Query(ctx, listDueRongCloudDiscussionCommands, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []RongcloudDiscussionCommand{}
+	for rows.Next() {
+		var i RongcloudDiscussionCommand
+		if err := rows.Scan(
+			&i.CommandID,
+			&i.DiscussionID,
+			&i.RequestID,
+			&i.Kind,
+			&i.Payload,
+			&i.State,
+			&i.Attempts,
+			&i.AvailableAt,
+			&i.LeaseUntil,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listOverdueRongCloudDiscussionCommands = `-- name: ListOverdueRongCloudDiscussionCommands :many
+SELECT command_id, discussion_id, request_id, kind, payload, state, attempts, available_at, lease_until, created_at FROM rongcloud_discussion_command
+WHERE kind = 'dispatch'
+  AND state IN ('pending', 'sent')
+  AND created_at <= $2
+ORDER BY created_at ASC
+LIMIT $1
+`
+
+type ListOverdueRongCloudDiscussionCommandsParams struct {
+	Limit  int32              `json:"limit"`
+	Cutoff pgtype.Timestamptz `json:"cutoff"`
+}
+
+// 绝对上限兜底：心跳续期会让一轮的 available_at 一直往后推，agent 真挂死时
+// 就永不到期。这里按「派发时刻」而不是到期时刻筛，跨过上限的命令无论有心跳
+// 都要收敛（见 interactiveMaxTurnDuration）。
+func (q *Queries) ListOverdueRongCloudDiscussionCommands(ctx context.Context, arg ListOverdueRongCloudDiscussionCommandsParams) ([]RongcloudDiscussionCommand, error) {
+	rows, err := q.db.Query(ctx, listOverdueRongCloudDiscussionCommands, arg.Limit, arg.Cutoff)
 	if err != nil {
 		return nil, err
 	}

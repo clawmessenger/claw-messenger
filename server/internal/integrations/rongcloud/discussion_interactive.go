@@ -78,8 +78,32 @@ const (
 	// interactiveDefaultTurnTimeout 是 host.timeout_seconds 不可用时的兜底等待上限。
 	interactiveDefaultTurnTimeout = 300 * time.Second
 
-	// interactiveMinTurnTimeout 是单轮等待的下限：一次 agent 调用不可能更快。
-	interactiveMinTurnTimeout = 10 * time.Second
+	// interactiveTurnTimeoutFloor 是**派发时**的保底等待时长，不受管理端
+	// 「系统主持 timeout_seconds」（初始 60s）影响。
+	//
+	// 讨论是严格按序的：成员没说完就不该推进下一位，等多久都不算错。设备端从
+	// agent 启动到首个 token 常常就要几十秒（opencode/codex 冷启动 + 长思考），
+	// 60s 的配置会让正常轮次成批假超时 —— 线上表现为「第 7 轮质疑者响应超时 →
+	// 重试 → 跳过 → 主持人汇总同样超时 → summary_failed」。真正的掉线判定交给
+	// 心跳的空闲窗口（interactiveHeartbeatIdleWindow），这里只防死锁。
+	interactiveTurnTimeoutFloor = 300 * time.Second
+
+	// interactiveHeartbeatIdleWindow 是「最后一次心跳之后还能等多久」。
+	//
+	// 设备端（xiachat-cli）对每个 your_turn 轮次每 15s 发一条 relay_ping_<requestId>
+	// 心跳；每收到一条就把 outbox 的 available_at 推到「现在 + 窗口」。心跳在就
+	// 无限续期，断了 120s（漏掉 8 条）才判超时 —— 既容忍融云限流/丢包，也不会
+	// 让一个真挂死的成员把整场讨论按住十分钟。
+	interactiveHeartbeatIdleWindow = 120 * time.Second
+
+	// interactiveMaxTurnDuration 是单轮的**绝对**上限：从派发时刻算起，无论有
+	// 没有心跳都不再等。
+	//
+	// 心跳的语义是「设备还活着」，但设备的 ping 定时器只跟随轮次存活，不跟随
+	// agent —— agent 挂死时心跳照发，光靠续期会让这一轮永不超时，整场讨论卡在
+	// summarizing 且没有任何东西会来接管。30 分钟远大于任何正常的单轮（含长思考
+	// 与主持人的长纪要），只用来兜真死锁。
+	interactiveMaxTurnDuration = 30 * time.Minute
 
 	// interactiveSweepInterval 是超时恢复扫描的周期。它只决定「超时被发现的
 	// 滞后」，不决定超时本身（后者由 outbox 的 available_at 精确表达），
@@ -1534,8 +1558,13 @@ func (rt *discussionRuntime) interactiveTurnFailed(ctx context.Context, d Discus
 	rt.interactiveBroadcast(ctx, d, failure)
 
 	if task.IsHost {
-		retries := rt.interactiveHostRetryCount(ctx, d)
-		if retries >= interactiveMaxHostRetries {
+		// 重试上限按**本次派发链**的 attempt 判，不能统计整场讨论里的
+		// member_retry_scheduled 事件：一场 7 轮的讨论中，前几轮主持人偶发的
+		// 一次失败重试会永久累计，到最后一轮时计数早已到顶 —— 主持人第一次
+		// 超时就被判 summary_failed，连重试机会都没有（线上 2026-10-22 的
+		// 「第 7 轮质疑者已跳过 → 5 分钟后讨论失败」）。attempt 只属于当前
+		// 任务链，天然按轮隔离，也自动覆盖「重试主持任务」按钮开的新链。
+		if interactiveHostRetryExhausted(task.Attempt) {
 			advanced, advErr := rt.interactiveAdvance(ctx, d.DiscussionID, func(cur DiscussionRecord) (AdvanceDiscussionParams, bool, error) {
 				if !IsLiveDiscussionStatus(cur.Status) {
 					// 并发终结（用户取消）已经落定：不要再把它改写成 failed。
@@ -1622,30 +1651,18 @@ func (rt *discussionRuntime) interactiveTurnFailed(ctx context.Context, d Discus
 	}
 }
 
-// interactiveHostRetryCount 统计本讨论里主持人已被重试的次数。
-func (rt *discussionRuntime) interactiveHostRetryCount(ctx context.Context, d DiscussionRecord) int {
-	_, host, ok := interactiveRoles(d)
-	if !ok {
-		return 0
+// interactiveHostRetryExhausted 报告主持人汇总的重试次数是否已用尽。
+// attempt 是**本次派发链**内的序号（dispatch 时从 1 起，重试 +1），所以
+// attempt 1..interactiveMaxHostRetries 都还有下一次机会，超过才判失败。
+//
+// 为什么不用「统计事件里的 member_retry_scheduled」：那是跨轮累计的，一场
+// 多轮讨论里前几轮的零星重试会把计数吃满，最后一轮的主持人一次超时就被判
+// 失败（线上 2026-10-22 的 summary_failed）。
+func interactiveHostRetryExhausted(attempt int) bool {
+	if attempt <= 0 {
+		attempt = 1
 	}
-	events, err := rt.repo.ListEventsAfter(ctx, d.DiscussionID, 0)
-	if err != nil {
-		return 0
-	}
-	count := 0
-	for _, e := range events {
-		if e.EventType != "member_retry_scheduled" {
-			continue
-		}
-		var payload map[string]interface{}
-		if err := json.Unmarshal(e.Payload, &payload); err != nil {
-			continue
-		}
-		if member, _ := payload["memberId"].(string); member == host.MemberID {
-			count++
-		}
-	}
-	return count
+	return attempt > interactiveMaxHostRetries
 }
 
 // interactiveRoleByID 从角色板里取一个成员（含主持人）。
@@ -1666,9 +1683,29 @@ func (rt *discussionRuntime) interactiveRoleByID(d DiscussionRecord, memberID st
 
 // interactiveSweep 扫描到期的派发命令（可用时间即超时时刻），按超时处理。
 // 由 channel 的恢复 ticker 周期调用；进程重启后也能续上（outbox 是持久的）。
+//
+// 两段：先收敛跨过绝对上限的命令（心跳也不能无限续命），再处理普通到期。
+// 没有第一段，一次 agent 挂死的心跳（CLI 的 ping 定时器按轮次存活，不看
+// agent 是否还在跑）会让这一轮永远不到期，整场讨论卡在 summarizing。
 func (rt *discussionRuntime) interactiveSweep(ctx context.Context) {
 	if !rt.interactiveReady() {
 		return
+	}
+	handled := make(map[string]struct{}, 8)
+	overdue, err := rt.queries.ListOverdueRongCloudDiscussionCommands(ctx, db.ListOverdueRongCloudDiscussionCommandsParams{
+		Limit:  32,
+		Cutoff: pgtype.Timestamptz{Time: time.Now().Add(-interactiveMaxTurnDuration), Valid: true},
+	})
+	if err != nil {
+		rt.logger.Warn("discussion: sweep list overdue commands failed", "error", err)
+	} else {
+		for _, cmd := range overdue {
+			handled[cmd.CommandID] = struct{}{}
+			rt.logger.Warn("discussion: turn exceeded the absolute cap",
+				"discussionId", cmd.DiscussionID, "commandId", cmd.CommandID,
+				"cap", interactiveMaxTurnDuration)
+			rt.interactiveExpireCommand(ctx, cmd)
+		}
 	}
 	due, err := rt.queries.ListDueRongCloudDiscussionCommands(ctx, 32)
 	if err != nil {
@@ -1676,42 +1713,53 @@ func (rt *discussionRuntime) interactiveSweep(ctx context.Context) {
 		return
 	}
 	for _, cmd := range due {
-		var task interactiveTask
-		if err := json.Unmarshal(cmd.Payload, &task); err != nil {
+		if _, seen := handled[cmd.CommandID]; seen {
 			continue
 		}
-		d, err := rt.repo.Get(ctx, cmd.DiscussionID)
-		if err != nil {
-			continue
-		}
-		if !IsLiveDiscussionStatus(d.Status) || task.Round != d.CurrentRound {
-			_, _ = rt.queries.SettleRongCloudDiscussionCommand(ctx, db.SettleRongCloudDiscussionCommandParams{
-				State: "failed", CommandID: cmd.CommandID,
-			})
-			continue
-		}
-		if _, err := rt.queries.SettleRongCloudDiscussionCommand(ctx, db.SettleRongCloudDiscussionCommandParams{
-			State: "failed", CommandID: cmd.CommandID,
-		}); err != nil {
-			continue
-		}
-		timeout, _, emitErr := rt.interactiveEmit(ctx, d, interactiveEvent{
-			EventType: "task_timeout", ActorID: "system", TargetID: task.TargetID,
-			Payload:   map[string]interface{}{},
-			Key:       "timeout:" + cmd.CommandID,
-			RequestID: cmd.CommandID, StateVer: d.Version, Round: task.Round,
-			Revision: task.RoundRevision,
-		})
-		if emitErr == nil {
-			rt.interactiveBroadcast(ctx, d, timeout)
-		}
-		rt.logger.Warn("discussion: turn timed out",
-			"discussionId", d.DiscussionID, "target", task.TargetID, "isHost", task.IsHost)
-		rt.interactiveTurnFailed(ctx, d, task, "")
+		rt.interactiveExpireCommand(ctx, cmd)
 	}
 }
 
-// interactiveTurnTimeout 是单轮等待上限：优先用系统主持配置的 timeout_seconds。
+// interactiveExpireCommand 把一条过期派发按超时处理（终结 outbox + 落事件 +
+// 走重试/跳过/失败的分支）。
+func (rt *discussionRuntime) interactiveExpireCommand(ctx context.Context, cmd db.RongcloudDiscussionCommand) {
+	var task interactiveTask
+	if err := json.Unmarshal(cmd.Payload, &task); err != nil {
+		return
+	}
+	d, err := rt.repo.Get(ctx, cmd.DiscussionID)
+	if err != nil {
+		return
+	}
+	if !IsLiveDiscussionStatus(d.Status) || task.Round != d.CurrentRound {
+		_, _ = rt.queries.SettleRongCloudDiscussionCommand(ctx, db.SettleRongCloudDiscussionCommandParams{
+			State: "failed", CommandID: cmd.CommandID,
+		})
+		return
+	}
+	if _, err := rt.queries.SettleRongCloudDiscussionCommand(ctx, db.SettleRongCloudDiscussionCommandParams{
+		State: "failed", CommandID: cmd.CommandID,
+	}); err != nil {
+		return
+	}
+	timeout, _, emitErr := rt.interactiveEmit(ctx, d, interactiveEvent{
+		EventType: "task_timeout", ActorID: "system", TargetID: task.TargetID,
+		Payload:   map[string]interface{}{},
+		Key:       "timeout:" + cmd.CommandID,
+		RequestID: cmd.CommandID, StateVer: d.Version, Round: task.Round,
+		Revision: task.RoundRevision,
+	})
+	if emitErr == nil {
+		rt.interactiveBroadcast(ctx, d, timeout)
+	}
+	rt.logger.Warn("discussion: turn timed out",
+		"discussionId", d.DiscussionID, "target", task.TargetID, "isHost", task.IsHost)
+	rt.interactiveTurnFailed(ctx, d, task, "")
+}
+
+// interactiveTurnTimeout 是单轮等待上限：优先用系统主持配置的 timeout_seconds，
+// 但绝不低于 interactiveTurnTimeoutFloor。配置项管的是「多久没回包算可疑」，
+// 不是「正常轮次的上限」—— 讨论按序发言，等前一位说完等多久都不该算错。
 func (rt *discussionRuntime) interactiveTurnTimeout() time.Duration {
 	timeout := interactiveDefaultTurnTimeout
 	if rt.systemHostLoader != nil {
@@ -1719,10 +1767,55 @@ func (rt *discussionRuntime) interactiveTurnTimeout() time.Duration {
 			timeout = time.Duration(cfg.TimeoutSeconds) * time.Second
 		}
 	}
-	if timeout < interactiveMinTurnTimeout {
-		timeout = interactiveMinTurnTimeout
+	if timeout < interactiveTurnTimeoutFloor {
+		timeout = interactiveTurnTimeoutFloor
 	}
 	return timeout
+}
+
+// interactiveHeartbeatWindow 是心跳续期后给的窗口：取「单轮上限」与空闲窗口的
+// 较大者。管理端配得更长时按配置走，配得更短时仍给满空闲窗口（心跳在 = 还活着）。
+func (rt *discussionRuntime) interactiveHeartbeatWindow() time.Duration {
+	window := rt.interactiveTurnTimeout()
+	if window < interactiveHeartbeatIdleWindow {
+		window = interactiveHeartbeatIdleWindow
+	}
+	return window
+}
+
+// interactiveNotifyStreamActivity 是讨论组的心跳入口：requestID 是设备端
+// relay_ping_ 前缀剥掉之后的原始 requestId（= outbox 的 command_id）。
+//
+// 返回 true 表示这条消息被当作心跳消化 —— 调用方不能再把它当回包处理（否则
+// 空的 command_result 会被 interactiveAcceptTurn 当成「成员发言为空」而判失败）。
+//
+// 只续期未终结的派发命令：已 acknowledged / failed 的（迟到心跳）返回 false，
+// 由调用方继续走 relay 的未知心跳路径（那条路径恒定消化，不会漏进别处）。
+func (rt *discussionRuntime) interactiveNotifyStreamActivity(ctx context.Context, requestID string) bool {
+	if !rt.interactiveReady() || requestID == "" {
+		return false
+	}
+	cmd, err := rt.queries.GetRongCloudDiscussionCommand(ctx, requestID)
+	if err != nil || cmd.Kind != "dispatch" {
+		return false
+	}
+	if cmd.State != "pending" && cmd.State != "sent" {
+		return false
+	}
+	rows, err := rt.queries.ExtendRongCloudDiscussionCommandDeadline(ctx, db.ExtendRongCloudDiscussionCommandDeadlineParams{
+		CommandID:   requestID,
+		AvailableAt: pgtype.Timestamptz{Time: time.Now().Add(rt.interactiveHeartbeatWindow()), Valid: true},
+	})
+	if err != nil {
+		rt.logger.Warn("discussion: extend dispatch deadline failed",
+			"requestId", requestID, "error", err)
+		return true // 心跳本身是合法的：别让它漏成回包
+	}
+	if rows == 0 {
+		// 心跳与回包赛跑：命令刚好在这一刻被终结。心跳仍是心跳。
+		return true
+	}
+	return true
 }
 
 // ---- 用户动作（v3 分支） ---------------------------------------------------

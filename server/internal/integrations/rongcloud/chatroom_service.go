@@ -20,6 +20,9 @@ type ChatroomCreateParams struct {
 	MaxRounds           int32
 	ConversationKind    string
 	Config              json.RawMessage
+	// PortraitUri 是本地读模型的头像（融云聊天室 API 没有头像字段）。空值由
+	// CreateChatroom 兜底成统一默认图。
+	PortraitUri string
 }
 
 // ChatroomMemberConfig holds AI member configuration.
@@ -81,6 +84,7 @@ func (s *ChatroomService) CreateChatroom(ctx context.Context, params ChatroomCre
 		ConversationKind:    pgtype.Text{String: params.ConversationKind, Valid: params.ConversationKind != ""},
 		Config:              params.Config,
 		Status:              "active",
+		PortraitUri:         DefaultPortraitIfEmpty(params.PortraitUri),
 	})
 }
 

@@ -175,7 +175,9 @@ func (h *systemHandler) handleGroupCreate(ctx context.Context, msg NormalizedMes
 	}
 
 	memberIDs := getStringSlice(cmd.Params, "memberIds")
-	portraitURI := strings.TrimSpace(getString(cmd.Params, "portraitUri"))
+	// 建群头像非必填（web 的 CreateGroupDialog 初始就是空串）。空值落统一默认图，
+	// 否则融云群资料头像为空，各端只能各显示各的兜底图。
+	portraitURI := DefaultPortraitIfEmpty(getString(cmd.Params, "portraitUri"))
 	description := strings.TrimSpace(getString(cmd.Params, "description"))
 	maxRounds := groupMaxRounds(cmd.Params["openclawMaxRounds"])
 
@@ -199,6 +201,14 @@ func (h *systemHandler) handleGroupCreate(ctx context.Context, msg NormalizedMes
 	if err := h.client.createGroup(ctx, groupID, groupName, userIDs); err != nil {
 		h.logger.Error("rongcloud: group create", "error", err, "group_id", groupID)
 		return h.sendWebError(ctx, msg, cmd, 500, "failed to create the RongCloud group")
+	}
+
+	// 融云 /group/create.json 不收 portraitUri（见 group_api.go），群头像只能建群后
+	// 用 /group/refresh.json 补一次。best-effort：失败只记日志，绝不回滚已建好的群
+	// —— 下一次 group/update 或 backfill 还能补。
+	if err := h.client.refreshGroupInfo(ctx, groupID, "", portraitURI); err != nil {
+		h.logger.Warn("rongcloud: group create portrait refresh failed",
+			"group_id", groupID, "portrait_uri", portraitURI, "error", err)
 	}
 
 	// 融云侧已经建好，本地镜像写失败不回滚（镜像只是管理端的读模型，

@@ -594,6 +594,35 @@ const SEND_FREQUENCY_TOO_FAST = 20604;
 const SEND_RETRY_ATTEMPTS = 4;
 const SEND_RETRY_BASE_MS = 250;
 
+// 23406 / 23410：不在聊天室里 / 聊天室不存在。融云要求「先加入聊天室才能往
+// 聊天室发消息」，而讨论组的流式帧恰恰是发进聊天室（conversationType 4）的。
+// CLI 以前从不 join，于是每一个 chat_stream 帧都被 23406 拒收（2026-10-22
+// 现场：hermes 一轮 75 帧、opencode 148 帧全灭）——用户看到的就是「一次性
+// 整段输出、没有思考过程、等待漫长」。现在发送前确保已加入，遇到这两个码
+// 就重新加入再试一次（房间可能被回收、成员也可能被移出）。
+const NOT_IN_CHATROOM = 23406;
+const CHATROOM_NOT_EXIST = 23410;
+const CHATROOM_REJOIN_ATTEMPTS = 2;
+
+/** 这两个码值得「重新加入聊天室再发一次」；禁言/参数类错误重试没有意义。 */
+export function isChatroomMembershipError(code: number): boolean {
+  return code === NOT_IN_CHATROOM || code === CHATROOM_NOT_EXIST;
+}
+
+export type SendFailureAction = "rejoin" | "retry" | "fail";
+
+/**
+ * 一次发送失败后该怎么办（纯函数，便于单测）：
+ * - rejoin：重新加入聊天室后重发（成员身份丢了）；
+ * - retry：限频，退避后重发；
+ * - fail：放弃，交给调用方的失败处理（终帧重试 / 日志）。
+ */
+export function planSendFailure(code: number, attempt: number): SendFailureAction {
+  if (isChatroomMembershipError(code) && attempt < CHATROOM_REJOIN_ATTEMPTS) return "rejoin";
+  if (code === SEND_FREQUENCY_TOO_FAST && attempt < SEND_RETRY_ATTEMPTS) return "retry";
+  return "fail";
+}
+
 // 全连接串行发送队列：融云限速是「整个连接每秒 ≤5 条」，不分消息类型。
 // 流帧每 500ms 一帧、一帧超 9KB 又切多个 wire 分块，突发就是限速的数倍 ——
 // 事后退避重试追不上持续突发。所有发送（流帧/分块/command_result/文本）都
@@ -700,9 +729,34 @@ export async function createImlibTransport(): Promise<IMTransport> {
     throw new Error(`unsupported objectName: ${objectName}`);
   };
 
+  // 已加入的聊天室（发流式帧的前提，见 NOT_IN_CHATROOM 注释）。
+  const joinedChatrooms = new Set<string>();
+  /**
+   * 确保本端在这个聊天室里。count: -1 = 不拉历史：设备端不需要房间历史，
+   * 拉了反而会把别人已经播过的旧帧重放一遍。
+   */
+  const ensureChatroomJoined = async (targetId: string, force = false): Promise<void> => {
+    if (!force && joinedChatrooms.has(targetId)) return;
+    joinedChatrooms.delete(targetId);
+    const joined = await imlib.joinExistChatRoom(targetId, { count: -1 });
+    if (joined.isOk) {
+      joinedChatrooms.add(targetId);
+      return;
+    }
+    // 空房间会被回收：joinChatRoom 会「创建并加入」，讨论组重建后仍能发帧。
+    const created = await imlib.joinChatRoom(targetId, { count: -1 });
+    if (!created.isOk) {
+      throw new Error(`join chatroom failed: ${created.code} ${created.msg}`);
+    }
+    joinedChatrooms.add(targetId);
+  };
+
   return {
     async connect(appKey: string, token: string): Promise<void> {
       imlib.init({ appkey: appKey });
+      // 重新连接后聊天室成员身份由 SDK 自行恢复，但可能已经失效 —— 清掉缓存，
+      // 下一帧发送时重新确认一次（多一次 join 比丢整轮流式便宜）。
+      joinedChatrooms.clear();
       // Custom message types shared with the web client / Go server
       // (protocol.ts, web im.ts CUSTOM_MESSAGE_TYPES); registered before
       // sending. card_message/card_update are persisted; card_action is
@@ -761,13 +815,32 @@ export async function createImlibTransport(): Promise<IMTransport> {
         targetId,
       };
       const message = toBaseMessage(objectName, content);
+      const isChatroom = conversationType === 4;
       return sendThrottle.run(async () => {
+        // 聊天室消息必须先加入房间，否则每条都 23406（见常量注释）。
+        // 加入失败不在这里抛：让下面那条 sendMessage 给出真实错误码，
+        // 免得一次网络抖动把整轮流式打死。
+        if (isChatroom) await ensureChatroomJoined(targetId).catch(() => {});
         for (let attempt = 1; ; attempt += 1) {
           const res = await imlib.sendMessage(conversation, message);
           if (res.isOk) return;
-          if (res.code !== SEND_FREQUENCY_TOO_FAST || attempt >= SEND_RETRY_ATTEMPTS) {
+          const action = planSendFailure(res.code, attempt);
+          if (action === "fail") {
             throw new Error(`imlib sendMessage failed: ${res.code} ${res.msg}`);
           }
+          if (action === "rejoin") {
+            console.warn(
+              `send: not in chatroom (${res.code}) target=${targetId}, rejoining and retrying`,
+            );
+            await ensureChatroomJoined(targetId, true).catch((err: unknown) => {
+              console.warn(
+                "join chatroom before retry failed:",
+                err instanceof Error ? err.message : err,
+              );
+            });
+            continue;
+          }
+          // Back off and try again: 250ms, 500ms, 1s.
           await sleep(SEND_RETRY_BASE_MS * 2 ** (attempt - 1));
         }
       });
@@ -779,6 +852,7 @@ export async function createImlibTransport(): Promise<IMTransport> {
       return selfUserId || imlib.getCurrentUserId() || undefined;
     },
     async disconnect(): Promise<void> {
+      joinedChatrooms.clear();
       await imlib.disconnect();
     },
   };

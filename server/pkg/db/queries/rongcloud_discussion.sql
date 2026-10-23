@@ -211,6 +211,17 @@ UPDATE rongcloud_discussion_command
 SET state = @state, lease_until = NULL
 WHERE command_id = @command_id;
 
+-- name: ExtendRongCloudDiscussionCommandDeadline :execrows
+-- 流式心跳续期：设备端在轮次进行中每 15s 发一条 relay_ping_<requestId>，
+-- 服务端把这条派发命令的到期时刻往后推。讨论组的单轮此前只有固定墙钟
+-- （available_at 在派发时定死），设备明明还在流式产出也照样被判超时 ——
+-- 第 N 轮「响应超时」→ 重试 → 跳过 → 主持人汇总同样超时 → summary_failed，
+-- 线上 2026-10-22 那次失败就是这条链。只有未终结的命令才需要续期。
+UPDATE rongcloud_discussion_command
+SET available_at = @available_at
+WHERE command_id = @command_id
+  AND state IN ('pending', 'leased', 'sent');
+
 -- name: ListRongCloudDiscussionCommandsByDiscussion :many
 -- 取该讨论的全部命令，供「当前活跃派发」判定（引擎按 payload->>'round' 与 state 过滤）。
 SELECT * FROM rongcloud_discussion_command
@@ -224,6 +235,17 @@ WHERE kind = 'dispatch'
   AND state IN ('pending', 'sent')
   AND available_at <= now()
 ORDER BY available_at ASC
+LIMIT $1;
+
+-- name: ListOverdueRongCloudDiscussionCommands :many
+-- 绝对上限兜底：心跳续期会让一轮的 available_at 一直往后推，agent 真挂死时
+-- 就永不到期。这里按「派发时刻」而不是到期时刻筛，跨过上限的命令无论有心跳
+-- 都要收敛（见 interactiveMaxTurnDuration）。
+SELECT * FROM rongcloud_discussion_command
+WHERE kind = 'dispatch'
+  AND state IN ('pending', 'sent')
+  AND created_at <= @cutoff
+ORDER BY created_at ASC
 LIMIT $1;
 
 -- name: InsertRongCloudRoundDocument :one

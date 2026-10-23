@@ -918,6 +918,21 @@ func renderRelayRound(round relayRound) string {
 // 「成员还在产出」的信号。老设备不发心跳 → 行为与从前一致（纯固定超时）。
 const relayPingPrefix = "relay_ping_"
 
+// parseStreamPing 剥出流式心跳里的原始 requestId。前缀被两个消费方共用：
+// 闲聊中继的轮次 id 以 relay_ 开头，讨论组的轮次 id 是 UUID —— 两者都由设备端
+// 统一成 relay_ping_<requestId> 发送，服务端按「谁的 outbox/会话认得这个 id」
+// 决定归谁续期（见 systemHandler.handleCommandResult）。
+func parseStreamPing(requestID string) (string, bool) {
+	if !strings.HasPrefix(requestID, relayPingPrefix) {
+		return "", false
+	}
+	turnID := strings.TrimPrefix(requestID, relayPingPrefix)
+	if turnID == "" {
+		return "", false
+	}
+	return turnID, true
+}
+
 // relayTurnTimeoutFloor 是群聊/聊天室中继单轮的**保底**等待时长，不受管理端
 // 「系统主持 timeout_seconds」（初始 60s）影响。群聊里长思考的运行时（openclaw
 // 这类不流式的）单轮动辄 90~120s，60s 一到服务端就放行下一位，用户看到的就是

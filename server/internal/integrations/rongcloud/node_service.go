@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -260,7 +261,9 @@ func (s *NodeService) Register(ctx context.Context, params NodeRegisterParams) (
 		}
 	}
 	rcUserID := fmt.Sprintf("rc_node_%s", machineIdentityKey(params.MacAddress))
-	token, err := s.client.getUserToken(ctx, rcUserID, params.Name, "")
+	// 机器主节点同样要带默认头像：它虽然在好友列表里隐藏，但会话/群成员里仍会
+	// 出现，空头像会让各端各自兜底出不同的图。
+	token, err := s.client.getUserToken(ctx, rcUserID, params.Name, DefaultUserPortrait())
 	if err != nil {
 		return NodeRegisterResult{}, fmt.Errorf("rongcloud: getUserToken: %w", err)
 	}
@@ -290,6 +293,7 @@ func (s *NodeService) Register(ctx context.Context, params NodeRegisterParams) (
 			WorkspaceID:     params.WorkspaceID,
 			RongcloudUserID: rcUserID,
 			Name:            pgText(params.Name),
+			PortraitUri:     pgText(DefaultUserPortrait()),
 			TokenEncrypted:  pgText(encToken),
 			IsAiNode:        true,
 			NodeType:        "ai",
@@ -447,7 +451,15 @@ func (s *NodeService) RefreshToken(ctx context.Context, nodeID string) (string, 
 	if err != nil {
 		return "", fmt.Errorf("rongcloud: get node: %w", err)
 	}
-	token, err := s.client.getUserToken(ctx, node.RongcloudUserID, "", "")
+	rcUser, err := s.queries.GetRongCloudUserByRongCloudID(ctx, node.RongcloudUserID)
+	if err != nil {
+		return "", fmt.Errorf("rongcloud: get user: %w", err)
+	}
+	// getUserToken 在融云侧用户不存在时会建号：传空 name/portrait 就会落下
+	// 一个无名无头像的账号。用库内的权威资料，头像再兜一层默认图。
+	name := rcUser.Name.String
+	portrait := DefaultPortraitIfEmpty(rcUser.PortraitUri.String)
+	token, err := s.client.getUserToken(ctx, node.RongcloudUserID, name, portrait)
 	if err != nil {
 		return "", fmt.Errorf("rongcloud: refresh token: %w", err)
 	}
@@ -457,10 +469,6 @@ func (s *NodeService) RefreshToken(ctx context.Context, nodeID string) (string, 
 		if err == nil {
 			encToken = base64.StdEncoding.EncodeToString(sealed)
 		}
-	}
-	rcUser, err := s.queries.GetRongCloudUserByRongCloudID(ctx, node.RongcloudUserID)
-	if err != nil {
-		return "", fmt.Errorf("rongcloud: get user: %w", err)
 	}
 	_, _ = s.queries.UpdateRongCloudUserToken(ctx, db.UpdateRongCloudUserTokenParams{
 		ID:             rcUser.ID,
@@ -672,7 +680,18 @@ func (s *NodeService) GetUserByRongCloudID(ctx context.Context, rcUserID string)
 // 并同步推送融云侧用户信息（/user/refresh.json）。融云好友列表渲染的是
 // 融云侧的昵称，而 getToken 不会更新已存在用户的信息——若只写本地库，
 // 好友列表会一直显示旧昵称（或裸的用户 id）。
+//
+// 头像兜底：UpdateRongCloudUserProfile（rongcloud.sql:31）的 SET 没有 COALESCE，
+// 传空串就把本地镜像清空，所以这里先取库内现值，仍为空才落统一默认图 ——
+// 绝不允许把空 portrait_uri 写进 rongcloud_user。
 func (s *NodeService) UpdateUserProfile(ctx context.Context, id pgtype.UUID, name, portrait string) error {
+	portrait = strings.TrimSpace(portrait)
+	if portrait == "" {
+		if current, err := s.queries.GetRongCloudUserByID(ctx, id); err == nil {
+			portrait = strings.TrimSpace(current.PortraitUri.String)
+		}
+		portrait = DefaultPortraitIfEmpty(portrait)
+	}
 	user, err := s.queries.UpdateRongCloudUserProfile(ctx, db.UpdateRongCloudUserProfileParams{
 		ID:          id,
 		Name:        pgText(name),
@@ -728,6 +747,10 @@ type BackfillFriendsOptions struct {
 	Bidirectional bool
 	// DryRun reports what would happen without calling RongCloud.
 	DryRun bool
+	// OnlyRCUserIDs 是可选的白名单：非空时存量补齐只处理 rongcloud_user_id 精确
+	// 命中这些值的行。CLI 的 -user 走它，否则一次「只补某个用户」会顺手刷全部
+	// workspace 的 rongcloud_user —— 那既是越权写也是不可控的融云调用量。
+	OnlyRCUserIDs []string
 }
 
 // BackfillFriendOutcome records one owner->agent friend attempt.
@@ -887,6 +910,116 @@ func (s *NodeService) SyncNodeNicknames(ctx context.Context, workspaceID pgtype.
 		})
 	}
 	return outcomes, nil
+}
+
+// PortraitSyncOutcome records one default-portrait backfill attempt.
+type PortraitSyncOutcome struct {
+	// Scope is rongcloud_user (node/AI/human mirrors) or claw_im_users (真人的
+	// 账号表，写库由 CLI 负责，融云推送走 PushUserPortrait).
+	Scope  string `json:"scope"`
+	RCUser string `json:"rc_user"`
+	Name   string `json:"name"`
+	From   string `json:"from"`
+	To     string `json:"to"`
+	// Status is one of: planned (dry run), updated, skipped (already default or
+	// a自定义头像), failed.
+	Status string `json:"status"`
+	Error  string `json:"error,omitempty"`
+}
+
+// SyncUserPortraits 把 workspace 内 rongcloud_user 的「默认头像」统一成
+// DefaultUserPortrait()：只命中空值 / 已知旧默认值（NeedsDefaultPortrait），
+// 用户自定义头像一律 skipped。写库与推融云走 refreshUser + 回写，因为 getToken
+// 对已存在用户不更新资料 —— 只改常量或注册路径对存量完全无效。
+// 幂等：已是统一默认图的记录直接 skipped，不产生额外融云调用。
+//
+// opts.OnlyRCUserIDs 非空时只处理 rc id 精确命中的行（`-user` 白名单），
+// 其余行静默跳过、不产生 planned/skipped 噪音。
+func (s *NodeService) SyncUserPortraits(ctx context.Context, workspaceID pgtype.UUID, opts BackfillFriendsOptions) ([]PortraitSyncOutcome, error) {
+	if s.queries == nil || s.client == nil {
+		return nil, errors.New("rongcloud: service not configured")
+	}
+	var allowed map[string]struct{}
+	if len(opts.OnlyRCUserIDs) > 0 {
+		allowed = make(map[string]struct{}, len(opts.OnlyRCUserIDs))
+		for _, id := range opts.OnlyRCUserIDs {
+			if trimmed := strings.TrimSpace(id); trimmed != "" {
+				allowed[trimmed] = struct{}{}
+			}
+		}
+	}
+	users, err := s.queries.ListRongCloudUsersByWorkspace(ctx, workspaceID)
+	if err != nil {
+		return nil, fmt.Errorf("rongcloud: list users: %w", err)
+	}
+	outcomes := make([]PortraitSyncOutcome, 0, len(users))
+	for _, u := range users {
+		if allowed != nil {
+			if _, ok := allowed[u.RongcloudUserID]; !ok {
+				continue
+			}
+		}
+		current := strings.TrimSpace(u.PortraitUri.String)
+		outcome := PortraitSyncOutcome{
+			Scope:  "rongcloud_user",
+			RCUser: u.RongcloudUserID,
+			Name:   u.Name.String,
+			From:   current,
+			To:     DefaultUserPortrait(),
+		}
+		if !NeedsDefaultPortrait(current) {
+			outcome.Status = "skipped"
+			outcomes = append(outcomes, outcome)
+			continue
+		}
+		if opts.DryRun {
+			outcome.Status = "planned"
+			outcomes = append(outcomes, outcome)
+			continue
+		}
+		// 先推融云再落库：若 refreshUser 失败，库内仍是旧值，下一次 backfill 还能
+		// 命中重试；反过来先写库会让失败记录永远 skipped。
+		if _, err := s.client.refreshUser(ctx, u.RongcloudUserID, u.Name.String, outcome.To); err != nil {
+			outcome.Status = "failed"
+			outcome.Error = err.Error()
+			outcomes = append(outcomes, outcome)
+			continue
+		}
+		if _, err := s.queries.UpdateRongCloudUserProfile(ctx, db.UpdateRongCloudUserProfileParams{
+			ID:          u.ID,
+			Name:        u.Name,
+			PortraitUri: pgText(outcome.To),
+		}); err != nil {
+			outcome.Status = "failed"
+			outcome.Error = err.Error()
+			outcomes = append(outcomes, outcome)
+			continue
+		}
+		outcome.Status = "updated"
+		outcomes = append(outcomes, outcome)
+	}
+	return outcomes, nil
+}
+
+// PushUserPortrait 只把头像推到融云（/user/refresh.json），不动本地库。真人账号
+// 的 portrait_uri 存在 claw_im_users（无 sqlc 写查询），由调用方自行落库后再调用
+// 本方法。name 传空串时融云保持原昵称不变。
+func (s *NodeService) PushUserPortrait(ctx context.Context, rcUserID, name, portrait string) error {
+	if s.client == nil {
+		return errors.New("rongcloud: API client not configured")
+	}
+	_, err := s.client.refreshUser(ctx, rcUserID, name, DefaultPortraitIfEmpty(portrait))
+	return err
+}
+
+// RefreshGroupPortrait 把群头像推到融云（/group/refresh.json），不动本地库。
+// 融云 /group/create.json 不收 portraitUri，群头像只能靠这条 refresh 补写 ——
+// 存量群的补齐就落在这里。local 列由调用方回写（best-effort 调用方决定）。
+func (s *NodeService) RefreshGroupPortrait(ctx context.Context, groupID, portrait string) error {
+	if s.client == nil {
+		return errors.New("rongcloud: API client not configured")
+	}
+	return s.client.refreshGroupInfo(ctx, groupID, "", DefaultPortraitIfEmpty(portrait))
 }
 
 func (s *NodeService) ListNodeModels(ctx context.Context, nodeID pgtype.UUID) ([]db.RongcloudNodeModelCatalog, error) {
@@ -1282,15 +1415,100 @@ func DefaultAgentNodeName(agent string) string {
 	return strings.TrimSpace(agent)
 }
 
-// DefaultAgentNodePortrait 返回 AI 节点的默认头像 URL。两端前端（web
-// ChatAvatar.tsx / uniapp conversation-list.vue）早就在用这张 openclaw 图作
-// AI 兜底；把它同时写进融云侧资料，好友列表/会话头部就能直接渲染，不再依赖
-// 各端各自的本地兜底。可用 CLAW_AI_NODE_PORTRAIT_URI 覆盖。
-func DefaultAgentNodePortrait(agent string) string {
-	if v := strings.TrimSpace(os.Getenv("CLAW_AI_NODE_PORTRAIT_URI")); v != "" {
+// DefaultUserPortraitURI 是全平台统一的默认头像：真人、AI agent、机器主节点、
+// 群、讨论组与聊天室成员共用同一张图（web 端 public/default_user.png 是同源副本）。
+// 融云侧只回显它自己存的 portraitUri，图源必须唯一，否则各入口一漂移就是各端
+// 看到不同默认图。
+const DefaultUserPortraitURI = "https://newsradar.dreamdt.cn/newschat/static/imgs/rongyun/default_user.png"
+
+// LegacyDefaultPortraitPath 是旧默认头像的免鉴权静态路由。旧部署用
+// <MULTICA_PUBLIC_URL> + 该路径拼出任意 host，所以存量识别按 URL path 精确命中，
+// 而不是对整串做模糊匹配 —— 任何 LIKE '%default%' 式条件都可能误伤用户自定义头像。
+// 导出给 backfill CLI 的 SQL 预筛复用（逐行仍由 NeedsDefaultPortrait 复核）。
+const LegacyDefaultPortraitPath = "/api/static/claw/avatar-default.png"
+
+// legacyDefaultPortraitURIs 是历史上的默认头像取值，仅在存量识别（backfill）时
+// 使用，绝不作为新写入值。
+var legacyDefaultPortraitURIs = []string{
+	"https://newsradar.dreamdt.cn/newschat/static/imgs/rongyun/openclaw.png",
+	"https://newsradar.dreamdt.cn/im-test/api/static/claw/avatar-default.png",
+}
+
+// LegacyDefaultPortraitURIs 返回历史默认头像取值的副本（存量识别用，只读）。
+func LegacyDefaultPortraitURIs() []string {
+	return append([]string(nil), legacyDefaultPortraitURIs...)
+}
+
+// DefaultUserPortrait 返回统一默认头像 URL。CLAW_DEFAULT_PORTRAIT_URI 覆盖优先
+// （自建域名 / CDN），否则用统一图源 DefaultUserPortraitURI。
+//
+// 这里刻意不再按 MULTICA_PUBLIC_URL 拼旧静态路径：线上只要设了它，就会继续把
+// 1.9 KB 的旧灰人形图推给融云。也不再有单独的 AI 节点头像 env —— 那会让
+// 「AI 一张图、真人另一张图」的漂移重开。
+func DefaultUserPortrait() string {
+	if v := strings.TrimSpace(os.Getenv("CLAW_DEFAULT_PORTRAIT_URI")); v != "" {
 		return v
 	}
-	return "https://newsradar.dreamdt.cn/newschat/static/imgs/rongyun/openclaw.png"
+	return DefaultUserPortraitURI
+}
+
+// LogDefaultPortraitSource 在服务启动时打一条默认头像图源日志（Info），并在
+// CLAW_DEFAULT_PORTRAIT_URI 覆盖了统一图源时 Warn —— 覆盖值往往是历史遗留，
+// 会让线上继续推旧图，运维需要一眼看见。
+//
+// CLAW_AI_NODE_PORTRAIT_URI 已废弃且不再读取：仍留在环境里说明部署配置没清干净，
+// 也 Warn 一次（不参与决议）。
+func LogDefaultPortraitSource(logger *slog.Logger) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	uri := DefaultUserPortrait()
+	logger.Info("默认头像图源", "url", uri, "canonical", DefaultUserPortraitURI)
+	if v := strings.TrimSpace(os.Getenv("CLAW_DEFAULT_PORTRAIT_URI")); v != "" && v != DefaultUserPortraitURI {
+		logger.Warn("CLAW_DEFAULT_PORTRAIT_URI 覆盖了统一默认头像，请确认这是期望的图源",
+			"value", v, "canonical", DefaultUserPortraitURI)
+	}
+	if v := strings.TrimSpace(os.Getenv("CLAW_AI_NODE_PORTRAIT_URI")); v != "" {
+		logger.Warn("CLAW_AI_NODE_PORTRAIT_URI 已废弃且不再生效，请从部署配置中删除", "value", v)
+	}
+}
+
+// DefaultPortraitIfEmpty 返回 portrait 本身，空串时回退统一默认头像。所有写库与
+// 推融云的入口都走它，保证 portrait_uri 不会被写成空串。
+func DefaultPortraitIfEmpty(portrait string) string {
+	if trimmed := strings.TrimSpace(portrait); trimmed != "" {
+		return trimmed
+	}
+	return DefaultUserPortrait()
+}
+
+// NeedsDefaultPortrait 判断一条 portrait_uri 是否需要补默认头像：空值，或精确
+// 等于已知的旧默认值（旧静态路径按 URL path 精确命中）。用户自定义头像一律返回
+// false —— 存量补齐绝不能覆盖用户自己设的图。
+func NeedsDefaultPortrait(portrait string) bool {
+	trimmed := strings.TrimSpace(portrait)
+	if trimmed == "" {
+		return true
+	}
+	if trimmed == DefaultUserPortrait() {
+		return false // 已经是统一默认图：幂等跳过
+	}
+	for _, legacy := range legacyDefaultPortraitURIs {
+		if trimmed == legacy {
+			return true
+		}
+	}
+	if parsed, err := url.Parse(trimmed); err == nil && strings.HasSuffix(parsed.Path, LegacyDefaultPortraitPath) {
+		return true
+	}
+	return false
+}
+
+// DefaultAgentNodePortrait 是 AI 节点默认头像的统一入口，与真人 / 机器主节点 /
+// 群 / 讨论组共用同一图源（DefaultUserPortrait），杜绝两处漂移。agent 参数保留
+// 以兼容既有调用点。
+func DefaultAgentNodePortrait(agent string) string {
+	return DefaultUserPortrait()
 }
 
 // machineDisplayName reduces the name a device registered under to the host
@@ -1457,7 +1675,7 @@ func (s *NodeService) ensureAgentNodeWithRC(ctx context.Context, machineNode db.
 		rcUserID = existing.RongcloudUserID
 	}
 	// Default display name only — a node the owner renamed keeps its name below,
-	// where the stored row wins over this value. 头像同理：默认 openclaw 图，
+	// where the stored row wins over this value. 头像同理：默认统一默认图，
 	// 用户已设自定义头像时下方 stored-row 路径胜出。
 	name := DefaultAgentNodeName(agent)
 	token, err := s.client.getUserToken(ctx, rcUserID, name, DefaultAgentNodePortrait(agent))
@@ -1485,12 +1703,9 @@ func (s *NodeService) ensureAgentNodeWithRC(ctx context.Context, machineNode db.
 		// re-sync the authoritative database name on every re-bind. This also
 		// repairs devices renamed through the web before the rename flow
 		// started pushing to RongCloud. Best-effort: a stale RongCloud-side
-		// nickname must not fail the bind itself. 头像取「库内已设值，否则默认
-		// openclaw 图」—— 同样走 getToken 不会更新的字段，重绑时补推。
-		portrait := rcUser.PortraitUri.String
-		if portrait == "" {
-			portrait = DefaultAgentNodePortrait(agent)
-		}
+		// nickname must not fail the bind itself. 头像取「库内已设值，否则统一
+		// 默认图」—— 同样走 getToken 不会更新的字段，重绑时补推。
+		portrait := DefaultPortraitIfEmpty(rcUser.PortraitUri.String)
 		if rcUser.Name.Valid && rcUser.Name.String != "" {
 			if _, err := s.client.refreshUser(ctx, rcUserID, rcUser.Name.String, portrait); err != nil {
 				s.logger.Warn("rongcloud: refresh agent nickname on rebind failed",

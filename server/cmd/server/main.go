@@ -22,6 +22,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/dbstartup"
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/handler"
+	"github.com/multica-ai/multica/server/internal/integrations/rongcloud"
 	"github.com/multica-ai/multica/server/internal/integrations/wecom"
 	"github.com/multica-ai/multica/server/internal/logger"
 	"github.com/multica-ai/multica/server/internal/maintenance"
@@ -870,6 +871,11 @@ func main() {
 			slog.Error("pprof server disabled after startup error", "error", err)
 		}
 	}()
+
+	// 默认头像图源：全平台（真人 / AI 节点 / 群 / 讨论组 / 聊天室成员）共用一张图。
+	// 取值与 env 覆盖情况在启动日志里显式打出来，避免「线上到底推的是哪张图」只能靠
+	// 翻代码推断。
+	rongcloud.LogDefaultPortraitSource(slog.Default())
 
 	go func() {
 		slog.Info("server starting", "port", port)

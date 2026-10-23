@@ -58,15 +58,27 @@ func (h *systemHandler) handleCommandResult(ctx context.Context, msg NormalizedM
 		}
 		kind, _ := result.Payload["kind"].(string)
 		errMsg, _ := result.Payload["error"].(string)
+		// 流式心跳（设备端 relay_ping_<requestId>）只做续期，绝不当回包。
+		// 必须排在 interactiveAcceptTurn 与 relayHub 之前：
+		//   · 讨论组的 requestId 是 UUID，但 relayHub.NotifyStreamActivity 对
+		//     **任何** relay_ping_ 前缀都恒返回 true（未知轮次也消化），放在
+		//     它后面会让讨论心跳永远被吞掉；
+		//   · 讨论组此前完全收不到心跳 → 单轮只有派发时定死的墙钟，设备明明
+		//     还在流式产出也照样被判超时：第 N 轮「响应超时」→ 重试 → 跳过 →
+		//     主持人汇总同样超时 → summary_failed（线上 2026-10-22）。
+		if turnID, ok := parseStreamPing(result.RequestID); ok {
+			if h.discussionRuntime.interactiveNotifyStreamActivity(ctx, turnID) {
+				return
+			}
+			if h.relayHub != nil && h.relayHub.NotifyStreamActivity(result.RequestID) {
+				return
+			}
+		}
 		if h.discussionRuntime.interactiveAcceptTurn(ctx, msg.FromUserID, result.RequestID,
 			content, kind == "error", errMsg) {
 			return
 		}
 		// 讨论组闲聊中继：relay_ 前缀的 your_turn 回包在这里消化，不进旧协调器。
-		// 流式心跳（relay_ping_ 前缀）只续期不当回包，必须先于 AcceptResponse。
-		if h.relayHub != nil && h.relayHub.NotifyStreamActivity(result.RequestID) {
-			return
-		}
 		if h.relayHub != nil && h.relayHub.AcceptResponse(ctx, msg.FromUserID, result.RequestID,
 			content, kind == "error", errMsg) {
 			return

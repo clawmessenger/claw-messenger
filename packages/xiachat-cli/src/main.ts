@@ -215,8 +215,8 @@ export function buildProgram(opts: BuildProgramOpts): Command {
     .name("clawmessenger")
     .description("User-device agent CLI over RongCloud IM")
     // ⚠️ 与 package.json 的 version 手动同步：SEA 打包后读不到外部 package.json，
-    //    改版本时两处一起改（0.2.51：流式帧退避重试 + 帧间隔放宽）
-    .version("0.2.51")
+    //    改版本时两处一起改（0.2.53：讨论组心跳续期 + 重开切场）
+    .version("0.2.53")
     // Tests parse this program in-process; commander would otherwise
     // process.exit on missing options and kill the vitest runner.
     .exitOverride();

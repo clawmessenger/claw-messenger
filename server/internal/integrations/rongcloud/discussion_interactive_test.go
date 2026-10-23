@@ -276,24 +276,89 @@ func TestInteractiveHostPromptReadsSnapshot(t *testing.T) {
 	}
 }
 
-// TestInteractiveTurnTimeoutFloor 验证单轮等待上限不会被配置压到下限以下
-// （一次 agent 调用不可能 10s 内完成，更小的值只会让每一轮都假超时）。
+// TestInteractiveTurnTimeoutFloor 验证单轮等待上限不会被配置压到下限以下。
+//
+// 讨论是按序发言的：成员没说完就不该推进下一位，等多久都不算错。管理端
+// 「系统主持 timeout_seconds」初始只有 60s，而设备端从 agent 冷启动到首个
+// token 常常就要几十秒 —— 60s 会让**正常**轮次成批假超时（线上表现为
+// 「第 N 轮响应超时 → 重试 → 跳过 → 主持人汇总超时 → summary_failed」）。
 func TestInteractiveTurnTimeoutFloor(t *testing.T) {
 	rt := &discussionRuntime{}
 	if got := rt.interactiveTurnTimeout(); got != interactiveDefaultTurnTimeout {
 		t.Errorf("default timeout = %v", got)
 	}
+	// 配置比保底值小：抬到保底值，绝不按 1s / 60s 掐正常轮次。
+	for _, seconds := range []int{1, 60, 120} {
+		rt.systemHostLoader = func(ctx context.Context) (DiscussionSystemHostConfig, bool, error) {
+			return DiscussionSystemHostConfig{TimeoutSeconds: seconds}, true, nil
+		}
+		if got := rt.interactiveTurnTimeout(); got != interactiveTurnTimeoutFloor {
+			t.Errorf("configured %ds must be raised to floor, got %v", seconds, got)
+		}
+	}
+	// 配置比保底值大：按配置走（管理端确实想等更久时不被压回来）。
 	rt.systemHostLoader = func(ctx context.Context) (DiscussionSystemHostConfig, bool, error) {
-		return DiscussionSystemHostConfig{TimeoutSeconds: 1}, true, nil
+		return DiscussionSystemHostConfig{TimeoutSeconds: 900}, true, nil
 	}
-	if got := rt.interactiveTurnTimeout(); got != interactiveMinTurnTimeout {
-		t.Errorf("clamped timeout = %v, want %v", got, interactiveMinTurnTimeout)
-	}
-	rt.systemHostLoader = func(ctx context.Context) (DiscussionSystemHostConfig, bool, error) {
-		return DiscussionSystemHostConfig{TimeoutSeconds: 120}, true, nil
-	}
-	if got := rt.interactiveTurnTimeout(); got.Seconds() != 120 {
+	if got := rt.interactiveTurnTimeout(); got.Seconds() != 900 {
 		t.Errorf("configured timeout = %v", got)
+	}
+}
+
+// TestInteractiveHeartbeatWindow 验证心跳续期窗口不小于空闲窗口：设备每 15s
+// 一条心跳，窗口 120s 意味着漏掉 8 条才判掉线；配置更长时按配置。
+func TestInteractiveHeartbeatWindow(t *testing.T) {
+	rt := &discussionRuntime{}
+	if got := rt.interactiveHeartbeatWindow(); got < interactiveHeartbeatIdleWindow {
+		t.Errorf("heartbeat window %v must be >= idle window %v", got, interactiveHeartbeatIdleWindow)
+	}
+	rt.systemHostLoader = func(ctx context.Context) (DiscussionSystemHostConfig, bool, error) {
+		return DiscussionSystemHostConfig{TimeoutSeconds: 600}, true, nil
+	}
+	if got := rt.interactiveHeartbeatWindow(); got.Seconds() != 600 {
+		t.Errorf("heartbeat window should follow longer config, got %v", got)
+	}
+}
+
+// TestInteractiveHostRetryExhausted 钉住主持人汇总的重试语义：按**本次派发链**
+// 的 attempt 判，而不是整场讨论累计的重试事件数。
+//
+// 旧实现统计全场的 member_retry_scheduled（memberId == host），7 轮讨论里前几轮
+// 的零星重试会把计数吃满，最后一轮主持人**第一次**超时就直接判 summary_failed。
+func TestInteractiveHostRetryExhausted(t *testing.T) {
+	if interactiveMaxHostRetries < 1 {
+		t.Fatalf("host must get at least one retry, got %d", interactiveMaxHostRetries)
+	}
+	for attempt := 1; attempt <= interactiveMaxHostRetries; attempt++ {
+		if interactiveHostRetryExhausted(attempt) {
+			t.Errorf("attempt %d must still be retryable", attempt)
+		}
+	}
+	if !interactiveHostRetryExhausted(interactiveMaxHostRetries + 1) {
+		t.Error("attempt past the cap must fail the discussion")
+	}
+	// 缺省/异常 attempt（老 payload 没有该字段 = 0）按第一次处理，不能被当成用尽。
+	if interactiveHostRetryExhausted(0) {
+		t.Error("attempt 0 must be treated as the first try")
+	}
+}
+
+// TestParseStreamPing 钉住心跳信封的解析：前缀剥完就得到 outbox 的 command_id，
+// 讨论组（UUID）与闲聊中继（relay_*）共用同一条通道。
+func TestParseStreamPing(t *testing.T) {
+	if id, ok := parseStreamPing("relay_ping_3f1c2e4d-0000-4000-8000-000000000000"); !ok ||
+		id != "3f1c2e4d-0000-4000-8000-000000000000" {
+		t.Errorf("uuid ping parse = %q, %v", id, ok)
+	}
+	if id, ok := parseStreamPing("relay_ping_relay_9_0"); !ok || id != "relay_9_0" {
+		t.Errorf("relay ping parse = %q, %v", id, ok)
+	}
+	// 普通回包不是心跳：前缀不匹配必须放过，否则每轮完成回包都会被吞掉。
+	if _, ok := parseStreamPing("3f1c2e4d-0000-4000-8000-000000000000"); ok {
+		t.Error("plain request id must not parse as ping")
+	}
+	if _, ok := parseStreamPing("relay_ping_"); ok {
+		t.Error("empty ping id must not parse")
 	}
 }
 

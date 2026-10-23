@@ -192,8 +192,7 @@ export interface TurnRunner {
   ) => Promise<string>;
 }
 
-// 一轮 your_turn 的会话形态。三种场合共用同一条 IM 命令：
-//   - group    普通群组（融云 group）闲聊的按序中继，服务端提示词就是
+// 一轮 your_turn 的会话形态。三种场合共用同一条 IM 命令：//   - group    普通群组（融云 group）闲聊的按序中继，服务端提示词就是
 //              「这是普通群聊的一次自由对话…」；
 //   - chatroom 聊天室（讨论组的非讨论态）闲聊的按序中继，提示词同构；
 //   - discussion v3 圆桌讨论的正式轮次，role_prompt 是角色人设。
@@ -224,6 +223,23 @@ export function resolveTurnVenue(
 // 不带键时（openclaw）所有形态挤在同一个主会话里，讨论组的共识会被群聊继承。
 export function turnSessionKey(venue: TurnVenue, conversationId: string): string {
   return `cm-${venue}-${conversationId}`;
+}
+
+/**
+ * 服务端**按序派发**的轮次需要流式心跳：服务端每收到一条 relay_ping_<requestId>
+ * 就把该轮的 deadline 推到「现在 + 空闲窗口」，心跳在就永不超时。
+ *
+ * 讨论组与群聊/聊天室中继都按序推进，一个人没说完不该让下一位开跑，所以都要
+ * 心跳；私聊是即时应答，没有别人排队等它。
+ *
+ * ⚠️ 判据**不能**写成 requestId.startsWith("relay_")：闲聊中继的轮次 id 以
+ * relay_ 开头，讨论组的轮次 id 是服务端生成的 UUID。按前者判会让讨论组整场
+ * 不发心跳，服务端只剩派发时定死的墙钟 —— 设备还在流式产出也被判「响应超时」，
+ * 重试、跳过，最后主持人汇总同样超时，整场讨论以 summary_failed 收场
+ * （线上 2026-10-22）。
+ */
+export function turnNeedsHeartbeat(venue: TurnVenue): boolean {
+  return venue !== "private";
 }
 
 // html_revise 要把上一版 HTML 交给 agent。内嵌进提示词最省事，但页面一大就超过
@@ -437,6 +453,12 @@ export class MessageDispatcher {
         turns,
         // 流式心跳收件人 = 轮次派发者（服务端系统节点私聊下发 your_turn）。
         yourTurnFrom: msg.fromUserId,
+        // 服务端对**所有**按序轮次都要心跳续期，不只是闲聊中继（relay_*）：
+        // 讨论组的轮次 id 是 UUID，此前心跳条件写死了 startsWith("relay_")，
+        // 讨论组于是永远不发心跳，服务端只有派发时定死的墙钟 —— 设备还在流式
+        // 产出也会被判「响应超时」，重试后跳过，最后主持人汇总超时 → 讨论失败
+        // summary_failed（线上 2026-10-22）。私聊轮次不是按序派发，不需要心跳。
+        heartbeat: turnNeedsHeartbeat(venue),
         fallback: async (out) => {
           await this.deps.send(
             replyTo,
@@ -477,6 +499,11 @@ export class MessageDispatcher {
     sessionKey?: string;
     /** your_turn 轮的派发者（服务端系统节点）：流式心跳的收件人。 */
     yourTurnFrom?: string;
+    /**
+     * 是否为这一轮发流式心跳。true 用于服务端**按序派发**的轮次（闲聊中继与
+     * 讨论组）：服务端按心跳续期该轮 deadline，缺了它长思考轮会被固定墙钟判超时。
+     */
+    heartbeat?: boolean;
     fallback: (out: string) => Promise<void>;
     onError?: (errMsg: string) => Promise<void>;
   }): Promise<void> {
@@ -584,11 +611,15 @@ export class MessageDispatcher {
     /** 轮次开始时刻：日志里打 elapsed，用来回答「这一轮到底跑了多久」。 */
     const turnStartedAt = Date.now();
     try {
-      // 流式心跳：relay_ 轮**从轮次一开始**就发，不分区分流式/降级路径 ——
-      // openclaw 这类不流式的运行时全程沉默、只在结束时发一帧，若只挂在
+      // 流式心跳：**所有服务端按序派发的轮次**都从轮次一开始发，不分流式/降级
+      // 路径 —— openclaw 这类不流式的运行时全程沉默、只在结束时发一帧，若只挂在
       // 流式分支，它长跑超 60s 照样被服务端轮次超时掐掉（15:36 实测）。
       // 只要轮还没完成，心跳就证明「这位还活着」，服务端持续续期。
-      if (ctx.requestMessageId.startsWith("relay_") && opts.yourTurnFrom && this.deps.send) {
+      //
+      // 判据不是「id 以 relay_ 开头」：讨论组的轮次 id 是服务端生成的 UUID，
+      // 旧判据让讨论组整场不发心跳，服务端只有派发时定死的墙钟，于是出现
+      // 「设备还在输出 → 响应超时 → 跳过 → 主持人汇总也超时 → summary_failed」。
+      if (opts.heartbeat && opts.yourTurnFrom && this.deps.send) {
         const pingRequestId = `relay_ping_${ctx.requestMessageId}`;
         const pingTarget = opts.yourTurnFrom;
         // 心跳失败不能静默：它是服务端唯一的「还在产出」信号，融云限流
