@@ -392,6 +392,9 @@ func (h *systemHandler) actionChatroomGetList(ctx context.Context, cmd CommandCo
 	for _, r := range pageRooms {
 		list = append(list, chatroomViewData(listViewRow{r}, nil, false))
 	}
+	// 附上每间房「最后一条消息」（见 chatroom_last_message.go）：聊天室不存历史，
+	// 会话列表没有它就只剩占位文案。批量查一页，失败不影响列表本身。
+	h.applyChatroomLastEvents(ctx, pageRooms, list)
 	return okResult(map[string]interface{}{
 		"list":     list,
 		"total":    total,

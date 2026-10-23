@@ -88,3 +88,37 @@ FROM rongcloud_chatroom_member m
 LEFT JOIN rongcloud_node n ON n.id = m.node_id
 WHERE m.chatroom_id = $1
 ORDER BY m.speaking_order ASC NULLS LAST, m.created_at ASC;
+
+-- name: ListRongCloudChatroomLastEvents :many
+-- 会话/聊天室列表要显示「最后一条消息」：聊天室在融云那边不存历史，唯一可靠的
+-- 时间线就是 rongcloud_discussion_event。这里每间房只取最近一条**可展示**事件。
+--
+-- 只挑这五类：成员发言、主持人轮次纪要、主持人插话、讨论取消、讨论失败。
+-- round_checkpoint / assignment_created / host_turn_requested 这些中间态事件
+-- 不是用户眼里的「消息」，把它们的正文塞到列表上只会让人看不懂。
+--
+-- 关联走 discussion_id 而不是 event.chatroom_id：事件表的 chatroom_id 列目前
+-- 是空的（历史原因），按它查会一条都查不到。
+SELECT DISTINCT ON (d.chatroom_id)
+       d.chatroom_id             AS chatroom_id,
+       e.event_type              AS event_type,
+       e.actor_id                AS actor_id,
+       e.round_number            AS round_number,
+       e.created_at              AS created_at,
+       e.payload                 AS payload,
+       COALESCE(m.role_name, '') AS role_name
+FROM rongcloud_discussion d
+JOIN rongcloud_discussion_event e ON e.discussion_id = d.discussion_id
+LEFT JOIN rongcloud_chatroom c
+       ON c.rongcloud_chatroom_id = d.chatroom_id
+LEFT JOIN rongcloud_chatroom_member m
+       ON m.chatroom_id = c.id AND m.member_id = e.actor_id
+WHERE d.chatroom_id = ANY(@chatroom_ids::text[])
+  AND e.event_type IN (
+    'contribution_completed',
+    'round_summary_completed',
+    'user_interjection',
+    'discussion_cancelled',
+    'discussion_failed'
+  )
+ORDER BY d.chatroom_id, e.created_at DESC, e.seq DESC NULLS LAST;
