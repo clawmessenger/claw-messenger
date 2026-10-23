@@ -32,13 +32,11 @@ package rongcloud
 import (
 	"context"
 	"crypto/rand"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"time"
 
@@ -122,89 +120,36 @@ func (h *systemHandler) handleUserCommand(ctx context.Context, msg NormalizedMes
 }
 
 func (h *systemHandler) handleWeChatLogin(ctx context.Context, msg NormalizedMessage, cmd CommandContent) error {
-	appID := strings.TrimSpace(os.Getenv(wechatOpenIDEnvAppID))
-	appSecret := strings.TrimSpace(os.Getenv(wechatOpenIDEnvSecret))
-	if appID == "" || appSecret == "" {
-		h.logger.Warn("rongcloud: wechat login requested but not configured",
-			"has_appid", appID != "", "has_secret", appSecret != "")
-		return h.replyErr(ctx, msg, cmd, 503, "微信登录未配置：缺少 WECHAT_MP_APPID / WECHAT_MP_SECRET")
-	}
+	// 业务逻辑在 WeChatLogin（wechat_login.go），HTTP 通道 POST /api/wechat/login
+	// 复用同一份实现。这里只做 command 通道的入参解析与回包映射。
 	code := strings.TrimSpace(getStringAny(cmd.Params, "code", "jsCode", "js_code"))
-	if code == "" {
-		return h.replyErr(ctx, msg, cmd, 400, "code is required")
+	deps := WeChatLoginDeps{
+		Store:      h.userStore,
+		Logger:     h.logger,
+		APIBase:    h.wechatAPIBase,
+		HTTPClient: h.wechatHTTPClient,
 	}
-	if h.userStore == nil {
-		return h.replyErr(ctx, msg, cmd, 503, "user service is unavailable")
+	if h.client != nil {
+		deps.MintToken = func(ctx context.Context, userID, name, portraitURI string) (string, error) {
+			return h.client.getUserToken(ctx, userID, name, portraitURI)
+		}
 	}
-
-	openID, err := h.wechatCode2Session(ctx, appID, appSecret, code)
+	result, err := WeChatLogin(ctx, deps, code)
 	if err != nil {
-		var apiErr *wechatAPIError
-		if errors.As(err, &apiErr) {
-			// code 一次性、5 分钟有效：过期/复用时微信在这里回 40163/40029。
-			h.logger.Warn("rongcloud: wechat jscode2session rejected",
-				"errcode", apiErr.code, "errmsg", apiErr.message)
-			return h.replyErr(ctx, msg, cmd, 400, "微信登录失败："+apiErr.message)
+		var loginErr *WeChatLoginError
+		if errors.As(err, &loginErr) {
+			return h.replyErr(ctx, msg, cmd, loginErr.Status, loginErr.Message)
 		}
-		h.logger.Error("rongcloud: wechat jscode2session", "error", err)
-		return h.replyErr(ctx, msg, cmd, 500, "failed to reach the WeChat login service")
+		return h.replyErr(ctx, msg, cmd, 500, err.Error())
 	}
-
-	user, found, err := h.userStore.FindByOpenID(ctx, openID)
-	if err != nil {
-		h.logger.Error("rongcloud: wechat login lookup", "error", err)
-		return h.replyErr(ctx, msg, cmd, 500, "failed to load the account")
-	}
-	isNewUser := false
-	if !found {
-		var created bool
-		user, created, err = h.userStore.CreateWeChatUser(ctx, CreateWeChatUserParams{
-			OpenID:       openID,
-			Nickname:     defaultWeChatNickname(openID),
-			PortraitURI:  DefaultPortraitIfEmpty(""),
-			PasswordHash: wechatOnlyPasswordHash,
-		})
-		if err != nil {
-			h.logger.Error("rongcloud: wechat login create account", "error", err)
-			return h.replyErr(ctx, msg, cmd, 500, "failed to create the account")
-		}
-		// created=false 表示并发下另一个请求抢先建了号（ON CONFLICT 回查），
-		// 本次只是登录它 —— 不能记成「新建账号」（DEF-4）。
-		if created {
-			h.logger.Info("rongcloud: wechat account created", "user_id", user.UserID)
-		}
-		isNewUser = created
-	}
-	if user.Status != "" && user.Status != "active" {
-		return h.replyErr(ctx, msg, cmd, 401, "账户已被禁用")
-	}
-
-	token := strings.TrimSpace(user.RongCloudToken)
-	if token == "" {
-		if h.client == nil {
-			return h.replyErr(ctx, msg, cmd, 503, "user service is unavailable")
-		}
-		minted, err := h.client.getUserToken(ctx, user.UserID, user.Nickname, user.PortraitURI)
-		if err != nil || strings.TrimSpace(minted) == "" {
-			h.logger.Error("rongcloud: wechat login mint IM token", "error", err, "user_id", user.UserID)
-			return h.replyErr(ctx, msg, cmd, 500, "微信登录成功，但获取 IM Token 失败")
-		}
-		token = strings.TrimSpace(minted)
-		if err := h.userStore.SaveRongCloudToken(ctx, user.UserID, token); err != nil {
-			// 回写失败不影响本次登录（token 已经拿到），但要留下日志：
-			// 下次登录会再向融云换发，把其它端的旧 token 顶掉。
-			h.logger.Warn("rongcloud: wechat login persist IM token", "error", err, "user_id", user.UserID)
-		}
-	}
-
 	return h.replyOK(ctx, msg, cmd, map[string]interface{}{
-		"userId":      user.UserID,
-		"id":          user.UserID,
-		"username":    user.Username,
-		"nickname":    user.Nickname,
-		"portraitUri": DefaultPortraitIfEmpty(user.PortraitURI),
-		"token":       token,
-		"isNewUser":   isNewUser,
+		"userId":      result.UserID,
+		"id":          result.UserID,
+		"username":    result.Username,
+		"nickname":    result.Nickname,
+		"portraitUri": result.PortraitURI,
+		"token":       result.Token,
+		"isNewUser":   result.IsNewUser,
 	})
 }
 
@@ -213,48 +158,7 @@ func (h *systemHandler) handleWeChatLogin(ctx context.Context, msg NormalizedMes
 // 微信对业务错误也返回 HTTP 200，只有 errcode 区分成功/失败，所以必须读
 // errcode；网络/解析失败按 500 处理（不是调用方的错）。
 func (h *systemHandler) wechatCode2Session(ctx context.Context, appID, appSecret, code string) (string, error) {
-	base := strings.TrimSpace(h.wechatAPIBase)
-	if base == "" {
-		base = defaultWeChatAPIBase
-	}
-	endpoint := strings.TrimRight(base, "/") + "/sns/jscode2session?" + url.Values{
-		"appid":      {appID},
-		"secret":     {appSecret},
-		"js_code":    {code},
-		"grant_type": {"authorization_code"},
-	}.Encode()
-
-	reqCtx, cancel := context.WithTimeout(ctx, weChatHTTPTimeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		// url.Parse 的失败也是 *url.Error，同样会带上含 secret 的整条 URL。
-		return "", sanitizeWeChatTransportError(err)
-	}
-	resp, err := h.wechatClient().Do(req)
-	if err != nil {
-		return "", sanitizeWeChatTransportError(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("wechat jscode2session: unexpected status %d", resp.StatusCode)
-	}
-	var parsed wechatSessionResponse
-	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
-		return "", fmt.Errorf("wechat jscode2session: decode response: %w", err)
-	}
-	if parsed.ErrCode != 0 {
-		message := strings.TrimSpace(parsed.ErrMsg)
-		if message == "" {
-			message = fmt.Sprintf("errcode %d", parsed.ErrCode)
-		}
-		return "", &wechatAPIError{code: parsed.ErrCode, message: message}
-	}
-	openID := strings.TrimSpace(parsed.OpenID)
-	if openID == "" {
-		return "", errors.New("wechat jscode2session: empty openid")
-	}
-	return openID, nil
+	return wechatCode2Session(ctx, h.wechatAPIBase, h.wechatHTTPClient, appID, appSecret, code)
 }
 
 // wechatClient 允许测试注入假微信服务；默认 8s 超时，避免命令通道被拖到

@@ -1668,6 +1668,11 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// 供 clawmessenger-web / clawmessenger-uniapp 前端直连。
 	r.Post("/api/register", h.ClawRegister)
 	r.Post("/api/login", h.ClawLogin)
+	// 微信小程序手机号登录。与 /api/login 同级公开：微信登录发生在「还没有任何
+	// 凭据」的时刻，走不了融云 command 通道（那条通道要求已连 IM，未登录连不上，
+	// 会死锁到 10s 超时报「融云连接失败」）。业务逻辑与 command 通道共用
+	// internal/integrations/rongcloud/wechat_login.go 的 WeChatLogin。
+	r.Post("/api/wechat/login", h.ClawWeChatLogin)
 	// 默认头像：embed 进二进制的公开静态资源（注册/节点绑定时写进融云资料）。
 	handler.ServeClawStaticAssets(r)
 	// P4：C 端圆桌扁平 REST（对齐旧 Python app.py:3042-3084 的路由与鉴权契约）。

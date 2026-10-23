@@ -375,6 +375,11 @@ type Handler struct {
 
 	// RongCloud integration services (nil when MULTICA_RONGCLOUD_SECRET_KEY is not set).
 	RongCloudInstall    *rongcloud.InstallService
+	// wechatAPIBase / wechatHTTPClient 只供测试注入假的微信 jscode2session
+	// 服务（空值走 https://api.weixin.qq.com 与 8s 超时客户端）。注入范式与
+	// rongcloud 包 systemHandler 的同名字段一致：业务代码不设置它们。
+	wechatAPIBase    string
+	wechatHTTPClient *http.Client
 	RongCloudNode       *rongcloud.NodeService
 	RongCloudChatroom   *rongcloud.ChatroomService
 	RongCloudPairing    *rongcloud.PairingService
