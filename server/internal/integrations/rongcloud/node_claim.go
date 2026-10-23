@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
@@ -123,6 +124,121 @@ func (s *NodeService) InvalidateNodeClaimants() {
 	s.claimCache = nil
 	s.claimCacheAt = time.Time{}
 	s.claimMu.Unlock()
+}
+
+// ---- claimed_by_user_id：好友边反查结果的本地投影（migrations/600） ----
+//
+// 归属的**真相**仍然是融云好友边；这一列只是把它缓存进库，让读路径（好友
+// service 的 getDeviceOwner）从 O(N) 次 /friend/get.json 降到一次 SELECT。
+//
+// 为什么不用 sqlc：该列是 600 号迁移新加的，generated/ 目录本轮明确不做
+// 全量 regen（工作区里有在途改动），所以这里直接走 DBTX 的参数化 SQL。
+
+// ErrNodeClaimStoreUnavailable 表示调用方没有注入 DBTX（见 SetClaimDB），
+// 投影列写不进去。所有调用点都把它当成 best-effort：归属的真相在好友边，
+// 投影缺失只会让下一次读回退到反查（并顺带回填），不会答错。
+var ErrNodeClaimStoreUnavailable = errors.New("rongcloud: node claim store not configured")
+
+// claimEpoch 是投影列的写世代号：任何一次「改列」都会 +1，friendNodeOwners
+// 用它判定自己手里那张 15s 反查 map 是否已经过期。
+//
+// 为什么需要它（而不是给读路径加 bypass）：归属的真值在融云好友边，15s map 是
+// 它的记忆化副本，而写路径（绑定/转移/解绑/注销/主持解绑/手删好友）分散在
+// NodeService 与 friend service 两处、**没有任何共享结构**。给写路径加一个
+// 全局世代号，读路径只在「取缓存」时多比较一个整数，语义零变化；反过来给读
+// 路径加 bypass 会改变「节点行不存在时还用不用缓存」这种边界语义，风险更大。
+//
+// 代价：任何一次认领写都会让所有实例的下一次读重建一次表（写很稀疏，可接受）。
+var claimEpoch atomic.Uint64
+
+// bumpClaimEpoch 必须在**列真的被改过之后**调用；失败路径不调用，避免无谓重建。
+func bumpClaimEpoch() { claimEpoch.Add(1) }
+
+// SetClaimDB injects the connection used by SetNodeClaim/ClearNodeClaim.
+//
+// Idempotent and safe to call on every request: the handler layer passes its
+// own DBTX because the service is constructed in router.go with *db.Queries
+// only, and that file is outside this change's scope. Once set it stays set.
+func (s *NodeService) SetClaimDB(dbtx db.DBTX) {
+	if s == nil || dbtx == nil {
+		return
+	}
+	s.mu.Lock()
+	s.claimDB = dbtx
+	s.mu.Unlock()
+}
+
+func (s *NodeService) claimStore() db.DBTX {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.claimDB
+}
+
+// SetNodeClaim records ownerRCID as the claimant of nodeRCID in the local
+// projection. Best-effort: the caller keeps going on error (the friend edge is
+// the truth), which is why every failure is logged rather than returned to the
+// user.
+func (s *NodeService) SetNodeClaim(ctx context.Context, nodeRCID, ownerRCID string) error {
+	dbtx := s.claimStore()
+	if dbtx == nil {
+		return ErrNodeClaimStoreUnavailable
+	}
+	nodeRCID = strings.TrimSpace(nodeRCID)
+	ownerRCID = strings.TrimSpace(ownerRCID)
+	if nodeRCID == "" || ownerRCID == "" {
+		return nil
+	}
+	_, err := dbtx.Exec(ctx, `
+		UPDATE rongcloud_node SET claimed_by_user_id = $1 WHERE rongcloud_user_id = $2`,
+		ownerRCID, nodeRCID)
+	if err != nil {
+		s.log().Warn("rongcloud: record node claim failed",
+			"node_rc", nodeRCID, "owner", ownerRCID, "error", err)
+		return err
+	}
+	// 写路径 ①②：绑定 / 管理端转移。列变了，别的实例手里那张 map 立刻作废
+	// （否则解绑/改归属后仍会在 15s 内答旧 owner）。
+	bumpClaimEpoch()
+	return nil
+}
+
+// ClearNodeClaim drops the local projection for nodeRCID. An empty ownerRCID
+// clears it unconditionally; a non-empty one only clears a claim that actually
+// belongs to that account, so deleting somebody else's friend edge cannot blank
+// out the real owner's row.
+func (s *NodeService) ClearNodeClaim(ctx context.Context, nodeRCID, ownerRCID string) error {
+	dbtx := s.claimStore()
+	if dbtx == nil {
+		return ErrNodeClaimStoreUnavailable
+	}
+	nodeRCID = strings.TrimSpace(nodeRCID)
+	if nodeRCID == "" {
+		return nil
+	}
+	_, err := dbtx.Exec(ctx, `
+		UPDATE rongcloud_node SET claimed_by_user_id = NULL
+		WHERE rongcloud_user_id = $1 AND ($2 = '' OR claimed_by_user_id = $2)`,
+		nodeRCID, strings.TrimSpace(ownerRCID))
+	if err != nil {
+		s.log().Warn("rongcloud: clear node claim failed",
+			"node_rc", nodeRCID, "owner", ownerRCID, "error", err)
+		return err
+	}
+	// 写路径 ③④（管理端删设备、C 端取消绑定/注销）：行虽然马上要被删掉，
+	// 但 15s 反查 map 里还可能留着这台设备的旧 owner —— 必须让读路径立刻
+	// 重建，否则「刚解绑，别人的设备还挂在我名下」还会被展示一整个 TTL。
+	bumpClaimEpoch()
+	return nil
+}
+
+func (s *NodeService) log() *slog.Logger {
+	if s != nil && s.logger != nil {
+		return s.logger
+	}
+	return slog.Default()
 }
 
 // GrantFriendship adds targetID to userID's RongCloud friend list, reporting

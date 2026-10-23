@@ -55,6 +55,12 @@ type NodeService struct {
 	claimMu      sync.Mutex
 	claimCache   map[string]string
 	claimCacheAt time.Time
+	// claimDB is the connection used for rongcloud_node.claimed_by_user_id, the
+	// local projection of "who claims this node" (migrations/600). sqlc has no
+	// query for that column yet (and the generated package must not be
+	// regenerated during this change), so the projection is read/written with
+	// plain SQL. Guarded by mu; set through SetClaimDB.
+	claimDB db.DBTX
 }
 
 func NewNodeService(queries *db.Queries, client *rongcloudAPIClient, box *secretbox.Box, logger *slog.Logger) *NodeService {
@@ -1077,6 +1083,14 @@ func (s *NodeService) UnbindNode(ctx context.Context, node db.RongcloudNode, own
 			return fmt.Errorf("delete node model catalogue: %w", err)
 		}
 	}
+	// 写路径 ③/④（管理端删除设备、C 端取消绑定/注销）：行马上要被删掉，这里
+	// 仍先清投影列 —— 删行失败时行会留下来，带着「已被解绑的人」的认领值是
+	// 最糟的状态；清成 NULL 则下次读回退到好友边反查，答的仍是真话。
+	if err := s.ClearNodeClaim(ctx, node.RongcloudUserID, ownerRongCloudID); err != nil &&
+		!errors.Is(err, ErrNodeClaimStoreUnavailable) {
+		s.logger.Warn("rongcloud: clear node claim on unbind failed",
+			"node_rc", node.RongcloudUserID, "owner", ownerRongCloudID, "error", err)
+	}
 	return s.queries.DeleteRongCloudNode(ctx, node.ID)
 }
 
@@ -1388,6 +1402,15 @@ func (s *NodeService) bindAgentsToMachine(ctx context.Context, machineNode db.Ro
 		if ownerRongCloudID != "" && agent != OpsAgentType && binding.RongcloudUserID != "" {
 			if _, err := s.client.addFriend(ctx, ownerRongCloudID, binding.RongcloudUserID, ""); err != nil {
 				s.logger.Warn("rongcloud: add friend for bound agent failed",
+					"owner", ownerRongCloudID, "agent", agent, "error", err)
+			}
+			// 写路径 ①：好友边是本地的真相，claimed_by_user_id 是它的投影。
+			// 每次绑定都必须同步，否则读路径会拿到「列说有主、其实已经换人」
+			// 的旧值（脏列不会像 15s 缓存那样自己过期）。best-effort，失败只
+			// 记日志：下一次 getDeviceOwner 会回退到反查并回填。
+			if err := s.SetNodeClaim(ctx, binding.RongcloudUserID, ownerRongCloudID); err != nil &&
+				!errors.Is(err, ErrNodeClaimStoreUnavailable) {
+				s.logger.Warn("rongcloud: sync node claim after bind failed",
 					"owner", ownerRongCloudID, "agent", agent, "error", err)
 			}
 		}

@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -584,6 +585,13 @@ func (h *Handler) clawAdminUnbindHostNode(ctx context.Context, nodeUUID pgtype.U
 			return "", err
 		}
 		h.RongCloudNode.InvalidateNodeClaimants()
+	}
+	// 好友边已撤（或本来就没有），claimed_by_user_id 投影必须跟着清。owner 为空
+	// 时也清：主持节点被平台收回，任何残留认领都是错的。
+	h.clawAttachNodeClaimDB()
+	if err := h.RongCloudNode.ClearNodeClaim(ctx, aiUserID, owner); err != nil {
+		slog.Warn("claw admin: clear node claim for discussion host failed",
+			"node_rc", aiUserID, "owner", owner, "error", err)
 	}
 
 	// 好友边是设备列表的依据，这两步只是让库内状态与之一致（旧后端同样写了）。

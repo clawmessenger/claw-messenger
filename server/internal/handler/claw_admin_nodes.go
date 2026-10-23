@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -625,6 +626,8 @@ func (h *Handler) ClawAdminDeleteNode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	claimants := h.clawAdminNodeClaimants(ctx, []string{rec.RongcloudUserID})
+	// UnbindNode 内部会把 claimed_by_user_id 投影列清掉，需要节点服务持有连接池。
+	h.clawAttachNodeClaimDB()
 	if err := h.RongCloudNode.UnbindNode(ctx, rec.dbNode(), claimants[rec.RongcloudUserID]); err != nil {
 		clawAdminFail(w, 500, "删除设备失败")
 		return
@@ -821,6 +824,21 @@ func (h *Handler) ClawAdminTransferNodeOwner(w http.ResponseWriter, r *http.Requ
 			}
 			clawAdminFail(w, 502, "设置新归属失败")
 			return
+		}
+		// 写路径 ②：好友边已经改到 target，claimed_by_user_id 投影必须同步。
+		// 列是读路径的第一跳，写不进去就会一直答旧归属（不像 15s 缓存会过期）。
+		h.clawAttachNodeClaimDB()
+		if err := h.RongCloudNode.SetNodeClaim(ctx, rec.RongcloudUserID, target); err != nil {
+			// 投影写失败不能回滚已经成功的换边；退而求其次把它清成 NULL，
+			// 让下一次读回退到好友边反查（那才是真话），而不是留着旧归属。
+			if !errors.Is(err, rongcloud.ErrNodeClaimStoreUnavailable) {
+				slog.Warn("claw admin: sync node claim after owner transfer failed",
+					"node", rec.NodeID, "from", current, "to", target, "error", err)
+				if err := h.RongCloudNode.ClearNodeClaim(ctx, rec.RongcloudUserID, ""); err != nil {
+					slog.Warn("claw admin: clear node claim after failed sync failed",
+						"node", rec.NodeID, "error", err)
+				}
+			}
 		}
 		h.RongCloudNode.InvalidateNodeClaimants()
 		h.clawAdminAudit(r, ident, "node_owner_changed", "node", rec.NodeID, map[string]interface{}{

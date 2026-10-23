@@ -29,6 +29,13 @@ type claimFriendServer struct {
 	friends map[string][]string
 	// fail 为真时回一个非 200 的业务错误码，模拟融云侧故障。
 	fail bool
+	// onCall 在每次应答之前回调（已释放锁）。用于把「build 进行中被写路径
+	// 改列」构造成确定性时序，比用 sleep 赌竞态可靠。
+	//
+	// 注意：friends 在回调**之前**就已从 map 取出（切片值），所以回调里把
+	// 条目置 nil 不会被本次响应读到 —— 否则「build 期间解绑」会被演化成
+	// 「build 读到解绑后的边」，测试自己把要证伪的时序跳过去了。
+	onCall func()
 }
 
 func (s *claimFriendServer) callCount() int {
@@ -53,7 +60,15 @@ func newClaimFriendServer(t *testing.T, s *claimFriendServer) *httptest.Server {
 		fail := s.fail
 		userID := r.PostForm.Get("userId")
 		friends := s.friends[userID]
+		onCall := s.onCall
 		s.mu.Unlock()
+
+		// 应答之前回调：此时调用方的 build() 还阻塞在这条 HTTP 请求上，
+		// 「build 进行中」是被保证的，不依赖任何计时。friends 上面已拷贝，
+		// 回调改 map 不影响本次响应（见 onCall 的注释）。
+		if onCall != nil {
+			onCall()
+		}
 
 		w.Header().Set("Content-Type", "application/json")
 		if fail {

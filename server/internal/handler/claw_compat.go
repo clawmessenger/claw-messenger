@@ -974,6 +974,8 @@ func (h *Handler) ClawBindPairing(w http.ResponseWriter, r *http.Request) {
 		clawJSON(w, 500, 500, "查询票据失败", nil)
 		return
 	}
+	// 绑定时 bindAgentsToMachine 会写好 claimed_by_user_id 投影列，需要连接池。
+	h.clawAttachNodeClaimDB()
 	results, err := h.RongCloudNode.BindAgents(r.Context(), session, req.Agents, userID)
 	if err != nil {
 		switch {
@@ -1145,7 +1147,20 @@ func (h *Handler) clawNodeService() clawNodeOps {
 	if h.RongCloudNode == nil {
 		return nil
 	}
+	h.clawAttachNodeClaimDB()
 	return h.RongCloudNode
+}
+
+// clawAttachNodeClaimDB 把连接池注入节点服务，供 rongcloud_node.claimed_by_user_id
+// 的读写使用。该列是 600 号迁移新加的，sqlc 里还没有查询（本轮不做全量 regen），
+// 只能直连；NodeService 在 router 里只拿到 *db.Queries，所以在 handler 取用时
+// 按需注入。幂等、nil 安全 —— 没注入时投影列写不进去，但归属真相在融云好友边，
+// 读路径会回退到反查并回填，不会答错。
+func (h *Handler) clawAttachNodeClaimDB() {
+	if h.RongCloudNode == nil {
+		return
+	}
+	h.RongCloudNode.SetClaimDB(h.DB)
 }
 
 // clawNodeOwnershipMessage 是「节点存在但不属于当前用户」的返回文案，与
@@ -1281,6 +1296,12 @@ func (h *Handler) ClawDeleteNode(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("claw: node unbind failed", "nodeId", nodeID, "unregister", r.URL.Query().Get("unregister"), "error", err)
 		clawJSON(w, 500, 500, "取消绑定失败", nil)
 		return
+	}
+	// 归属列来自 NodeClaimants 的 15s 记忆化好友边反查。这里刚删掉节点行与
+	// 好友边，缓存必须一起失效 —— 否则设备列表在 TTL 内仍会显示已解绑的归属
+	// （admin 的删除路径一直有这一步，本端点漏了）。
+	if h.RongCloudNode != nil {
+		h.RongCloudNode.InvalidateNodeClaimants()
 	}
 	clawJSON(w, 200, 200, "节点删除成功", map[string]interface{}{"ok": true})
 }
