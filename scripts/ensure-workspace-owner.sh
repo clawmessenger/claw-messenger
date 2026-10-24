@@ -58,8 +58,15 @@ total=0
 
 while IFS="$TAB" read -r wid slug mgr; do
   [ -z "$wid" ] && continue
+  # 解析失败保护：psql 的 -A 默认字段分隔符是 '|'，必须显式 -F 才能对上 IFS。
+  # 对不上时整行会塞进 wid，slug/mgr 为空 —— 那会把「有 owner」误报成缺失，
+  # 与其静默出错不如停下。
+  if [ -z "${mgr:-}" ]; then
+    echo "!! 解析 psql 输出失败（wid=$wid）—— 检查 -F 分隔符是否与 IFS 一致"
+    exit 2
+  fi
   total=$((total + 1))
-  if [ "${mgr:-0}" != "0" ]; then
+  if [ "$mgr" != "0" ]; then
     printf '[ok] %-28s owner/admin=%s\n' "$slug" "$mgr"
     continue
   fi
@@ -87,7 +94,7 @@ while IFS="$TAB" read -r wid slug mgr; do
   else
     echo "     !! 补失败：$out"
   fi
-done < <(psql "$DSN" -Atqc "
+done < <(psql "$DSN" -At -F "$TAB" -c "
   select w.id, w.slug,
          (select count(*) from member m
            where m.workspace_id = w.id and m.role in ('owner','admin'))
