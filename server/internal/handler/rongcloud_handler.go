@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/integrations/rongcloud"
+	"github.com/multica-ai/multica/server/internal/logger"
 	"github.com/multica-ai/multica/server/internal/util"
 )
 
@@ -89,6 +91,7 @@ func (h *Handler) RefreshRongCloudToken(w http.ResponseWriter, r *http.Request) 
 	}
 	token, err := h.RongCloudNode.RefreshToken(r.Context(), nodeID)
 	if err != nil {
+		slog.Error("refresh rongcloud token failed", append(logger.RequestAttrs(r), "error", err, "node_id", nodeID)...)
 		writeError(w, http.StatusInternalServerError, "failed to refresh token")
 		return
 	}

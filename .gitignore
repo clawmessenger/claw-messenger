@@ -81,3 +81,6 @@ __pycache__/
 perf-report/
 # The production example is a tracked template; `.env*` above would hide it.
 !apps/mobile/.env.production.example
+
+# AI team run artifacts (plans, reports, verification evidence)
+.agent-runs/

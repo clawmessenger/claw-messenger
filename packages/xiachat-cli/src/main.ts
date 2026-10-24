@@ -21,6 +21,8 @@ import {
   type Daemon,
   type DaemonPaths,
 } from "./daemon.js";
+import { installPaths } from "./install.js";
+import { checkForUpdate, stageUpdate } from "./self-update.js";
 
 // Deterministic per (ticket, machine): a retried claim after a lost
 // response reuses the same key, so the server deduplicates instead of
@@ -215,8 +217,8 @@ export function buildProgram(opts: BuildProgramOpts): Command {
     .name("clawmessenger")
     .description("User-device agent CLI over RongCloud IM")
     // ⚠️ 与 package.json 的 version 手动同步：SEA 打包后读不到外部 package.json，
-    //    改版本时两处一起改（1.0.0：生产环境正式版）
-    .version("1.0.0")
+    //    改版本时两处一起改（1.0.0：生产环境正式版；1.1.0：内置自更新）
+    .version("1.1.0")
     // Tests parse this program in-process; commander would otherwise
     // process.exit on missing options and kill the vitest runner.
     .exitOverride();
@@ -691,6 +693,45 @@ export function buildProgram(opts: BuildProgramOpts): Command {
       const report = daemon.status();
       const scope = opsScope();
       opts.stdout.write(formatDaemonStatus(scope ? scopeDaemonReport(report, scope) : report, daemonPaths));
+    });
+
+  // 自更新：下载 + 校验到安装目录旁，真正换上去放在下一次启动。
+  // 运行中的 exe 在 Windows 上无法被覆盖（EBUSY），但可以被改名 —— 所以这里
+  // 只落一份 `<target>.new-<version>`，由 bin.ts 在下次启动时完成交换。
+  program
+    .command("update")
+    .description("Fetch the latest release, verify its checksum, and stage it for the next start")
+    .option("--check", "only report whether a newer version is available")
+    .option("--force", "stage the latest release even when it is not newer than this build")
+    .action(async (cmdOpts: { check?: boolean; force?: boolean }) => {
+      const current = program.version() ?? "0.0.0";
+      const target = installPaths(process.platform, os.homedir()).target;
+      let plan;
+      try {
+        plan = await checkForUpdate(current, process.platform, process.arch);
+      } catch (err) {
+        throw new Error(`update check failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      opts.stdout.write(`current: ${plan.currentVersion}\nlatest:  ${plan.latestVersion}\n`);
+      if (plan.release.source === "cdn") {
+        opts.stdout.write(
+          "note: GitHub's API was unavailable (rate limit?), so the version came from the release CDN.\n" +
+          "      set CLAWMESSENGER_UPDATE_TOKEN to raise the API quota.\n",
+        );
+      }
+      if (!plan.updateAvailable && !cmdOpts.force) {
+        opts.stdout.write("already up to date\n");
+        return;
+      }
+      if (cmdOpts.check) {
+        opts.stdout.write("update available\n");
+        return;
+      }
+      const staged = await stageUpdate(plan.release, target, process.platform, process.arch);
+      opts.stdout.write(
+        `staged ${staged.version} (${staged.asset}, ${staged.bytes} bytes)\n` +
+        `it takes effect on the next start — run \`clawmessenger restart\`\n`,
+      );
     });
 
   // --- 后台常驻 -------------------------------------------------------------

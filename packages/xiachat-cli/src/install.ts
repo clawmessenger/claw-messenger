@@ -132,7 +132,6 @@ export function ensureInstalled(): InstallResult | null {
           renameSync(tmp, paths.target); // atomic-ish replace of an old install
         } catch {
           copyFileSync(process.execPath, paths.target);
-          unlinkSync(tmp);
         }
         copied = true;
       } catch (err) {
@@ -140,6 +139,15 @@ export function ensureInstalled(): InstallResult | null {
         process.stderr.write(
           `clawmessenger: could not self-install to ${paths.target}: ${err instanceof Error ? err.message : String(err)}\n`,
         );
+      } finally {
+        // A successful rename consumes tmp; every other exit path — including a
+        // fallback copy that throws EBUSY on a locked target — must not leave a
+        // full-size stray file next to the install.
+        try {
+          unlinkSync(tmp);
+        } catch {
+          // already renamed into place, or never created
+        }
       }
     }
     const pathAdded = platform === "win32" ? ensureWindowsPath(paths.dir) : ensureUnixPath(paths.dir);

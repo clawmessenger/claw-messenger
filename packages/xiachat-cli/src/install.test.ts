@@ -1,11 +1,75 @@
-import { describe, expect, it } from "vitest";
+import * as fs from "node:fs";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import {
+  ensureInstalled,
   installPaths,
   isSeaExecutable,
   nextPathValue,
   parseRegPathQuery,
   samePath,
 } from "./install.js";
+
+// Self-install tests need a virtual filesystem: the assertions are about what
+// is left on disk after each failure path (in particular: no 88 MB stray tmp
+// file next to the install), not about which fs function was called.
+// `disk` is the source of truth — copyFileSync creates, unlinkSync removes,
+// renameSync moves. Everything else in this file is pure and unaffected.
+vi.mock("node:fs", () => {
+  const disk = new Set<string>();
+  const copyFailure = new Map<string, Error>();
+  const control = { renameError: null as Error | null };
+
+  const copyFileSync = vi.fn((_src: string, dest: string) => {
+    const err = copyFailure.get(dest);
+    if (err) throw err;
+    disk.add(dest);
+  });
+  const renameSync = vi.fn((from: string, to: string) => {
+    if (control.renameError) throw control.renameError;
+    disk.delete(from);
+    disk.add(to);
+  });
+  const unlinkSync = vi.fn((p: string) => {
+    if (!disk.has(p)) {
+      throw Object.assign(new Error(`ENOENT: no such file or directory, unlink '${p}'`), { code: "ENOENT" });
+    }
+    disk.delete(p);
+  });
+  const existsSync = vi.fn((p: string) => disk.has(p));
+  const mkdirSync = vi.fn();
+  const readFileSync = vi.fn(() => "");
+  const writeFileSync = vi.fn((p: string) => {
+    disk.add(p);
+  });
+
+  return {
+    copyFileSync,
+    renameSync,
+    unlinkSync,
+    existsSync,
+    mkdirSync,
+    readFileSync,
+    writeFileSync,
+    __disk: disk,
+    __copyFailure: copyFailure,
+    __control: control,
+  };
+});
+
+vi.mock("node:child_process", () => ({
+  // PATH lookup/update is irrelevant here; keep `reg` out of the test.
+  spawnSync: vi.fn(() => ({ status: 1, stdout: "", stderr: "" })),
+}));
+
+vi.mock("node:os", () => ({ homedir: () => "C:\\Users\\u" }));
+
+type FsMock = typeof fs & {
+  __disk: Set<string>;
+  __copyFailure: Map<string, Error>;
+  __control: { renameError: Error | null };
+};
+
+const fsMock = fs as FsMock;
 
 describe("installPaths", () => {
   it("maps windows to LOCALAPPDATA clawmessenger dir with .exe", () => {
@@ -102,5 +166,111 @@ describe("nextPathValue", () => {
 
   it("uses ':' separator on unix", () => {
     expect(nextPathValue("/usr/bin", "/home/u/.local/bin", "linux")).toBe("/usr/bin:/home/u/.local/bin");
+  });
+});
+
+describe("ensureInstalled self-copy", () => {
+  const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
+  const originalArgv1 = process.argv[1];
+  const originalLocalAppData = process.env.LOCALAPPDATA;
+  let stderrSpy: MockInstance<typeof process.stderr.write>;
+
+  const paths = installPaths("win32", "C:\\Users\\u", undefined);
+  const tmpPath = `${paths.target}.tmp-${process.pid}`;
+  const ebusy = () => Object.assign(new Error("EBUSY: resource busy or locked, copyfile"), { code: "EBUSY" });
+  const stderrText = (): string => stderrSpy.mock.calls.map((c) => String(c[0])).join("");
+
+  beforeAll(() => {
+    // The incident happened on Windows; pin the platform so the test does not
+    // depend on where CI runs.
+    Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+  });
+
+  afterAll(() => {
+    if (platformDescriptor) Object.defineProperty(process, "platform", platformDescriptor);
+    process.argv[1] = originalArgv1;
+    if (originalLocalAppData === undefined) delete process.env.LOCALAPPDATA;
+    else process.env.LOCALAPPDATA = originalLocalAppData;
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    fsMock.__disk.clear();
+    fsMock.__copyFailure.clear();
+    fsMock.__control.renameError = null;
+    // Run as a SEA binary coming from Downloads, and make the install base
+    // deterministic.
+    process.argv[1] = "C:\\Users\\u\\Downloads\\clawmessenger.exe";
+    delete process.env.LOCALAPPDATA;
+    stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+  });
+
+  afterEach(() => {
+    stderrSpy.mockRestore();
+  });
+
+  it("leaves no tmp file when the fallback copy hits EBUSY on a locked target (incident)", () => {
+    // rename fails (old install present), then the fallback copy fails because
+    // the running exe holds the target: the pre-fix code threw here and skipped
+    // unlinkSync(tmp), leaving a full-size stray file behind forever.
+    fsMock.__control.renameError = Object.assign(new Error("EPERM: operation not permitted, rename"), { code: "EPERM" });
+    fsMock.__copyFailure.set(paths.target, ebusy());
+
+    let result: ReturnType<typeof ensureInstalled>;
+    expect(() => {
+      result = ensureInstalled();
+    }).not.toThrow();
+
+    // The fallback really was attempted and really did throw.
+    expect(fsMock.copyFileSync).toHaveBeenCalledWith(process.execPath, paths.target);
+
+    expect(result!).not.toBeNull();
+    expect(result!.copied).toBe(false);
+    // The tmp path is exactly the one the implementation used, and the file is
+    // gone from the virtual disk — nothing is left next to the install.
+    expect(fsMock.unlinkSync).toHaveBeenCalledWith(tmpPath);
+    expect(fsMock.__disk.has(tmpPath)).toBe(false);
+    expect(stderrText()).toContain("could not self-install");
+  });
+
+  it("cleans up the tmp file when the fallback copy succeeds", () => {
+    fsMock.__control.renameError = Object.assign(new Error("EPERM: operation not permitted, rename"), { code: "EPERM" });
+
+    const result = ensureInstalled();
+
+    expect(fsMock.copyFileSync).toHaveBeenCalledWith(process.execPath, paths.target);
+    expect(result).not.toBeNull();
+    expect(result!.copied).toBe(true);
+    expect(fsMock.__disk.has(paths.target)).toBe(true);
+    expect(fsMock.unlinkSync).toHaveBeenCalledWith(tmpPath);
+    expect(fsMock.__disk.has(tmpPath)).toBe(false);
+  });
+
+  it("keeps copied === true on the atomic rename path even though cleanup throws ENOENT", () => {
+    // rename consumes tmp, so the finally-block unlink finds nothing (ENOENT)
+    // and must swallow it instead of failing the install.
+    const result = ensureInstalled();
+
+    expect(result).not.toBeNull();
+    expect(result!.copied).toBe(true);
+    expect(fsMock.__disk.has(paths.target)).toBe(true);
+    expect(fsMock.unlinkSync).toHaveBeenCalledWith(tmpPath);
+    expect(fsMock.__disk.has(tmpPath)).toBe(false);
+    expect(stderrText()).not.toContain("could not self-install");
+  });
+
+  it("returns copied === false and reports on stderr when the first copy to tmp fails", () => {
+    fsMock.__copyFailure.set(tmpPath, Object.assign(new Error("ENOSPC: no space left on device, copyfile"), { code: "ENOSPC" }));
+
+    let result: ReturnType<typeof ensureInstalled>;
+    expect(() => {
+      result = ensureInstalled();
+    }).not.toThrow();
+
+    expect(result!).not.toBeNull();
+    expect(result!.copied).toBe(false);
+    expect(fsMock.__disk.has(tmpPath)).toBe(false);
+    expect(stderrText()).toContain("could not self-install");
+    expect(stderrText()).toContain("ENOSPC");
   });
 });
