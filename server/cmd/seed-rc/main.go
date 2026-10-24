@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/multica-ai/multica/server/internal/util/secretbox"
 	"github.com/jackc/pgx/v5"
+	"github.com/multica-ai/multica/server/internal/util/secretbox"
 )
 
 func main() {
@@ -40,9 +40,9 @@ func main() {
 	encSecret := base64.StdEncoding.EncodeToString(sealed)
 
 	cfg := map[string]string{
-		"app_key":             appKey,
+		"app_key":              appKey,
 		"app_secret_encrypted": encSecret,
-		"system_node_id":      "system",
+		"system_node_id":       "system",
 	}
 	cfgJSON, _ := json.Marshal(cfg)
 
@@ -59,6 +59,36 @@ func main() {
 	if err != nil {
 		fmt.Println("workspace:", err)
 		os.Exit(1)
+	}
+
+	// 设备注册要求 workspace 有 owner/admin：node_service.go 的
+	// resolveWorkspaceAttribution 查 member 表，空了就返回
+	// "workspace ... has no manager to own the node"，而 /api/ai/register
+	// 只把它翻成 500，日志里没有任何线索。走 POST /api/workspaces 建
+	// workspace 会在同一事务里写 owner，但本工具是直接写库、绕过了那层，
+	// 所以这里补一条幂等的 owner 关系，避免 seed 完的环境绑不了设备。
+	var managers int
+	if err := conn.QueryRow(ctx,
+		`SELECT count(*) FROM member WHERE workspace_id = $1::uuid AND role IN ('owner', 'admin')`,
+		workspaceID).Scan(&managers); err != nil {
+		fmt.Println("member count:", err)
+		os.Exit(1)
+	}
+	if managers == 0 {
+		var ownerID string
+		if err := conn.QueryRow(ctx, `SELECT id::text FROM "user" ORDER BY created_at LIMIT 1`).Scan(&ownerID); err != nil {
+			fmt.Println(`workspace has no owner and "user" is empty — create a user first:`, err)
+			os.Exit(1)
+		}
+		if _, err := conn.Exec(ctx, `
+			INSERT INTO member (workspace_id, user_id, role)
+			VALUES ($1::uuid, $2::uuid, 'owner')
+			ON CONFLICT (workspace_id, user_id) DO UPDATE SET role = 'owner'`,
+			workspaceID, ownerID); err != nil {
+			fmt.Println("ensure workspace owner:", err)
+			os.Exit(1)
+		}
+		fmt.Println("workspace owner ensured:", ownerID)
 	}
 
 	// channel_installation.agent_id 非空，指向 agent 表；确保存在一个可用 agent。
