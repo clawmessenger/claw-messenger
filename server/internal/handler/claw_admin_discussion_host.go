@@ -523,6 +523,10 @@ func (h *Handler) ClawAdminDiscussionHostPut(w http.ResponseWriter, r *http.Requ
 	// 普通用户的设备列表里。解绑失败要如实上报，不能假装成功。
 	unboundFrom, unbindErr := h.clawAdminUnbindHostNode(r.Context(), hostNodeUUID)
 	if unbindErr != nil {
+		// 这一条同时写日志与审计：502 是「配置已落库但解绑失败」的中间态，
+		// 只回报表不写日志的话，线上只能靠翻库猜原因（2026-10-24 实测踩过）。
+		slog.Warn("claw admin: unbind discussion host node failed",
+			"node_id", nodeID, "ai_user_id", aiUserID, "error", unbindErr)
 		h.clawAdminAudit(r, ident, "admin_system_discussion_host_unbind_failed", "system_config",
 			clawAdminDiscussionHostKey, map[string]interface{}{
 				"node_id": nodeID, "error": unbindErr.Error(),
@@ -559,8 +563,10 @@ func (h *Handler) ClawAdminDiscussionHostPut(w http.ResponseWriter, r *http.Requ
 // 只列出调用者好友列表里的节点，所以只要删掉这条边，该节点就不再出现在该用户的
 // 设备列表里 —— 这正是旧 Python 后端 _persist 里
 // `DELETE FROM im_user_nodes WHERE node_id = …` 那一步，Go 移植时漏掉了。
-// 同步把 rongcloud_node.owner_user_id 清空、并把该节点标为系统保留（同一时刻
-// 只有一个主持），与旧后端 `user_id = NULL, is_system_reserved = TRUE` 对齐。
+// 同时把该节点标为系统保留（同一时刻只有一个主持），与旧后端
+// `is_system_reserved = TRUE` 对齐。
+// 旧后端那句 `user_id = NULL` **不移植**：rongcloud_node.owner_user_id 在 564 号
+// 迁移里是 UUID NOT NULL，且它存的是 multica 工作区管理员而不是 C 端认领者。
 //
 // 返回被解绑的账号 id（空串表示本来就没绑定）。调用方在失败时按 502 上报：
 // 配置已经落库，但「强制解绑」这一半没做成，不能假装成功。
@@ -594,12 +600,15 @@ func (h *Handler) clawAdminUnbindHostNode(ctx context.Context, nodeUUID pgtype.U
 			"node_rc", aiUserID, "owner", owner, "error", err)
 	}
 
-	// 好友边是设备列表的依据，这两步只是让库内状态与之一致（旧后端同样写了）。
-	if _, err := h.DB.Exec(ctx, `
-		UPDATE rongcloud_node SET owner_user_id = NULL, updated_at = now() WHERE id = $1`,
-		nodeUUID); err != nil {
-		return owner, err
-	}
+	// 这里**不写** rongcloud_node.owner_user_id：564 号迁移把它定义为
+	// `owner_user_id UUID NOT NULL`，赋 NULL 会直接违反约束；而且它指向的是
+	// multica 工作区管理员（安装账号）—— 全库所有节点行都是同一个值，从来不是
+	// C 端认领者（见 node_claim.go 顶部注释、claw_admin_nodes.go 的实测记录）。
+	// 早期移植照抄旧 Python 的 `user_id = NULL`，导致每次保存都在这一步撞
+	// not-null 约束：配置已经落库，却恒定回 502「解除原用户绑定失败」。
+	// 设备归属的真相是融云好友边 + claimed_by_user_id 投影，两者上面都已清空，
+	// 对 C 端 /api/claw/nodes 来说该节点已经不再属于任何人。
+
 	// 同一时刻只有一个主持：把上一个主持的保留标记摘掉（只动 AI 节点，
 	// 别碰真人账号）。
 	if _, err := h.DB.Exec(ctx, `
