@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
 import {
+  agentRuntimeEnv,
   buildAgentArgs,
   buildSpawnInvocation,
   buildModelArgs,
@@ -153,6 +154,53 @@ describe("splitModelRoute / buildModelArgs", () => {
     expect(buildModelArgs("claude", "sonnet-4")).toEqual(["--model", "sonnet-4"]);
     // Unknown agents keep the legacy flags.
     expect(buildModelArgs("kimi", "m1")).toEqual(["--model", "m1"]);
+  });
+
+  it("strips the provider segment for qwen, which only takes the upstream slug", () => {
+    expect(buildModelArgs("qwen", "quukk/glm-5.2")).toEqual(["--model", "glm-5.2"]);
+    expect(buildModelArgs("qwen", "glm-5.2")).toEqual(["--model", "glm-5.2"]);
+    expect(buildModelArgs("qwen", undefined)).toEqual([]);
+  });
+
+  it("never passes --model to codebuddy (it only exposes a free port)", () => {
+    // codebuddy rejects any model id it does not own (`--model glm-5.2` →
+    // "Authentication required"), so the model rides CODEBUDDY_MODEL instead.
+    expect(buildModelArgs("codebuddy", "quukk/glm-5.2")).toEqual(["--port", "0"]);
+    expect(buildModelArgs("codebuddy", undefined)).toEqual(["--port", "0"]);
+  });
+});
+
+describe("agentRuntimeEnv", () => {
+  const CONFIG = {
+    endpoints: [
+      {
+        id: "quukk",
+        name: "Quukk AI",
+        baseUrl: "https://llmapi.quukk.com/v1",
+        apiKey: "sk-test",
+      },
+    ],
+    defaultModel: "quukk/glm-5.2",
+  };
+
+  it("points codebuddy at the configured gateway and passes the picked model", () => {
+    const env = agentRuntimeEnv("codebuddy", "quukk/glm-5.3", { env: { PATH: "/bin" }, config: CONFIG });
+    expect(env).toMatchObject({
+      PATH: "/bin",
+      CODEBUDDY_BASE_URL: "https://llmapi.quukk.com/v1",
+      CODEBUDDY_AUTH_TOKEN: "sk-test",
+      CODEBUDDY_MODEL: "glm-5.3",
+    });
+  });
+
+  it("falls back to the configured default model when none was picked", () => {
+    expect(agentRuntimeEnv("codebuddy", undefined, { env: {}, config: CONFIG }))
+      .toMatchObject({ CODEBUDDY_MODEL: "glm-5.2" });
+  });
+
+  it("leaves the environment alone for agents that need no gateway switch", () => {
+    expect(agentRuntimeEnv("qwen", "quukk/glm-5.2", { env: {}, config: CONFIG })).toBeNull();
+    expect(agentRuntimeEnv("codebuddy", "quukk/glm-5.2", { env: {}, config: null })).toBeNull();
   });
 });
 

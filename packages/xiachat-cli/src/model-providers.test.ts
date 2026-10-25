@@ -2,10 +2,12 @@ import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
   modelsUrl,
+  parseCodebuddyProviderConfig,
   parseCodexConfig,
   parseHermesConfig,
   parseModelIds,
   parseOpenclawConfig,
+  parseQwenConfig,
   probeProviderModels,
   readAgentConfig,
 } from "./model-providers.js";
@@ -38,6 +40,22 @@ describe("parseModelIds", () => {
 
   it("drops blank ids", () => {
     expect(parseModelIds(JSON.stringify({ data: [{ id: "  " }, { id: " ok " }] }))).toEqual(["ok"]);
+  });
+
+  it("drops models a chat turn cannot use (embedding/rerank/tts/vl)", () => {
+    const body = JSON.stringify({
+      data: [
+        { id: "glm-5.2" },
+        { id: "BGE-m3" },
+        { id: "Text-Embedding-V4-A" },
+        { id: "Qwen3-Rerank-A" },
+        { id: "Qwen-VL-Chat" },
+        { id: "kimi-k2.7-code" },
+        { id: "MiniMax-M3-A" },
+        { id: "whisper-large-v3" },
+      ],
+    });
+    expect(parseModelIds(body)).toEqual(["glm-5.2", "kimi-k2.7-code", "MiniMax-M3-A"]);
   });
 });
 
@@ -169,6 +187,65 @@ describe("parseHermesConfig", () => {
     const config = parseHermesConfig("model:\n  default: glm-5.3\n");
     expect(config.endpoints).toEqual([]);
     expect(config.defaultModel).toBeNull();
+  });
+});
+
+describe("parseQwenConfig", () => {
+  const SETTINGS = JSON.stringify({
+    security: { auth: { selectedType: "openai" } },
+    env: {
+      OPENAI_API_KEY: "sk-Txc",
+      OPENAI_BASE_URL: "https://llmapi.quukk.com/v1",
+      OPENAI_MODEL: "glm-5.2",
+    },
+    model: { name: "glm-5.2" },
+  });
+
+  it("reads the OpenAI-compatible endpoint from settings.env", () => {
+    const config = parseQwenConfig(SETTINGS);
+    expect(config.endpoints).toEqual([
+      { id: "quukk", baseUrl: "https://llmapi.quukk.com/v1", apiKey: "sk-Txc" },
+    ]);
+    expect(config.defaultModel).toBe("quukk/glm-5.2");
+  });
+
+  it("returns nothing when the endpoint is missing or the file is not JSON", () => {
+    expect(parseQwenConfig(JSON.stringify({ env: { OPENAI_MODEL: "glm-5.2" } })).endpoints).toEqual([]);
+    expect(parseQwenConfig("{not json")).toEqual({ endpoints: [], defaultModel: null });
+  });
+});
+
+describe("parseCodebuddyProviderConfig", () => {
+  const PROVIDER = JSON.stringify({
+    provider: "quukk",
+    name: "Quukk AI",
+    baseUrl: "https://llmapi.quukk.com/v1",
+    apiKey: "sk-Txc",
+    defaultModel: "glm-5.2",
+  });
+
+  it("reads the self-hosted gateway described in clawmessenger-provider.json", () => {
+    const config = parseCodebuddyProviderConfig(PROVIDER);
+    expect(config.endpoints).toEqual([
+      { id: "quukk", name: "Quukk AI", baseUrl: "https://llmapi.quukk.com/v1", apiKey: "sk-Txc" },
+    ]);
+    expect(config.defaultModel).toBe("quukk/glm-5.2");
+  });
+
+  it("derives the provider id from the host when it is not written out", () => {
+    const config = parseCodebuddyProviderConfig(JSON.stringify({
+      baseUrl: "https://llmapi.quukk.com/v1",
+    }));
+    expect(config.endpoints[0]?.id).toBe("quukk");
+    expect(config.defaultModel).toBeNull();
+  });
+
+  it("returns nothing without a baseUrl", () => {
+    expect(parseCodebuddyProviderConfig(JSON.stringify({ apiKey: "sk" }))).toEqual({
+      endpoints: [],
+      defaultModel: null,
+    });
+    expect(parseCodebuddyProviderConfig("nope")).toEqual({ endpoints: [], defaultModel: null });
   });
 });
 

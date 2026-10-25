@@ -9,6 +9,7 @@ import {
   classifyTool,
   createActivityTracker,
 } from "./agent-activity.js";
+import { readAgentConfig, type AgentConfig } from "./model-providers.js";
 import { TurnIncompleteError } from "./turn-error.js";
 
 // Mirrors knownAgentCLIs in server/internal/integrations/rongcloud/
@@ -88,6 +89,11 @@ export function splitModelRoute(route: string): { provider: string; model: strin
 
 /** Renders the model-selection flags for one agent. */
 export function buildModelArgs(name: string, model: string | undefined): string[] {
+  // codebuddy 的 `--model` 只认它自己的模型 id（`custom-local:<m>` 或云端托管
+  // 模型）；传裸模型名会直接要求登录，传自定义网关的 slug 则无意义 —— 它的
+  // 模型选择必须走 `CODEBUDDY_MODEL` 环境变量（见 agentRuntimeEnv）。这里只留
+  // `--port 0`：不给它固定端口，多个 agent 实例并发时会撞 EADDRINUSE。
+  if (name === "codebuddy") return ["--port", "0"];
   if (!model) return [];
   const route = splitModelRoute(model);
   if (name === "codex") {
@@ -98,7 +104,45 @@ export function buildModelArgs(name: string, model: string | undefined): string[
   if (name === "hermes") {
     return route ? ["-m", route.model, "--provider", route.provider] : ["-m", model];
   }
+  // qwen 走 OpenAI 兼容网关，`--model` 只接受上游的裸模型名（`quukk/glm-5.2`
+  // 会被它当成未知模型名发给上游）。
+  if (name === "qwen") {
+    return route ? ["--model", route.model] : ["--model", model];
+  }
   return ["--model", model];
+}
+
+// Subprocess environment overrides per agent. Returns the full env to hand to
+// spawn() (the caller's env already merged in), or `null` when the agent needs
+// no change and should simply inherit.
+//
+// codebuddy is the only one today: its CLI dropped ANTHROPIC_BASE_URL support
+// and only honours the self-hosted-gateway switches `CODEBUDDY_BASE_URL` /
+// `CODEBUDDY_AUTH_TOKEN` / `CODEBUDDY_MODEL` (OpenAI-compatible
+// `/v1/chat/completions`, verified against quukk). Without these it falls back
+// to the WorkBuddy-hosted channel, which answers `Authentication required`
+// or 429 weekly-quota once the account limit is hit.
+export function agentRuntimeEnv(
+  agentName: string | undefined,
+  model: string | undefined,
+  opts: { env?: NodeJS.ProcessEnv; config?: AgentConfig | null } = {},
+): NodeJS.ProcessEnv | null {
+  if (agentName !== "codebuddy") return null;
+  const config = opts.config === undefined ? readAgentConfig("codebuddy") : opts.config;
+  const endpoint = config?.endpoints[0];
+  if (!endpoint) return null;
+  const baseEnv = opts.env ?? process.env;
+  const route = model ? splitModelRoute(model) : null;
+  const chosen = route?.model
+    ?? (config?.defaultModel ? splitModelRoute(config.defaultModel)?.model : undefined)
+    ?? model;
+  const env: NodeJS.ProcessEnv = {
+    ...baseEnv,
+    CODEBUDDY_BASE_URL: endpoint.baseUrl,
+    ...(endpoint.apiKey ? { CODEBUDDY_AUTH_TOKEN: endpoint.apiKey } : {}),
+    ...(chosen ? { CODEBUDDY_MODEL: chosen } : {}),
+  };
+  return env;
 }
 
 // 结构化事件流可用性：这些 agent 都能以「逐行 JSON 事件」模式运行，正文增量
@@ -810,11 +854,14 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
     const agentArgs = argvMode
       ? strategyArgs
       : buildModelArgs(opts.agentName ?? "", opts.model);
+    const spawnEnv = agentRuntimeEnv(opts.agentName, opts.model);
     const { file, args } = buildSpawnInvocation(opts.execPath, agentArgs);
     const child = spawn(file, args, {
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
       cwd: opts.cwd,
+      // null = 继承当前进程环境（只有需要改网关的 agent 才返回对象）。
+      ...(spawnEnv ? { env: spawnEnv } : {}),
     });
 
     // stdout accumulates raw bytes; decoding happens through a streaming

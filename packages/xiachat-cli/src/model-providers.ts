@@ -62,6 +62,18 @@ function asString(value: unknown): string | null {
 
 // --- probing ---------------------------------------------------------------
 
+// Gateways list every model they front — embedding, rerank, TTS, vision-only
+// endpoints included (quukk returns ~200 entries, a third of them unusable for
+// a chat turn). Selecting one of those in 设备管理 → 默认模型 makes every later
+// turn fail, so the probe drops them. Agent CLIs' own `models list` output is
+// not filtered: those are models the agent itself vouches for.
+const NON_CHAT_MODEL_RE =
+  /(embed|rerank|bge|whisper|\btts\b|\basr\b|moderation|dall-e|stable-diffusion|inpaint|-vl\b|\bvl-|vl-chat|vision-only)/i;
+
+function isChatModel(id: string): boolean {
+  return !NON_CHAT_MODEL_RE.test(id);
+}
+
 // `GET {base}/models` — tolerate the several envelopes seen in the wild:
 // OpenAI's `{data:[{id}]}`, openclaw-style `{models:[{key}]}`, and plain
 // arrays. `null` means "not a model list", so callers can tell an unusable
@@ -78,13 +90,13 @@ export function parseModelIds(body: string): string[] | null {
     if (ids.length >= MAX_MODELS) return;
     if (typeof entry === "string") {
       const id = asString(entry);
-      if (id !== null) ids.push(id);
+      if (id !== null && isChatModel(id)) ids.push(id);
       return;
     }
     if (typeof entry !== "object" || entry === null) return;
     const record = entry as Record<string, unknown>;
     const id = asString(record.id ?? record.key ?? record.model);
-    if (id !== null) ids.push(id);
+    if (id !== null && isChatModel(id)) ids.push(id);
   };
 
   if (Array.isArray(parsed)) {
@@ -331,12 +343,97 @@ export function parseOpenclawConfig(text: string): AgentConfig {
   };
 }
 
+// Derives the provider id the web panel shows from the endpoint host, so a
+// gateway like `llmapi.quukk.com` presents as `quukk` instead of a generic
+// `openai` bucket. Unusable hosts (bare `com`, `localhost`) fall back.
+function providerIdFromBaseUrl(baseUrl: string, fallback: string): string {
+  let host: string;
+  try {
+    host = new URL(baseUrl).hostname;
+  } catch {
+    return fallback;
+  }
+  const labels = host
+    .split(".")
+    .filter((label) => label !== "" && !/^(www|api|llmapi|gateway|openai|v1)$/i.test(label));
+  const first = labels[0];
+  if (!first || /^(com|cn|net|org|io|ai|local|localhost)$/i.test(first)) return fallback;
+  const slug = first.replace(/[^A-Za-z0-9._-]/g, "");
+  return slug === "" ? fallback : slug;
+}
+
+// `~/.qwen/settings.json` — qwen-code 的鉴权走 `security.auth.selectedType`，
+// 端点与密钥放在 `env` 里（实测 `OPENAI_BASE_URL` / `OPENAI_API_KEY` /
+// `OPENAI_MODEL` 三项生效；qwen 自己没有可枚举模型目录的子命令）。
+export function parseQwenConfig(text: string): AgentConfig {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return { endpoints: [], defaultModel: null };
+  }
+  if (typeof parsed !== "object" || parsed === null) {
+    return { endpoints: [], defaultModel: null };
+  }
+  const record = parsed as Record<string, unknown>;
+  const env = (typeof record.env === "object" && record.env !== null
+    ? record.env
+    : {}) as Record<string, unknown>;
+  const baseUrl = asString(env.OPENAI_BASE_URL ?? env.OPENAI_API_BASE);
+  if (!baseUrl) return { endpoints: [], defaultModel: null };
+  const apiKey = asString(env.OPENAI_API_KEY ?? env.OPENAI_KEY);
+  const id = providerIdFromBaseUrl(baseUrl, "openai");
+  const modelField = record.model;
+  const model = asString(env.OPENAI_MODEL ?? env.QWEN_MODEL)
+    ?? (typeof modelField === "object" && modelField !== null
+      ? asString((modelField as Record<string, unknown>).name)
+      : asString(modelField));
+  return {
+    endpoints: [{ id, baseUrl, ...(apiKey ? { apiKey } : {}) }],
+    defaultModel: model ? `${id}/${model}` : null,
+  };
+}
+
+// `~/.codebuddy/clawmessenger-provider.json` — codebuddy 自己的 settings.json
+// 只认 `custom-local:<m>`（走 WorkBuddy 托管通道，有周/月限额），且这个 build
+// 丢掉了 ANTHROPIC_BASE_URL 支持，唯一可直连自建网关的入口是环境变量
+// `CODEBUDDY_BASE_URL`（OpenAI 兼容，实测 `/v1/chat/completions`）。
+// 所以端点写在这份独立文件里：model-providers 用它 probe 模型目录，
+// agents.ts 用同一份文件给子进程注入 CODEBUDDY_* 环境变量。
+//
+//   { "provider": "quukk", "baseUrl": "https://llmapi.quukk.com/v1",
+//     "apiKey": "sk-…", "defaultModel": "glm-5.2" }
+export function parseCodebuddyProviderConfig(text: string): AgentConfig {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return { endpoints: [], defaultModel: null };
+  }
+  if (typeof parsed !== "object" || parsed === null) {
+    return { endpoints: [], defaultModel: null };
+  }
+  const record = parsed as Record<string, unknown>;
+  const baseUrl = asString(record.baseUrl ?? record.base_url);
+  if (!baseUrl) return { endpoints: [], defaultModel: null };
+  const apiKey = asString(record.apiKey ?? record.api_key);
+  const id = asString(record.provider) ?? providerIdFromBaseUrl(baseUrl, "codebuddy");
+  const name = asString(record.name);
+  const model = asString(record.defaultModel ?? record.default_model ?? record.model);
+  return {
+    endpoints: [{ id, ...(name ? { name } : {}), baseUrl, ...(apiKey ? { apiKey } : {}) }],
+    defaultModel: model ? `${id}/${model}` : null,
+  };
+}
+
 // --- per-agent wiring ------------------------------------------------------
 
 const AGENT_CONFIG_PARSERS: Readonly<Record<string, (text: string) => AgentConfig>> = {
   openclaw: parseOpenclawConfig,
   codex: parseCodexConfig,
   hermes: parseHermesConfig,
+  qwen: parseQwenConfig,
+  codebuddy: parseCodebuddyProviderConfig,
 };
 
 function configPaths(agentName: string, home: string, env: NodeJS.ProcessEnv): string[] {
@@ -352,6 +449,22 @@ function configPaths(agentName: string, home: string, env: NodeJS.ProcessEnv): s
     if (env.LOCALAPPDATA) candidates.push(join(env.LOCALAPPDATA, "hermes", "config.yaml"));
     candidates.push(join(home, ".hermes", "config.yaml"));
     candidates.push(join(home, ".config", "hermes", "config.yaml"));
+    return candidates;
+  }
+  if (agentName === "qwen") {
+    const candidates: string[] = [];
+    if (env.QWEN_HOME) candidates.push(join(env.QWEN_HOME, "settings.json"));
+    candidates.push(join(home, ".qwen", "settings.json"));
+    return candidates;
+  }
+  if (agentName === "codebuddy") {
+    // CLAWMESSENGER_CODEBUDDY_PROVIDER lets a machine point at a second
+    // gateway without editing the shared profile.
+    const candidates: string[] = [];
+    if (env.CLAWMESSENGER_CODEBUDDY_PROVIDER) {
+      candidates.push(env.CLAWMESSENGER_CODEBUDDY_PROVIDER);
+    }
+    candidates.push(join(home, ".codebuddy", "clawmessenger-provider.json"));
     return candidates;
   }
   return [];
