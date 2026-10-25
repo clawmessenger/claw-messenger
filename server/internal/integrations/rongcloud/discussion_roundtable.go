@@ -461,6 +461,70 @@ type roundtableHostConfig struct {
 	hostPrompt     string
 	configVersion  string
 	timeoutSeconds int
+	// model 是主持人自己的模型 route（`provider/slug`），空串 = 不指定、沿用
+	// 设备默认。三个 host 快照写入点都只在它非空时才落 `model` 键，所以空串
+	// 的讨论与改造前逐字节一致。
+	model string
+}
+
+// roundtableHostRoleEntry 是主持人在角色板里的条目。
+//
+// 这是**唯一**的 host 条目拼装点：`interactiveRoles`（discussion_interactive.go）
+// 只从角色板取 `role.Model`，所以 model 必须写在这里才真正生效。三个写入点
+// （引导式确认 / createRoundtable / 阶段机）原先各自内联了一份逐字相同的 map
+// 字面量，任何字段调整漏改一处就会出现「有的讨论组生效、有的不生效」——那种
+// 失败模式只能靠代码结构防，注释防不住。
+//
+// 注意这里**没有** speakingOrder：主持人不是排序队列的一员（引擎按 isHost 把他
+// 分出来，只在全员发言后汇总）。旧后端同样只在 discussion_order 非空时写这个
+// 字段，而 v3 的线上校验器（protocol_v3._role / 前端 discussion-v3.ts）要求它
+// 是非负整数 —— 给主持人写 -1 会把整段快照拒掉，写 0 又会让他混进发言顺序。
+func roundtableHostRoleEntry(host roundtableHostConfig) map[string]interface{} {
+	entry := map[string]interface{}{
+		"memberId":         host.aiUserID,
+		"nodeId":           host.nodeID,
+		"nickname":         host.displayName,
+		"portraitUri":      host.avatar,
+		"roleName":         roundtableHostRoleName,
+		"roleInstructions": "",
+		"capabilities":     roundtableRequiredHostCaps,
+		"isHost":           true,
+	}
+	// 非空才写键（不是写空串）：没配置模型时快照与改造前逐字节一致。
+	if host.model != "" {
+		entry["model"] = host.model
+	}
+	return entry
+}
+
+// roundtableHostSnapshotFields 是 host_config_snapshot 的内容。
+//
+// 除了 interactiveHostPrompt 读的 discussion_host_prompt，其余字段是留档：
+// 排障时能回答「这场讨论当时用的是哪个主持配置、哪个模型」。
+func roundtableHostSnapshotFields(host roundtableHostConfig) map[string]interface{} {
+	fields := map[string]interface{}{
+		"node_id":                host.nodeID,
+		"ai_user_id":             host.aiUserID,
+		"display_name":           host.displayName,
+		"avatar":                 host.avatar,
+		"discussion_host_prompt": host.hostPrompt,
+		"config_version":         host.configVersion,
+	}
+	if host.model != "" {
+		fields["model"] = host.model
+	}
+	return fields
+}
+
+// roundtableHostSnapshots 把 host 条目塞进角色板并序列化两段快照。
+//
+// 三个写入点（setup / actions / stages）统一调用它。调用方负责先把普通成员
+// 填进 roles；host 的条目由这里唯一地写入，因此不存在「某一条链路忘了带 model」。
+func roundtableHostSnapshots(host roundtableHostConfig, roles map[string]interface{}) (roleJSON, hostSnapshot []byte) {
+	roles[host.aiUserID] = roundtableHostRoleEntry(host)
+	roleJSON, _ = json.Marshal(roles)
+	hostSnapshot, _ = json.Marshal(roundtableHostSnapshotFields(host))
+	return roleJSON, hostSnapshot
 }
 
 // resolveHost 读取管理端配置的 system host，校验在线与能力。
@@ -516,5 +580,6 @@ func (s *roundtableCreationService) resolveHost(ctx context.Context) (roundtable
 		hostPrompt:     cfg.HostPrompt,
 		configVersion:  cfg.ConfigVersion,
 		timeoutSeconds: cfg.TimeoutSeconds,
+		model:          cfg.Model,
 	}, ""
 }

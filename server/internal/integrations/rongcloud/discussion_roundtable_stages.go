@@ -279,29 +279,9 @@ func (s *roundtableCreationService) ensureDiscussion(ctx context.Context, reques
 			"speakingOrder": role.SpeakingOrder,
 		}
 	}
-	roles[validated.host.aiUserID] = map[string]interface{}{
-		"memberId":         validated.host.aiUserID,
-		"nodeId":           validated.host.nodeID,
-		"nickname":         validated.host.displayName,
-		"portraitUri":      validated.host.avatar,
-		"roleName":         roundtableHostRoleName,
-		"roleInstructions": "",
-		"capabilities":     roundtableRequiredHostCaps,
-		"isHost":           true,
-		// 主持人没有 speakingOrder：他不是排序队列的一员（引擎按 isHost 把他分出来，
-		// 只在全员发言后汇总）。旧后端同样只在 discussion_order 非空时写这个字段，
-		// 而 v3 的线上校验器（protocol_v3._role / 前端 discussion-v3.ts）要求它是
-		// 非负整数 —— 写 -1 会被整段拒掉。
-	}
-	roleJSON, _ := json.Marshal(roles)
-	hostSnapshot, _ := json.Marshal(map[string]interface{}{
-		"node_id":                validated.host.nodeID,
-		"ai_user_id":             validated.host.aiUserID,
-		"display_name":           validated.host.displayName,
-		"avatar":                 validated.host.avatar,
-		"discussion_host_prompt": validated.host.hostPrompt,
-		"config_version":         validated.host.configVersion,
-	})
+	// host 条目（含 model）与 host_config_snapshot 由同一个函数唯一地拼装，
+	// 三个写入点共用 —— 见 roundtableHostSnapshots 的注释。
+	roleJSON, hostSnapshot := roundtableHostSnapshots(validated.host, roles)
 	var maxRounds pgtype.Int4
 	if canonical.MaxRounds != nil {
 		maxRounds = pgtype.Int4{Int32: int32(*canonical.MaxRounds), Valid: true}

@@ -400,25 +400,9 @@ func (rt *discussionRuntime) actionRestartRoundtable(ctx context.Context, cmd Co
 	if len(roles) == 0 {
 		return errResult(400, "ROLE_RECOMMENDATION_INVALID")
 	}
-	roles[host.aiUserID] = map[string]interface{}{
-		"memberId":         host.aiUserID,
-		"nodeId":           host.nodeID,
-		"nickname":         host.displayName,
-		"portraitUri":      host.avatar,
-		"roleName":         roundtableHostRoleName,
-		"roleInstructions": "",
-		"capabilities":     roundtableRequiredHostCaps,
-		"isHost":           true,
-	}
-	roleJSON, _ := json.Marshal(roles)
-	hostSnapshot, _ := json.Marshal(map[string]interface{}{
-		"node_id":                host.nodeID,
-		"ai_user_id":             host.aiUserID,
-		"display_name":           host.displayName,
-		"avatar":                 host.avatar,
-		"discussion_host_prompt": host.hostPrompt,
-		"config_version":         host.configVersion,
-	})
+	// host 条目（含 model）与 host_config_snapshot 由同一个函数唯一地拼装，
+	// 三个写入点共用 —— 见 roundtableHostSnapshots 的注释。
+	roleJSON, hostSnapshot := roundtableHostSnapshots(host, roles)
 	// 新讨论 ID：不能复用确定性派生（同房间会撞旧讨论的 ID），用随机 UUID。
 	discussionID := uuid.NewString()
 	_, err = s.queries.CreateRongCloudDiscussion(ctx, db.CreateRongCloudDiscussionParams{

@@ -19,9 +19,17 @@ func (h *systemHandler) handleNodeMessage(ctx context.Context, msg NormalizedMes
 	// role-recommendation preview) rather than a discussion turn. Offer it to the
 	// broker first: it returns true only for a request id it issued, so real
 	// discussion turns still fall through to the coordinator below.
-	if msg.ObjectName == objectNameCommand && h.nodeRequests != nil &&
-		h.nodeRequests.AcceptResponse(msg.FromUserID, msg.Content) {
-		return
+	//
+	// 模型目录响应先于 command_result 判定：它**不是** command_result（自带
+	// msg_type，见 node_request_broker.go 的 AcceptCatalogResponse），但同样
+	// 只能由 broker 消费，不能落进命令分发器。
+	if msg.ObjectName == objectNameCommand && h.nodeRequests != nil {
+		if h.nodeRequests.AcceptCatalogResponse(msg.FromUserID, msg.Content) {
+			return
+		}
+		if h.nodeRequests.AcceptResponse(msg.FromUserID, msg.Content) {
+			return
+		}
 	}
 
 	switch msg.ObjectName {
@@ -165,6 +173,27 @@ func (h *systemHandler) dispatchToCoordinator(ctx context.Context, targetID stri
 	if !h.registry.SendResponse(chatroomID, resp) {
 		h.logger.Warn("rongcloud: no active discussion or channel full", "chatroomID", targetID)
 	}
+}
+
+// isModelCatalogResponse 识别设备对 `discussion_model_catalog_request` 的回包
+// （管理端「供应商 → 模型」选择器要的那份目录）。
+//
+// 它走 command 通道，但**不是** command_result —— 设备端按 web 的协议直接回
+// `{msg_type:"discussion_model_catalog_response", protocolVersion:2, …}`
+// （packages/xiachat-cli/src/model-catalog.ts 的 buildModelCatalogResponse）。
+// 不在这里单独识别的话，它会掉进 dispatchCommandAsync 被当成一条未知命令，
+// 于是等目录的那一侧只能等到超时。
+func isModelCatalogResponse(msg NormalizedMessage) bool {
+	if msg.ObjectName != objectNameCommand {
+		return false
+	}
+	var peek struct {
+		MsgType string `json:"msg_type"`
+	}
+	if err := json.Unmarshal([]byte(msg.Content), &peek); err != nil {
+		return false
+	}
+	return peek.MsgType == catalogResponseMsgType
 }
 
 func isCommandResult(msg NormalizedMessage) bool {

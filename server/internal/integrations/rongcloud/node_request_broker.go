@@ -15,9 +15,10 @@ import (
 )
 
 // NodeRequestBroker brokers server-initiated requests that a device answers over
-// the IM `command` channel. The first (and currently only) client is the admin
-// 「系统 → 讨论主持 AI → 测试角色推荐」 button, but the shape is general:
-// start → send → await → validate.
+// the IM `command` channel. Two clients: the admin 「系统 → 讨论主持 AI → 测试
+// 角色推荐」 button (`roles_…`, command_result envelope) and the same page's
+// 「供应商 → 模型」选择器 (`catalog_…`, discussion_model_catalog_response
+// envelope). The shape is the same for both: start → send → await → validate.
 //
 // The legacy Python backend persisted these to `node_requests` /
 // `role_recommendations` because it ran multi-process behind gunicorn, so the
@@ -64,6 +65,17 @@ const (
 	NodeRequestCodeHostOffline       = "SYSTEM_HOST_OFFLINE"
 	NodeRequestCodeRecommendTimeout  = "ROLE_RECOMMENDATION_TIMEOUT"
 	NodeRequestCodeRecommendInvalid  = "ROLE_RECOMMENDATION_INVALID"
+	// 模型目录往返的失败码（管理端「供应商 → 模型」选择器用）。
+	NodeRequestCodeCatalogTimeout = "MODEL_CATALOG_TIMEOUT"
+	NodeRequestCodeCatalogInvalid = "MODEL_CATALOG_INVALID"
+	// NodeRequestCodeCatalogUnavailable 是**对外统一**的目录失败码：管理端接口
+	// 把「节点不存在 / 不是主持节点 / 离线 / 超时 / 应答不合协议」全部折叠成它，
+	// 精确原因只写服务端日志 —— 该接口会以系统账号向设备私发 IM 并触发一次本机
+	// 探测，不能同时充当「某 node_id 是否存在 / 在线」的探测预言机。
+	NodeRequestCodeCatalogUnavailable = "MODEL_CATALOG_UNAVAILABLE"
+	// NodeRequestCodeModelNotAvailable 是「目录拿到了、但里面没有这个模型」：
+	// 唯一一种应当拒绝保存的模型错误（离线/超时一律放行）。
+	NodeRequestCodeModelNotAvailable = "MODEL_NOT_AVAILABLE"
 )
 
 // The discussion runtime's role-recommendation request, as it rides the shared
@@ -104,6 +116,9 @@ type pendingNodeRequest struct {
 	status    string
 	errorCode string
 	roles     []map[string]interface{}
+	// catalog 是 MODEL_CATALOG 族请求的终态（roles 族恒为零值）。两者共用
+	// status/errorCode，靠 kind 区分，避免再造一套等待机制。
+	catalog DiscussionModelCatalog
 }
 
 func NewNodeRequestBroker(logger *slog.Logger) *NodeRequestBroker {
@@ -194,6 +209,9 @@ func (b *NodeRequestBroker) StartRecommendation(ctx context.Context, host NodeRe
 
 	if err := send(ctx, host.AIUserID, string(content)); err != nil {
 		b.settle(requestID, "", NodeRequestCodeRecommendInvalid, nil)
+		// 发送失败后调用方直接返回错误码，不会走 AwaitRecommendation 里的
+		// delete —— 不在这里释放，这条记录会永久驻留 pending（无界泄漏）。
+		b.forgetRequest(requestID)
 		b.logger.Warn("role recommendation: send failed",
 			"request_id", requestID, "ai_user_id", host.AIUserID, "error", err)
 		return "", NodeRequestCodeRecommendInvalid
@@ -248,6 +266,364 @@ func (b *NodeRequestBroker) RecommendRoles(ctx context.Context, host NodeRequest
 		return nil, code
 	}
 	return b.AwaitRecommendation(ctx, requestID)
+}
+
+// ---- 模型目录请求族（protocolVersion 2）---------------------------------
+//
+// 管理端「讨论主持 AI」的「供应商 → 模型」两级选择器需要主持节点自报的模型
+// 目录。C 端是浏览器直连设备（clawmessenger-web/src/services/node-model-catalog.ts），
+// 但管理端没有 IM SDK，所以由服务端代理这一次往返：内容和线上的 C 端请求
+// **逐字节同构**（`msg_type` / `protocolVersion:2` / `requestId` / `timestamp`），
+// 设备端 CLI 的 `parseModelCatalogRequest`（packages/xiachat-cli/src/model-catalog.ts）
+// 因此无需任何改动就能应答。
+//
+// 请求 id 前缀 `catalog_`，与 `roles_` / `turn_` 区分：三条族共用一个 pending
+// 表，靠前缀就能保证一个族永远看不到另一个族的回包。
+const (
+	catalogRequestMsgType  = "discussion_model_catalog_request"
+	catalogResponseMsgType = "discussion_model_catalog_response"
+	catalogProtocolVersion = 2
+	catalogRequestPrefix   = "catalog_"
+
+	// 与 web 的 normalizeCatalog 同一套上限（node-model-catalog.ts）：
+	// 越界的响应整份作废，而不是截断——半份目录会让操作员选到一个不存在的模型。
+	catalogMaxProviders     = 64
+	catalogMaxModelsPerProv = 500
+	catalogMaxSegmentLen    = 128
+	catalogMaxLabelLen      = 500
+)
+
+// DiscussionModelCatalog 与 C 端的 NodeModelCatalog 同形
+// （clawmessenger-web/src/types/discussion.ts），只是字段名改成 Go 的大写形式。
+// 管理端页面据此渲染与「设备详情」页一致的级联选择器。
+type DiscussionModelCatalog struct {
+	// DefaultModel 是设备自己的默认模型 route（`provider/slug`），可能为空：
+	// 设备没配默认、或默认不在目录里时前端拿不到它。
+	DefaultModel string
+	Providers    []DiscussionModelProvider
+}
+
+// DiscussionModelProvider 是一个已配置的供应商及其可枚举的模型。
+type DiscussionModelProvider struct {
+	ID     string
+	Name   string
+	Models []DiscussionModelEntry
+}
+
+// DiscussionModelEntry 是供应商下的一个模型（id 是 provider 内唯一的 slug）。
+type DiscussionModelEntry struct {
+	ID   string
+	Name string
+}
+
+// StartModelCatalog records a pending catalog request and sends it to the host.
+func (b *NodeRequestBroker) StartModelCatalog(ctx context.Context, host NodeRequestHost) (string, string) {
+	if host.AIUserID == "" {
+		return "", NodeRequestCodeHostNotConfigured
+	}
+
+	requestID := catalogRequestPrefix + uuid.NewString()
+	timeout := time.Duration(host.TimeoutSeconds) * time.Second
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+
+	// 设备的 `parseModelCatalogRequest` 只认这四个键，多一个键它也不拒（它不
+	// 做键集白名单），但保持与 web 逐字节同构能省掉一次联调排查。
+	content, err := json.Marshal(map[string]interface{}{
+		"msg_type":        catalogRequestMsgType,
+		"protocolVersion": catalogProtocolVersion,
+		"requestId":       requestID,
+		"timestamp":       b.now().UnixMilli(),
+	})
+	if err != nil {
+		return "", NodeRequestCodeCatalogInvalid
+	}
+
+	b.mu.Lock()
+	if b.send == nil {
+		b.mu.Unlock()
+		b.logger.Warn("model catalog: no sender bound, reporting host offline",
+			"ai_user_id", host.AIUserID)
+		return "", NodeRequestCodeHostOffline
+	}
+	send := b.send
+	b.pending[requestID] = &pendingNodeRequest{
+		requestID:      requestID,
+		kind:           catalogRequestMsgType,
+		host:           host,
+		targetAIUserID: host.AIUserID,
+		expiresAt:      b.now().Add(timeout),
+		done:           make(chan struct{}),
+		status:         "pending",
+	}
+	b.mu.Unlock()
+
+	if err := send(ctx, host.AIUserID, string(content)); err != nil {
+		b.settleCatalog(requestID, "", NodeRequestCodeCatalogInvalid, DiscussionModelCatalog{})
+		// 同 StartRecommendation：这一族也在热路径上（页面每次切节点都会拉一次
+		// 目录），发送失败必须立刻释放记录，否则 pending 无界增长。
+		b.forgetRequest(requestID)
+		b.logger.Warn("model catalog: send failed",
+			"request_id", requestID, "ai_user_id", host.AIUserID, "error", err)
+		return "", NodeRequestCodeCatalogInvalid
+	}
+	b.logger.Info("model catalog: request sent",
+		"request_id", requestID, "ai_user_id", host.AIUserID)
+	return requestID, ""
+}
+
+// AwaitModelCatalog blocks until the node answers, the request expires, or the
+// caller's context is cancelled.
+func (b *NodeRequestBroker) AwaitModelCatalog(ctx context.Context, requestID string) (DiscussionModelCatalog, string) {
+	b.mu.Lock()
+	record, ok := b.pending[requestID]
+	b.mu.Unlock()
+	if !ok {
+		return DiscussionModelCatalog{}, NodeRequestCodeCatalogInvalid
+	}
+
+	timer := time.NewTimer(time.Until(record.expiresAt))
+	defer timer.Stop()
+
+	select {
+	case <-record.done:
+	case <-timer.C:
+		b.settleCatalog(requestID, "", NodeRequestCodeCatalogTimeout, DiscussionModelCatalog{})
+		<-record.done
+	case <-ctx.Done():
+		b.settleCatalog(requestID, "", NodeRequestCodeCatalogTimeout, DiscussionModelCatalog{})
+		<-record.done
+	}
+
+	b.mu.Lock()
+	delete(b.pending, requestID)
+	status, errorCode, catalog := record.status, record.errorCode, record.catalog
+	b.mu.Unlock()
+
+	if status != "completed" {
+		if errorCode == "" {
+			errorCode = NodeRequestCodeCatalogTimeout
+		}
+		return DiscussionModelCatalog{}, errorCode
+	}
+	return catalog, ""
+}
+
+// FetchModelCatalog runs a full start + await round trip.
+//
+// 它**只是**一次尽力而为的往返：调用方（管理端保存/目录查询）必须自己决定
+// 「拿不到目录」时是否降级，而不是把这个错误当致命错误——主持节点常常离线。
+func (b *NodeRequestBroker) FetchModelCatalog(ctx context.Context, host NodeRequestHost) (DiscussionModelCatalog, string) {
+	requestID, code := b.StartModelCatalog(ctx, host)
+	if code != "" {
+		return DiscussionModelCatalog{}, code
+	}
+	return b.AwaitModelCatalog(ctx, requestID)
+}
+
+// AcceptCatalogResponse hands an inbound `discussion_model_catalog_response` to
+// the broker. Reports whether the message belonged to a catalog request this
+// broker issued — an unrelated command simply falls through to the discussion
+// command dispatcher.
+//
+// 与 AcceptResponse 的关键差别是**入站信封不同**：catalog 响应不是
+// `command_result`，它自己带 `msg_type`（web 的 handleNodeModelCatalogResponse
+// 也是按 msg_type 直配的），所以必须在 channel 路由层单独识别。
+func (b *NodeRequestBroker) AcceptCatalogResponse(senderID, content string) bool {
+	var result map[string]interface{}
+	if err := json.Unmarshal([]byte(content), &result); err != nil {
+		return false
+	}
+	if result["msg_type"] != catalogResponseMsgType {
+		return false
+	}
+	requestID, _ := result["requestId"].(string)
+	if requestID == "" {
+		return false
+	}
+	// protocolVersion 不符（旧设备/未来协议）时整份丢弃：设备端的
+	// parseModelCatalogRequest 对请求侧也是同样处理，两端口径必须一致。
+	if version, ok := result["protocolVersion"].(float64); !ok || int(version) != catalogProtocolVersion {
+		return false
+	}
+
+	b.mu.Lock()
+	record, ok := b.pending[requestID]
+	status := ""
+	if ok {
+		status = record.status
+	}
+	b.mu.Unlock()
+	if !ok {
+		return false
+	}
+
+	// 认领这个 id 就到此为止：它肯定不是讨论命令，别再让分发器当命令处理。
+	if status != "pending" {
+		return true
+	}
+	if record.targetAIUserID != senderID {
+		b.logger.Warn("model catalog: answer from unexpected node",
+			"request_id", requestID, "expected", record.targetAIUserID, "got", senderID)
+		return true
+	}
+	if b.now().After(record.expiresAt) {
+		b.settleCatalog(requestID, "", NodeRequestCodeCatalogTimeout, DiscussionModelCatalog{})
+		return true
+	}
+
+	catalog, err := normalizeModelCatalog(result)
+	if err != nil {
+		b.logger.Warn("model catalog: invalid payload",
+			"request_id", requestID, "error", err)
+		b.settleCatalog(requestID, "", NodeRequestCodeCatalogInvalid, DiscussionModelCatalog{})
+		return true
+	}
+	b.settleCatalog(requestID, "completed", "", catalog)
+	return true
+}
+
+// settleCatalog 是 model_catalog 族的 settle：与 settle 同一把锁、同一套
+// 「首次结算取胜」语义，只是终态字段不同。
+func (b *NodeRequestBroker) settleCatalog(requestID, status, errorCode string, catalog DiscussionModelCatalog) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	record, ok := b.pending[requestID]
+	if !ok || record.settled {
+		return
+	}
+	record.settled = true
+	record.status = status
+	record.errorCode = errorCode
+	record.catalog = catalog
+	close(record.done)
+}
+
+// catalogSegment 是 route 的一段（provider id 或 model id）：非空、≤128 字符、
+// 无空白、不含 `/`。与 web 的 segment() 一字不差（node-model-catalog.ts:18-25）：
+// 两端口径一偏，管理端就会把一个 web 侧永远选不到的模型写进配置。
+func catalogSegment(value interface{}) (string, bool) {
+	text, ok := value.(string)
+	if !ok || text == "" || len(text) > catalogMaxSegmentLen {
+		return "", false
+	}
+	if strings.TrimSpace(text) != text || strings.Contains(text, "/") {
+		return "", false
+	}
+	if strings.ContainsAny(text, " \t\r\n") {
+		return "", false
+	}
+	return text, true
+}
+
+// catalogLabel 是展示名：非空、≤500 字符（web 的 label()）。
+func catalogLabel(value interface{}) (string, bool) {
+	text, ok := value.(string)
+	if !ok || text == "" || len(text) > catalogMaxLabelLen {
+		return "", false
+	}
+	return text, true
+}
+
+// normalizeModelCatalog 严格校验设备回的目录，键集/唯一性/长度任何一项不符
+// 就整份作废。移植自 web 的 normalizeCatalog：宁可报「目录不可用」，也不要
+// 把半份目录渲染成下拉框让操作员保存一个设备根本跑不了的模型。
+func normalizeModelCatalog(payload map[string]interface{}) (DiscussionModelCatalog, error) {
+	rawProviders, ok := payload["providers"]
+	if !ok || rawProviders == nil {
+		return DiscussionModelCatalog{}, fmt.Errorf("providers missing")
+	}
+	list, ok := rawProviders.([]interface{})
+	if !ok || len(list) > catalogMaxProviders {
+		return DiscussionModelCatalog{}, fmt.Errorf("providers must be a list of at most %d", catalogMaxProviders)
+	}
+
+	defaultModel := ""
+	if raw, ok := payload["defaultModel"]; ok && raw != nil {
+		text, ok := raw.(string)
+		if !ok {
+			return DiscussionModelCatalog{}, fmt.Errorf("defaultModel must be text or null")
+		}
+		defaultModel = text
+	}
+
+	providers := make([]DiscussionModelProvider, 0, len(list))
+	routes := make(map[string]struct{})
+	seenProviders := make(map[string]struct{}, len(list))
+	for _, item := range list {
+		entry, ok := item.(map[string]interface{})
+		if !ok {
+			return DiscussionModelCatalog{}, fmt.Errorf("provider must be an object")
+		}
+		id, ok := catalogSegment(entry["id"])
+		if !ok {
+			return DiscussionModelCatalog{}, fmt.Errorf("provider id invalid")
+		}
+		name, ok := catalogLabel(entry["name"])
+		if !ok {
+			return DiscussionModelCatalog{}, fmt.Errorf("provider name invalid")
+		}
+		if _, dup := seenProviders[id]; dup {
+			return DiscussionModelCatalog{}, fmt.Errorf("duplicate provider %q", id)
+		}
+		seenProviders[id] = struct{}{}
+		rawModels, ok := entry["models"].([]interface{})
+		if !ok || len(rawModels) > catalogMaxModelsPerProv {
+			return DiscussionModelCatalog{}, fmt.Errorf("models must be a list of at most %d", catalogMaxModelsPerProv)
+		}
+		models := make([]DiscussionModelEntry, 0, len(rawModels))
+		seenModels := make(map[string]struct{}, len(rawModels))
+		for _, rawModel := range rawModels {
+			model, ok := rawModel.(map[string]interface{})
+			if !ok {
+				return DiscussionModelCatalog{}, fmt.Errorf("model must be an object")
+			}
+			modelID, ok := catalogSegment(model["id"])
+			if !ok {
+				return DiscussionModelCatalog{}, fmt.Errorf("model id invalid")
+			}
+			modelName, ok := catalogLabel(model["name"])
+			if !ok {
+				return DiscussionModelCatalog{}, fmt.Errorf("model name invalid")
+			}
+			if _, dup := seenModels[modelID]; dup {
+				return DiscussionModelCatalog{}, fmt.Errorf("duplicate model %q in %q", modelID, id)
+			}
+			seenModels[modelID] = struct{}{}
+			routes[id+"/"+modelID] = struct{}{}
+			models = append(models, DiscussionModelEntry{ID: modelID, Name: modelName})
+		}
+		providers = append(providers, DiscussionModelProvider{ID: id, Name: name, Models: models})
+	}
+
+	// 设备的默认模型必须真的在目录里，否则丢弃（web 同款）。留在目录外的
+	// defaultModel 会让前端把它当成一个可选值展示出来，实际设备跑不了。
+	if defaultModel != "" {
+		if _, ok := routes[defaultModel]; !ok {
+			defaultModel = ""
+		}
+	}
+	return DiscussionModelCatalog{DefaultModel: defaultModel, Providers: providers}, nil
+}
+
+// CatalogHasRoute reports whether `provider/model` appears in the catalog.
+// 管理端保存时用它做存在性校验（目录取到才校验；取不到就放行）。
+func (c DiscussionModelCatalog) CatalogHasRoute(provider, model string) bool {
+	if provider == "" || model == "" {
+		return false
+	}
+	for _, candidate := range c.Providers {
+		if candidate.ID != provider {
+			continue
+		}
+		for _, entry := range candidate.Models {
+			if entry.ID == model {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // AcceptResponse hands an inbound node `command_result` to the broker. It
@@ -308,6 +684,24 @@ func (b *NodeRequestBroker) AcceptResponse(senderID, content string) bool {
 
 	b.settle(result.RequestID, "", mapNodeError(result.Payload["error"]), nil)
 	return true
+}
+
+// forgetRequest 释放一条「已结算且确定无人等待」的 pending 记录。
+//
+// 只有发送失败那条路径需要显式调用：那里调用方拿到错误码就直接返回，不会走
+// Await* 里的 delete(b.pending, …)。其余路径（正常回包 / 超时 / ctx 取消）都由
+// Await* 收尾，不需要也不应该提前删——否则等待方会拿到 unknown request。
+func (b *NodeRequestBroker) forgetRequest(requestID string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.pending, requestID)
+}
+
+// pendingCount 是测试用的观测口（pending 表里残留多少条请求）。
+func (b *NodeRequestBroker) pendingCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.pending)
 }
 
 // settle records the terminal state and wakes the waiter. First settle wins, so

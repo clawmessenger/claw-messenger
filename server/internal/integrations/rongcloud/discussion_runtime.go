@@ -66,6 +66,11 @@ type DiscussionSystemHostConfig struct {
 	// RecommendationPrompt 是运营配置的「角色推荐提示词」（P5 的 recommendRoles
 	// 下发给设备端，拼在推荐 prompt 最前）。
 	RecommendationPrompt string
+	// Model 是运营为主持人指定的模型 route（`provider/slug`，空串 = 不指定）。
+	// 它只作用于**主持人自己的轮次**（轮次总结 / 串场）：创建讨论时会被写进
+	// 角色快照的 host 条目，之后由 v3 引擎读成 `role.Model` 并随 your_turn 的
+	// `params.model` 下发。空串时必须与改造前逐字节一致（快照不写这个键）。
+	Model string
 }
 
 // discussionActor 是讨论身份域里的操作者。两个来源：

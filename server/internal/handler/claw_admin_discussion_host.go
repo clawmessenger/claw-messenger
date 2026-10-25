@@ -24,8 +24,10 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -45,7 +47,41 @@ const (
 	clawAdminDiscussionHostMinTimeout  = 10
 	clawAdminDiscussionHostMaxTimeout  = 600
 	clawAdminDiscussionHostTimeoutInit = 60
+
+	// clawAdminDiscussionHostMaxModelSegment 是 provider / model 单段的字符上限，
+	// 与设备端（xiachat-cli/src/model-catalog.ts 的 ROUTE_RE）以及 web 的
+	// segment() 一致：超过这个长度设备侧本来也解析不出 route。
+	clawAdminDiscussionHostMaxModelSegment = 128
+	// 向主持节点要一次模型目录的等待上限。目录是设备本机的快跑查询（CLI 侧还有
+	// 5 分钟缓存），8s 与 C 端浏览器的超时同值；查询接口放宽到 12s，因为那是一
+	// 次显式的人工操作，而保存路径要短——离线节点不能让「改个提示词」卡 12 秒。
+	clawAdminDiscussionHostCatalogTimeout  = 12 * time.Second
+	clawAdminDiscussionHostVerifyTimeout   = 8 * time.Second
 )
+
+// clawAdminModelSegmentCharset 是 provider / model 单段允许的字符集。`@` 保留在
+// 这里只是为了给出更准确的报错（有些网关的模型名带它），route 正则并不放行 ——
+// 设备端 buildModelArgs 拆不出带 `@` 的段，所以这类值最终仍会被拒。
+var clawAdminModelSegmentCharset = regexp.MustCompile(`^[A-Za-z0-9._:/@-]+$`)
+
+// clawAdminModelRouteRE 与 rongcloud 包 modelRouteRE（discussion_bridge.go）、
+// 设备端 buildModelArgs、web 的 device-default-model 同源：provider 段
+// `[A-Za-z0-9][A-Za-z0-9._-]{0,127}` + model 段
+// `/[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`。两段都必填 —— 只有 model 会退化成裸 id，
+// 设备端拆不出 provider（见 clawAdminDiscussionHostNormalizeModel）。
+var clawAdminModelRouteRE = regexp.MustCompile(
+	`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`,
+)
+
+// 模型核验的三种结局。目录**拿不到**（离线 / 超时 / 旧 CLI 不响应）必须放行，
+// 只有「目录拿到了、里面明确没有这个模型」才拒绝——主持节点常常是一台离线
+// 备用机，做成一票否决会让整个选择器在最常见的运维场景下不可用。
+const (
+	clawAdminModelCheckVerified   = "verified"
+	clawAdminModelCheckUnverified = "unverified"
+	clawAdminModelCheckRejected   = "rejected"
+)
+
 
 // clawAdminRequiredHostCapabilities mirrors REQUIRED_HOST_CAPABILITIES in the
 // legacy discussion/system_host.py: a node advertising anything less than all
@@ -70,11 +106,24 @@ type clawAdminDiscussionHostConfig struct {
 	DiscussionHostPrompt     string `json:"discussion_host_prompt"`
 	TimeoutSeconds           int    `json:"timeout_seconds"`
 	ConfigVersion            int    `json:"config_version"`
+	// ModelProvider / Model 是运营为主持人指定的模型（空串 = 不指定，沿用设备
+	// 默认）。两者分开存是为了让「供应商 → 模型」两级选择器原样来回读写；
+	// 运行时只认拼好的 route（见 clawAdminDiscussionHostModelRoute）。
+	ModelProvider string `json:"model_provider"`
+	Model         string `json:"model"`
+	// ModelVerified 只在 PUT 响应里出现，且只在「这次保存带了模型但没能核验」
+	// 时为 false（目录拿不到 / 节点离线 / 旧 CLI 不响应）。指向 bool 是为了区分
+	// 「没核验过」与「核验通过了」——GET 恒为 nil，不写这个键。
+	ModelVerified *bool `json:"model_verified,omitempty"`
 }
 
 // clawAdminDiscussionHostBody is the PUT payload. Every field is a pointer so a
 // missing key is distinguishable from a zero value — the legacy contract
 // rejects bodies that omit any of them.
+//
+// ModelProvider / Model 例外：它们**可选**。旧客户端不带这两个键时必须仍然
+// 能保存（行为与改造前完全一致），所以既不能设成必填，也不能把缺失当成清空
+// 之外的语义 —— nil 与空串在此等价，都表示「不指定模型」。
 type clawAdminDiscussionHostBody struct {
 	ExpectedConfigVersion    *int    `json:"expected_config_version"`
 	Enabled                  *bool   `json:"enabled"`
@@ -84,7 +133,10 @@ type clawAdminDiscussionHostBody struct {
 	RoleRecommendationPrompt *string `json:"role_recommendation_prompt"`
 	DiscussionHostPrompt     *string `json:"discussion_host_prompt"`
 	TimeoutSeconds           *int    `json:"timeout_seconds"`
+	ModelProvider            *string `json:"model_provider"`
+	Model                    *string `json:"model"`
 }
+
 
 // clawAdminDiscussionHostWorkspaceID resolves which workspace the config row
 // belongs to: the one already holding a row for this key, else whatever
@@ -188,9 +240,106 @@ func applyClawAdminDiscussionHostStored(stored map[string]interface{}, cfg *claw
 	if v, ok := stored["timeout_seconds"].(float64); ok && v > 0 {
 		cfg.TimeoutSeconds = int(v)
 	}
+	if v, ok := stored["model_provider"].(string); ok {
+		cfg.ModelProvider = strings.TrimSpace(v)
+	}
+	if v, ok := stored["model"].(string); ok {
+		cfg.Model = strings.TrimSpace(v)
+	}
+	// 读路径兜底（M3）：写入口不止管理端 PUT 一个 —— 旁路
+	// `PUT /api/workspaces/{id}/rongcloud/system-host` 会把 config 整块覆盖，
+	// 不做任何字段校验。模型串最终会进角色快照、IM payload 和设备 argv，所以在
+	// 读的这一侧统一用同一套规则 clamp 一次：非法值丢弃并回到「不指定模型」，
+	// 运行时永远只可能吃到合法 route。
+	if provider, model, fail := clawAdminDiscussionHostNormalizeModel(cfg.ModelProvider, cfg.Model); fail != "" {
+		// 只告警一次：这个函数在每次加载配置时都会跑（含每场讨论），
+		// 每次刷日志会把真正的故障信号淹掉。
+		clawAdminInvalidStoredModelOnce.Do(func() {
+			slog.Warn("claw admin: dropping invalid stored discussion host model",
+				"reason", fail,
+				"model_provider", cfg.ModelProvider,
+				"model", cfg.Model)
+		})
+		cfg.ModelProvider, cfg.Model = "", ""
+	} else {
+		cfg.ModelProvider, cfg.Model = provider, model
+	}
 	if v, ok := stored["node_id"].(string); ok && v != "" && cfg.NodeID == "" {
 		cfg.NodeID = v
 	}
+}
+
+// clawAdminInvalidStoredModelOnce 让「丢弃非法存量模型」的告警只打一次。
+var clawAdminInvalidStoredModelOnce sync.Once
+
+// clawAdminDiscussionHostModelRoute 把两级选择拼成 `provider/slug`。
+//
+// 两个键同进同出（归一化保证了这一点），所以这里没有「只有 model」的分支 ——
+// 那个形态在 normalize 阶段就被 400 拒了，运行时永远看不到裸 id。
+func clawAdminDiscussionHostModelRoute(provider, model string) string {
+	if provider == "" || model == "" {
+		return ""
+	}
+	return provider + "/" + model
+}
+
+// clawAdminDiscussionHostModelFields 读 PUT body 里的两个可选字段并校验。
+func clawAdminDiscussionHostModelFields(providerRaw, modelRaw *string) (provider, model, fail string) {
+	return clawAdminDiscussionHostNormalizeModel(
+		strings.TrimSpace(derefString(providerRaw)),
+		strings.TrimSpace(derefString(modelRaw)),
+	)
+}
+
+// clawAdminDiscussionHostNormalizeModel 是「供应商 + 模型」的**唯一**校验/归一化点。
+//
+// 三个调用方共用它，因此「什么算合法模型」只有一处定义：
+//   - PUT（写入口）；
+//   - applyClawAdminDiscussionHostStored（**读路径**兜底：旁路写入口
+//     PUT /api/workspaces/{id}/rongcloud/system-host 会整块覆盖 config、不做任何
+//     字段校验，读路径不 clamp 的话非法串会一路进快照、进 IM payload、进设备 argv）；
+//   - 测试。
+//
+// 两个键要么都有要么都没有：只剩 model 会退化成裸 id，设备端 buildModelArgs 拆不出
+// provider（codex 会用自己配置里的 provider），表现为「选了但模型不对」。
+func clawAdminDiscussionHostNormalizeModel(provider, model string) (normProvider, normModel, fail string) {
+	if provider == "" && model == "" {
+		return "", "", ""
+	}
+	if provider == "" {
+		return "", "", "选择模型时必须同时指定供应商"
+	}
+	if model == "" {
+		return "", "", "选择供应商后必须选择模型"
+	}
+	// 逐段校验。文案统一用中文且带字段名：这几个 400 只可能出现在「手填」形态，
+	// 是运营直接看到的话，别把开发者英文（+ 裸字段名）摊给ta。
+	for _, field := range []struct{ label, value string }{
+		{"供应商", provider},
+		{"模型", model},
+	} {
+		if len([]rune(field.value)) > clawAdminDiscussionHostMaxModelSegment {
+			return "", "", field.label + "最多 128 个字符"
+		}
+		if !clawAdminModelSegmentCharset.MatchString(field.value) {
+			return "", "", field.label + "只能包含字母、数字和 . _ : - 这些字符"
+		}
+	}
+	// 拼起来必须是一条设备端认得的 route：CLI 的 buildModelArgs 会按它拆出
+	// provider（codex / hermes 需要分别传 -c model_provider 与 --provider），
+	// 形状不对时模型会被整条当成裸 id 传下去，表现为「选择生效但模型不对」。
+	if !clawAdminModelRouteRE.MatchString(clawAdminDiscussionHostModelRoute(provider, model)) {
+		return "", "", "供应商或模型的写法无法拼成“供应商/模型”形式"
+	}
+	return provider, model, ""
+}
+
+// derefString 读一个可选字符串字段（nil 视为空串）。
+func derefString(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
 }
 
 // clawAdminDiscussionHostNodeByUUID looks a node up by its primary key (the id
@@ -439,6 +588,13 @@ func (h *Handler) ClawAdminDiscussionHostPut(w http.ResponseWriter, r *http.Requ
 		clawAdminFail(w, 400, "discussion_host_prompt is required")
 		return
 	}
+	// 模型可选：两个字段都缺省 = 不指定（与改造前完全一致）。格式校验放在
+	// 查库之前，非法输入不该先付一次数据库往返。
+	modelProvider, model, modelFail := clawAdminDiscussionHostModelFields(body.ModelProvider, body.Model)
+	if modelFail != "" {
+		clawAdminFail(w, 400, modelFail)
+		return
+	}
 
 	// 节点必须真实存在，且自报能力覆盖主持所需的全部能力 —— 旧后端把这一条
 	// 放在保存时校验，前端下拉框也用同一套门槛。
@@ -485,7 +641,33 @@ func (h *Handler) ClawAdminDiscussionHostPut(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	configJSON, err := json.Marshal(map[string]interface{}{
+	// 模型存在性核验：目录**取得到**时才判定，取不到（离线 / 超时 / 旧 CLI
+	// 不响应）一律放行并标记未核验 —— 主持节点常常是一台离线备用机，做成一票
+	// 否决会让「改个提示词」也被卡死。
+	//
+	// 模型一个字都没改时直接跳过这次往返：运维最常见的动作是「只改人设提示词」，
+	// 那不该为此多等一次设备往返（最多 8s），也不该每次都在页面上弹「未能核验」。
+	modelUnchanged := exists && current.ModelProvider == modelProvider && current.Model == model
+	var modelVerified *bool
+	if model != "" && !modelUnchanged {
+		check, reason := h.clawAdminDiscussionHostCheckModel(r.Context(), hostNodeUUID, aiUserID, modelProvider, model)
+		switch check {
+		case clawAdminModelCheckRejected:
+			clawAdminFail(w, 400, rongcloud.NodeRequestCodeModelNotAvailable)
+			return
+		case clawAdminModelCheckUnverified:
+			slog.Info("claw admin: discussion host model saved unverified",
+				"node_id", nodeID, "model", clawAdminDiscussionHostModelRoute(modelProvider, model),
+				"reason", reason)
+			unverified := false
+			modelVerified = &unverified
+		default:
+			verified := true
+			modelVerified = &verified
+		}
+	}
+
+	stored := map[string]interface{}{
 		"enabled":                    *body.Enabled,
 		"node_id":                    nodeID,
 		"ai_user_id":                 aiUserID,
@@ -494,7 +676,17 @@ func (h *Handler) ClawAdminDiscussionHostPut(w http.ResponseWriter, r *http.Requ
 		"role_recommendation_prompt": rolePrompt,
 		"discussion_host_prompt":     hostPrompt,
 		"timeout_seconds":            *body.TimeoutSeconds,
-	})
+	}
+	// 未指定模型时**不写**这两个键（而不是写空串）：存量配置的形状不变，
+	// 读回来 cfg.Model == ""，三处 host 快照都不写 model，设备端 buildModelArgs
+	// 的 if (!model) 让行为与改造前逐字节一致。
+	if model != "" {
+		stored["model"] = model
+		if modelProvider != "" {
+			stored["model_provider"] = modelProvider
+		}
+	}
+	configJSON, err := json.Marshal(stored)
 	if err != nil {
 		clawAdminFail(w, 400, "invalid payload")
 		return
@@ -542,6 +734,7 @@ func (h *Handler) ClawAdminDiscussionHostPut(w http.ResponseWriter, r *http.Requ
 			"expected_version": *body.ExpectedConfigVersion,
 			"enabled":          *body.Enabled,
 			"unbound_from":     unboundFrom,
+			"model":            clawAdminDiscussionHostModelRoute(modelProvider, model),
 		})
 
 	clawAdminOK(w, clawAdminDiscussionHostConfig{
@@ -554,7 +747,218 @@ func (h *Handler) ClawAdminDiscussionHostPut(w http.ResponseWriter, r *http.Requ
 		DiscussionHostPrompt:     hostPrompt,
 		TimeoutSeconds:           *body.TimeoutSeconds,
 		ConfigVersion:            version,
+		ModelProvider:            modelProvider,
+		Model:                    model,
+		ModelVerified:            modelVerified,
 	})
+}
+
+// ---- 模型目录：GET /api/admin/system/discussion-host/model-catalog ----
+//
+// 「供应商 → 模型」两级选择器的数据源。管理端没有 IM SDK（package.json 只有
+// @rongcloud/embed-console-sdk），做不到 C 端那样浏览器直连设备，因此由服务端
+// 代理这一次往返：节点请求 broker 下发 `discussion_model_catalog_request`
+// （protocolVersion 2），设备端 CLI 已经有应答器，**无需任何改动**。
+//
+// 返回形状与 C 端的 NodeModelCatalog 一致，前端因此可以 1:1 抄「设备详情」页的
+// 级联选择器（clawmessenger-web/src/sections/DeviceDetail.tsx:390-430）。
+//
+// 取不到目录时的语义：**一律** 503 + 同一个 code（MODEL_CATALOG_UNAVAILABLE），
+// 页面据此降级成两个可手填的输入框。具体原因（节点不存在 / 不是主持节点 /
+// 不可展示 / 离线 / 超时 / 设备应答不合协议）只写服务端日志与审计，不回给调用方：
+// 这个接口会以系统账号向一台设备私发 IM 并让它跑一次本机探测，属于**有副作用**
+// 的操作，不能同时充当「某个 node_id 是否存在 / 是否在线」的探测预言机。
+//
+// 注意门控是 system:write 而不是 system:read：只读管理员不该能动用这条有副作用的通道。
+
+// clawAdminDiscussionHostCatalog 是目录接口的响应体。
+type clawAdminDiscussionHostCatalog struct {
+	ProtocolVersion int                           `json:"protocolVersion"`
+	NodeID          string                        `json:"node_id"`
+	DefaultModel    string                        `json:"default_model"`
+	Providers       []clawAdminDiscussionHostProv `json:"providers"`
+	FetchedAt       string                        `json:"fetched_at"`
+	Source          string                        `json:"source"`
+}
+
+type clawAdminDiscussionHostProv struct {
+	ID     string                       `json:"id"`
+	Name   string                       `json:"name"`
+	Models []clawAdminDiscussionHostMdl `json:"models"`
+}
+
+type clawAdminDiscussionHostMdl struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+func (h *Handler) ClawAdminDiscussionHostModelCatalog(w http.ResponseWriter, r *http.Request) {
+	ident := h.requireClawAdmin("system:write", w, r)
+	if ident == nil {
+		return
+	}
+
+	nodeID := strings.TrimSpace(r.URL.Query().Get("node_id"))
+	// 不传 node_id 时回落到已保存配置的节点：页面首屏就是「已配置的节点」，
+	// 让它可以不带参数地先拉一次。这一段不泄露任何东西（配置本身 GET 就能读）。
+	if nodeID == "" {
+		cfg, found, err := h.clawAdminDiscussionHostLoad(r.Context())
+		if err != nil {
+			clawAdminFail(w, 503, "discussion host config unavailable")
+			return
+		}
+		if !found || cfg.NodeID == "" {
+			h.auditCatalogFetch(r, ident, "", rongcloud.NodeRequestCodeHostNotConfigured)
+			clawAdminFail(w, 400, rongcloud.NodeRequestCodeHostNotConfigured)
+			return
+		}
+		nodeID = cfg.NodeID
+	}
+
+	// clawAdminCatalogUnavailable 是这条接口唯一的失败出口：对外的码不区分原因
+	// （见 B2），但审计里要留下「谁、对哪台节点、因为什么」—— 收紧到
+	// system:write 之后，审计是枚举这类行为的**唯一**证据。
+	unavailable := func(reason string, detail ...interface{}) {
+		slog.Warn("claw admin: discussion host model catalog unavailable",
+			append([]interface{}{"reason", reason}, detail...)...)
+		h.auditCatalogFetch(r, ident, nodeID, rongcloud.NodeRequestCodeCatalogUnavailable, "reason", reason)
+		clawAdminFail(w, 503, rongcloud.NodeRequestCodeCatalogUnavailable)
+	}
+
+	nodeUUID, err := uuid.Parse(nodeID)
+	if err != nil {
+		unavailable("node_id is not a valid node id")
+		return
+	}
+	if h.Queries == nil {
+		// 半装配的 Handler（只有 DB、没有 Queries）：当作目录不可用，别 panic。
+		unavailable("node queries not wired")
+		return
+	}
+	nodeUUIDValue := pgtype.UUID{Bytes: nodeUUID, Valid: true}
+	node, err := h.Queries.GetRongCloudNodeByID(r.Context(), nodeUUIDValue)
+	if err != nil {
+		unavailable("node lookup failed")
+		return
+	}
+	// 与 eligible-nodes / PUT 同一套闸门：只有「可展示 + 能力位齐备」的节点才允许
+	// 被点名。缺了这道门，任何已存在的 rongcloud_node.id 都能被套出 provider/model
+	// 清单，还会顺带让它跑一次本机 agent 探测（机器基础设施节点、运维维护 agent、
+	// 其它 workspace 的节点都在范围内 —— 与 node_capabilities.go 的展示契约冲突）。
+	if !rongcloud.IsDisplayNode(node) {
+		unavailable("node is not displayable", "node_id", nodeID)
+		return
+	}
+	if missing := clawAdminMissingHostCapabilities(clawAdminParseCapabilities(node.Capabilities)); len(missing) > 0 {
+		unavailable("node is not a discussion host", "node_id", nodeID, "missing", missing)
+		return
+	}
+
+	catalog, code := h.clawAdminDiscussionHostFetchCatalog(
+		r.Context(), nodeUUIDValue, node.RongcloudUserID, clawAdminDiscussionHostCatalogTimeout)
+	if code != "" {
+		unavailable(code, "node_id", nodeID)
+		return
+	}
+
+	providers := make([]clawAdminDiscussionHostProv, 0, len(catalog.Providers))
+	for _, provider := range catalog.Providers {
+		models := make([]clawAdminDiscussionHostMdl, 0, len(provider.Models))
+		for _, entry := range provider.Models {
+			models = append(models, clawAdminDiscussionHostMdl{ID: entry.ID, Name: entry.Name})
+		}
+		providers = append(providers, clawAdminDiscussionHostProv{
+			ID: provider.ID, Name: provider.Name, Models: models,
+		})
+	}
+	h.auditCatalogFetch(r, ident, nodeID, "", "source", "device",
+		"provider_count", len(providers))
+	clawAdminOK(w, clawAdminDiscussionHostCatalog{
+		ProtocolVersion: 2,
+		NodeID:          nodeID,
+		DefaultModel:    catalog.DefaultModel,
+		Providers:       providers,
+		FetchedAt:       time.Now().UTC().Format(time.RFC3339),
+		Source:          "device",
+	})
+}
+
+// auditCatalogFetch 记一条「拉取主持节点模型目录」的审计。
+//
+// errorCode 为空表示成功。之所以连成功也记：这条接口会让一台设备跑一次本机
+// agent 探测（有副作用），收紧到 system:write 之后，审计是唯一能回答「谁在
+// 什么时候枚举了哪台节点」的地方。
+func (h *Handler) auditCatalogFetch(
+	r *http.Request, ident *clawAdminIdentity, nodeID, errorCode string, extra ...interface{},
+) {
+	detail := map[string]interface{}{"node_id": nodeID}
+	if errorCode != "" {
+		detail["error_code"] = errorCode
+	}
+	for i := 0; i+1 < len(extra); i += 2 {
+		key, ok := extra[i].(string)
+		if !ok {
+			continue
+		}
+		detail[key] = extra[i+1]
+	}
+	h.clawAdminAudit(r, ident, "fetch_discussion_host_model_catalog", "system_config",
+		clawAdminDiscussionHostKey, detail)
+}
+
+// clawAdminDiscussionHostFetchCatalog 向主持节点要一次模型目录。
+// 返回空 code 表示拿到了；否则是可直接回给前端的具名错误码。
+func (h *Handler) clawAdminDiscussionHostFetchCatalog(
+	ctx context.Context, nodeUUID pgtype.UUID, aiUserID string, timeout time.Duration,
+) (rongcloud.DiscussionModelCatalog, string) {
+	if aiUserID == "" {
+		return rongcloud.DiscussionModelCatalog{}, rongcloud.NodeRequestCodeHostNotConfigured
+	}
+	if h.RongCloudNodeRequests == nil {
+		// broker 未装配：当作「目录不可用」，不是 500 —— 前端降级手填即可。
+		return rongcloud.DiscussionModelCatalog{}, rongcloud.NodeRequestCodeHostOffline
+	}
+	// 在线判定走融云 presence（与 eligible-nodes 同一份真相）。节点服务未装配
+	// 时判不了，只能尝试一次 —— broker 发不出去会立刻回 HOST_OFFLINE，不阻塞。
+	if h.RongCloudNode != nil && !h.RongCloudNode.IsOnline(nodeUUID) {
+		return rongcloud.DiscussionModelCatalog{}, rongcloud.NodeRequestCodeHostOffline
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	host := rongcloud.NodeRequestHost{
+		AIUserID:       aiUserID,
+		TimeoutSeconds: int(timeout / time.Second),
+	}
+	return h.RongCloudNodeRequests.FetchModelCatalog(ctx, host)
+}
+
+// clawAdminDiscussionHostCheckModel 判断刚保存的模型在主持节点上是否可用。
+//
+// 三态：verified / unverified / rejected。只有「目录确实拿到了、且里面没有这个
+// model」才 rejected；离线、超时、目录为空、broker 未装配一律 unverified（放行）。
+func (h *Handler) clawAdminDiscussionHostCheckModel(
+	ctx context.Context, nodeUUID pgtype.UUID, aiUserID, provider, model string,
+) (string, string) {
+	if model == "" {
+		return clawAdminModelCheckVerified, ""
+	}
+	catalog, code := h.clawAdminDiscussionHostFetchCatalog(
+		ctx, nodeUUID, aiUserID, clawAdminDiscussionHostVerifyTimeout)
+	if code != "" {
+		return clawAdminModelCheckUnverified, code
+	}
+	if len(catalog.Providers) == 0 {
+		// 设备答了「我没有可用模型」：这不构成拒绝的理由（可能只是 agent 配置
+		// 读不出来），按未核验处理并让页面提示一句。
+		return clawAdminModelCheckUnverified, "empty catalog"
+	}
+	// 走到这里 provider 与 model 一定都非空（NormalizeModel 保证），所以目录里
+	// 一定能按 `provider/model` 定位到具体条目，不存在「裸 id 无法定位」的兜底。
+	if !catalog.CatalogHasRoute(provider, model) {
+		return clawAdminModelCheckRejected, "model is not available on the host node"
+	}
+	return clawAdminModelCheckVerified, ""
 }
 
 // clawAdminUnbindHostNode 把被指定为系统主持的节点从原用户名下摘掉。
@@ -768,5 +1172,9 @@ func (h *Handler) ClawDiscussionSystemHostConfig(ctx context.Context) (rongcloud
 		Enabled:              cfg.Enabled,
 		TimeoutSeconds:       cfg.TimeoutSeconds,
 		RecommendationPrompt: cfg.RoleRecommendationPrompt,
+		// 运行时只认拼好的 route（`provider/slug`）：三处 host 快照把它原样
+		// 写进角色板的 host 条目，v3 引擎读成 role.Model 后随 your_turn 的
+		// params.model 下发，设备端 buildModelArgs 再按 `/` 拆回两段。
+		Model: clawAdminDiscussionHostModelRoute(cfg.ModelProvider, cfg.Model),
 	}, true, nil
 }

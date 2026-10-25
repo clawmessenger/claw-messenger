@@ -1730,6 +1730,9 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	r.Get("/api/admin/system/discussion-host", h.ClawAdminDiscussionHostGet)
 	r.Put("/api/admin/system/discussion-host", h.ClawAdminDiscussionHostPut)
 	r.Get("/api/admin/system/discussion-host/eligible-nodes", h.ClawAdminDiscussionHostEligibleNodes)
+	// 「供应商 → 模型」两级选择器的数据源：服务端代理一次「向主持节点要目录」
+	// 的 IM 往返（设备端 CLI 已有 discussion_model_catalog_request 应答器）。
+	r.Get("/api/admin/system/discussion-host/model-catalog", h.ClawAdminDiscussionHostModelCatalog)
 	r.Post("/api/admin/system/discussion-host/test-recommendation", h.ClawAdminDiscussionHostTestRecommendation)
 	r.Get("/api/admin/admins", h.ClawAdminListAdmins)
 	r.Post("/api/admin/admins", h.ClawAdminCreateAdmin)

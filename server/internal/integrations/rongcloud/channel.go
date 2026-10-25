@@ -136,6 +136,15 @@ func (c *rongcloudChannel) handleWebhook(w http.ResponseWriter, r *http.Request)
 			w.WriteHeader(http.StatusOK)
 			return
 		}
+		if isModelCatalogResponse(msg) {
+			// 模型目录回包同理（管理端「供应商 → 模型」选择器）。
+			// 它和 command_result 一样是「设备在回答服务端发起的一次请求」，
+			// 必须同步转交 broker；落到下面的命令分发器里只会被当未知命令丢掉，
+			// 管理端于是永远拿不到目录。
+			c.systemHandler.handleNodeMessage(r.Context(), msg)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		// 命令一律先 200 再处理：recommendRoles / createRoundtable 要走融云
 		// P2P 下发给设备、等设备端 agent 跑完才回包，同步做会让融云的回调
 		// 客户端先超时断开（r.Context() 被取消，回包发不出去），还会触发重投

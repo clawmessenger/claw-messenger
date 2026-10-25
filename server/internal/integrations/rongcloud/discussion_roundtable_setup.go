@@ -619,26 +619,9 @@ func setupRoleSnapshots(canonical roundtableCanonical, validated roundtableValid
 			roles[node.RongcloudUserID].(map[string]interface{})["model"] = *role.Model
 		}
 	}
-	roles[validated.host.aiUserID] = map[string]interface{}{
-		"memberId":         validated.host.aiUserID,
-		"nodeId":           validated.host.nodeID,
-		"nickname":         validated.host.displayName,
-		"portraitUri":      validated.host.avatar,
-		"roleName":         roundtableHostRoleName,
-		"roleInstructions": "",
-		"capabilities":     roundtableRequiredHostCaps,
-		"isHost":           true,
-	}
-	roleJSON, _ := json.Marshal(roles)
-	hostSnapshot, _ := json.Marshal(map[string]interface{}{
-		"node_id":                validated.host.nodeID,
-		"ai_user_id":             validated.host.aiUserID,
-		"display_name":           validated.host.displayName,
-		"avatar":                 validated.host.avatar,
-		"discussion_host_prompt": validated.host.hostPrompt,
-		"config_version":         validated.host.configVersion,
-	})
-	return roleJSON, hostSnapshot
+	// host 条目（含 model）与 host_config_snapshot 由同一个函数唯一地拼装，
+	// 三个写入点共用 —— 见 roundtableHostSnapshots 的注释。
+	return roundtableHostSnapshots(validated.host, roles)
 }
 
 // parseSetupConfirmRoles 解析确认时提交的勾选角色（snake_case/camelCase 字段双读）。
