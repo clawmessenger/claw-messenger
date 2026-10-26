@@ -18,25 +18,97 @@
 //   node scripts/build-exe.mjs                          # dist/clawmessenger.exe from src/bin.ts
 //   node scripts/build-exe.mjs --entry <file> --name <name>
 import { spawnSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const pkgRoot = resolve(here, "..");
 
+/**
+ * 失败时必须留下 `::error::` 注解。这个脚本跑在发布流水线里，失败时 GitHub 只给
+ * 一句 "Process completed with exit code 1."，真正的异常堆栈在日志里 —— 而日志要
+ * 登录才能看。注解不需要。
+ */
+function fail(message) {
+  console.log(`::error::build-exe: ${message.replace(/%/g, "%25").replace(/\r?\n/g, "%0A")}`);
+  throw new Error(message);
+}
+
 /** Resolve a package-internal file (e.g. `esbuild/bin/esbuild`) up the workspace. */
 function findModuleFile(relative) {
+  const tried = [];
   let dir = pkgRoot;
   for (;;) {
     const candidate = join(dir, "node_modules", relative);
+    tried.push(candidate);
     if (existsSync(candidate)) return candidate;
     const parent = dirname(dir);
-    if (parent === dir) {
-      throw new Error(`node_modules/${relative} not found in any ancestor — run from the pnpm workspace`);
-    }
+    if (parent === dir) break;
     dir = parent;
   }
+  // `.npmrc` 里是 shamefully-hoist=true，所以上面这条路径应当命中；真命中不了
+  // 就把试过的路径全写进注解，别让人再去猜 pnpm 把包装到哪了。
+  fail(`cannot find node_modules/${relative}; tried: ${tried.join(" | ")}`);
+}
+
+/** Last `n` lines of a captured stream, for the annotation. */
+function tail(text, n = 15) {
+  const lines = text.split(/\r?\n/).filter((line) => line.trim() !== "");
+  return lines.slice(-n).join(" ⏎ ") || "<empty>";
+}
+
+/**
+ * Run a build tool and turn **every** failure mode into an annotation.
+ *
+ * 三个理由：
+ *   1. `spawnSync` 对「起不来」只把 error 挂在返回值上，而 esbuild 自己的 JS shim
+ *      在子进程失败时是直接 throw 的 —— 那样就绕过了状态检查。
+ *   2. 工具的输出（esbuild 到底在抱怨什么）默认只进日志，而日志要登录才能看。
+ *      所以 stdio 一律落到文件，失败时把末尾几行塞进注解。
+ *   3. 输出接**文件**而不是管道：接文件时子进程的 stdout 是同步写，接管道是异步
+ *      写，判断依据不该取决于采集方式。
+ */
+function run(label, file, commandArgs) {
+  const out = join(distDir, `.${label}.out`);
+  const err = join(distDir, `.${label}.err`);
+  let result;
+  try {
+    const outFd = openSync(out, "w");
+    const errFd = openSync(err, "w");
+    try {
+      result = spawnSync(file, commandArgs, { stdio: ["ignore", outFd, errFd] });
+    } finally {
+      closeSync(outFd);
+      closeSync(errFd);
+    }
+  } catch (err2) {
+    fail(`${label} threw: ${err2 instanceof Error ? err2.message : String(err2)}`);
+  }
+  const stdout = (existsSync(out) ? readFileSync(out, "utf8") : "").trim();
+  const stderr = (existsSync(err) ? readFileSync(err, "utf8") : "").trim();
+  rmSync(out, { force: true });
+  rmSync(err, { force: true });
+  // 成功也把工具输出打出来：日志里仍能看到 esbuild 的 warning / postject 的注入信息。
+  if (stdout) console.log(stdout);
+  if (stderr) console.error(stderr);
+  if (result.error) fail(`${label} could not be started: ${result.error.message}`);
+  if (result.status !== 0) {
+    fail(
+      `${label} failed (exit ${result.status ?? "signal"}): ${file} ${commandArgs[0] ?? ""} — ` +
+        `stdout: ${tail(stdout)} | stderr: ${tail(stderr)}`,
+    );
+  }
+  return result;
 }
 
 const args = process.argv.slice(2);
@@ -68,7 +140,7 @@ const rawVersion = (opt("--version", process.env.CLAWMESSENGER_VERSION || pkg.ve
 const versionMatch = rawVersion.match(/(\d+\.\d+\.\d+)/);
 const injectedVersion = versionMatch ? versionMatch[1] : "";
 if (!injectedVersion) {
-  throw new Error(
+  fail(
     `cannot resolve a version from ${JSON.stringify(rawVersion)}: ` +
       "pass --version x.y.z, set CLAWMESSENGER_VERSION=x.y.z, or set package.json#version",
   );
@@ -78,37 +150,63 @@ if (injectedVersion !== rawVersion) {
 }
 const outCjs = join(distDir, `${exeName}.sea.cjs`);
 const esbuildCli = findModuleFile(join("esbuild", "bin", "esbuild"));
+console.log(
+  `building ${exeName} ${injectedVersion} on ${process.platform}/${process.arch} ` +
+    `with node ${process.version} (esbuild: ${esbuildCli})`,
+);
 // define 的值**只能编码一次**：JSON.stringify 一次得到的 `"1.3.0"`（带引号的
 // JSON 字符串字面量）正是 esbuild 期望的形式。编码两次会得到 `"\"1.3.0\""`，
 // 注入进二进制的字符串自带引号 —— 见文件头关于 1.3.0 首次发布的注释。
 const defineArg = `--define:__CLAWMESSENGER_VERSION__=${JSON.stringify(injectedVersion)}`;
-const bundle = spawnSync(
-  process.execPath,
-  [
-    esbuildCli,
-    entry,
-    "--bundle",
-    "--platform=node",
-    "--format=cjs",
-    "--target=node20",
-    defineArg,
-    `--outfile=${outCjs}`,
-    "--log-level=warning",
-  ],
-  { stdio: "inherit" },
-);
-if (bundle.status !== 0) throw new Error(`esbuild failed (exit ${bundle.status})`);
+run("esbuild", process.execPath, [
+  esbuildCli,
+  entry,
+  "--bundle",
+  "--platform=node",
+  "--format=cjs",
+  "--target=node20",
+  defineArg,
+  `--outfile=${outCjs}`,
+  "--log-level=warning",
+]);
 
 // 1b. 自检：把刚打出的 bundle 当普通 node 脚本跑一次，确认它答出来的版本**逐字符**
-// 等于注入值。上面那个双重编码的 bug 靠这一步在构建期就断掉，而不是等发版时由
-// 流水线的闸门去发现（那次三个 POSIX job 挂掉、Release 没建出来，代价是两轮 CI）。
-const probe = spawnSync(process.execPath, [outCjs, "--version"], { encoding: "utf8" });
-const probed = (probe.stdout ?? "").trim();
-if (probe.status !== 0 || probed !== injectedVersion) {
-  throw new Error(
-    `the bundle reports ${JSON.stringify(probed)} (exit ${probe.status}) but ${JSON.stringify(injectedVersion)} was injected — ` +
-      `stderr: ${(probe.stderr ?? "").trim() || "<empty>"}`,
-  );
+// 等于注入值。上面那个双重编码的 bug 靠这一步在构建期就暴露，而不是等到发版时由
+// 流水线的闸门发现（代价是两轮 CI）。
+//
+// 只警告、不阻断：权威在发布闸门（Gate 1 跑的就是同一个 bundle，Gate 2 跑最终产物），
+// 这里是「尽早说话」而不是第二个把关人 —— 一个因环境原因跑不起来的自检不该拦住
+// 一个好版本。失败原因写进 `::warning::`，注解里直接能读。
+//
+// 用文件接住子进程的 stdout，而不是默认管道：接文件时 process.stdout 是同步写、
+// 接管道是异步写，判断依据不该取决于采集方式。
+const probeOut = join(distDir, `${exeName}.version-probe.out`);
+const probeErr = join(distDir, `${exeName}.version-probe.err`);
+let probe = { status: null, error: null };
+try {
+  const probeOutFd = openSync(probeOut, "w");
+  const probeErrFd = openSync(probeErr, "w");
+  try {
+    probe = spawnSync(process.execPath, [outCjs, "--version"], {
+      stdio: ["ignore", probeOutFd, probeErrFd],
+    });
+  } finally {
+    closeSync(probeOutFd);
+    closeSync(probeErrFd);
+  }
+} catch (err) {
+  probe = { status: null, error: err };
+}
+const probed = (existsSync(probeOut) ? readFileSync(probeOut, "utf8") : "").trim();
+const probeStderr = (existsSync(probeErr) ? readFileSync(probeErr, "utf8") : "").trim();
+rmSync(probeOut, { force: true });
+rmSync(probeErr, { force: true });
+console.log(`bundle self-check: --version -> ${JSON.stringify(probed)} (exit ${probe.status})`);
+if (probe.error || probe.status !== 0 || probed !== injectedVersion) {
+  const detail =
+    `${probe.error ? `could not start (${probe.error.message})` : `exit ${probe.status}`}` +
+    `, stdout ${JSON.stringify(probed)}, injected ${JSON.stringify(injectedVersion)}, stderr: ${tail(probeStderr, 10)}`;
+  console.log(`::warning::build-exe: the bundle self-check disagrees — ${detail.replace(/%/g, "%25").replace(/\r?\n/g, "%0A")}`);
 }
 
 // 2. SEA config → blob.
@@ -128,25 +226,19 @@ writeFileSync(
     2,
   ),
 );
-const sea = spawnSync(process.execPath, ["--experimental-sea-config", configPath], { stdio: "inherit" });
-if (sea.status !== 0) throw new Error(`node --experimental-sea-config failed (exit ${sea.status})`);
+run("sea-blob", process.execPath, ["--experimental-sea-config", configPath]);
 
 // 3. Copy the current node binary and inject the blob.
 rmSync(exePath, { force: true });
 copyFileSync(process.execPath, exePath);
 const postjectCli = findModuleFile(join("postject", "dist", "cli.js"));
-const inject = spawnSync(
-  process.execPath,
-  [
-    postjectCli,
-    exePath,
-    "NODE_SEA_BLOB",
-    blobPath,
-    "--sentinel-fuse",
-    "NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2",
-  ],
-  { stdio: "inherit" },
-);
-if (inject.status !== 0) throw new Error(`postject failed (exit ${inject.status})`);
+run("postject", process.execPath, [
+  postjectCli,
+  exePath,
+  "NODE_SEA_BLOB",
+  blobPath,
+  "--sentinel-fuse",
+  "NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2",
+]);
 
 console.log(`built ${exePath} (clawmessenger ${injectedVersion})`);
