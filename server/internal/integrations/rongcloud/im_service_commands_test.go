@@ -402,9 +402,13 @@ func TestLobsterUpdateRejectsAnEmptyPatch(t *testing.T) {
 
 // --- friend -----------------------------------------------------------------
 
-// 「好友申请」在融云服务端 API 上没有对应能力（只有 optType=2 直加）。伪造空列
-// 表会让「新的朋友」页误判「没有申请」，所以必须回明确的「暂不支持」错误。
-func TestFriendRequestActionsReplyExplicitUnsupported(t *testing.T) {
+// friend 的四个审批 action 已有真实实现（审批表见 migrations/603，逻辑见
+// friend_request.go）。**没装配审批表**时必须是 503「能力未启用」，而不是
+// 501（那是「融云没这接口」的旧结论，已不成立）也不能伪造成功 —— 客户端据此
+// 区分「后端没这能力」与「本实例没接库」，前者不会再出现。
+//
+// 具体行为（申请落库、拥有者独家审批、批后建节点边）在 friend_request_test.go。
+func TestFriendRequestActionsFailClosedWhenTheApprovalTableIsNotWired(t *testing.T) {
 	rec, srv := newIMServiceServer(t, imServiceServerOptions{})
 	defer srv.Close()
 	handler := newIMServiceHandler(t, srv)
@@ -412,8 +416,12 @@ func TestFriendRequestActionsReplyExplicitUnsupported(t *testing.T) {
 
 	for _, action := range []string{"getRequests", "sendRequest", "approveRequest", "rejectRequest"} {
 		sendWebCommand(t, handler, "user-1", "friend", action,
-			map[string]interface{}{"toUserId": "user-2", "requestId": "fr-1"})
-		wantWebError(t, rec.last(t), 501, "暂不支持")
+			map[string]interface{}{
+				"toUserId":     "user-2",
+				"requestId":    "fr-1",
+				"deviceNodeId": "rc_node_abc_agent",
+			})
+		wantWebError(t, rec.last(t), 503, "friend service is unavailable")
 	}
 }
 

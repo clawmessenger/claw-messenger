@@ -65,6 +65,12 @@ var workspaceDeletionManifest = map[string]workspaceDeleteAction{
 	// 龙虾档案（599）：同样挂在 claw_im_users.user_id 上、没有 workspace_id，
 	// 属于 installation 级用户数据。
 	"claw_lobster":                       workspaceDeleteKeep,
+	// 「加 AI 节点为好友」的审批表（603）与 Web 扫码登录票据表（604）：
+	// 两者都以融云 user id / 一次性票据为主键，没有 workspace_id，
+	// 属于 installation 级状态。workspace 拆除不得触碰（否则删一个工作区
+	// 会把全站待审批的节点申请清空）。
+	"im_friend_request":                  workspaceDeleteKeep,
+	"im_web_login_sessions":              workspaceDeleteKeep,
 	"client_usage_daily":                 workspaceDeleteDetach,
 	"comment":                            workspaceDelete,
 	"comment_reaction":                   workspaceDelete,

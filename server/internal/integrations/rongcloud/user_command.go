@@ -112,6 +112,10 @@ func (h *systemHandler) handleUserCommand(ctx context.Context, msg NormalizedMes
 	switch cmd.Action {
 	case "wxLogin":
 		return h.handleWeChatLogin(ctx, msg, cmd)
+	case "confirmWebLogin":
+		// Web 扫码登录的移动端确认（web_login_command.go）。前端两处扫码入口
+		// （会话页、搜索页）用它把 pending 票据置成 confirmed。
+		return h.handleConfirmWebLogin(ctx, msg, cmd)
 	default:
 		// user 服务的其余 action（login/getInfo/getProfiles/…）没有 IM 实现：
 		// 走 404 契约，客户端据此降级到 HTTP（/api/login、/api/user/info）。

@@ -105,7 +105,13 @@ func newRongCloudFactory(deps ChannelDeps) channel.Factory {
 		if deps.DB != nil {
 			systemHandler.lobsterStore = NewLobsterStore(deps.DB)
 			systemHandler.friendStore = NewFriendStore(deps.DB, client, logger)
+			// 「加 AI 节点为好友」的审批表（migrations/603）。与 friendStore
+			// 分开装配：friendStore 只服务好友边归属投影，审批状态在这张表里。
+			systemHandler.friendRequests = NewFriendRequestStore(deps.DB, logger)
 			systemHandler.userStore = NewUserStore(deps.DB)
+			// Web 扫码登录的确认表（migrations/604）。签发/兑换在 HTTP 侧
+			// （internal/handler/claw_web_qr_login.go），移动端确认走这里。
+			systemHandler.webLoginSessions = NewWebLoginSessionStore(deps.DB, logger)
 			// 运行时可观测的装配证据：这一行出现，才说明 service=user/friend/
 			// lobster 走的是真表而不是 503 兜底（见 im_service_commands_test.go
 			// 的 TestFactoryAttachesTheLocalStoresOnlyWhenDBIsProvided）。

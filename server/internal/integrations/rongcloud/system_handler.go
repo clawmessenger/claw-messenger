@@ -32,11 +32,22 @@ type systemHandler struct {
 	// 不 panic），这样没有 DB 装配的部署/测试仍能跑通其余 service。
 	lobsterStore *LobsterStore
 	friendStore  *FriendStore
-	userStore    *UserStore
+	// friendRequests 是「加 AI 节点为好友」的审批表读写（migrations/603）。
+	// 与 friendStore 分开：前者是审批过程的状态，后者是好友边归属的投影。
+	friendRequests *FriendRequestStore
+	userStore      *UserStore
+	// webLoginSessions 是 Web 扫码登录的确认表读写（migrations/604）。与
+	// userStore 分开：它只服务「一次性票据」这一个生命周期，不与账号表耦合。
+	webLoginSessions *WebLoginSessionStore
 	// actorResolver 是命令通道的身份解析注入点。nil 时走 resolveActor
 	// （rongcloud_user → claw_im_users 双表兜底，chatroom_commands.go:64-83）。
 	// 只在测试里替换，生产恒为 nil。
 	actorResolver func(ctx context.Context, fromUserID string) (string, error)
+	// agentNodeLookup 是 isAgentNode 的测试接缝：非 nil 时优先用它。
+	// 生产恒为 nil（走真查询）。加它的唯一理由是「目标确实是 AI 节点 → 403」
+	// 这个正例必须能在没有数据库的 CI 里跑；伪造 Scan 的接收者列表会随生成代码
+	// 静默失效，比不测更危险。
+	agentNodeLookup func(ctx context.Context, rcID string) (bool, error)
 	// wechatAPIBase / wechatHTTPClient 供 service=user 的 wxLogin 调微信
 	// jscode2session；空值走默认域名与 8s 超时客户端（测试注入假服务）。
 	wechatAPIBase    string

@@ -1676,6 +1676,15 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// 供 clawmessenger-web / clawmessenger-uniapp 前端直连。
 	r.Post("/api/register", h.ClawRegister)
 	r.Post("/api/login", h.ClawLogin)
+	// Web 扫码登录三件套（移植自旧 Python app.py:1133-1210）。公开路由：二维码
+	// 出现时用户**还没有任何凭据**，exchange 本身就是「用一次性票据换 token」的
+	// 那一步，不可能先要 Bearer。
+	//
+	// 这三条曾整组缺失：迁移时 /api/login、/api/register 都搬了，但这组路径前缀
+	// 停在 /api/auth/ 下，扫路由时被漏掉，线上表现为二维码「加载失败 + Not Found」。
+	r.Post("/api/auth/web-qr/sessions", h.ClawCreateWebQrLoginSession)
+	r.Get("/api/auth/web-qr/sessions/{ticket}", h.ClawGetWebQrLoginStatus)
+	r.Post("/api/auth/web-qr/sessions/{ticket}/exchange", h.ClawExchangeWebQrLogin)
 	// 微信小程序手机号登录。与 /api/login 同级公开：微信登录发生在「还没有任何
 	// 凭据」的时刻，走不了融云 command 通道（那条通道要求已连 IM，未登录连不上，
 	// 会死锁到 10s 超时报「融云连接失败」）。业务逻辑与 command 通道共用

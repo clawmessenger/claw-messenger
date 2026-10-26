@@ -11,15 +11,35 @@ package rongcloud
 //	getDeviceOwner → {nodeId} → {ownerId}（AI 节点归属者）
 //	sendRequest / getRequests / approveRequest / rejectRequest → 好友申请
 //
-// 好友关系的权威数据源是**融云好友边**，本服务不建好友关系表（调研结论见
-// .agent-runs/2026-10-23/task-003/backend-im-service-pattern.md §3.3/§6.2）。
+// 好友**关系**的权威数据源仍是融云好友边，本服务不另建好友关系表
+// （调研结论见 .agent-runs/2026-10-23/task-003/backend-im-service-pattern.md §6.2）。
 // 融云的 /friend/add.json 用 optType 区分两种行为：2 直加、1 发申请（user_api.go）。
-// add 会把客户端传的 optType 透传下去（缺省仍 2，保持既有客户端的直加行为）；
-// 但「申请」的读回与审批融云服务端 API 没有对等接口 —— getRequests /
-// approveRequest / rejectRequest 统一回「暂不支持」的明确错误，而不是伪造一个
-// 空列表：返回空数组会让「新的朋友」页以为真的没有申请（申请数据本身在融云
-// SDK 侧，客户端有自己的能力）。sendRequest 仍列在 501 里只为保持四个 action
-// 一致，发起申请请走 add + optType=1。
+// add 会把客户端传的 optType 透传下去（缺省仍 2，保持既有客户端的直加行为），但
+// 目标是 AI 节点时**任何 optType 都拦成 403**：optType=2 会绕过拥有者直接建边，
+// optType=1 则会把申请投给节点账号本身（审批人应该是拥有者，没人会去批那条）。
+// 节点只能走 sendRequest（见 handleFriendAdd）。
+//
+// 「申请-审批」这一个环节需要自建表：融云服务端能**发出**申请，却没有「读申请
+// 列表 / 同意 / 拒绝」的对等接口，所以「谁在申请哪台设备、拥有者批没批」只能
+// 自己存（migrations/603_im_friend_request，读写在 friend_request.go）。
+// 这不是重新发明好友关系：审批通过后建的是**融云好友边**，表里只留审批过程的
+// 状态。同一个 §6.2 的结论也是这么写的：「若要『申请-同意』，必须新建表」。
+//
+// 四个审批 action 的分工：
+//
+//	sendRequest    → 已是好友直接回 alreadyFriend（不落行、不投递）；否则落一条待审批
+//	                 申请 + 向拥有者投递融云申请（optType=1）
+//	getRequests    → 列出「我作为审批人」的待审批（**只读表，不做任何自动批准**；
+//	                 拥有者在融云侧私下同意不足以作为审批凭据，理由见 friend_request.go 文件头）
+//	approveRequest → 复核拥有者 → 建 拥有者↔请求方 + 请求方↔节点 双向边 → 再复核一次
+//	                 拥有者（中途换人就撤边并置拒绝）→ 置为已通过；回包里 status/approved
+//	                 一律取库里的行，不按调用方意图覆盖；若并发下输给别人先拒绝，
+//	                 补撤刚建的节点边（否则被拒的申请照样拿到了节点）
+//	rejectRequest  → 置为已拒绝，并 best-effort 回收可能已建出的「请求方↔节点」双向边
+//	                 （approve 中途失败会留下单向边）；这对关系若已有过通过的申请
+//	                 则不撤（重复申请被拒不能连带删掉已生效的关系）
+//
+// 只有节点类好友申请走这四个 action；普通用户之间的好友申请用 add + optType=1。
 //
 // 红线 #6（claw_admin_groups.go:263-265、node_service.go:1588-1603）：机器主节点
 // 会被打成默认 ai_type，按 (machine_id, ai_type) 反查会命中它；好友/设备列表
@@ -40,11 +60,6 @@ import (
 
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
-
-// friendUnsupportedMessage 是「好友申请」类 action 的固定文案。客户端会把
-// message 直接弹给用户（search-user/index.vue），所以必须说清「缺的到底是
-// 什么」：add 已经能发真申请（optType=1），真正没有的是**申请列表与审批**。
-const friendUnsupportedMessage = "好友申请暂不支持：融云服务端未提供申请列表/审批接口，发起申请请用 friend/add 带 optType=1，读取与审批请用客户端融云 SDK 的好友申请能力"
 
 // FriendStore is the local projection the friend service needs on top of the
 // RongCloud friend edges. Sole callback today: inverting the edges to answer
@@ -74,9 +89,14 @@ func (h *systemHandler) handleFriendCommand(ctx context.Context, msg NormalizedM
 		return h.handleFriendDelete(ctx, msg, cmd)
 	case "getDeviceOwner":
 		return h.handleFriendDeviceOwner(ctx, msg, cmd)
-	case "sendRequest", "getRequests", "approveRequest", "rejectRequest":
-		// 已注册但融云侧无对应能力：用 501 明确拒绝，绝不回空列表伪装成功。
-		return h.replyErr(ctx, msg, cmd, 501, friendUnsupportedMessage)
+	case "sendRequest":
+		return h.handleFriendSendRequest(ctx, msg, cmd)
+	case "getRequests":
+		return h.handleFriendGetRequests(ctx, msg, cmd)
+	case "approveRequest":
+		return h.handleFriendApproveRequest(ctx, msg, cmd)
+	case "rejectRequest":
+		return h.handleFriendRejectRequest(ctx, msg, cmd)
 	default:
 		return h.replyErr(ctx, msg, cmd, 404, unknownServiceOrActionMessage(cmd))
 	}
@@ -136,21 +156,29 @@ func (h *systemHandler) handleFriendCheckRelation(ctx context.Context, msg Norma
 			break
 		}
 	}
-	// isPending 的真相只存在于融云 SDK 侧：服务端 API 能「发申请」
-	// （/friend/add.json optType=1），却没有「读申请状态」的接口，所以这里
-	// 查不出来。为了不骗客户端，回包里显式标 isPendingKnown=false：
-	//   - isFriend=true  → isPending 必为 false 且是可信的（好友边已建）；
-	//   - isFriend=false → isPending=false 只表示「好友边没建」，
-	//     **不代表没有待处理申请**，客户端要判申请态必须用 SDK 的
-	//     getFriendApplications / FRIEND_APPLICATION_STATUS_CHANGED。
-	// 保留 isPending 键是为了兼容既有客户端（search-user/index.vue 用
-	// `res.data?.isPending === true` 读，缺键也不会崩，但少一个字段更容易
-	// 被误判成后端回退）。
+	// 申请状态现在有本地真相（im_friend_request，见 friend_request.go）：节点类
+	// 申请的 pending 由我们自己答，不再只能说「不知道」。
+	//
+	// 这里**只读表，不做对账**：早先的实现在这里顺手补建「拥有者已在融云侧同意」
+	// 的节点边，但那个判据（双方当前是融云好友）可以被请求方单方面造出来
+	// （friend/add optType=2 由客户端决定），等于请求方调一次 checkRelation 就能
+	// 让服务端替他把节点边建好。审批权必须只留在 approveRequest。
+	pending := false
+	pendingKnown := isFriend
+	if !isFriend && h.friendRequests != nil {
+		if _, found, err := h.friendRequests.FindPending(ctx, userID, friendID); err == nil && found {
+			pending = true
+			pendingKnown = true
+		}
+	}
+	// isPendingKnown=false 仍保留原来的语义：这是普通用户之间的申请（只有融云
+	// SDK 侧知道），或好友申请能力未装配（无 DB）。客户端遇到 false 时仍应回退
+	// 到 SDK 的 getFriendApplications。
 	return h.replyOK(ctx, msg, cmd, map[string]interface{}{
 		"friendId":       friendID,
 		"isFriend":       isFriend,
-		"isPending":      false,
-		"isPendingKnown": isFriend,
+		"isPending":      pending,
+		"isPendingKnown": pendingKnown,
 	})
 }
 
@@ -177,6 +205,28 @@ func (h *systemHandler) handleFriendAdd(ctx context.Context, msg NormalizedMessa
 	}
 	if optType != friendOptTypeDirect && optType != friendOptTypeRequest {
 		return h.replyErr(ctx, msg, cmd, 400, `optType must be "1" (request) or "2" (direct add)`)
+	}
+	// AI 节点不能经由 friend/add 建好友关系，**任何 optType 都拦**：
+	//   - optType=2 是直加，等于任何人知道节点 id 就能把自己挂到节点上，拥有者
+	//     完全不知情 —— 审批链路（friend/sendRequest）被直接绕过；
+	//   - optType=1 虽然当期不建边，但会把申请投给**节点账号**本身。审批人应该是
+	//     拥有者，节点自己不会批，这条申请只会变成没人能处理的僵尸申请。
+	// 判定按「行是否存在于 rongcloud_node」做，隐藏节点（机器主节点 / ops）更该拦。
+	//
+	// 这条门禁不影响既有流程：全仓没有调用方用 friend/add 加节点
+	// （clawmessenger-uniapp 的 friendService.add 在 src/ 里零调用方），普通用户之间
+	// 仍走 add + optType=1（缺省仍 2 直加）。代价是本检查依赖 DB —— direct 与 request
+	// 两条路径都会受 DB 可用性影响，所以查询报错必须 fail-closed（见下）。
+	isNode, nodeErr := h.isAgentNode(ctx, friendID)
+	if nodeErr != nil {
+		// 门禁的判定依据读不到时必须 fail-closed：放行等于「制造一次 DB 抖动就
+		// 能绕过审批」。但也不能回 403 —— 那说的是「你没权限」，会让用户以为
+		// 功能不存在；服务不可用就是 503。
+		h.logger.Error("rongcloud: friend add node lookup", "error", nodeErr, "rongcloud_id", friendID)
+		return h.replyErr(ctx, msg, cmd, 503, "friend service is unavailable")
+	}
+	if isNode {
+		return h.replyErr(ctx, msg, cmd, 403, "use friend/sendRequest: 加 AI 节点为好友必须由节点拥有者审批")
 	}
 	// 客户端的 message 用作融云的备注名（remark）。
 	remark := strings.TrimSpace(getStringAny(cmd.Params, "message", "remark"))
@@ -286,6 +336,35 @@ func (h *systemHandler) friendRecord(ctx context.Context, friend friendEntry) ma
 		"name":        nickname,
 		"portraitUri": DefaultPortraitIfEmpty(portrait),
 	}
+}
+
+// isAgentNode reports whether rcID 对应一台 AI 节点。
+//
+// 只按「行是否存在于 rongcloud_node」判定，不套 isHiddenNode 之类的可见性过滤 ——
+// 调用方要的是「任何节点行都拦」，隐藏节点（机器主节点 / ops）更该拦。
+// GetRongCloudNodeByRongCloudUserID 的 WHERE 也只有 rongcloud_user_id，所以隐藏
+// 节点同样会被查出来。
+//
+// 返回 (是否节点, 查询错误)：ErrNoRows 与「DB 未装配」（单测场景）都算「不是节点」
+// 放行，与 ensureVisibleAgentNode 的既有约定一致；其余查询错误交给调用方回 503
+// （fail-closed，别让 DB 抖动变成绕过审批的后门）。
+//
+// agentNodeLookup 非 nil 时直接用它（测试接缝，见 system_handler.go 该字段的注释）：
+// 「目标确实是节点 → 403」这条正例必须在没有数据库的 CI 里也能跑。
+func (h *systemHandler) isAgentNode(ctx context.Context, rcID string) (bool, error) {
+	if h.agentNodeLookup != nil {
+		return h.agentNodeLookup(ctx, rcID)
+	}
+	if h.queries == nil || strings.TrimSpace(rcID) == "" {
+		return false, nil
+	}
+	if _, err := h.queries.GetRongCloudNodeByRongCloudUserID(ctx, rcID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // isHiddenFriendNode reports whether a friend id is one of the internal nodes
