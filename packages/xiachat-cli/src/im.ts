@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { ARGV_PROMPT_MAX_CHARS } from "./agents.js";
 import { collectProducedArtifacts, snapshotWorkdir, type ProducedArtifact, type WorkdirSnapshot } from "./artifacts.js";
 import type { ActivityStep } from "./agent-activity.js";
+import type { AnsweredTurn, AnsweredTurnStore } from "./answered-turns.js";
 import { decodeCommandContent, encodeCommandResult } from "./protocol.js";
 import { buildChatStreamFrame, encodeChatStreamWireFrames, parseChatStopRequest, type ChatStreamStatus, type ChatStreamTimelineEntry } from "./chat-stream.js";
 import { buildHtmlCard, extractHtmlFence, htmlReviseFromFilePrompt, htmlRevisePrompt } from "./cards.js";
@@ -170,6 +171,10 @@ export interface DispatcherDeps {
   // 把采集到的文件送上服务端，返回可被 web 引用的地址。省略、抛错或返回
   // undefined 都只意味着「这个文件没上去」，绝不影响正常回合。
   uploadArtifact?: (artifact: ProducedArtifact) => Promise<UploadedArtifact | undefined>;
+  // 已答轮次台账（见 answered-turns.ts）。服务端按 request_id 重派时，命中
+  // 台账就只补帧、不再跑一遍 agent —— 融云重连重放的是**新消息**（新
+  // messageUId），run.ts 的 UID 去重拦不住它。省略 -> 退化成旧行为（重跑）。
+  answeredTurns?: AnsweredTurnStore;
 }
 
 /** 一个已经落到服务端的产出文件。 */
@@ -294,9 +299,26 @@ const STALE_RUNTIME_RECOVERY_REQUEST_MS = 60_000;
 // 放宽到 900ms，并把失败重试放进 emit —— 帧是全量快照，少发一帧只影响流畅度，
 // 但终帧发不出去前端就会永远停在「正在思考」。
 const STREAM_FRAME_INTERVAL_MS = 900;
+// 正文增量帧的间隔。上面那个 900ms 是给**全量快照**定的：思考流一帧要重发
+// 整段 reasoning（实测 glm-5.2 单轮 4~20k 字），5 帧/秒既会撞融云限频，也会
+// 把消息体放大几十倍。正文不是这样：它只在最后几秒密集生成，且这一档帧**不带**
+// 思考/过程流（见 sendDelta 的 sideChannels），单帧只有正文本身，几百字节。
+// 所以正文可以单独走短窗口 —— 这是「agent 吐什么就实时输出什么」，不是伪流式
+// 回放：帧里是真增量，只是把合并粒度从 900ms 收到 200ms（≈5 帧/秒）。
+const STREAM_TEXT_FRAME_INTERVAL_MS = 200;
+// 终帧补发前的间隔：足够让第一份走完 IM 链路，又不至于让用户多等。
+const TERMINAL_RESEND_GAP_MS = 600;
 // 流式心跳间隔：比服务端轮次超时（默认 60s）短一个量级，服务端每收到一次
 // 心跳就把该轮 deadline 重置成完整超时 —— 只要流还在动就永不超时。
 const STREAM_PING_INTERVAL_MS = 15_000;
+
+/** 一个在飞的流式轮次。见 MessageDispatcher.activeStreams。 */
+interface ActiveStream {
+  controller: AbortController;
+  requestMessageId: string;
+  conversationType: 1 | 3 | 4;
+  conversationId: string;
+}
 
 export class MessageDispatcher {
   // cardId -> latest html for cards this bridge produced, so card_action
@@ -311,9 +333,12 @@ export class MessageDispatcher {
   // Same guard for the admin role-recommendation preview: a replayed request
   // must not spend a whole agent turn again. Bounded: evicts oldest.
   private readonly answeredRoleRecommendRequests = new Set<string>();
-  // streamId -> AbortController for turns in flight, so chat_stop can cancel
-  // the active one. Entries live exactly for the duration of a streamed turn.
-  private readonly activeStreams = new Map<string, AbortController>();
+  // streamId -> 在飞轮次。除了 AbortController，还要记住这一轮挂在哪会话、
+  // 哪个 request_message_id 上：chat_stop 的 stream_id 一旦对不上（帧丢了、
+  // web 从占位气泡取到了别的 id），就得靠后两个字段把它找回来 —— 否则停止
+  // 静默失效，用户看到的就是「点了停止仍在跑」+「新消息被判『上一个任务还在
+  // 执行中』」。条目正好活一轮。
+  private readonly activeStreams = new Map<string, ActiveStream>();
 
   constructor(private readonly deps: DispatcherDeps) {}
 
@@ -382,7 +407,7 @@ export class MessageDispatcher {
     // AbortController），并按协议回 chat_stop_result。
     if (msg.objectName === "chat_stop") {
       const stop = parseChatStopRequest(msg.content);
-      if (stop) await this.handleChatStop(msg, stop.requestId, stop.streamId);
+      if (stop) await this.handleChatStop(msg, stop.requestId, stop.streamId, stop.requestMessageId);
       return;
     }
 
@@ -460,6 +485,15 @@ export class MessageDispatcher {
       const requesterId = typeof params.requester_id === "string" && params.requester_id
         ? params.requester_id
         : msg.fromUserId;
+      // 服务端按 request_id 重派（设备重启/重连后必现）：命中台账就只补帧，
+      // 绝不再跑一遍 agent。重派在融云里是**一条新消息**（新 messageUId），
+      // run.ts 的 UID 去重拦不住它 —— 2026-10-26 现场同一轮 codex 被跑了三次，
+      // 正文三份各不相同（276/326/282 字），web 上就是同一角色说了三遍。
+      const answeredTurn = this.deps.answeredTurns?.get(cmd.request_id);
+      if (answeredTurn) {
+        await this.replayAnsweredTurn(cmd.request_id, answeredTurn, replyTo);
+        return;
+      }
       await this.runStreamedTurn({
         conversationType: convType,
         conversationId: replyTo,
@@ -503,13 +537,73 @@ export class MessageDispatcher {
     }
   }
 
+  /**
+   * 服务端把同一个 request_id 又派了一次：把上一轮已经发出去的东西原样再发
+   * 一遍，**不跑 agent**。
+   *
+   * 为什么两条都要重发：
+   *  - 终帧让 web 端的气泡落定。复用原 stream_id + 原 seq，web 侧
+   *    mergeChatStreamMessage 对「已是终态 + 同 seq」直接返回原列表，不会多一条
+   *    气泡；从没收到过这条消息的新端则能正常渲染出来。
+   *  - command_result 才是服务端推进下一位发言人的依据。只补终帧不补它，整场
+   *    讨论会干等到轮次超时，用户看到的是「卡住」。
+   *
+   * 失败都只记日志：这一轮的内容上一轮已经交付过，补发是幂等修复，不该反过来
+   * 把这轮弄成失败。
+   */
+  private async replayAnsweredTurn(
+    requestId: string,
+    prior: AnsweredTurn,
+    replyTo: string,
+  ): Promise<void> {
+    const sendStream = this.deps.sendStream;
+    if (sendStream) {
+      const serialized = buildChatStreamFrame({
+        streamId: prior.streamId,
+        requestMessageId: requestId,
+        requesterId: prior.requesterId,
+        nodeId: this.deps.nodeId || this.deps.selfUserId || "",
+        conversationType: prior.conversationType,
+        conversationId: prior.conversationId,
+        seq: prior.seq,
+        status: "completed",
+        text: prior.text,
+      });
+      const payload = JSON.parse(serialized) as Record<string, unknown>;
+      for (const wire of encodeChatStreamWireFrames(payload)) {
+        await sendStream(prior.conversationType, prior.conversationId, wire.objectName, wire.content)
+          .catch((err: unknown) => {
+            console.error(
+              "answered turn replay frame failed:",
+              err instanceof Error ? err.message : err,
+            );
+          });
+      }
+    }
+    await this.deps
+      .send(replyTo, "command", encodeCommandResult(requestId, "text", { content: prior.text }))
+      .catch((err: unknown) => {
+        console.error(
+          "answered turn replay result failed:",
+          err instanceof Error ? err.message : err,
+        );
+      });
+    console.log(
+      `im in: replaying answered turn req=${requestId}`
+      + ` (answered ${Math.round((Date.now() - prior.at) / 1000)}s ago,`
+      + ` text=${prior.text.length}) — agent not re-run`,
+    );
+  }
+
   // runStreamedTurn 是所有会话形态共用的流式回合执行器：
   //  1. 先发 status=processing 的 0 号帧（web 立刻出现打字气泡）；
   //  2. runTurnStreamed 可用时逐 chunk 发 status=streaming 全量快照帧；
   //  3. 结束发 completed 终帧；异常发 failed 帧；被停止发 cancelled 帧；
   //  4. 终帧之后仍回调 fallback（command_result / 卡片），保持中继推进与
   //     旧消费方兼容——旧 web 不解析 chat_stream 也照常工作。
-  // 帧节流：融云自定义消息限频，帧间隔至少 STREAM_FRAME_INTERVAL_MS；
+  // 帧节流：融云自定义消息限频，**带思考/过程流的帧**间隔至少
+  // STREAM_FRAME_INTERVAL_MS（900ms，全量快照太重）；只有正文的增量帧走
+  // STREAM_TEXT_FRAME_INTERVAL_MS（200ms），见 sendDelta 里的 textOnly 分支；
   // 帧超限时由 encodeChatStreamWireFrames 自动切 wire 分块。
   private async runStreamedTurn(opts: {
     conversationType: 1 | 3 | 4;
@@ -621,7 +715,12 @@ export class MessageDispatcher {
       : undefined;
     // Active-stream registry keyed by streamId for chat_stop cancellation.
     const controller = new AbortController();
-    this.activeStreams.set(ctx.streamId, controller);
+    this.activeStreams.set(ctx.streamId, {
+      controller,
+      requestMessageId: ctx.requestMessageId,
+      conversationType: ctx.conversationType,
+      conversationId: ctx.conversationId,
+    });
     // 过程流的补偿帧定时器：声明在 try 之外，finally 才能把它撤掉（见文件末尾）。
     let pendingActivityFlush: ReturnType<typeof setTimeout> | null = null;
     // 流式心跳定时器：同理，finally 撤。
@@ -726,11 +825,22 @@ export class MessageDispatcher {
       let lastSent = 0;
       // 节流窗口内到达的过程流更新需要一次补偿帧：长工具阶段正文久久不来，
       // 若完全等下一个 chunk，用户就看不到「正在联网搜索」这一步。
-      const emitStreamingFrame = async () => {
+      // sideChannels=false 只发正文：高频正文帧（200ms）省掉每帧重发的思考
+      // 快照与时间线。web 端 merge 对这三个字段是 `incoming.X ?? current.X`
+      // （chat-stream.ts:253-255），缺字段等于「保留已上屏的那份」，不会清空。
+      const emitStreamingFrame = async (sideChannels = true) => {
         const frameSeq = seq;
         seq += 1;
         lastSent = Date.now();
-        await emit(frameSeq, "streaming", snapshot, reasoningSnapshot || undefined, undefined, activitySnapshot, timeline);
+        await emit(
+          frameSeq,
+          "streaming",
+          snapshot,
+          sideChannels ? reasoningSnapshot || undefined : undefined,
+          undefined,
+          sideChannels ? activitySnapshot : undefined,
+          sideChannels ? timeline : undefined,
+        );
       };
       const sendDelta = async (delta: string, reasoningDelta?: string, activity?: ActivityStep[]) => {
         if (controller.signal.aborted) return;
@@ -752,17 +862,21 @@ export class MessageDispatcher {
           activitySnapshot = activity;
         }
         const now = Date.now();
+        // 只有「纯正文增量」才走短窗口，并且这一帧不带思考/过程流（见上）。
+        // 带思考或带步骤的帧仍是全量快照，维持 900ms —— 降它会把消息体放大几十倍。
+        const textOnly = delta.length > 0 && !reasoningDelta && !activity;
+        const interval = textOnly ? STREAM_TEXT_FRAME_INTERVAL_MS : STREAM_FRAME_INTERVAL_MS;
         // 节流：距上一帧不足间隔时只攒不动，由下个 chunk 或终帧冲刷。
-        if (now - lastSent < STREAM_FRAME_INTERVAL_MS) {
+        if (now - lastSent < interval) {
           if (activity && pendingActivityFlush === null) {
             pendingActivityFlush = setTimeout(() => {
               pendingActivityFlush = null;
-              void emitStreamingFrame();
-            }, STREAM_FRAME_INTERVAL_MS - (now - lastSent));
+              void emitStreamingFrame(true);
+            }, interval - (now - lastSent));
           }
           return;
         }
-        await emitStreamingFrame();
+        await emitStreamingFrame(!textOnly);
       };
       let finalText = "";
       // 自动补跑：「撞在失败的工具上就没下文」（agent_incomplete + failedStep）
@@ -884,7 +998,30 @@ export class MessageDispatcher {
         }
       }
       await emit(seq, "completed", visibleText, reasoningSnapshot || undefined, undefined, activitySnapshot, timeline);
+      // 终帧补发一次（同 seq、同内容）。它是唯一让气泡收尾的帧：一旦没落地，
+      // 前端就一直转圈（还在显示「停止生成」），随后这条兜底整包文本会被
+      // 当成第二条回复追加 —— 界面上就是两条一模一样的回答（2026-10-26 现场，
+      // 一条终帧实测被切成 16 块，任何一块丢失都会重演）。
+      //
+      // 重复终帧在两端都是幂等的：web 端 mergeChatStreamMessage 对「已是终态 +
+      // 同 seq」直接返回原列表；分块路径按 messageId(=wire_sha) 命中 completed
+      // 缓存，判为 replay 后丢弃。所以这里只花一次冗余流量，换「至少送达一次」。
+      if (!controller.signal.aborted) {
+        await new Promise<void>((resolve) => setTimeout(resolve, TERMINAL_RESEND_GAP_MS));
+        await emit(seq, "completed", visibleText, reasoningSnapshot || undefined, undefined, activitySnapshot, timeline);
+      }
       await opts.fallback(visibleText);
+      // 记账只认**成功收尾**的轮次（终帧与 command_result 都已发出）。中止、
+      // 超时、失败的轮次不记账 —— 那种情况服务端重派是合理的，应该真跑一遍。
+      this.deps.answeredTurns?.remember(ctx.requestMessageId, {
+        at: Date.now(),
+        streamId: ctx.streamId,
+        seq,
+        text: visibleText,
+        requesterId: ctx.requesterId,
+        conversationType: ctx.conversationType,
+        conversationId: ctx.conversationId,
+      });
       await this.sendArtifactMessages(ctx, uploaded);
     } catch (err) {
       // 失败必须留痕 + 发终帧。原来这条路径只有 finally：异常冒泡出去，
@@ -1031,15 +1168,68 @@ export class MessageDispatcher {
   }
 
   // chat_stop 处理：取消活动流并回执。
-  private async handleChatStop(msg: InboundIMMessage, requestId: string, streamId: string): Promise<void> {
-    const controller = this.activeStreams.get(streamId);
-    if (!controller) {
+  //
+  // 三级定位（精确 → 轮次 → 会话）：
+  //  1. stream_id 精确命中：正常路径，web 回传的就是我们发出去的那个 id。
+  //  2. request_message_id 命中：帧上那个 id 与本地 key 对不上（web 拿到的是
+  //     占位气泡、或帧在途丢了），但轮次是同一轮。
+  //  3. 同会话唯一在飞轮次：私聊/群聊每会话并发恒为 1（queueDepth 1），所以
+  //     「这个会话里只有一轮在跑」是确定的事实，不是猜测。
+  // 三级都不中才 reject —— 并且在 reject 之前把「注册了几条」打进日志，
+  // 否则又是「点了停止没反应，日志里也看不出为什么」。
+  private async handleChatStop(
+    msg: InboundIMMessage,
+    requestId: string,
+    streamId: string,
+    requestMessageId: string,
+  ): Promise<void> {
+    const found = this.locateActiveStream(msg, streamId, requestMessageId);
+    if (!found) {
+      console.log(
+        `chat_stop: rejected no_active_task stream=${streamId}`
+        + ` request_message_id=${requestMessageId || "-"}`
+        + ` active=${this.activeStreams.size}`,
+      );
       await this.sendStopResult(msg, requestId, streamId, "rejected", "no_active_task");
       return;
     }
-    controller.abort();
-    this.activeStreams.delete(streamId);
+    const { streamKey, stream, matchedBy } = found;
+    const wasAborted = stream.controller.signal.aborted;
+    stream.controller.abort();
+    this.activeStreams.delete(streamKey);
+    console.log(
+      `chat_stop: accepted stream=${streamKey} match=${matchedBy}`
+      + ` req=${stream.requestMessageId} requester_aborted=${wasAborted}`,
+    );
     await this.sendStopResult(msg, requestId, streamId, "accepted", "stop_requested");
+  }
+
+  /** 见 handleChatStop 的三级定位。返回命中的 key 与「靠哪一级命中」。 */
+  private locateActiveStream(
+    msg: InboundIMMessage,
+    streamId: string,
+    requestMessageId: string,
+  ): { streamKey: string; stream: ActiveStream; matchedBy: "stream" | "request" | "conversation" } | undefined {
+    const exact = this.activeStreams.get(streamId);
+    if (exact) return { streamKey: streamId, stream: exact, matchedBy: "stream" };
+    if (requestMessageId) {
+      for (const [key, stream] of this.activeStreams) {
+        if (stream.requestMessageId === requestMessageId) {
+          return { streamKey: key, stream, matchedBy: "request" };
+        }
+      }
+    }
+    // 停止请求是从请求者那一侧发来的；私聊轮的 conversationId 就是请求者，
+    // 群/聊天室轮则是房间 id（web 不会替别人的房间点停止，这里仍要求同发送者）。
+    const sameConversation = [...this.activeStreams].filter(([, stream]) => (
+      stream.conversationType === msg.conversationType
+      && stream.conversationId === msg.fromUserId
+    ));
+    if (sameConversation.length === 1) {
+      const [key, stream] = sameConversation[0]!;
+      return { streamKey: key, stream, matchedBy: "conversation" };
+    }
+    return undefined;
   }
 
   private async sendStopResult(

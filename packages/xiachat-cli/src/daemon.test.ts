@@ -394,6 +394,45 @@ describe("daemon status", () => {
     expect(formatDaemonStatus(report, h.paths)).toContain("supervisor has not reported yet");
   });
 
+  // 回归：2026-10-26 照 status 的「not running」跑 stop，杀掉了一个在线 17 小时的节点。
+  // 成因是 status 走 `readPidFile() ?? state?.pid`（只认第一个候选），而 stop 走
+  // findLiveSupervisor（两个候选都试）。pid 文件残留死 pid、状态文件里才是活进程时，
+  // 两个命令对同一条事实给出相反答案：一个说没在跑，一个真杀掉。
+  it("agrees with stop when the pid file and the state file disagree", async () => {
+    const h = harness();
+    state(h.paths, 888, ["opencode"]); // 状态文件：真正活着的 supervisor
+    writeFileSync(h.paths.pidFile, "4242\n"); // pid 文件：上一次留下的死 pid
+    h.alive.add(888);
+
+    const report = h.daemon.status();
+    expect(report.running).toBe(true);
+    expect(report.pid).toBe(888);
+    expect(report.agents).toEqual(["opencode"]);
+    expect(report.note).toContain("pid file says 4242");
+    expect(formatDaemonStatus(report, h.paths)).toContain("note   : pid file says 4242");
+
+    // 同一个场景下 stop 会杀的就是 status 刚报的那个 pid —— 这是本条断言的意义。
+    await h.daemon.stop();
+    expect(h.signals).toEqual([{ pid: 888, signal: "SIGTERM" }]);
+  });
+
+  it("prefers the pid file when that is the live one (state file is the stale side)", () => {
+    const h = harness();
+    state(h.paths, 4242, ["stale-agent"]);
+    // 反过来的分叉：pid 文件里是活的，状态文件还停在上一次启动的 pid 上。
+    mkdirSync(h.paths.stateDir, { recursive: true });
+    writeFileSync(h.paths.stateFile, `${JSON.stringify({ pid: 999, startedAt: 1, agents: ["ghost"] })}\n`);
+    writeFileSync(h.paths.pidFile, "4242\n");
+    h.alive.add(4242);
+
+    const report = h.daemon.status();
+    expect(report.running).toBe(true);
+    expect(report.pid).toBe(4242);
+    // 详情只跟随与 pid 匹配的那份状态文件，不会把别的进程的 agent 列表串上来。
+    expect(report.agents).toEqual([]);
+    expect(report.note).toContain("pid file says 4242, state file says 999");
+  });
+
   it("surfaces the configured autostart entry", () => {
     const h = harness();
     mkdirSync(join(h.home, ".config", "systemd", "user"), { recursive: true });

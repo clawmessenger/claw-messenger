@@ -433,7 +433,7 @@ export function parseCodebuddyProviderConfig(text: string): AgentConfig {
 // 注释，真实的 `.jsonc` 就带 `//`，所以先剥注释再交给 JSON.parse。剥注释时
 // **必须跳过字符串字面量内部**：`"baseURL": "https://…"` 里的 `//` 一旦被当成
 // 行注释，整个 baseURL 连同后面半份配置都会被吞掉（provider 全都消失）。
-function stripJsonComments(text: string): string {
+export function stripJsonComments(text: string): string {
   let out = "";
   let inString = false;
   let quote = "";
@@ -601,9 +601,59 @@ function configPaths(agentName: string, home: string, env: NodeJS.ProcessEnv): s
 }
 
 /**
- * Reads the agent's own config. `null` means "no readable config", which is
- * not an error — it just means we fall back to the agent's CLI output.
+ * 找出 opencode 实际会读的那份配置文件（第一个存在的候选）。
+ *
+ * 只给「派生设备端精简配置」用 —— 原文件必须原样不动：里面可能有用户自己
+ * 维护的 plugin / MCP，删掉会改变他交互使用 opencode 的体验。
  */
+export function discoverOpencodeConfigPath(opts: DiscoverOpts = {}): string | null {
+  const home = opts.home ?? homedir();
+  const env = opts.env ?? process.env;
+  const readFile = opts.readFile ?? defaultReadFile;
+  for (const path of configPaths("opencode", home, env)) {
+    try {
+      readFile(path);
+      return path;
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+/**
+ * 从用户的 opencode 配置派生出「设备端专用」精简版：只去掉 `plugin` 与 `mcp`。
+ *
+ * 为什么要这么做（2026-10-26 实测）：那两段里的 `superpowers@git+https://…`
+ * 插件与 `uvx --from git+https://…` 的 MCP，会让 `opencode run` 在
+ * `message=init` 上卡七十秒以上、零输出 —— 设备端每轮都要重新付这笔启动
+ * 开销，用户看到的就是「先想很久」。provider / model / instructions /
+ * permission 全部保留，所以模型与人格不变。
+ *
+ * 返回 null 表示这份配置读不懂（带 BOM、非对象、JSON 破损）——调用方这时
+ * 应该什么都不做，让 opencode 用原配置，别把它弄成「配置没了」。
+ */
+export function buildDeviceOpencodeConfig(rawText: string): { text: string; dropped: string[] } | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stripJsonComments(rawText.replace(/^\uFEFF/, "")));
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+  const source = parsed as Record<string, unknown>;
+  const out: Record<string, unknown> = { ...source };
+  const dropped: string[] = [];
+  for (const key of ["plugin", "mcp"]) {
+    if (key in out) {
+      delete out[key];
+      dropped.push(key);
+    }
+  }
+  return { text: JSON.stringify(out, null, 2), dropped };
+}
+
+
 export function readAgentConfig(
   agentName: string | undefined,
   opts: DiscoverOpts = {},

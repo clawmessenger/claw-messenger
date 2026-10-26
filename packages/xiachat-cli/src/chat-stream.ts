@@ -66,6 +66,18 @@ export interface ChatStreamFrameInput {
 export interface ChatStreamStopRequestParsed {
   requestId: string;
   streamId: string;
+  /**
+   * 被停止那一轮的 request_message_id（web 从收到的那条帧上抄下来的）。
+   *
+   * 为什么要它：设备端 activeStreams 的 key 是**本地生成**的
+   * `stream-<requestMessageId>-<rand6>`。web 回传的 stream_id 正常情况下与它
+   * 一致，但这条链路一旦对不上（帧丢了、web 拿到的是占位气泡、或换了 stream
+   * 版本），停止就会掉进 `no_active_task` —— 用户眼里「点了停止，任务还在跑，
+   * 两分钟后发新消息还被判『上一个任务还在执行中』」。app 端这段代码没有日志，
+   * 2026-10-26 现场只能靠「日志里从来没有 agent turn aborted」反推。
+   * 带上轮次 id 后，设备端可以退一步按轮次、再退一步按会话定位到那一轮。
+   */
+  requestMessageId: string;
 }
 
 export function buildChatStreamFrame(input: ChatStreamFrameInput): string {
@@ -83,10 +95,40 @@ export function buildChatStreamFrame(input: ChatStreamFrameInput): string {
     text: input.text,
   };
   if (input.reasoning) payload.reasoning = input.reasoning;
-  if (input.activity && input.activity.length > 0) payload.activity = input.activity;
+  if (input.activity && input.activity.length > 0) payload.activity = compactActivityForFrame(input.activity);
   if (input.timeline && input.timeline.length > 0) payload.timeline = input.timeline;
   if (input.errorCode) payload.error_code = input.errorCode;
   return JSON.stringify(payload);
+}
+
+/**
+ * 流帧里单步「完整输入/输出」的字符上限。
+ *
+ * agent-activity 保留的原文可以到 2000/1500 字（展开详情要能看懂），但那是
+ * **一帧之内 × 每步 × 每帧重发**：13 个工具步骤的终帧实测序列化 **90 KB**，
+ * 被 wire 切成 **16 块**，也就是一条终帧要连发 16 条融云消息。任一块没落地
+ * （限频、重连把 ingress generation 顶掉、客户端重组过期），前端就永远收不到
+ * 终帧 —— 表现是气泡一直转圈（还在显示「停止生成」），紧接着兜底整包文本被
+ * 当成第二条回复追加，界面上就是两条一模一样的回答（2026-10-26 现场）。
+ *
+ * 每步 160 字仍足够看清「跑的什么命令、输出了什么」，而终帧降到 3~4 块。
+ */
+const FRAME_STEP_DETAIL_MAX_CHARS = 160;
+
+function clipFrameDetail(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  return value.length <= FRAME_STEP_DETAIL_MAX_CHARS
+    ? value
+    : `${value.slice(0, FRAME_STEP_DETAIL_MAX_CHARS - 1)}…`;
+}
+
+/** 帧内步骤详情瘦身（只影响发出去的那一份，agent-activity 侧不动）。 */
+function compactActivityForFrame(steps: readonly ActivityStep[]): ActivityStep[] {
+  return steps.map((step) => ({
+    ...step,
+    ...(step.inputDetail ? { inputDetail: clipFrameDetail(step.inputDetail) } : {}),
+    ...(step.outputDetail ? { outputDetail: clipFrameDetail(step.outputDetail) } : {}),
+  }));
 }
 
 // --- wire 分块编码（与 web 端 ChatStreamWireReassembler 对齐）------------
@@ -144,5 +186,7 @@ export function parseChatStopRequest(raw: string): ChatStreamStopRequestParsed |
   const c = parsed as Record<string, unknown>;
   if (c.msg_type !== "chat_stop" || typeof c.stream_id !== "string") return null;
   const requestId = typeof c.request_id === "string" ? c.request_id : "";
-  return { requestId, streamId: c.stream_id };
+  // 老 web 不发这个字段：缺省成空串，停止仍按 stream_id 精确匹配那条老路走。
+  const requestMessageId = typeof c.request_message_id === "string" ? c.request_message_id : "";
+  return { requestId, streamId: c.stream_id, requestMessageId };
 }

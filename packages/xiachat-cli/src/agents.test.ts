@@ -1,5 +1,10 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
+
+// 本文件有用例真跑 runAgentTurn，codex 分支会「确保 $CODEX_HOME/AGENTS.md 含
+// 输出风格段」。不重定向的话，跑一次测试就写进了执行者自己的 ~/.codex/AGENTS.md
+// （2026-10-26 实测踩到：探针文件里凭空多出正式段落）。
+process.env.CODEX_HOME = mkdtempSync(join(tmpdir(), "cm-codex-home-"));
 import {
   agentRuntimeEnv,
   buildAgentArgs,
@@ -24,6 +29,11 @@ import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { classifyTurnError } from "./turn-error.js";
+
+// 本文件测的是 run --format json 那条路径的解析（part 去重、缓冲截断、半句判据）。
+// opencode 默认已改走 serve + SSE（真增量），这里统一关掉，让假脚本能按 run 的
+// 输出喂进来；serve 那条路自己的用例在 opencode-server.test.ts。
+process.env.CLAWMESSENGER_OPENCODE_SERVER = "0";
 
 interface FailureAgentFixture {
   agentPath: string;
@@ -850,6 +860,34 @@ describe("runAgentTurn", () => {
       });
       expect(out).toContain("没装 arkcli");
     } finally {
+      fixture.cleanup();
+    }
+  });
+
+  // serve 是新路径：旧版 opencode 没有 serve 子命令，起来就退。这时必须无声
+  // 退回 run --format json —— 流式改造不能让一轮直接失败。
+  it("serve 起不来时自动回退到 run，正文照样拿到", async () => {
+    const prevServer = process.env.CLAWMESSENGER_OPENCODE_SERVER;
+    const prevFull = process.env.CLAWMESSENGER_OPENCODE_FULL_CONFIG;
+    delete process.env.CLAWMESSENGER_OPENCODE_SERVER;
+    // 别在测试里派生设备端配置（那会动 ~/.clawmessenger）。
+    process.env.CLAWMESSENGER_OPENCODE_FULL_CONFIG = "1";
+    const answer = JSON.stringify({ type: "text", part: { id: "p1", type: "text", text: "老版本也能答" } });
+    const fixture = createEchoAgentScript("opencode", { stdoutText: `${answer}\n` });
+    try {
+      const out = await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "opencode",
+        prompt: "p",
+        timeoutMs: 30_000,
+        onReasoningChunk: () => {},
+      });
+      expect(out).toBe("老版本也能答");
+    } finally {
+      if (prevServer === undefined) delete process.env.CLAWMESSENGER_OPENCODE_SERVER;
+      else process.env.CLAWMESSENGER_OPENCODE_SERVER = prevServer;
+      if (prevFull === undefined) delete process.env.CLAWMESSENGER_OPENCODE_FULL_CONFIG;
+      else process.env.CLAWMESSENGER_OPENCODE_FULL_CONFIG = prevFull;
       fixture.cleanup();
     }
   });

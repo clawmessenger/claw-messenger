@@ -6,6 +6,7 @@ import { MessageDispatcher, planReadReceipt } from "./im.js";
 import { runAgentTurn, runAgentCommand } from "./agents.js";
 import { buildChatStreamFrame } from "./chat-stream.js";
 import { createModelCatalogLoader, parseModelCatalogRequest } from "./model-catalog.js";
+import { createAnsweredTurnStore } from "./answered-turns.js";
 import {
   createRuntimeProber,
   createSerialGate,
@@ -317,6 +318,11 @@ export interface StartRunLoopOpts extends ConnectTransportOpts {
   // Where to persist the processed-message markers (see
   // createInboundReplayDedupe). Omitted -> in-memory only.
   processedUidsPath?: string;
+  // 已答轮次台账落盘位置（见 answered-turns.ts）。这两份去重互补：
+  // processed-uids 按融云 messageUId 拦「同一条消息被重放」，answered-turns
+  // 按服务端 request_id 拦「同一轮被重新派发」—— 后者在融云里是新消息，前者
+  // 拦不住。省略 -> 纯内存，重启后回到「重跑一遍」的旧行为。
+  answeredTurnsPath?: string;
   // 按用户的模型偏好落盘位置（见 user-models.ts）。省略 -> 用默认位置
   // （~/.clawmessenger/user-models-<nodeId>.json）。
   userModelsPath?: string;
@@ -387,8 +393,18 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
     opts.userModelsPath ?? defaultUserModelsPath(opts.transport.getSelfUserId?.()),
   );
 
+  // 已答轮次台账：在 dispatcher 构造之前就要有，deps 直接引用它。
+  const answeredTurns = createAnsweredTurnStore({ path: opts.answeredTurnsPath });
+  if (opts.answeredTurnsPath) {
+    // 与 processed-uids 同理：写入是防抖的，正常停机不能丢掉最后一批 ——
+    // 丢掉的那批正好是「停机前最后答完的几轮」，也正是重启后最容易被重派的。
+    process.once("exit", () => answeredTurns.flush());
+    process.once("SIGINT", () => answeredTurns.flush());
+    process.once("SIGTERM", () => answeredTurns.flush());
+  }
   const dispatcher = new MessageDispatcher({
     send: (toUserId, objectName, content) => opts.transport.sendMessage(toUserId, objectName, content),
+    answeredTurns,
     loadModelCatalog: () => catalogLoader.load(),
     userModels,
     probeRuntime,

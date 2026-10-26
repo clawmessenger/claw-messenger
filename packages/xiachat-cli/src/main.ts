@@ -13,7 +13,7 @@ import {
   type MachineAgentCredential,
 } from "./api.js";
 import { discoverAgents } from "./agents.js";
-import { DEFAULT_SERVER_URL, machineId, defaultProcessedUidsPath, defaultUpgradeInflightPath } from "./config.js";
+import { DEFAULT_SERVER_URL, machineId, defaultAnsweredTurnsPath, defaultProcessedUidsPath, defaultUpgradeInflightPath } from "./config.js";
 import { agentNameFromRcUser, ensureOpencodeInstalled, OPS_AGENT_NAME, OPS_TURN_TIMEOUT_MS, setupOpsWorkdir } from "./ops.js";
 import {
   ALLOW_DUPLICATE_SUPERVISOR_ENV,
@@ -1094,6 +1094,7 @@ export function buildProgram(opts: BuildProgramOpts): Command {
           turnTimeoutMs,
           cwd,
           processedUidsPath: defaultProcessedUidsPath(creds.nodeId),
+          answeredTurnsPath: defaultAnsweredTurnsPath(creds.nodeId),
           ensureRuntime,
         });
       } finally {

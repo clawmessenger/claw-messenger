@@ -2,10 +2,11 @@
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ARGV_PROMPT_MAX_CHARS } from "./agents.js";
 import type { ActivityStep } from "./agent-activity.js";
 import { MessageDispatcher, planReadReceipt, resolveTurnVenue, turnNeedsHeartbeat, turnSessionKey } from "./im.js";
+import { createAnsweredTurnStore } from "./answered-turns.js";
 import { TurnIncompleteError } from "./turn-error.js";
 import { MemoryUserModelStore } from "./user-models.js";
 
@@ -1031,6 +1032,124 @@ describe("MessageDispatcher discussion recommend_roles", () => {
   });
 });
 
+// ---- 服务端重派同一 request_id：只补帧，不再跑一遍 agent ----
+//
+// 2026-10-26 现场：讨论组里同一轮 `req=74f0de2a-…` 被 codex 跑了三次（正文
+// 276 / 326 / 282 字各不相同），三次分别落在三次设备重启之后。原因是服务端
+// 重派在融云里是一条**新消息**（新 messageUId），run.ts 的 UID 去重拦不住。
+
+describe("MessageDispatcher 已答轮次台账（重派不重跑）", () => {
+  interface SentItem { to: string; type: string; content: string }
+
+  function buildDeps() {
+    const sent: SentItem[] = []
+    const streams: Array<{ conversationType: number; conversationId: string; content: string }> = []
+    const answeredTurns = createAnsweredTurnStore()
+    const deps = {
+      sent,
+      streams,
+      answeredTurns,
+      send: async (to: string, type: string, content: string) => { sent.push({ to, type, content }) },
+      sendStream: async (
+        conversationType: 1 | 3 | 4,
+        conversationId: string,
+        _objectName: string,
+        content: string,
+      ) => { streams.push({ conversationType, conversationId, content }) },
+      selfUserId: "node_self",
+      nodeId: "node_self",
+    }
+    return { deps, sent, streams, answeredTurns }
+  }
+
+  const yourTurn = (requestId: string) => ({
+    objectName: "command",
+    fromUserId: "host_node",
+    toUserId: "rc_node_x",
+    targetId: "rc_node_x",
+    conversationType: 1 as const,
+    content: JSON.stringify({
+      request_id: requestId,
+      service: "discussion",
+      action: "your_turn",
+      params: { round: 1, speaking_order: 1, role_name: "reviewer", chatroom_id: "rt_1" },
+    }),
+  })
+
+  it("重派时 agent 只跑一次，补发的终帧复用原 stream_id 与 seq", async () => {
+    const { deps, streams, sent } = buildDeps()
+    const dispatcher = new MessageDispatcher(deps)
+    let runs = 0
+    const turns = {
+      runTurn: async () => { throw new Error("should use streamed variant") },
+      runTurnStreamed: async () => { runs += 1; return "圆桌唯一答案" },
+    }
+
+    await dispatcher.handle(yourTurn("rt-turn-uuid-1"), turns)
+    expect(runs).toBe(1)
+    const firstCompleted = JSON.parse(streams.at(-1)!.content) as Record<string, unknown>
+    expect(firstCompleted.status).toBe("completed")
+    const streamsBefore = streams.length
+    const sentBefore = sent.length
+
+    // 设备重连：服务端把同一个 request_id 又派了一次。
+    await dispatcher.handle(yourTurn("rt-turn-uuid-1"), turns)
+
+    expect(runs).toBe(1)
+    expect(streams.length).toBe(streamsBefore + 1)
+    const replayed = JSON.parse(streams.at(-1)!.content) as Record<string, unknown>
+    // 复用原 stream_id + 原 seq：web 端 mergeChatStreamMessage 对「已是终态 +
+    // 同 seq」直接返回原列表，不会多出一条气泡；换新 id 就会多一条。
+    expect(replayed.stream_id).toBe(firstCompleted.stream_id)
+    expect(replayed.seq).toBe(firstCompleted.seq)
+    expect(replayed.text).toBe("圆桌唯一答案")
+    expect(replayed.status).toBe("completed")
+
+    // command_result 必须一起补：服务端靠它推进下一位，缺了整场讨论干等超时。
+    expect(sent.length).toBe(sentBefore + 1)
+    const result = JSON.parse(sent.at(-1)!.content) as Record<string, unknown>
+    expect(result.request_id).toBe("rt-turn-uuid-1")
+    expect((result.payload as Record<string, unknown>).content).toBe("圆桌唯一答案")
+  })
+
+  it("失败的轮次不记账：服务端重派时应该真跑一遍", async () => {
+    const { deps } = buildDeps()
+    const dispatcher = new MessageDispatcher(deps)
+    let runs = 0
+    const failing = {
+      runTurn: async () => { throw new Error("should use streamed variant") },
+      runTurnStreamed: async () => { runs += 1; throw new Error("model 429") },
+    }
+    await dispatcher.handle(yourTurn("rt-turn-fail"), failing)
+    expect(runs).toBe(1)
+    expect(deps.answeredTurns.get("rt-turn-fail")).toBeUndefined()
+
+    // 重派时上一轮没成功 ⇒ 必须重跑，否则这一轮永远没有答案。
+    const ok = {
+      runTurn: async () => { throw new Error("should use streamed variant") },
+      runTurnStreamed: async () => { runs += 1; return "第二次成功" },
+    }
+    await dispatcher.handle(yourTurn("rt-turn-fail"), ok)
+    expect(runs).toBe(2)
+    expect(deps.answeredTurns.get("rt-turn-fail")?.text).toBe("第二次成功")
+  })
+
+  it("没配台账时保持旧行为（重派就重跑），老部署不至于卡住", async () => {
+    const sent: SentItem[] = []
+    const dispatcher = new MessageDispatcher({
+      send: async (to: string, type: string, content: string) => { sent.push({ to, type, content }) },
+      selfUserId: "node_self",
+    })
+    let runs = 0
+    // 没有 sendStream 时走降级路径（runTurn），同样要把「没配台账」这件事
+    // 说清楚：去重是增强，不是前置条件。
+    const turns = { runTurn: async () => { runs += 1; return "答案" } }
+    await dispatcher.handle(yourTurn("rt-no-store"), turns)
+    await dispatcher.handle(yourTurn("rt-no-store"), turns)
+    expect(runs).toBe(2)
+  })
+});
+
 // ---- chat_stream 流式输出（所有会话形态共用 runStreamedTurn）----
 
 describe("MessageDispatcher chat_stream streaming", () => {
@@ -1230,6 +1349,84 @@ describe("MessageDispatcher chat_stream streaming", () => {
     // 取消后不再发 completed 终帧
     const frames = streams.map((s) => parseFrame(s.content))
     expect(frames.at(-1)!.status).toBe("cancelled")
+  })
+
+  // 2026-10-26 现场：点「停止生成」后气泡显示「已停止」，但那轮其实还在跑
+  // （两分钟后发新消息还被判「上一个任务还在执行中」），全日志里**一次
+  // `agent turn aborted` 都没有**。根因是 activeStreams 只按本地生成的
+  // streamId 精确匹配，一旦对不上就静默 reject —— 而 reject 分支原来连日志
+  // 都不打。下面两条锁住后两级兜底。
+  function hangingTurn() {
+    let rejectTurn!: (e: Error) => void
+    const turns = {
+      runTurn: async () => { throw new Error("unused") },
+      runTurnStreamed: async (
+        _p: string,
+        _m: string | undefined,
+        onDelta: (d: string) => void,
+        signal?: AbortSignal,
+      ) => {
+        onDelta("部分内容")
+        return new Promise<string>((_resolve, reject) => {
+          signal?.addEventListener("abort", () => reject(new Error("agent turn aborted")), { once: true })
+          rejectTurn = reject
+        })
+      },
+    }
+    return { turns, abort: (e: Error) => rejectTurn(e) }
+  }
+
+  it("chat_stop 的 stream_id 对不上时按 request_message_id 兜底命中，真的中止", async () => {
+    const { deps, sent } = buildDeps()
+    const dispatcher = new MessageDispatcher(deps)
+    const { turns, abort } = hangingTurn()
+    const handleDone = dispatcher.handle({
+      objectName: "RC:TxtMsg", fromUserId: "user_a", toUserId: "", targetId: "node_self",
+      conversationType: 1, messageUId: "U-STOP-REQUEST", content: JSON.stringify({ content: "hi" }),
+    }, turns)
+    await new Promise((r) => setTimeout(r, 30))
+
+    await dispatcher.handle({
+      objectName: "chat_stop", fromUserId: "user_a", toUserId: "", targetId: "node_self",
+      conversationType: 1,
+      content: JSON.stringify({
+        msg_type: "chat_stop", protocol_version: 1, request_id: "stop-x",
+        stream_id: "stream-does-not-match", request_message_id: "U-STOP-REQUEST",
+        node_id: "node_self", conversation_type: 1, conversation_id: "user_a",
+      }),
+    }, { runTurn: async () => "" })
+
+    const result = JSON.parse(sent.find((s) => s.type === "chat_stop_result")!.content) as Record<string, unknown>
+    expect(result.status).toBe("accepted")
+    abort(new Error("agent turn aborted"))
+    // handle 真的返回 = 队列槽位释放；不返回的话下一条消息会一直被丢成 busy。
+    await handleDone
+  })
+
+  it("两个 id 都对不上、但同会话只有一轮在飞时按会话兜底，不让停止静默失效", async () => {
+    const { deps, sent } = buildDeps()
+    const dispatcher = new MessageDispatcher(deps)
+    const { turns, abort } = hangingTurn()
+    const handleDone = dispatcher.handle({
+      objectName: "RC:TxtMsg", fromUserId: "user_a", toUserId: "", targetId: "node_self",
+      conversationType: 1, content: JSON.stringify({ content: "hi" }),
+    }, turns)
+    await new Promise((r) => setTimeout(r, 30))
+
+    await dispatcher.handle({
+      objectName: "chat_stop", fromUserId: "user_a", toUserId: "", targetId: "node_self",
+      conversationType: 1,
+      content: JSON.stringify({
+        msg_type: "chat_stop", protocol_version: 1, request_id: "stop-y",
+        stream_id: "stream-unknown",
+        node_id: "node_self", conversation_type: 1, conversation_id: "user_a",
+      }),
+    }, { runTurn: async () => "" })
+
+    const result = JSON.parse(sent.find((s) => s.type === "chat_stop_result")!.content) as Record<string, unknown>
+    expect(result.status).toBe("accepted")
+    abort(new Error("agent turn aborted"))
+    await handleDone
   })
 
   it("chat_stop for an unknown stream is rejected with no_active_task", async () => {
@@ -1983,4 +2180,135 @@ describe("MessageDispatcher /use-model", () => {
     const result = JSON.parse(deps.sent.at(-1)!.content);
     expect(result.payload.content).toContain("out(quukk/sonnet-4)");
   });
+});
+
+// ---- 帧节流：正文走短窗口（200ms），思考/过程流维持 900ms ----
+//
+// 背景（2026-10-26 现场）：opencode 改走 serve+SSE 后 agent 已经是 token 级增量
+// （实测 272 帧/2 秒），但设备端仍用统一 900ms 节流，正文 2 秒只发出 2~3 帧，
+// 观感依旧是「一下全出来」。这里把「只带正文的增量」和「带思考/过程流的全量
+// 快照」分开：前者 200ms 且不重发思考快照，后者维持 900ms。
+describe("chat_stream 帧节流", () => {
+  interface Frame { status: string; seq: number; text?: string; reasoning?: string; activity?: unknown; timeline?: unknown }
+
+  /** 用受控时钟（Date.now）驱动，不依赖真实等待，避免用例跑满几秒。 */
+  async function collectFrames(
+    script: Array<{ text?: string; reasoning?: string }>,
+    stepMs: number,
+  ): Promise<Frame[]> {
+    const raw: string[] = []
+    const dispatcher = new MessageDispatcher({
+      send: async () => {},
+      sendStream: async (_t: 1 | 3 | 4, _c: string, _o: string, content: string) => { raw.push(content) },
+      selfUserId: "node_self",
+    })
+    let clock = Date.parse("2026-10-26T00:00:00Z")
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => clock)
+    try {
+      await dispatcher.handle({
+        objectName: "RC:TxtMsg", fromUserId: "user_a", toUserId: "", targetId: "node_self",
+        conversationType: 1, content: JSON.stringify({ content: "hi" }),
+      }, {
+        runTurn: async () => { throw new Error("should use streamed variant") },
+        runTurnStreamed: async (
+          _p: string,
+          _m: string | undefined,
+          onDelta: (text: string, reasoning?: string) => unknown,
+        ) => {
+          let text = ""
+          for (const step of script) {
+            clock += stepMs
+            if (step.text) {
+              text += step.text
+              // 同时给两个参数 = 与 run 路径一致（正文与思考在同一次回调里到达）
+              await onDelta(step.text, step.reasoning)
+            } else if (step.reasoning) {
+              await onDelta("", step.reasoning)
+            }
+          }
+          return text
+        },
+      })
+    } finally {
+      nowSpy.mockRestore()
+    }
+    return raw.map((c) => JSON.parse(c) as Frame)
+  }
+
+  const textScript = (n: number) => Array.from({ length: n }, () => ({ text: "字" }))
+  const reasonScript = (n: number) => Array.from({ length: n }, () => ({ reasoning: "想" }))
+
+  it("纯正文增量按 200ms 发帧：2 秒内的帧数远多于 900ms 口径", async () => {
+    // 40 × 50ms = 2000ms
+    const frames = await collectFrames(textScript(40), 50)
+    const streaming = frames.filter((f) => f.status === "streaming")
+    // 200ms 窗口 → 约 10 帧；旧 900ms 口径最多 3 帧
+    expect(streaming.length).toBeGreaterThanOrEqual(8)
+    // 正文逐帧增长，且每帧都是上一帧的延续（客户端按 seq 覆盖，倒退会掉字）
+    for (let i = 1; i < streaming.length; i += 1) {
+      expect(streaming[i]!.text!.startsWith(streaming[i - 1]!.text!)).toBe(true)
+      expect(streaming[i]!.text!.length).toBeGreaterThan(streaming[i - 1]!.text!.length)
+    }
+  })
+
+  it("纯正文帧不带思考/过程流（web 端 ?? 保留上一份，不会清空面板）", async () => {
+    const frames = await collectFrames(textScript(40), 50)
+    const streaming = frames.filter((f) => f.status === "streaming")
+    for (const f of streaming) {
+      expect(f.reasoning).toBeUndefined()
+      expect(f.activity).toBeUndefined()
+      expect(f.timeline).toBeUndefined()
+    }
+    // 终帧仍然是完整快照，思考与过程流不会因为中途省略而丢失
+    const completed = frames.at(-1)!
+    expect(completed.status).toBe("completed")
+    expect(completed.text).toBe("字".repeat(40))
+  })
+
+  it("思考增量仍按 900ms 节流，且每帧都带 reasoning 快照", async () => {
+    // 同样 40 个 delta / 2000ms，思考口径下只应发 2~4 帧
+    const frames = await collectFrames(reasonScript(40), 50)
+    const streaming = frames.filter((f) => f.status === "streaming")
+    expect(streaming.length).toBeLessThanOrEqual(4)
+    expect(streaming.length).toBeGreaterThanOrEqual(1)
+    for (const f of streaming) expect(f.reasoning).toBe("想".repeat(40).slice(0, f.reasoning!.length))
+    // 节流期间攒下的思考由终帧补齐，不会丢
+    expect(frames.at(-1)!.status).toBe("completed")
+    expect(frames.at(-1)!.reasoning).toBe("想".repeat(40))
+  })
+
+  it("正文与思考同一次回调到达时走长窗口（全量快照太重，不能高频重发）", async () => {
+    const mixed = Array.from({ length: 40 }, () => ({ text: "字", reasoning: "想" }))
+    const frames = await collectFrames(mixed, 50)
+    const streaming = frames.filter((f) => f.status === "streaming")
+    expect(streaming.length).toBeLessThanOrEqual(4)
+    for (const f of streaming) expect(f.reasoning).toBeTruthy()
+  })
+});
+
+// ---- 终帧补发：终帧丢了气泡就永远转圈，兜底文本会变成第二条回复 ----
+describe("chat_stream 终帧补发", () => {
+  it("completed 帧连发两次（同 seq 同内容），前端按幂等丢弃重复项", async () => {
+    const raw: string[] = []
+    const dispatcher = new MessageDispatcher({
+      send: async () => {},
+      sendStream: async (_t: 1 | 3 | 4, _c: string, _o: string, content: string) => { raw.push(content) },
+      selfUserId: "node_self",
+    })
+    await dispatcher.handle({
+      objectName: "RC:TxtMsg", fromUserId: "user_a", toUserId: "", targetId: "node_self",
+      conversationType: 1, content: JSON.stringify({ content: "hi" }),
+    }, {
+      runTurn: async () => { throw new Error("should use streamed variant") },
+      runTurnStreamed: async (_p: string, _m: string | undefined, onDelta: (d: string) => void) => {
+        onDelta("你好")
+        return "你好"
+      },
+    })
+    const completed = raw.map((c) => JSON.parse(c)).filter((f) => f.status === "completed")
+    expect(completed).toHaveLength(2)
+    expect(completed[0].seq).toBe(completed[1].seq)
+    expect(completed[0].text).toBe(completed[1].text)
+    expect(completed[0].stream_id).toBe(completed[1].stream_id)
+  })
 });

@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { access, constants } from "node:fs/promises";
+import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 
@@ -9,7 +10,18 @@ import {
   classifyTool,
   createActivityTracker,
 } from "./agent-activity.js";
-import { readAgentConfig, type AgentConfig } from "./model-providers.js";
+import { ensureCodexOutputStyle } from "./agent-instructions.js";
+import {
+  buildDeviceOpencodeConfig,
+  discoverOpencodeConfigPath,
+  readAgentConfig,
+  type AgentConfig,
+} from "./model-providers.js";
+import {
+  isServeStartupFailure,
+  parseServeListeningUrl,
+  runServerSession,
+} from "./opencode-server.js";
 import { TurnIncompleteError } from "./turn-error.js";
 
 // Mirrors knownAgentCLIs in server/internal/integrations/rongcloud/
@@ -59,6 +71,9 @@ export interface RunAgentTurnOpts {
   // 所问。支持显式会话键的 agent（当前只有 openclaw 的 --session-key）按
   // 「会话形态 + 会话 id」分桶；不支持的 agent 忽略此参数。
   sessionKey?: string;
+  // 内部用：serve 模式起不来时退回 run --format json，递归进来时置 true，
+  // 避免二次分流。外部调用方不该传。
+  disableServerMode?: boolean;
 }
 
 // Agents known to reject or hang on stdin-mode invocation get an argv
@@ -865,6 +880,181 @@ export function extractStreamJsonFinalText(raw: string): string | undefined {
   return joined.length > 0 ? joined : undefined;
 }
 
+// --- opencode 服务端模式（真流式）----------------------------------------
+//
+// `opencode run --format json` 只在 part 完成时上报**整段全文**：实测一轮 800
+// 字长文只有 4 行事件（step_start / reasoning / text / step_finish），正文与思考
+// 各出现一次。设备端因此只能发 1 帧正文，客户端看到的就是「憋两分钟 → 全文
+// 一次性蹦出」。
+//
+// `opencode serve` 的 SSE 才是真增量：`message.part.delta` 一条一个 token 片段
+// （同一 prompt 实测 12,620 条、平均 1.7 字/片、持续 101 秒）。所以 opencode 默认
+// 走 serve，run 退化为「旧版本兜底」。
+//
+//   CLAWMESSENGER_OPENCODE_SERVER=0        关掉，回到 run --format json
+//   CLAWMESSENGER_OPENCODE_FULL_CONFIG=1   不派生精简配置（保留 plugin / MCP）
+const SERVE_STARTUP_TIMEOUT_MS = 25_000;
+
+export function opencodeServerEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = (env.CLAWMESSENGER_OPENCODE_SERVER ?? "").trim();
+  if (!raw) return true;
+  return !/^(0|false|no|off)$/i.test(raw);
+}
+
+function envFlag(raw: string | undefined): boolean {
+  return /^(1|true|yes|on)$/i.test((raw ?? "").trim());
+}
+
+/**
+ * serve 进程的环境：**派生一份设备端专用 opencode 配置**，去掉 plugin 与 mcp。
+ *
+ * 为什么（2026-10-26 实测）：用户配置里的 `superpowers@git+https://…` 插件与两个
+ * `uvx --from git+https://…` 的 MCP 会让 opencode 在 `message=init` 上卡七十秒
+ * 以上、零输出；设备端每轮都要重新付这笔开销，表现就是「先想很久」。provider /
+ * model / instructions / permission 全部保留，模型与人格不变。
+ *
+ * 用户显式指定过 OPENCODE_CONFIG（或 CLAWMESSENGER_OPENCODE_CONFIG）时不动 ——
+ * 那说明他自己管这份配置。
+ */
+function opencodeServeEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  if (!envFlag(env.CLAWMESSENGER_OPENCODE_FULL_CONFIG)
+    && !env.OPENCODE_CONFIG
+    && !env.CLAWMESSENGER_OPENCODE_CONFIG) {
+    const config = ensureDeviceOpencodeConfig(env);
+    if (config) env.OPENCODE_CONFIG = config;
+  }
+  // serve 只绑 127.0.0.1、端口随机；带着密码只会让本地请求全部 401。
+  delete env.OPENCODE_SERVER_PASSWORD;
+  return env;
+}
+
+function ensureDeviceOpencodeConfig(env: NodeJS.ProcessEnv): string | null {
+  let source: string | null = null;
+  try {
+    source = discoverOpencodeConfigPath({ env });
+  } catch {
+    return null;
+  }
+  if (!source) return null;
+  let raw: string;
+  try {
+    raw = readFileSync(source, "utf8");
+  } catch {
+    return null;
+  }
+  const built = buildDeviceOpencodeConfig(raw);
+  if (!built) return null;
+  const target = join(homedir(), ".clawmessenger", "opencode-device.json");
+  try {
+    const existing = existsSync(target) ? readFileSync(target, "utf8") : null;
+    // 内容没变就不重写：既省 IO，也避免每轮都触发 opencode 重新加载配置。
+    if (existing === built.text) return target;
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, built.text, "utf8");
+  } catch {
+    return null;
+  }
+  return target;
+}
+
+/** 起 `opencode serve` 并等它把监听地址打到 stdout，然后跑完一轮。 */
+async function runOpenCodeServerTurn(
+  opts: RunAgentTurnOpts,
+  timeoutMs: number,
+  hardLimit: number,
+): Promise<string> {
+  const { file, args } = buildSpawnInvocation(opts.execPath, [
+    "serve",
+    // 端口 0 = 让内核挑空闲端口，多台设备/多个 agent 不会撞。
+    "--port", "0",
+    "--hostname", "127.0.0.1",
+  ]);
+  const child = spawn(file, args, {
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+    cwd: opts.cwd,
+    env: opencodeServeEnv(),
+  });
+
+  let stderr = "";
+  child.stderr.on("data", (buf: Buffer) => {
+    stderr = (stderr + buf.toString("utf8")).slice(-2000);
+  });
+
+  const baseUrl = await new Promise<string>((resolve, reject) => {
+    let tail = "";
+    let done = false;
+    const finish = (fn: () => void) => {
+      if (done) return;
+      done = true;
+      clearTimeout(startTimer);
+      opts.signal?.removeEventListener("abort", onAbort);
+      fn();
+    };
+    const onAbort = () => finish(() => reject(new Error("agent turn aborted")));
+    opts.signal?.addEventListener("abort", onAbort, { once: true });
+    const startTimer = setTimeout(() => {
+      finish(() => reject(new Error(
+        `opencode serve did not report its listening URL within ${SERVE_STARTUP_TIMEOUT_MS}ms: ${stderr.slice(-400)}`,
+      )));
+    }, SERVE_STARTUP_TIMEOUT_MS);
+    child.stdout.on("data", (buf: Buffer) => {
+      tail += buf.toString("utf8");
+      const url = parseServeListeningUrl(tail);
+      if (url) {
+        finish(() => resolve(url));
+        return;
+      }
+      // 启动期会打若干行日志；只留尾部，别让长跑把内存吃满。
+      if (tail.length > 4000) tail = tail.slice(-2000);
+    });
+    child.on("error", (err) => finish(() => reject(err)));
+    child.on("exit", (code) => {
+      finish(() => reject(new Error(`opencode serve exited with code ${code}: ${stderr.slice(-400)}`)));
+    });
+  });
+
+  try {
+    const result = await runServerSession({
+      baseUrl,
+      prompt: opts.prompt,
+      model: opts.model,
+      timeoutMs,
+      signal: opts.signal,
+      onText: opts.onChunk,
+      onReasoning: opts.onReasoningChunk,
+      onActivity: opts.onActivity,
+      // 字符上限按字节上限的一半估：中文 UTF-8 三字节，留余量不误杀长回答。
+      maxTextChars: Math.max(1, Math.floor(hardLimit / 2)),
+    });
+    if (!result.sawDelta) {
+      // serve 起来了但没有增量事件：多半是旧版 opencode。内容不丢，只是不流。
+      console.warn(
+        `opencode serve 未上报 message.part.delta（正文 ${result.text.length} 字）——`
+        + " 该版本可能不支持增量事件，本轮按整段返回。",
+      );
+    }
+    if (result.endedOnFailedTool && result.failedStep) {
+      const step = result.failedStep;
+      const failedCmd = (step.detail ?? "").replace(/\s+/g, " ").trim().slice(0, 120);
+      const failedOut = (step.outputDetail ?? "").replace(/\s+/g, " ").trim().slice(0, 160);
+      throw new TurnIncompleteError(
+        "agent_incomplete",
+        result.text,
+        `turn ended on a failed ${step.label} with no follow-up text`
+          + (failedCmd ? ` [cmd: ${failedCmd}]` : "")
+          + (failedOut ? ` [output: ${failedOut}]` : ""),
+        { label: step.label, command: failedCmd || undefined, output: failedOut || undefined },
+      );
+    }
+    return result.text;
+  } finally {
+    // serve 是本轮专用进程，收尾必须整棵杀掉：留着就是下一个孤儿端口。
+    killProcessTree(child);
+  }
+}
+
 export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const hardLimit = opts.hardOutputBytes ?? HARD_OUTPUT_BYTES;
@@ -873,6 +1063,32 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
   const bufferLimit = opts.maxOutputBytes ?? (streamJsonTurn
     ? STREAM_JSON_MAX_OUTPUT_BYTES
     : emitsJsonEnvelope(opts.agentName) ? ENVELOPE_MAX_OUTPUT_BYTES : DEFAULT_MAX_OUTPUT_BYTES);
+
+  if (opts.signal?.aborted) return Promise.reject(new Error("agent turn aborted"));
+
+  // codex 会把执行过程写进正文（2026-10-26 现场：「我先核对每段字数…这里没有
+  // 安装 Python，我改用 PowerShell 直接按字符计数」就是正文第一段）。这类内容
+  // 属于思考。约束落在**指令层**（$CODEX_HOME/AGENTS.md）而不是 prompt：私聊的
+  // prompt 就是用户原话，往里塞一句会污染输入，而且 agent 可能复述它。
+  // 幂等且失败静默 —— 写不了指令文件不该让这一轮答不出来。
+  if (opts.agentName === "codex") ensureCodexOutputStyle();
+
+  // opencode：默认走 serve + SSE（真 token 级增量）。只有 argv 策略成立时
+  // 才走这条路 —— 超长 prompt 会退回 stdin 模式，那条路沿用 run 的老实现。
+  if (opts.agentName === "opencode" && !opts.disableServerMode && opencodeServerEnabled()) {
+    const strategyArgs = buildAgentArgs(opts.agentName, opts.prompt, opts.model, opts.sessionKey);
+    if (strategyArgs.length > 0) {
+      return runOpenCodeServerTurn(opts, timeoutMs, hardLimit).catch((err: unknown) => {
+        if (!isServeStartupFailure(err)) throw err;
+        // 起不来（旧版 opencode 没有 serve / 端口被占 / 配置坏）就退回 run：
+        // 内容仍然拿得到，只是回到「整段落地」。绝不因为流式改造让一轮失败。
+        console.warn(
+          `opencode serve 不可用，回退到 run --format json：${err instanceof Error ? err.message : String(err)}`,
+        );
+        return runAgentTurn({ ...opts, disableServerMode: true });
+      });
+    }
+  }
 
   return new Promise<string>((resolve, reject) => {
     if (opts.signal?.aborted) {

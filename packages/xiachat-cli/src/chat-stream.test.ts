@@ -160,8 +160,79 @@ describe("stream-json 解析器", () => {
 describe("chat_stop 解析（回归）", () => {
   it("解析停止请求并透传非停止消息", () => {
     expect(parseChatStopRequest(JSON.stringify({ msg_type: "chat_stop", stream_id: "s1", request_id: "r1" })))
-      .toEqual({ requestId: "r1", streamId: "s1" });
+      .toEqual({ requestId: "r1", streamId: "s1", requestMessageId: "" });
     expect(parseChatStopRequest(JSON.stringify({ msg_type: "other" }))).toBeNull();
     expect(parseChatStopRequest("not json")).toBeNull();
+  });
+
+  it("带上 request_message_id 时透传，供设备端按轮次回找", () => {
+    // stream_id 对不上是停止失效的主因（见 handleChatStop 的三级定位）：
+    // 有轮次 id 就能退一步命中，老 web 不带这个字段时缺省空串。
+    expect(parseChatStopRequest(JSON.stringify({
+      msg_type: "chat_stop", stream_id: "s1", request_id: "r1", request_message_id: "D1ER-XYZ",
+    }))).toEqual({ requestId: "r1", streamId: "s1", requestMessageId: "D1ER-XYZ" });
+    expect(parseChatStopRequest(JSON.stringify({
+      msg_type: "chat_stop", stream_id: "s1", request_message_id: 42,
+    }))).toEqual({ requestId: "", streamId: "s1", requestMessageId: "" });
+  });
+});
+
+// ---- 帧内步骤详情瘦身：终帧块数从 16 降到 3~4 ----
+//
+// 2026-10-26 现场：codex 一轮 13 个工具步骤，每步带 inputDetail(≤2000)/outputDetail(≤1500)，
+// 终帧序列化 90 KB → 16 个 wire 块 → 16 条融云消息。任何一块没落地，前端就收不到
+// 终帧（气泡一直转圈），随后兜底整包文本被当成第二条回复 → 界面上两条一样的回答。
+describe("chat_stream 帧内 detail 瘦身", () => {
+  const heavySteps = Array.from({ length: 13 }, (_, i) => ({
+    id: `step_${i}`,
+    kind: "command" as const,
+    label: "执行命令",
+    detail: "d".repeat(120),
+    inputDetail: "i".repeat(2000),
+    outputDetail: "o".repeat(1500),
+    status: "done" as const,
+    startedAt: 1_700_000_000_000,
+    endedAt: 1_700_000_001_000,
+  }));
+
+  it("单步 inputDetail/outputDetail 在帧里被截到 160 字（detail 摘要不动）", () => {
+    const frame = JSON.parse(buildChatStreamFrame({ ...baseFrame, activity: heavySteps }));
+    expect(frame.activity).toHaveLength(13);
+    for (const step of frame.activity) {
+      expect(step.inputDetail.length).toBe(160);
+      expect(step.inputDetail.endsWith("…")).toBe(true);
+      expect(step.outputDetail.length).toBe(160);
+      expect(step.detail).toBe("d".repeat(120));
+      // id/kind/label/status/时间戳原样保留（web 端要按它渲染与算耗时）
+      expect(step.kind).toBe("command");
+      expect(step.startedAt).toBe(1_700_000_000_000);
+    }
+  });
+
+  it("重终帧（13 步 + 6366 字思考）块数从 16 降到个位数", () => {
+    const reasoning = "想".repeat(6366);
+    const frame = buildChatStreamFrame({
+      ...baseFrame,
+      seq: 35,
+      status: "completed",
+      text: "长".repeat(848),
+      reasoning,
+      activity: heavySteps,
+      timeline: [["r", reasoning] as ["r", string], ...heavySteps.map((s) => ["s", s.id] as ["s", string])],
+    });
+    const bytes = Buffer.byteLength(frame, "utf8");
+    const chunks = encodeChatStreamWireFrames(JSON.parse(frame) as Record<string, unknown>);
+    // 未瘦身时实测 90,482 字节 / 16 块；瘦身后 ~49KB / 9 块。
+    // 剩下的体量主要是「思考全文 ×2」（reasoning 与 timeline 各存一份），
+    // 那属于协议结构问题，不在这一刀里动。
+    expect(bytes).toBeLessThan(50_000);
+    expect(chunks.length).toBeLessThanOrEqual(9);
+  });
+
+  it("没有详情字段时不凭空造出 undefined（帧体与原样一致）", () => {
+    const plain = [{ id: "t1", kind: "search" as const, label: "联网搜索", status: "running" as const }];
+    const frame = JSON.parse(buildChatStreamFrame({ ...baseFrame, activity: plain }));
+    expect(frame.activity).toEqual(plain);
+    expect("inputDetail" in frame.activity[0]).toBe(false);
   });
 });

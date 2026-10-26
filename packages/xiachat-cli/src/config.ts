@@ -30,6 +30,17 @@ export function defaultProcessedUidsPath(nodeId?: string): string {
   return join(homedir(), ".clawmessenger", `processed-uids${suffix}.json`);
 }
 
+// 已答轮次台账（见 answered-turns.ts）。processed-uids 按融云 messageUId 去重，
+// 而服务端重派一次 your_turn 在融云里是一条**新消息**（新 UID）—— 两份都要，
+// 缺了这份就会出现「设备一重启，同一轮讨论被重跑一遍」。
+//
+// 同样按节点分文件：supervisor 为每个 agent 起一个子进程，共享一个文件会互相
+// 覆盖。
+export function defaultAnsweredTurnsPath(nodeId?: string): string {
+  const suffix = nodeId ? `-${nodeId.replace(/[^A-Za-z0-9._-]/g, "_")}` : "";
+  return join(homedir(), ".clawmessenger", `answered-turns${suffix}.json`);
+}
+
 // Length of a freshly minted machine id, in decimal digits.
 //
 // The machine id is embedded in every RongCloud user id this device owns:

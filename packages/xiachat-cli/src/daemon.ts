@@ -151,6 +151,8 @@ export interface DaemonStatusReport {
   logs: string[];
   autostart?: string;
   serviceName: string;
+  /** pid 文件与状态文件指向不同进程时的说明（两个来源分叉，见 status()）。 */
+  note?: string;
 }
 
 export interface Daemon {
@@ -572,13 +574,21 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
 
   function status(): DaemonStatusReport {
     const state = readSupervisorState(paths);
-    const pidFromFile = readPidFile();
-    const pid = pidFromFile ?? state?.pid;
-    const alive = pid !== undefined && isAlive(pid);
+    // 与 stop() 共用**同一个**判据 findRunning()（= findLiveSupervisor）：pid 文件与
+    // 状态文件里**先活着的那个**就算在跑。
+    //
+    // 别改回 `readPidFile() ?? state?.pid`。那是 2026-10-26 误停一个在线 17 小时节点的
+    // 直接原因：这个写法只要 pid 文件存在就再不看状态文件，而两者**本来就会分叉** ——
+    // supervisor 每次启动都重写这两个文件，一次崩溃/强杀/换 exe 重启就可能留下
+    // 「pid 文件里是旧 pid、状态文件里才是活进程」。此时 status 因为第一个候选死了就
+    // 报「not running」，用户照着它跑 `stop`，而 stop 用的是 findLiveSupervisor、
+    // 找到活的那个照杀不误。**一个说没在跑、一个真杀掉**，用户没有任何办法看出矛盾。
+    const live = findRunning();
+    const alive = live !== null;
     const report: DaemonStatusReport = {
       platform,
       running: alive,
-      stale: !alive && (pid !== undefined || state !== null),
+      stale: !alive && (stateFilesPresent() || state !== null),
       agents: [],
       logs: [],
       serviceName: DAEMON_SERVICE_NAME,
@@ -588,14 +598,23 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
     const latest = latestLogPath(paths);
     if (latest) report.logs.push(latest);
     if (!alive) return report;
+    const pid = live.pid;
     report.pid = pid;
-    if (state && state.pid === pid) {
-      report.startedAt = state.startedAt;
-      report.uptimeMs = Math.max(0, now() - state.startedAt);
-      report.agents = state.agents;
-      report.execPath = state.execPath;
-      report.cwd = state.cwd;
-      if (state.model) report.model = state.model;
+    const liveState = live.state;
+    if (liveState) {
+      report.startedAt = liveState.startedAt;
+      report.uptimeMs = Math.max(0, now() - liveState.startedAt);
+      report.agents = liveState.agents;
+      report.execPath = liveState.execPath;
+      report.cwd = liveState.cwd;
+      if (liveState.model) report.model = liveState.model;
+    }
+    // 两个来源指向不同进程时必须说出来，否则这个分叉下次还是查不出来。
+    const pidFromFile = readPidFile();
+    if (pidFromFile !== undefined && state !== null && pidFromFile !== state.pid) {
+      report.note =
+        `pid file says ${pidFromFile}, state file says ${state.pid}; ` +
+        `reporting the live one (${pid}). Files will be rewritten on the next restart.`;
     }
     return report;
   }
@@ -989,5 +1008,6 @@ export function formatDaemonStatus(report: DaemonStatusReport, paths: DaemonPath
   const logShown = report.logs[0] ?? report.logs.join(", ");
   lines.push(`logs   : ${logShown || paths.logDir}`);
   lines.push(`autostart: ${report.autostart ?? "not configured (clawmessenger install-service)"}`);
+  if (report.note) lines.push(`note   : ${report.note}`);
   return `${lines.join("\n")}\n`;
 }
