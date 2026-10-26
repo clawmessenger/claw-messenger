@@ -345,12 +345,62 @@ export function createModelCatalogLoader(opts: ModelCatalogLoaderOpts): ModelCat
     const grouped: GroupedProviders = new Map();
     let defaultModel = config?.defaultModel ?? null;
 
-    if (spec) {
+    // 配置文件里**显式声明**的清单先落袋：它离线、瞬时、稳定，不依赖任何一次
+    // 网络往返 —— 后面 `opencode models` 失败或端点 probe 超时都不会把它冲掉。
+    // 这也是 opencode 唯一能在 web 的 8s 窗口内稳定给出目录的路子。
+    // 计的是**真正进了目录**的条数（已过 ROUTE_RE 与容量上限），不是配置里的原始
+    // 条数：一份全是不合法 slug 的配置不该让我们跳过 CLI 却交出空目录。
+    let declaredAdded = 0;
+    for (const [id, slugs] of Object.entries(config?.declaredModels ?? {})) {
+      // 与 groupRoutes / mergeEndpointModels 用同一把尺子：wire 上的 provider id 与
+      // model id 必须能拼成 `provider/model` 路由，否则前端既存不下也回传不了。
+      // 配置是用户手写的，`"my provider": {...}` 这种 key 完全可能，不能裸推进目录。
+      const valid = slugs.filter((slug) => ROUTE_RE.test(`${id}/${slug}`));
+      if (valid.length === 0) continue;
+      const existing = grouped.get(id);
+      if (!existing && grouped.size >= MAX_PROVIDERS) continue;
+      const group = existing ?? { name: id, models: new Map<string, string>() };
+      for (const slug of valid) {
+        if (group.models.size >= MAX_MODELS_PER_PROVIDER) break;
+        if (!group.models.has(slug)) group.models.set(slug, slug);
+      }
+      grouped.set(id, group);
+      declaredAdded += valid.length;
+      opts.logger?.(
+        `model catalog: ${opts.agentName} provider ${id} +${valid.length} model(s) from config`,
+      );
+    }
+
+    // 配置里已经有合法清单时，不再等 CLI 列举：`opencode models` 热启动就要 3–5s、
+    // 未登录/配置异常时能拖满 30s 超时，而 web 只等 8s。配置清单是同步拿到手的，
+    // 让它先出目录是本轮修复的全部意义；为了多列几个内置 provider 而把 8s 窗口
+    // 输掉，是本末倒置。
+    const hasDeclared = declaredAdded > 0;
+    if (spec && hasDeclared) {
+      opts.logger?.(
+        `model catalog: ${opts.agentName} skipping \`${spec.argv.join(" ")}\` — ${declaredAdded} model(s) already declared in config`,
+      );
+    }
+
+    if (spec && !hasDeclared) {
       const label = `${opts.agentName} ${spec.argv.join(" ")}`;
       try {
         const stdout = await opts.runCommand(spec.argv, spec.timeoutMs, spec.maxOutputBytes);
         const fromCli = parseModelCatalogOutput(opts.agentName, stdout);
-        for (const [id, group] of groupsFromCatalog(fromCli)) grouped.set(id, group);
+        // 并集而不是覆盖：同一个 provider 既在配置里声明了清单、CLI 又回报了
+        // 一份时（opencode 两条路都会命中），覆盖会把配置里那份**更完整**的
+        // 清单缩成 CLI 那份子集。
+        for (const [id, group] of groupsFromCatalog(fromCli)) {
+          const existing = grouped.get(id);
+          if (!existing) {
+            grouped.set(id, group);
+            continue;
+          }
+          for (const [modelId, name] of group.models) {
+            if (existing.models.size >= MAX_MODELS_PER_PROVIDER) break;
+            if (!existing.models.has(modelId)) existing.models.set(modelId, name);
+          }
+        }
         if (!defaultModel) defaultModel = fromCli.defaultModel;
         opts.logger?.(`model catalog: ${label} -> ${fromCli.providers.length} provider(s)`);
       } catch (err) {
@@ -358,7 +408,11 @@ export function createModelCatalogLoader(opts: ModelCatalogLoaderOpts): ModelCat
       }
     }
 
-    const endpoints = config?.endpoints ?? [];
+    // 配置里已经写死了模型清单的端点不再 probe：白等最多 8s（正是 web 超时窗口
+    // 的元凶），而且再探一遍也只可能得到同一份清单的子集。
+    const endpoints = (config?.endpoints ?? []).filter(
+      (endpoint) => !config?.declaredModels?.[endpoint.id]?.length,
+    );
     if (endpoints.length > 0) {
       const probed = await Promise.all(
         endpoints.map(async (endpoint) => ({ endpoint, ids: await probe(endpoint) })),

@@ -14,6 +14,7 @@ import {
 } from "./runtime-recovery.js";
 import type { StoredCredentials } from "./keystore.js";
 import type { XiachatApi } from "./api.js";
+import { defaultUserModelsPath, FileUserModelStore } from "./user-models.js";
 
 // Per-conversation FIFO. Same conversation serializes (agent busy -> queue,
 // overflow -> onBusy); different conversations run in parallel. Cross-session
@@ -316,6 +317,9 @@ export interface StartRunLoopOpts extends ConnectTransportOpts {
   // Where to persist the processed-message markers (see
   // createInboundReplayDedupe). Omitted -> in-memory only.
   processedUidsPath?: string;
+  // 按用户的模型偏好落盘位置（见 user-models.ts）。省略 -> 用默认位置
+  // （~/.clawmessenger/user-models-<nodeId>.json）。
+  userModelsPath?: string;
   // Idempotent local repair for action="recover" (main.ts passes
   // ensureOpencodeInstalled for opencode nodes). Omitted -> recover can only
   // diagnose, never install.
@@ -377,9 +381,16 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
       return result;
     });
 
+  // 按用户切模型（`/use-model`）：落在 home 目录，重启不丢。节点 id 参与文件
+  // 名，supervisor 并行起的多个 agent 子进程不会互相覆盖。
+  const userModels = new FileUserModelStore(
+    opts.userModelsPath ?? defaultUserModelsPath(opts.transport.getSelfUserId?.()),
+  );
+
   const dispatcher = new MessageDispatcher({
     send: (toUserId, objectName, content) => opts.transport.sendMessage(toUserId, objectName, content),
     loadModelCatalog: () => catalogLoader.load(),
+    userModels,
     probeRuntime,
     agentName: opts.agentName,
     selfUserId: opts.transport.getSelfUserId?.(),
@@ -423,13 +434,22 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
         ? opts.transport.sendMessageTo(conversationType, conversationId, objectName, content)
         : Promise.reject(new Error("transport lacks sendMessageTo")),
   });
+  // 模型优先级：**这一轮显式指定的** > `--model`（节点默认）。
+  //
+  // `model` 两个来源，都是显式意图：
+  //   · 圆桌轮次的 params.model —— 服务端按角色配置下发的角色级模型
+  //     （discussion_interactive.go 的 params["model"] = role.Model）；
+  //   · 私聊里 per-user 的模型 —— 用户自己 `/use-model` 选的（im.ts）。
+  // 原来写的是 `opts.model ?? model`，即 `clawmessenger run --model X` 会**静默
+  // 压死**上面两者：设备上只要带过 `--model`，服务端给角色配的模型就永远不生效，
+  // 用户在界面里换模型也看不出任何变化。默认值不该打赢显式指定，所以反过来。
   const turns: TurnRunner = {
     runTurn: (prompt, model, sessionKey) =>
       runAgentTurn({
         execPath: opts.agentExecPath,
         agentName: opts.agentName,
         prompt,
-        model: opts.model ?? model,
+        model: model ?? opts.model,
         timeoutMs: opts.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS,
         cwd: opts.cwd,
         sessionKey,
@@ -443,7 +463,7 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
         execPath: opts.agentExecPath,
         agentName: opts.agentName,
         prompt,
-        model: opts.model ?? model,
+        model: model ?? opts.model,
         timeoutMs: opts.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS,
         cwd: opts.cwd,
         onChunk: onDelta,

@@ -36,6 +36,9 @@ export interface AgentConfig {
   endpoints: ProviderEndpoint[];
   // The agent's own configured default, as a `provider/model` route.
   defaultModel: string | null;
+  /** 配置文件里**显式声明**的模型清单（provider id → slugs）。
+   *  有它时不必 probe 端点：省掉 8s 超时窗口，且离线可用。 */
+  declaredModels?: Record<string, string[]>;
 }
 
 export interface DiscoverOpts {
@@ -426,6 +429,118 @@ export function parseCodebuddyProviderConfig(text: string): AgentConfig {
   };
 }
 
+// `~/.config/opencode/opencode.json`（或 `.jsonc`）—— opencode 的配置天生允许
+// 注释，真实的 `.jsonc` 就带 `//`，所以先剥注释再交给 JSON.parse。剥注释时
+// **必须跳过字符串字面量内部**：`"baseURL": "https://…"` 里的 `//` 一旦被当成
+// 行注释，整个 baseURL 连同后面半份配置都会被吞掉（provider 全都消失）。
+function stripJsonComments(text: string): string {
+  let out = "";
+  let inString = false;
+  let quote = "";
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    if (inString) {
+      out += char;
+      if (char === "\\") {
+        // 转义序列整体照抄，`\"` 不能被当成字符串结束。
+        if (i + 1 < text.length) {
+          out += text[i + 1];
+          i += 1;
+        }
+        continue;
+      }
+      if (char === quote) inString = false;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      inString = true;
+      quote = char;
+      out += char;
+      continue;
+    }
+    if (char === "/" && text[i + 1] === "/") {
+      while (i < text.length && text[i] !== "\n") i += 1;
+      // 用换行替换注释，避免把前后两个 token 粘在一起。
+      out += "\n";
+      continue;
+    }
+    if (char === "/" && text[i + 1] === "*") {
+      i += 2;
+      while (i < text.length && !(text[i] === "*" && text[i + 1] === "/")) i += 1;
+      i += 1; // 落在 `/` 上，for 的 i += 1 越过它
+      continue;
+    }
+    out += char;
+  }
+  return out;
+}
+
+// `~/.config/opencode/opencode.json` —— opencode 与上面几个 agent 不同：它把
+// **模型清单本身**写进配置（`provider.<id>.models` 的 key 就是 slug），所以
+// 这里除了端点，还能直接交出 `declaredModels`：离线、瞬时、不赌 8s 窗口。
+//
+//   { "model": "quukk/glm-5.2",            ← 默认路由，本来就是 provider/model
+//     "provider": {
+//       "quukk": { "name": "Quukk AI",
+//                  "options": { "baseURL": "https://…/v1", "apiKey": "sk-…" },
+//                  "models": { "glm-5.2": {…}, "k3": {…} } } } }
+//
+// 注意 key 的大小写：baseURL / apiKey 是驼峰，别写成 baseUrl。
+export function parseOpencodeConfig(text: string): AgentConfig {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    try {
+      parsed = JSON.parse(stripJsonComments(text));
+    } catch {
+      return { endpoints: [], defaultModel: null };
+    }
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return { endpoints: [], defaultModel: null };
+  }
+  const record = parsed as Record<string, unknown>;
+  const endpoints: ProviderEndpoint[] = [];
+  const declaredModels: Record<string, string[]> = {};
+
+  const providers = record.provider;
+  if (typeof providers === "object" && providers !== null && !Array.isArray(providers)) {
+    for (const [rawId, value] of Object.entries(providers as Record<string, unknown>)) {
+      // provider 的 key 就是 id（`provider.<id>.name` 只是展示名）。
+      const id = asString(rawId);
+      if (!id) continue;
+      if (typeof value !== "object" || value === null) continue;
+      const provider = value as Record<string, unknown>;
+      const options = (typeof provider.options === "object" && provider.options !== null
+        ? provider.options
+        : {}) as Record<string, unknown>;
+      const name = asString(provider.name);
+      const baseUrl = asString(options.baseURL ?? options.baseUrl ?? options.base_url);
+      const apiKey = asString(options.apiKey ?? options.api_key);
+      if (baseUrl) {
+        endpoints.push({ id, ...(name ? { name } : {}), baseUrl, ...(apiKey ? { apiKey } : {}) });
+      }
+      const models = provider.models;
+      if (typeof models !== "object" || models === null || Array.isArray(models)) continue;
+      const slugs: string[] = [];
+      for (const rawSlug of Object.keys(models as Record<string, unknown>)) {
+        const slug = asString(rawSlug);
+        if (!slug || slugs.includes(slug)) continue;
+        slugs.push(slug);
+      }
+      if (slugs.length > 0) declaredModels[id] = slugs;
+    }
+  }
+
+  return {
+    endpoints,
+    // 顶层 `model` 本来就是 `provider/model` 路由，原样返回，不要重新拼。
+    defaultModel: asString(record.model),
+    ...(Object.keys(declaredModels).length > 0 ? { declaredModels } : {}),
+  };
+}
+
 // --- per-agent wiring ------------------------------------------------------
 
 const AGENT_CONFIG_PARSERS: Readonly<Record<string, (text: string) => AgentConfig>> = {
@@ -434,6 +549,7 @@ const AGENT_CONFIG_PARSERS: Readonly<Record<string, (text: string) => AgentConfi
   hermes: parseHermesConfig,
   qwen: parseQwenConfig,
   codebuddy: parseCodebuddyProviderConfig,
+  opencode: parseOpencodeConfig,
 };
 
 function configPaths(agentName: string, home: string, env: NodeJS.ProcessEnv): string[] {
@@ -465,6 +581,20 @@ function configPaths(agentName: string, home: string, env: NodeJS.ProcessEnv): s
       candidates.push(env.CLAWMESSENGER_CODEBUDDY_PROVIDER);
     }
     candidates.push(join(home, ".codebuddy", "clawmessenger-provider.json"));
+    return candidates;
+  }
+  if (agentName === "opencode") {
+    // opencode 自己按 XDG 找配置；Windows 上 XDG_CONFIG_HOME 通常缺失，所以
+    // 无条件再补一条 ~/.config（opencode 自身也是这么回落的）。
+    const candidates: string[] = [];
+    if (env.CLAWMESSENGER_OPENCODE_CONFIG) candidates.push(env.CLAWMESSENGER_OPENCODE_CONFIG);
+    const xdg = env.XDG_CONFIG_HOME;
+    if (xdg) {
+      candidates.push(join(xdg, "opencode", "opencode.json"));
+      candidates.push(join(xdg, "opencode", "opencode.jsonc"));
+    }
+    candidates.push(join(home, ".config", "opencode", "opencode.json"));
+    candidates.push(join(home, ".config", "opencode", "opencode.jsonc"));
     return candidates;
   }
   return [];

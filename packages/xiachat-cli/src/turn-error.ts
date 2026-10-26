@@ -70,6 +70,16 @@ const AUTH_PATTERNS: readonly RegExp[] = [
   /authentication(?:_error| failed| error)/i,
   /no such model/i,
   /model not found/i,
+  // 「需要登录 / 未登录」：kimi 的 `Tip: send /login to use Kimi for Code`、
+  // Claude Code 的 `Please run /login` / `Invalid API key · Please run /login`。
+  // 归到已有的 model_auth_failed：web 已发布文案（「去设备端换 key」），不需要
+  // 改前端，也不必新增枚举值（新增码会让线上旧前端丢文案）。
+  /\/login\b/i,
+  /login required/i,
+  /not logged in/i,
+  /please (?:run |re-?)?login/i,
+  /authentication required/i,
+  /请先登录|未登录|需要登录/,
 ];
 
 // 只认**我们自己**的超时措辞（agents.ts 的 `agent turn timeout after Nms`）。

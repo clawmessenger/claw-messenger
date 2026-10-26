@@ -87,6 +87,13 @@ export function splitModelRoute(route: string): { provider: string; model: strin
   return match ? { provider: match[1], model: match[2] } : null;
 }
 
+// `agentArgvStrategies` 在本文件里定义于 buildModelArgs **之后**。它是 const，
+// 直接写 `agentArgvStrategies[name]` 在可读性上像 TDZ 陷阱（实际调用发生在模块
+// 初始化完成后，是安全的），所以统一经这个惰性函数判断：谁在前谁在后都不影响。
+function agentHasArgvStrategy(name: string): boolean {
+  return agentArgvStrategies[name] !== undefined;
+}
+
 /** Renders the model-selection flags for one agent. */
 export function buildModelArgs(name: string, model: string | undefined): string[] {
   // codebuddy 的 `--model` 只认它自己的模型 id（`custom-local:<m>` 或云端托管
@@ -94,8 +101,25 @@ export function buildModelArgs(name: string, model: string | undefined): string[
   // 模型选择必须走 `CODEBUDDY_MODEL` 环境变量（见 agentRuntimeEnv）。这里只留
   // `--port 0`：不给它固定端口，多个 agent 实例并发时会撞 EADDRINUSE。
   if (name === "codebuddy") return ["--port", "0"];
+  // kimi 的 `-m` 只认自己的模型别名（`kimi-code/kimi-for-coding` 这类），
+  // 我们的 `provider/model` 路由会被它当成未知模型拒绝。模型选择交给它自己的
+  // 配置（`default_model`），这里不注入。
+  if (name === "kimi") return [];
   if (!model) return [];
   const route = splitModelRoute(model);
+  // qwen 走 OpenAI 兼容网关，`--model` 只接受上游的裸模型名（`quukk/glm-5.2`
+  // 会被它当成未知模型名发给上游）。
+  //
+  // 它必须留在下面那道「无策略不注入」的守卫**之前**：qwen 在设备端没有 argv
+  // 策略（提示词走 stdin），但 `--model` 是它确实支持的参数，守卫先行会把
+  // stdin 模式下选好的模型静默丢掉。
+  if (name === "qwen") {
+    return route ? ["--model", route.model] : ["--model", model];
+  }
+  // 没有 argv 策略的 agent 会退化成「裸进程名」（buildAgentArgs 返回 []），给它
+  // 追加 `--model` 只会让不认这个参数的 CLI 更早退出（opencode 未知参数就是
+  // usage dump + exit 1）。模型选择对这些 agent 本来就无效，不要注入。
+  if (!agentHasArgvStrategy(name)) return [];
   if (name === "codex") {
     return route
       ? ["-c", `model_provider=${route.provider}`, "-m", route.model]
@@ -103,11 +127,6 @@ export function buildModelArgs(name: string, model: string | undefined): string[
   }
   if (name === "hermes") {
     return route ? ["-m", route.model, "--provider", route.provider] : ["-m", model];
-  }
-  // qwen 走 OpenAI 兼容网关，`--model` 只接受上游的裸模型名（`quukk/glm-5.2`
-  // 会被它当成未知模型名发给上游）。
-  if (name === "qwen") {
-    return route ? ["--model", route.model] : ["--model", model];
   }
   return ["--model", model];
 }
@@ -160,6 +179,23 @@ export function agentSupportsReasoning(name: string | undefined): boolean {
 }
 
 const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
+  // kimi — `-p/--prompt` 是官方唯一「不打开 TUI」的非交互入口（kimi Command
+  // 参考原文："Run a single prompt non-interactively and stream the Assistant
+  // output to stdout. This mode does not open the TUI"）。
+  //
+  // ⚠️ 这条策略是必须的，不是优化：过去 kimi 没有策略 → buildAgentArgs 返回 []
+  // → 实际 spawn 的是**裸 `kimi`**（交互式 TUI）。TUI 在 Windows 上拿不到
+  // console 时直接退出，stderr 只有一句
+  // `No Windows console found. Are you running cmd.exe?`（生产事故实证，
+  // 设备端由 VBS 自启、没有 console，所以 100% 复现）。
+  //
+  // `--output-format` 只能与 `-p` 同用，取值 text / stream-json。这里先用
+  // text：stdout 即正文（thinking 与工具过程走 stderr），不必为此新增一个
+  // JSONL 解析器——opencode 的教训就是「拿到 JSON 却解析不了」等于没输出。
+  //
+  // 不注入 --model：kimi 的 `-m` 只认它自己的模型别名（如
+  // kimi-code/kimi-for-coding），我们这里的 `provider/model` 路由会被它拒绝。
+  kimi: (prompt) => ["-p", prompt, "--output-format", "text"],
   claude: (prompt, model) => [
     "-p", prompt,
     // stream-json：逐行 JSON 事件流（thinking_delta / text_delta 可解析，
@@ -1136,7 +1172,15 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
         } else {
           // 失败退出同样收尾：failed 帧要带着完整步骤，别留下「进行中」。
           if (activity && activity.finish()) emitActivity();
-          reject(new Error(`agent exited with code ${code}: ${stderr}`));
+          // 只把 stderr 拼进错误串，会让「进程把原因打在 stdout」的 CLI 变成一句
+          // 「没有任何输出」：kimi 的欢迎横幅（含 `send /login`）、opencode 的
+          // usage dump（未知参数）都在 stdout 上。取尾部 800 字符就够
+          // classifyTurnError 认出 login / unknown option，也不会让错误串膨胀
+          // （几 MB 的 stdout 不能整个塞进去）。
+          const tail = stdout.length > 800 ? stdout.slice(-800) : stdout;
+          reject(new Error(
+            `agent exited with code ${code}: ${stderr}${tail ? `\n[stdout tail]\n${tail}` : ""}`,
+          ));
         }
       });
     });

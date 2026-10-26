@@ -201,9 +201,14 @@ describe("modelListSpec", () => {
 });
 
 describe("createModelCatalogLoader", () => {
+  // `readConfig: () => null` 不是可选项：opencode 现在有配置解析器，不注入就会
+  // 读**跑测试那台机器**的 ~/.config/opencode/opencode.json，测试结果取决于
+  // 开发者的 home（CI 与本机结论不一致）。
+  const noConfig = () => null;
+
   it("runs the agent command once and then serves the cache", async () => {
     const runCommand = vi.fn().mockResolvedValue(OPENCODE_OUTPUT);
-    const loader = createModelCatalogLoader({ agentName: "opencode", runCommand });
+    const loader = createModelCatalogLoader({ agentName: "opencode", runCommand, readConfig: noConfig });
 
     const first = await loader.load();
     expect(runCommand).toHaveBeenCalledTimes(1);
@@ -220,6 +225,7 @@ describe("createModelCatalogLoader", () => {
     const loader = createModelCatalogLoader({
       agentName: "opencode",
       runCommand,
+      readConfig: noConfig,
       ttlMs: 60_000,
       now: () => clock,
     });
@@ -250,14 +256,19 @@ describe("createModelCatalogLoader", () => {
   it("falls back to the empty catalog when the command fails", async () => {
     const runCommand = vi.fn().mockRejectedValue(new Error("boom"));
     const logger = vi.fn();
-    const loader = createModelCatalogLoader({ agentName: "opencode", runCommand, logger });
+    const loader = createModelCatalogLoader({
+      agentName: "opencode",
+      runCommand,
+      readConfig: noConfig,
+      logger,
+    });
     await expect(loader.load()).resolves.toBe(EMPTY_MODEL_CATALOG);
     expect(logger).toHaveBeenCalledWith(expect.stringContaining("boom"));
   });
 
   it("deduplicates concurrent requests", async () => {
     const runCommand = vi.fn().mockImplementation(() => new Promise((resolve) => setTimeout(() => resolve(OPENCODE_OUTPUT), 5)));
-    const loader = createModelCatalogLoader({ agentName: "opencode", runCommand });
+    const loader = createModelCatalogLoader({ agentName: "opencode", runCommand, readConfig: noConfig });
     const [first, second] = await Promise.all([loader.load(), loader.load()]);
     expect(runCommand).toHaveBeenCalledTimes(1);
     expect(first).toBe(second);
@@ -405,6 +416,205 @@ describe("createModelCatalogLoader with provider endpoints", () => {
 
     const catalog = await loader.load();
     expect(catalog.providers[0].models.map((m) => m.id)).toEqual(["glm-5.2"]);
+    expect(catalog.defaultModel).toBeNull();
+  });
+});
+
+// 配置文件里**显式声明**的模型清单（opencode 的 `provider.<id>.models`）。
+// 这是本轮的根因修复：现场「私有设备拿不到模型目录 + 对话报进程异常退出」，
+// 因为目录只能靠 `opencode models`（3-5s 冷启，可能超时/失败）和端点 probe
+// （最多 8s 空等）两条网络路径 —— 而 web 只等 8s。
+describe("createModelCatalogLoader with config-declared models", () => {
+  const QUUKK_ENDPOINT = { id: "quukk", baseUrl: "https://llmapi.example.com/v1" };
+
+  it("serves the declared models without probing the declared endpoint", async () => {
+    const probe = vi.fn(async () => {
+      throw new Error("declared providers must not be probed");
+    });
+    const loader = createModelCatalogLoader({
+      agentName: "opencode",
+      runCommand: vi.fn().mockResolvedValue(""),
+      readConfig: () => ({
+        endpoints: [QUUKK_ENDPOINT],
+        defaultModel: "quukk/glm-5.2",
+        declaredModels: { quukk: ["glm-5.2", "k3"] },
+      }),
+      probe,
+    });
+
+    const catalog = await loader.load();
+    // 声明即事实：再 probe 一遍只可能拿到同一份清单的子集，白等最多 8s。
+    expect(probe).not.toHaveBeenCalled();
+    expect(catalog.providers).toEqual([
+      {
+        id: "quukk",
+        name: "quukk",
+        models: [
+          { id: "glm-5.2", name: "glm-5.2" },
+          { id: "k3", name: "k3" },
+        ],
+      },
+    ]);
+    expect(catalog.defaultModel).toBe("quukk/glm-5.2");
+  });
+
+  it("probes only the endpoints that declare no models of their own", async () => {
+    const probe = vi.fn(async (endpoint: { id: string }) => [`${endpoint.id}-model`]);
+    const loader = createModelCatalogLoader({
+      agentName: "opencode",
+      runCommand: vi.fn().mockResolvedValue(""),
+      readConfig: () => ({
+        endpoints: [QUUKK_ENDPOINT, { id: "other", baseUrl: "https://other.example.com/v1" }],
+        defaultModel: null,
+        declaredModels: { quukk: ["glm-5.2"] },
+      }),
+      probe,
+    });
+
+    const catalog = await loader.load();
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(probe).toHaveBeenCalledWith(expect.objectContaining({ id: "other" }));
+    expect(catalog.providers.map((provider) => provider.id)).toEqual(["other", "quukk"]);
+    expect(catalog.providers[1].models.map((model) => model.id)).toEqual(["glm-5.2"]);
+  });
+
+  // 配置声明了清单时，CLI 列举**完全不必跑**：它既可能只回报一部分（把面板
+  // 缩小），也可能把 30s 超时拖进 web 的 8s 窗口。声明即权威。
+  it("treats the declaration as authoritative and never lets the CLI shrink it", async () => {
+    // 真实现场：配置声明 6 个，`opencode models` 只回报其中 2 个。整组替换会把
+    // 面板从 6 个缩成 2 个 —— 声明式目录的价值就是「配置说了算」。
+    const runCommand = vi.fn().mockResolvedValue("quukk/glm-5.2\nquukk/beam-free\n");
+    const loader = createModelCatalogLoader({
+      agentName: "opencode",
+      runCommand,
+      readConfig: () => ({
+        endpoints: [],
+        defaultModel: "quukk/glm-5.2",
+        declaredModels: { quukk: ["glm-5.2", "glm-5.3", "k3"] },
+      }),
+    });
+
+    const catalog = await loader.load();
+    expect(runCommand).not.toHaveBeenCalled();
+    expect(catalog.providers).toHaveLength(1);
+    expect(catalog.providers[0].models.map((model) => model.id)).toEqual([
+      "glm-5.2", "glm-5.3", "k3",
+    ]);
+    // CLI 独有但配置没声明的模型不会混进来：这一轮目录的来源只有配置。
+    expect(catalog.providers[0].models.map((model) => model.id)).not.toContain("beam-free");
+    expect(catalog.defaultModel).toBe("quukk/glm-5.2");
+  });
+
+  // 这条钉的是**延迟语义**，不是结果：web 只等 8s，而 `opencode models` 冷启
+  // 3-5s、超时上限 30s。只要 `if (spec && !hasDeclared)` 被改回 `if (spec)`，
+  // 结果类断言依然全绿，但线上会重新变成「拿不到模型列表」—— 所以这里必须
+  // 断言「一个子进程都没起」且「毫秒级返回」。
+  it("returns declared models without spawning the list command at all", async () => {
+    const runCommand = vi.fn(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 5_000));
+      return "quukk/from-cli";
+    });
+    const loader = createModelCatalogLoader({
+      agentName: "opencode",
+      runCommand,
+      readConfig: () => ({
+        endpoints: [],
+        defaultModel: "quukk/glm-5.2",
+        declaredModels: { quukk: ["glm-5.2"] },
+      }),
+    });
+
+    const startedAt = Date.now();
+    const catalog = await loader.load();
+    const elapsedMs = Date.now() - startedAt;
+
+    expect(elapsedMs).toBeLessThan(100);
+    expect(runCommand).not.toHaveBeenCalled();
+    expect(catalog.providers).toEqual([
+      { id: "quukk", name: "quukk", models: [{ id: "glm-5.2", name: "glm-5.2" }] },
+    ]);
+    expect(catalog.defaultModel).toBe("quukk/glm-5.2");
+  });
+
+  // 配置是用户手写的，provider key 里带空格完全可能。wire 上的 id 必须能拼成
+  // `provider/model` 路由（与 groupRoutes / mergeEndpointModels 同一把尺子），
+  // 否则前端既存不下也回传不了。
+  it("drops declared providers whose key cannot form a route", async () => {
+    const loader = createModelCatalogLoader({
+      agentName: "opencode",
+      runCommand: vi.fn().mockResolvedValue(""),
+      readConfig: () => ({
+        endpoints: [],
+        defaultModel: null,
+        declaredModels: { "my provider": ["glm-5.2"] },
+      }),
+    });
+
+    await expect(loader.load()).resolves.toBe(EMPTY_MODEL_CATALOG);
+  });
+
+  it("drops declared slugs that cannot form a route", async () => {
+    const loader = createModelCatalogLoader({
+      agentName: "opencode",
+      runCommand: vi.fn().mockResolvedValue(""),
+      readConfig: () => ({
+        endpoints: [],
+        defaultModel: null,
+        declaredModels: { p: ["bad model", "has/slash", "", "good"] },
+      }),
+    });
+
+    const catalog = await loader.load();
+    expect(catalog.providers.map((provider) => provider.id)).toEqual(["p"]);
+    expect(catalog.providers[0].models.map((model) => model.id)).toEqual(["good"]);
+  });
+
+  it("keeps every valid declared slug, in order", async () => {
+    const loader = createModelCatalogLoader({
+      agentName: "opencode",
+      runCommand: vi.fn().mockResolvedValue(""),
+      readConfig: () => ({
+        endpoints: [],
+        defaultModel: "quukk/k3",
+        declaredModels: { quukk: ["glm-5.2", "k3"] },
+      }),
+    });
+
+    const catalog = await loader.load();
+    expect(catalog.providers[0].models.map((model) => model.id)).toEqual(["glm-5.2", "k3"]);
+    expect(catalog.defaultModel).toBe("quukk/k3");
+  });
+
+  it("caps a single declared provider at 500 models", async () => {
+    // MAX_MODELS_PER_PROVIDER（model-catalog.ts:40），与 probe/CLI 路径同一个上限：
+    // 一份手写错的配置不能把整帧撑爆。
+    const slugs = Array.from({ length: 600 }, (_, i) => `m${i}`);
+    const loader = createModelCatalogLoader({
+      agentName: "opencode",
+      runCommand: vi.fn().mockResolvedValue(""),
+      readConfig: () => ({ endpoints: [], defaultModel: null, declaredModels: { p: slugs } }),
+    });
+
+    const catalog = await loader.load();
+    expect(catalog.providers[0].models).toHaveLength(500);
+    expect(catalog.providers[0].models.map((model) => model.id)).toContain("m0");
+    expect(catalog.providers[0].models.map((model) => model.id)).toContain("m499");
+    expect(catalog.providers[0].models.map((model) => model.id)).not.toContain("m500");
+  });
+
+  it("discards a declared default that the declaration itself does not contain", async () => {
+    const loader = createModelCatalogLoader({
+      agentName: "opencode",
+      runCommand: vi.fn().mockResolvedValue(""),
+      readConfig: () => ({
+        endpoints: [],
+        defaultModel: "quukk/not-declared",
+        declaredModels: { quukk: ["glm-5.2"] },
+      }),
+    });
+
+    const catalog = await loader.load();
+    expect(catalog.providers[0].models.map((model) => model.id)).toEqual(["glm-5.2"]);
     expect(catalog.defaultModel).toBeNull();
   });
 });

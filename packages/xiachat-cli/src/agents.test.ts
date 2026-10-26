@@ -20,6 +20,43 @@ import {
   trimIncompleteUtf8Tail,
 } from "./agents.js";
 import { createEchoAgentScript, type EchoAgentFixture } from "./test-fixtures.js";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { classifyTurnError } from "./turn-error.js";
+
+interface FailureAgentFixture {
+  agentPath: string;
+  cleanup: () => void;
+}
+
+// 一个「只往 stdout 打固定文本、stderr 一个字都不打、然后以 code 退出」的假
+// agent。现场（2026-10-25）kimi 就是这么失败的：横幅落在 stdout，我们只把
+// stderr 拼进错误串，于是 web 收到的是「进程异常退出，没有任何输出」。
+function createStdoutFailureAgent(
+  name: string,
+  stdoutText: string,
+  code = 1,
+): FailureAgentFixture {
+  const dir = mkdtempSync(join(tmpdir(), "cm-failure-agent-"));
+  const helper = join(dir, "failure-agent.cjs");
+  writeFileSync(helper, [
+    // 回调里退出，保证 stdout 已经冲刷完（否则管道异步写会被截断）。
+    `process.stdout.write(${JSON.stringify(stdoutText)}, () => process.exit(${code}));`,
+  ].join("\n"));
+  const isWin = process.platform === "win32";
+  const agentPath = join(dir, isWin ? `${name}.cmd` : name);
+  if (isWin) {
+    writeFileSync(agentPath, `@echo off\r\nnode "${helper}"\r\n`, { mode: 0o755 });
+  } else {
+    writeFileSync(agentPath, `#!/bin/sh\nexec node "${helper}"\n`, { mode: 0o755 });
+    chmodSync(agentPath, 0o755);
+  }
+  return {
+    agentPath,
+    cleanup: () => rmSync(dir, { recursive: true, force: true }),
+  };
+}
 
 describe("KNOWN_AGENT_CLIS", () => {
   it("matches the server-side knownAgentCLIs list", () => {
@@ -120,9 +157,19 @@ describe("buildAgentArgs", () => {
     ]);
   });
 
+  // kimi 必须走 -p：不带参数直接 spawn 的是交互式 TUI，Windows 上拿不到
+  // console 时会以 `No Windows console found` 退出（生产事故实证）。
+  it("kimi 走 -p 非交互入口（裸 kimi 是 TUI，无 console 会直接退出）", () => {
+    expect(buildAgentArgs("kimi", "hi")).toEqual(["-p", "hi", "--output-format", "text"]);
+    // 不注入 --model：kimi 的 -m 只认它自己的模型别名，不认 provider/model 路由。
+    expect(buildAgentArgs("kimi", "hi", "quukk/glm-5.2")).toEqual([
+      "-p", "hi", "--output-format", "text",
+    ]);
+  });
+
   it("returns [] for agents without a strategy", () => {
-    expect(buildAgentArgs("kimi", "hi", "m1")).toEqual([]);
     expect(buildAgentArgs("codebuddy", "hi")).toEqual([]);
+    expect(buildAgentArgs("grok", "hi")).toEqual([]);
   });
 
   it("returns [] past the argv length cap (falls back to stdin)", () => {
@@ -152,8 +199,28 @@ describe("splitModelRoute / buildModelArgs", () => {
     expect(buildModelArgs("opencode", undefined)).toEqual([]);
     expect(buildModelArgs("opencode", "quukk/glm-5.3")).toEqual(["--model", "quukk/glm-5.3"]);
     expect(buildModelArgs("claude", "sonnet-4")).toEqual(["--model", "sonnet-4"]);
-    // Unknown agents keep the legacy flags.
-    expect(buildModelArgs("kimi", "m1")).toEqual(["--model", "m1"]);
+    // 无 argv 策略的 agent 不注入模型参数：它们不认 `--model`（kimi 走 stdin，
+    // 收到未知参数只会 usage dump + exit 1），模型选择对它们本就无效。
+    expect(buildModelArgs("kimi", "m1")).toEqual([]);
+  });
+
+  // 3a 的守卫必须逐 agent 钉住：既不能给不认 `--model` 的 agent 乱塞参数，
+  // 也不能把本来支持 `--model` 的 agent 一起误伤（qwen 就是易回归点 ——
+  // 它在设备端没有 argv 策略，但 `--model` 是真实支持的参数）。
+  it("only renders model flags for agents that actually accept them", () => {
+    // 无策略 → 不注入
+    expect(buildModelArgs("kimi", "m1")).toEqual([]);
+    expect(buildModelArgs("grok", "m1")).toEqual([]);
+    // 有策略 → 按各家形状注入
+    expect(buildModelArgs("codex", "p/m")).toEqual(["-c", "model_provider=p", "-m", "m"]);
+    expect(buildModelArgs("opencode", "p/m")).toEqual(["--model", "p/m"]);
+    expect(buildModelArgs("hermes", "p/m")).toEqual(["-m", "m", "--provider", "p"]);
+    // 无策略但确实支持 --model：provider 段必须剥掉
+    expect(buildModelArgs("qwen", "p/m")).toEqual(["--model", "m"]);
+    // codebuddy 只留一个随机端口，模型走 CODEBUDDY_MODEL
+    expect(buildModelArgs("codebuddy", "m1")).toEqual(["--port", "0"]);
+    // 没选模型 → 什么都不加
+    expect(buildModelArgs("claude", undefined)).toEqual([]);
   });
 
   it("strips the provider segment for qwen, which only takes the upstream slug", () => {
@@ -503,11 +570,12 @@ describe("runAgentTurn", () => {
   });
 
   it("unknown agents keep stdin mode", async () => {
-    const fixture = createEchoAgentScript("kimi", { recordArgs: true });
+    // kimi 现在有策略了，不能再拿它当「未知 agent」样本；用仍无策略的 grok。
+    const fixture = createEchoAgentScript("grok", { recordArgs: true });
     try {
       const out = await runAgentTurn({
         execPath: fixture.agentPath,
-        agentName: "kimi",
+        agentName: "grok",
         prompt: "stdin-still-works",
         timeoutMs: 30_000,
       });
@@ -521,13 +589,58 @@ describe("runAgentTurn", () => {
     }
   });
 
-  it("passes --model when provided", async () => {
+  // 这条钉住生产事故的修复方向：kimi 必须以 -p 启动（argv 模式），
+  // 而不是退化成「裸 kimi」——裸 kimi 是交互式 TUI，在 Windows 上拿不到
+  // console 时会直接以 `No Windows console found` 退出。
+  it("kimi 以 -p 启动并把 prompt 作为 argv 传入（不再是 stdin 兜底）", async () => {
+    const fixture = createEchoAgentScript("kimi", { recordArgs: true });
+    try {
+      await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "kimi",
+        prompt: "kimi-argv-prompt",
+        timeoutMs: 30_000,
+      });
+      const args = fixture.recordedArgs();
+      expect(args).toContain("-p");
+      expect(args).toContain("kimi-argv-prompt");
+      expect(args).toContain("--output-format");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("passes --model for agents with an argv strategy", async () => {
     const fixture = createEchoAgentScript("claude", { recordArgs: true });
     try {
-      await runAgentTurn({ execPath: fixture.agentPath, prompt: "p", model: "sonnet-4", timeoutMs: 30_000 });
+      await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "claude",
+        prompt: "p",
+        model: "sonnet-4",
+        timeoutMs: 30_000,
+      });
       const args = fixture.recordedArgs();
       expect(args).toContain("--model");
       expect(args).toContain("sonnet-4");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("does not inject --model for an agent with no argv strategy", async () => {
+    // 现场（2026-10-25）：给不认 `--model` 的 CLI 追加参数，等于让它更早退出
+    // （usage dump + exit 1），用户看到的是「进程异常退出」。没有策略就不猜。
+    const fixture = createEchoAgentScript("grok", { recordArgs: true });
+    try {
+      await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "grok",
+        prompt: "p",
+        model: "m1",
+        timeoutMs: 30_000,
+      });
+      expect(fixture.recordedArgs()).not.toContain("--model");
     } finally {
       fixture.cleanup();
     }
@@ -780,6 +893,81 @@ describe("runAgentTurn", () => {
       await expect(
         runAgentTurn({ execPath: fixture.agentPath, prompt: "p", timeoutMs: 30_000 }),
       ).rejects.toThrow(/agent-boom/);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  // ── 事故核心回归（2026-10-25 私有设备私聊）──────────────────────────────
+  // kimi 的登录横幅打在 **stdout** 上、stderr 为空，然后 exit 1。旧实现只拼
+  // stderr，错误串是 "agent exited with code 1: "，前端于是说「进程异常退出，
+  // 没有任何输出」，classifyTurnError 也归成 agent_failed。用户永远不知道该去
+  // 登录/换 key —— 这条用例就是钉住「原因必须能被看见、被分类」。
+  it("把 stdout 尾巴并进错误串，kimi 的登录横幅不再变成「没有任何输出」", async () => {
+    const banner = [
+      "Kimi Code CLI",
+      "Session: abc",
+      "Tip: send /login to use Kimi for Code",
+    ].join("\n");
+    const fixture = createStdoutFailureAgent("kimi", `${banner}\n`, 1);
+    try {
+      const error = await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "kimi",
+        prompt: "hi",
+        timeoutMs: 30_000,
+      }).then(() => null, (err: Error) => err);
+
+      expect(error).toBeInstanceOf(Error);
+      const message = (error as Error).message;
+      expect(message).toContain("agent exited with code 1");
+      expect(message).toContain("[stdout tail]");
+      expect(message).toContain("Tip: send /login to use Kimi for Code");
+      // 分类器必须认得出这是鉴权/未登录，不是「未知崩溃」。
+      expect(classifyTurnError(message)).toBe("model_auth_failed");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("stdout 为空时不追加空的 [stdout tail] 段", async () => {
+    const fixture = createEchoAgentScript("kimi", { failWith: { code: 1, message: "agent-boom" } });
+    try {
+      const error = await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "kimi",
+        prompt: "p",
+        timeoutMs: 30_000,
+      }).then(() => null, (err: Error) => err);
+
+      const message = (error as Error).message;
+      expect(message).toContain("agent-boom");
+      expect(message).not.toContain("[stdout tail]");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("只带 stdout 末尾 800 字符，不把整份输出塞进错误串", async () => {
+    // 洪峰场景：几 MB 的 stdout 不能整体进错误串（会撑爆日志与 wire 帧）。
+    const stdout = `EARLY_MARKER${"x".repeat(4000)}\nTip: send /login to use Kimi for Code\n`;
+    const fixture = createStdoutFailureAgent("kimi", stdout, 1);
+    try {
+      const error = await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "kimi",
+        prompt: "hi",
+        timeoutMs: 30_000,
+      }).then(() => null, (err: Error) => err);
+
+      const message = (error as Error).message;
+      // 真正的结尾（含可分类的提示）必须还在
+      expect(message).toContain("Tip: send /login to use Kimi for Code");
+      // 头部早就不该在
+      expect(message).not.toContain("EARLY_MARKER");
+      // 尾巴 800 + 前缀措辞，整体远小于原始 stdout
+      expect(message.length).toBeLessThan(1_000);
+      expect(classifyTurnError(message)).toBe("model_auth_failed");
     } finally {
       fixture.cleanup();
     }

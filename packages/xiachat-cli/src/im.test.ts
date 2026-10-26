@@ -7,6 +7,7 @@ import { ARGV_PROMPT_MAX_CHARS } from "./agents.js";
 import type { ActivityStep } from "./agent-activity.js";
 import { MessageDispatcher, planReadReceipt, resolveTurnVenue, turnNeedsHeartbeat, turnSessionKey } from "./im.js";
 import { TurnIncompleteError } from "./turn-error.js";
+import { MemoryUserModelStore } from "./user-models.js";
 
 function makeDeps() {
   const sent: Array<{ to: string; objectName: string; content: string }> = [];
@@ -1787,5 +1788,199 @@ describe("MessageDispatcher agent-produced files", () => {
     );
     expect(deps.sent).toHaveLength(1);
     expect(deps.sent[0].objectName).toBe("card_message");
+  });
+});
+
+describe("MessageDispatcher /use-model", () => {
+  const CHATROOM_ID = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6";
+
+  const privateMsg = (text: string) => ({
+    objectName: "RC:TxtMsg",
+    fromUserId: "user-1",
+    toUserId: "node-a",
+    targetId: "node-a",
+    conversationType: 1,
+    content: JSON.stringify({ content: text }),
+  });
+
+  const ackOf = (sent: Array<{ content: string }>) => JSON.parse(sent[0].content).content as string;
+
+  it("switches the model for that user without spending an agent turn", async () => {
+    const deps = makeDeps();
+    const store = new MemoryUserModelStore();
+    const dispatcher = new MessageDispatcher({ send: deps.send, userModels: store });
+
+    await dispatcher.handle(privateMsg("/use-model quukk/glm-5.3"), {
+      runTurn: async () => {
+        throw new Error("a /use-model command must never reach the agent");
+      },
+    });
+
+    expect(store.get("user-1")).toBe("quukk/glm-5.3");
+    expect(deps.sent).toHaveLength(1);
+    expect(deps.sent[0].objectName).toBe("RC:TxtMsg");
+    expect(ackOf(deps.sent)).toContain("quukk/glm-5.3");
+  });
+
+  it("uses the stored model on the next private turn", async () => {
+    const deps = makeDeps();
+    const store = new MemoryUserModelStore({ "user-1": "quukk/glm-5.3" });
+    const dispatcher = new MessageDispatcher({ send: deps.send, userModels: store });
+
+    await dispatcher.handle(privateMsg("你好"), {
+      runTurn: async (_prompt, model) => `out(${model})`,
+    });
+
+    expect(ackOf(deps.sent)).toContain("out(quukk/glm-5.3)");
+  });
+
+  it("keeps one user's model away from another user on the same node", async () => {
+    const deps = makeDeps();
+    const store = new MemoryUserModelStore({ "user-2": "quukk/claude-sonnet-4" });
+    const dispatcher = new MessageDispatcher({ send: deps.send, userModels: store });
+
+    await dispatcher.handle(privateMsg("你好"), {
+      runTurn: async (_prompt, model) => `out(${model})`,
+    });
+
+    // user-1 没选过 -> 不传模型，跟随节点默认（run.ts 再兜到 --model）。
+    expect(ackOf(deps.sent)).toContain("out(undefined)");
+    expect(store.get("user-2")).toBe("quukk/claude-sonnet-4");
+  });
+
+  it("answers a bare /use-model with the current state", async () => {
+    const deps = makeDeps();
+    const store = new MemoryUserModelStore({ "user-1": "quukk/glm-5.3" });
+    const dispatcher = new MessageDispatcher({ send: deps.send, userModels: store });
+
+    await dispatcher.handle(privateMsg("/use-model"), {
+      runTurn: async () => {
+        throw new Error("a query must not reach the agent");
+      },
+    });
+
+    expect(ackOf(deps.sent)).toContain("当前模型：quukk/glm-5.3");
+  });
+
+  it("resets back to the node default", async () => {
+    const deps = makeDeps();
+    const store = new MemoryUserModelStore({ "user-1": "quukk/glm-5.3" });
+    const dispatcher = new MessageDispatcher({ send: deps.send, userModels: store });
+
+    await dispatcher.handle(privateMsg("/use-model default"), {
+      runTurn: async () => {
+        throw new Error("a reset must not reach the agent");
+      },
+    });
+
+    expect(store.get("user-1")).toBeUndefined();
+    expect(ackOf(deps.sent)).toContain("节点默认模型");
+  });
+
+  it("teaches the format instead of letting a bare slug reach the agent", async () => {
+    const deps = makeDeps();
+    const store = new MemoryUserModelStore();
+    const dispatcher = new MessageDispatcher({ send: deps.send, userModels: store });
+
+    await dispatcher.handle(privateMsg("/use-model glm-5.3"), {
+      runTurn: async () => {
+        throw new Error("an invalid route must not reach the agent");
+      },
+    });
+
+    expect(store.get("user-1")).toBeUndefined();
+    expect(ackOf(deps.sent)).toContain("<provider>/<model>");
+  });
+
+  it("says so when the node has no store wired, instead of swallowing the command", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+
+    await dispatcher.handle(privateMsg("/use-model quukk/glm-5.3"), {
+      runTurn: async () => {
+        throw new Error("the command must not reach the agent");
+      },
+    });
+
+    expect(deps.sent).toHaveLength(1);
+    expect(ackOf(deps.sent)).toContain("不支持");
+  });
+
+  it("still lets ordinary chat through to the agent", async () => {
+    const deps = makeDeps();
+    const store = new MemoryUserModelStore();
+    const dispatcher = new MessageDispatcher({ send: deps.send, userModels: store });
+
+    await dispatcher.handle(privateMsg("use-model 这个功能是怎么实现的？"), {
+      runTurn: async (prompt) => `echo:${prompt}`,
+    });
+
+    expect(ackOf(deps.sent)).toContain("echo:use-model 这个功能是怎么实现的？");
+  });
+
+  it("prefers the user's own choice over the role model in a discussion turn", async () => {
+    const deps = makeDeps();
+    const store = new MemoryUserModelStore({ "user-1": "quukk/glm-5.3" });
+    const dispatcher = new MessageDispatcher({ send: deps.send, userModels: store });
+
+    await dispatcher.handle(
+      {
+        objectName: "command",
+        fromUserId: "host_node",
+        toUserId: "rc_node_x",
+        targetId: "rc_node_x",
+        conversationType: 1,
+        content: JSON.stringify({
+          request_id: "turn_1_1",
+          service: "discussion",
+          action: "your_turn",
+          params: {
+            round: 1,
+            speaking_order: 1,
+            role_name: "reviewer",
+            model: "quukk/sonnet-4",
+            requester_id: "user-1",
+            chatroom_id: CHATROOM_ID,
+          },
+        }),
+      },
+      { runTurn: async (_prompt, model) => `out(${model})` },
+    );
+
+    const result = JSON.parse(deps.sent.at(-1)!.content);
+    expect(result.payload.content).toContain("out(quukk/glm-5.3)");
+  });
+
+  it("falls back to the role model when the user never picked one", async () => {
+    const deps = makeDeps();
+    const store = new MemoryUserModelStore();
+    const dispatcher = new MessageDispatcher({ send: deps.send, userModels: store });
+
+    await dispatcher.handle(
+      {
+        objectName: "command",
+        fromUserId: "host_node",
+        toUserId: "rc_node_x",
+        targetId: "rc_node_x",
+        conversationType: 1,
+        content: JSON.stringify({
+          request_id: "turn_1_2",
+          service: "discussion",
+          action: "your_turn",
+          params: {
+            round: 1,
+            speaking_order: 2,
+            role_name: "reviewer",
+            model: "quukk/sonnet-4",
+            requester_id: "user-1",
+            chatroom_id: CHATROOM_ID,
+          },
+        }),
+      },
+      { runTurn: async (_prompt, model) => `out(${model})` },
+    );
+
+    const result = JSON.parse(deps.sent.at(-1)!.content);
+    expect(result.payload.content).toContain("out(quukk/sonnet-4)");
   });
 });

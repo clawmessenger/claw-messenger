@@ -7,6 +7,7 @@ import {
   parseHermesConfig,
   parseModelIds,
   parseOpenclawConfig,
+  parseOpencodeConfig,
   parseQwenConfig,
   probeProviderModels,
   readAgentConfig,
@@ -249,6 +250,113 @@ describe("parseCodebuddyProviderConfig", () => {
   });
 });
 
+// 固定 fixture（形状取自真实的 ~/.config/opencode/opencode.json，但**不是**
+// 读本机文件）：opencode 把模型清单本身写在配置里，所以这一份既是端点来源，
+// 也是 declaredModels 来源。测试不许碰跑测试那台机器的 home。
+const OPENCODE_JSON = JSON.stringify({
+  model: "quukk/glm-5.2",
+  provider: {
+    quukk: {
+      name: "Quukk AI",
+      options: { baseURL: "https://llmapi.example.com/v1", apiKey: "sk-test" },
+      models: { "glm-5.2": {}, "glm-5.3": {}, k3: {} },
+    },
+    "empty-provider": {
+      name: "No Models",
+      options: { baseURL: "https://b.example.com/v1" },
+    },
+    "no-url": { name: "No URL", models: { x: {} } },
+  },
+});
+
+describe("parseOpencodeConfig", () => {
+  it("reads endpoints and the models each provider declares", () => {
+    const config = parseOpencodeConfig(OPENCODE_JSON);
+    // `provider` 的 key 就是 id；`options.baseURL` 决定它是不是可 probe 的端点。
+    expect(config.endpoints).toEqual([
+      {
+        id: "quukk",
+        name: "Quukk AI",
+        baseUrl: "https://llmapi.example.com/v1",
+        apiKey: "sk-test",
+      },
+      // 没有 models 但有 baseURL：端点仍然要报（目录靠 probe 补）。
+      { id: "empty-provider", name: "No Models", baseUrl: "https://b.example.com/v1" },
+    ]);
+    // 没有 baseURL 的 provider 不是一个可连的端点。
+    expect(config.endpoints.map((e) => e.id)).not.toContain("no-url");
+  });
+
+  it("declares models for every provider, including ones we cannot probe", () => {
+    const config = parseOpencodeConfig(OPENCODE_JSON);
+    // 顺序按配置书写顺序，不去重排序 —— 目录层自己会排。
+    expect(config.declaredModels?.quukk).toEqual(["glm-5.2", "glm-5.3", "k3"]);
+    // 没写 models 的 provider 不产生空清单（空清单会白白触发一次 probe）。
+    expect(config.declaredModels?.["empty-provider"]).toBeUndefined();
+    // 无 baseURL ≠ 不可用：opencode 的内置 provider 走 SDK 默认端点（如
+    // `opencode/*-free`），模型是真能跑的，只是我们**无法 probe** 它。
+    // 剔掉等于替用户隐藏可选项，所以它照样进 declaredModels（只是不进 endpoints）。
+    expect(config.declaredModels?.["no-url"]).toEqual(["x"]);
+    expect(config.endpoints.map((endpoint) => endpoint.id)).not.toContain("no-url");
+  });
+
+  it("returns the top-level model verbatim instead of re-assembling it", () => {
+    // 顶层 model 本来就是 `provider/slug` 路由；再拼一次会得到 `quukk/quukk/...`。
+    expect(parseOpencodeConfig(OPENCODE_JSON).defaultModel).toBe("quukk/glm-5.2");
+  });
+
+  it("leaves declaredModels out entirely when no provider declares any", () => {
+    const config = parseOpencodeConfig(JSON.stringify({
+      provider: { p: { options: { baseURL: "https://p.example.com/v1" } } },
+    }));
+    expect(config.endpoints.map((e) => e.id)).toEqual(["p"]);
+    expect("declaredModels" in config).toBe(false);
+    expect(config.defaultModel).toBeNull();
+  });
+
+  // opencode 的配置允许注释（真实 .jsonc 就带）。剥注释最容易写错的地方是
+  // **字符串里的 `//`**：`"baseURL": "https://a//b"` 一旦被当成行注释，baseURL
+  // 连同后面半份配置都会被吞掉，provider 全部消失。
+  it("strips // and /* */ comments but never a // inside a string", () => {
+    const jsonc = [
+      "// opencode 配置支持注释",
+      "{",
+      '  "model": "quukk/glm-5.2",   // 行尾注释',
+      '  "provider": {',
+      '    "quukk": {',
+      '      "name": "Quukk AI",',
+      '      /* 块注释：端点与密钥',
+      "         跨两行 */",
+      '      "options": { "baseURL": "https://a//b", "apiKey": "sk-test" },',
+      '      "models": { "glm-5.2": {}, "k3": {} }',
+      "    },",
+      '    "after": { "name": "After", "options": { "baseURL": "https://after.example.com/v1" } }',
+      "  }",
+      "}",
+    ].join("\n");
+    const config = parseOpencodeConfig(jsonc);
+    expect(config.endpoints).toEqual([
+      {
+        id: "quukk",
+        name: "Quukk AI",
+        // 双斜杠必须原样保留，不能被当成注释的起点。
+        baseUrl: "https://a//b",
+        apiKey: "sk-test",
+      },
+      // 注释之后声明的 provider 也必须还在：注释若吞掉换行，后面的 token 会粘连。
+      { id: "after", name: "After", baseUrl: "https://after.example.com/v1" },
+    ]);
+    expect(config.declaredModels).toEqual({ quukk: ["glm-5.2", "k3"] });
+    expect(config.defaultModel).toBe("quukk/glm-5.2");
+  });
+
+  it("returns an empty config (never throws) for unusable input", () => {
+    for (const text of ["", "not json", "[]", "null"]) {
+      expect(parseOpencodeConfig(text)).toEqual({ endpoints: [], defaultModel: null });
+    }
+  });
+});
+
 describe("readAgentConfig", () => {
   const OPENCLAW_JSON = JSON.stringify({
     models: { providers: { openai: { baseUrl: "http://127.0.0.1:49830/v1" } } },
@@ -279,8 +387,51 @@ describe("readAgentConfig", () => {
     expect(readAgentConfig("codex", { home, env: {}, readFile: () => { throw new Error("ENOENT"); } })).toBeNull();
   });
 
+  it("reads opencode.json from ~/.config/opencode", () => {
+    const home = join("/", "home", "u");
+    const path = join(home, ".config", "opencode", "opencode.json");
+    const readFile = vi.fn((p: string) => {
+      if (p === path) return OPENCODE_JSON;
+      throw new Error("ENOENT");
+    });
+    const config = readAgentConfig("opencode", { home, env: {}, readFile });
+    expect(config?.endpoints.map((endpoint) => endpoint.id)).toEqual(["quukk", "empty-provider"]);
+    expect(config?.defaultModel).toBe("quukk/glm-5.2");
+    expect(config?.declaredModels?.quukk).toEqual(["glm-5.2", "glm-5.3", "k3"]);
+    expect(readFile).toHaveBeenCalledWith(path);
+  });
+
+  it("tries XDG_CONFIG_HOME and the .jsonc fallback before giving up", () => {
+    const home = join("/", "home", "u");
+    const xdg = join("/", "xdg");
+    const jsoncPath = join(xdg, "opencode", "opencode.jsonc");
+    const readFile = vi.fn((p: string) => {
+      if (p === jsoncPath) return `// jsonc\n${OPENCODE_JSON}`;
+      throw new Error("ENOENT");
+    });
+    const config = readAgentConfig("opencode", { home, env: { XDG_CONFIG_HOME: xdg }, readFile });
+    expect(config?.defaultModel).toBe("quukk/glm-5.2");
+    // 先试 XDG 的 .json，再试 .jsonc —— 顺序固定，不能反过来先吃 .json。
+    expect(readFile.mock.calls.map(([p]) => p)).toEqual([
+      join(xdg, "opencode", "opencode.json"),
+      jsoncPath,
+    ]);
+  });
+
+  it("returns null when no opencode config exists", () => {
+    const home = join("/", "home", "u");
+    expect(readAgentConfig("opencode", {
+      home,
+      env: {},
+      readFile: () => { throw new Error("ENOENT"); },
+    })).toBeNull();
+  });
+
   it("has nothing for agents with no config reader", () => {
-    expect(readAgentConfig("opencode", { home: "/home/u", env: {} })).toBeNull();
+    // kimi 没有配置解析器（本机无字段样本，不猜）——不读任何文件，直接 null。
+    const readFile = vi.fn(() => { throw new Error("should not read"); });
+    expect(readAgentConfig("kimi", { home: "/home/u", env: {}, readFile })).toBeNull();
+    expect(readFile).not.toHaveBeenCalled();
     expect(readAgentConfig(undefined, {})).toBeNull();
   });
 });

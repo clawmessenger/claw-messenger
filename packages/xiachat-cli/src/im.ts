@@ -31,6 +31,8 @@ import {
   ROLE_RECOMMEND_ACTION,
   STALE_ROLE_RECOMMEND_REQUEST_MS,
 } from "./role-recommend.js";
+import { formatUseModelAck, parseUseModelCommand, type UseModelCommand } from "./use-model.js";
+import type { UserModelStore } from "./user-models.js";
 
 // Inbound message shape normalized from the IM SDK listener.
 export interface InboundIMMessage {
@@ -134,6 +136,11 @@ export interface DispatcherDeps {
   // Omitted (or resolving to an empty catalog) still answers the request, so
   // the panel degrades to "use the node default model" instead of hanging.
   loadModelCatalog?: () => Promise<DiscussionModelCatalog>;
+  // 按用户持久化的模型偏好（见 user-models.ts）。用户在私聊里发
+  // `/use-model <provider>/<model>` 时写进来的就是它，下一轮该用户的 turn
+  // 从它取模型。省略时 `/use-model` 只回一句「本节点不支持」，不会静默吞掉
+  // 命令、也不会把命令当提问送进 agent。
+  userModels?: UserModelStore;
   // Probes / repairs this node's local agent runtime for the web's
   // 设备详情 → 一键唤醒 (see runtime-recovery.ts). Omitted -> the request is
   // still answered, with an honest probe_failed, so the browser never hangs.
@@ -343,6 +350,15 @@ export class MessageDispatcher {
         return;
       }
       if (!text) return;
+      // `/use-model` 是 web 切模型发的**文本命令**（设备管理里选模型、圆桌里
+      // 给某个角色换模型，都是给目标节点的 AI 账号私发这一条）。必须在进
+      // agent 之前截住：以前没有这个分支，命令会变成用户提问，agent 要么回
+      // 「没有这个命令」，要么真去执行一个叫 use-model 的任务。
+      const useModel = parseUseModelCommand(text);
+      if (useModel) {
+        await this.handleUseModelCommand(msg.fromUserId, useModel);
+        return;
+      }
       // 私聊也走流式：web 端 chat_stream 帧先逐帧渲染，完成后 command_result
       // / 卡片兜底。sendStream 缺失（测试）时退回整包回复。
       await this.runStreamedTurn({
@@ -351,7 +367,8 @@ export class MessageDispatcher {
         requestMessageId: msg.messageUId || `req-${Date.now()}`,
         requesterId: msg.fromUserId,
         prompt: text,
-        model: undefined,
+        // per-user 模型：这个人自己选过的就用他的，没选过则跟随节点默认。
+        model: this.deps.userModels?.get(msg.fromUserId),
         // 私聊按对端分桶：不给键的话 openclaw 会把私聊也塞进主会话，和群聊、
         // 讨论组共享一串上下文。
         sessionKey: turnSessionKey("private", msg.fromUserId),
@@ -440,13 +457,20 @@ export class MessageDispatcher {
       const convType: 1 | 3 | 4 = !hasConvType ? 1
         : params.conversation_type === 3 ? 3
         : params.conversation_type === 4 ? 4 : 1;
+      const requesterId = typeof params.requester_id === "string" && params.requester_id
+        ? params.requester_id
+        : msg.fromUserId;
       await this.runStreamedTurn({
         conversationType: convType,
         conversationId: replyTo,
         requestMessageId: cmd.request_id,
-        requesterId: typeof params.requester_id === "string" ? params.requester_id : msg.fromUserId,
+        requesterId,
         prompt,
-        model: params.model,
+        // 轮次模型：用户自己 `/use-model` 选过的优先 —— 那是运行期的最新意图
+        // （web 的圆桌「角色模型」就是给该角色节点私发这条命令，不写服务端
+        // 角色配置）；没选过才用服务端按角色下发的 params.model；两者都没有
+        // 则交给 run.ts 回落到节点的 --model。
+        model: this.deps.userModels?.get(requesterId) ?? params.model,
         // 讨论组/群聊/聊天室各按自己的会话 id 分桶，讨论组里聊出来的共识
         // 不会顺着 agent 的共享会话爬进普通群聊。
         sessionKey: turnSessionKey(venue, replyTo),
@@ -975,6 +999,35 @@ export class MessageDispatcher {
       return `已生成 ${uploaded.length} 个文件：${uploaded.map((file) => file.name).join("、")}`;
     }
     return "（本轮没有产出内容）";
+  }
+
+  // `/use-model`：改「这个人」在本节点上用的模型，并立即回执。
+  //
+  // 刻意不进 agent、也不占用会话队列：用户点一下模型下拉就在等一个响应，spawn
+  // 一个 agent 冷启动好几秒，还会把队列里真正的提问挤到后面。
+  private async handleUseModelCommand(fromUserId: string, command: UseModelCommand): Promise<void> {
+    const store = this.deps.userModels;
+    if (!store) {
+      await this.deps.send(
+        fromUserId,
+        "RC:TxtMsg",
+        JSON.stringify({
+          content: "本节点不支持按用户切换模型，请在设备管理里调整默认模型。",
+        }),
+      ).catch(() => { });
+      return;
+    }
+
+    if (command.kind === "set") store.set(fromUserId, command.route);
+    else if (command.kind === "clear") store.set(fromUserId, null);
+
+    const current = store.get(fromUserId);
+    const ack = formatUseModelAck(command, current);
+    console.log(
+      `use-model: user=${fromUserId} action=${command.kind}` +
+      `${command.kind === "set" ? ` route=${command.route}` : ""} -> ${current ?? "(node default)"}`,
+    );
+    await this.deps.send(fromUserId, "RC:TxtMsg", JSON.stringify({ content: ack })).catch(() => { });
   }
 
   // chat_stop 处理：取消活动流并回执。

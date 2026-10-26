@@ -44,6 +44,25 @@ describe("classifyTurnError", () => {
     expect(classifyTurnError("HTTP 429 Too Many Requests")).toBe("model_rate_limited");
   });
 
+  // 现场（2026-10-25 私聊）：用户自有设备的 kimi 只把 `Tip: send /login …` 打在
+  // stdout 上就 exit 1，stderr 为空。这条消息就是「没配 key / 没登录」，
+  // 前端该说的是「去设备端换 key」，不是「进程异常退出」。
+  it("kimi / claude 的「去登录」提示归到鉴权失败", () => {
+    const cases = [
+      "agent exited with code 1:\n[stdout tail]\nTip: send /login to use Kimi for Code",
+      "Invalid API key · Please run /login",
+      "Please run /login",
+      "Authentication required",
+    ];
+    for (const raw of cases) expect(classifyTurnError(raw)).toBe("model_auth_failed");
+  });
+
+  it("中文的「未登录」措辞同样归到鉴权失败", () => {
+    for (const raw of ["请先登录", "未登录", "需要登录后再试"]) {
+      expect(classifyTurnError(raw)).toBe("model_auth_failed");
+    }
+  });
+
   it("用户主动停止不该被说成额度问题", () => {
     expect(classifyTurnError("agent turn aborted")).toBe("agent_failed");
   });
