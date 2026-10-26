@@ -1659,6 +1659,14 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// 按账号启停（运维助手 / 后台共用同一张 control 表）。per-agent 运维账号
 	// 只能操作自己服务的那个 agent，越界直接 403。
 	r.Post("/api/claw/device/control/set", h.ClawDeviceControlSet)
+	// 设备升级进度回传。领取升级指令复用上面的 /api/claw/device/control（同一次
+	// 10s 轮询里带回 version 与 upgrade 意图），这里只负责「下载到一半/校验失败/
+	// 已在重启」这些阶段跃迁 —— 它们不可能等到下一个轮询周期才说。
+	r.Post("/api/claw/device/upgrade/report", h.ClawDeviceUpgradeReport)
+	// 升级资产的服务端中转（设备直连 GitHub 失败时的回退）。公开路由：设备手里
+	// 只有设备凭据，而它拉的是公开 release 资产；鉴权靠短期 token，见
+	// upgrade_download.go。
+	r.Get("/api/agent/upgrade/download", h.ClawUpgradeDownload)
 	r.Get("/api/claw/nodes/{nodeId}/status", h.ClawNodeStatus)
 	r.Post("/api/claw/nodes/{nodeId}", h.ClawUpdateNode)
 	r.Delete("/api/claw/nodes/{nodeId}", h.ClawDeleteNode)
@@ -1756,6 +1764,13 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// 启停：写期望状态，由设备 supervisor 轮询执行（见 claw_device_control.go）。
 	r.Post("/api/admin/nodes/{id}/start", h.ClawAdminStartNode)
 	r.Post("/api/admin/nodes/{id}/stop", h.ClawAdminStopNode)
+	// 设备 exe 升级：单台与批量共用一条（body 里的 machine_ids），只下发「升到
+	// latest」的意图，版本/摘要/下载地址全部服务端解析（见 claw_admin_upgrade.go）。
+	r.Post("/api/admin/nodes/upgrade", h.ClawAdminRequestNodeUpgrade)
+	// 整批进度：弹窗每 4 秒刷一次，按机器逐台查会变成 N 台 N 条请求（见
+	// claw_admin_upgrade.go 的 ClawAdminListNodeUpgrades）。
+	r.Get("/api/admin/nodes/upgrade", h.ClawAdminListNodeUpgrades)
+	r.Get("/api/admin/nodes/upgrade/{machine_id}", h.ClawAdminGetNodeUpgrade)
 	// 归属变更：按融云好友边重建（本地 owner_user_id 与 IM 账号体系对不上，见
 	// claw_admin_nodes.go 的 ClawAdminTransferNodeOwner）。
 	r.Put("/api/admin/nodes/{id}/owner", h.ClawAdminTransferNodeOwner)

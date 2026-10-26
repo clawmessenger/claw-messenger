@@ -262,6 +262,82 @@ type clawAdminNodeRow struct {
 	Controllable   bool   `json:"controllable"`
 	DesiredState   string `json:"desired_state,omitempty"`
 	DesiredVersion int64  `json:"desired_version,omitempty"`
+	// 机器维度（exe 归属）：同一台机器上的多个 agent 行共享一个 machine_id，
+	// 也就共享一个 exe 版本与一个升级任务。页面的「exe 版本」列与「升级」按钮
+	// 都按 machine_id 聚合，避免同机重复下载。
+	MachineID string `json:"machine_id,omitempty"`
+	// ExeVersion 是设备上报的安装版本（install.ts 单机单路径）；空 = 从未上报，
+	// 页面显示「未知」。
+	ExeVersion string `json:"exe_version,omitempty"`
+	// ExePlatform 是设备上报的 "<os>-<arch>"（如 win32-x64）。页面的「升级」按钮
+	// 据此禁用：本期只做 Windows-x64 的自动重启，其它平台只能看版本。
+	ExePlatform string `json:"exe_platform,omitempty"`
+	// UpgradeStatus/Target/Error/UpdatedAt 来自 rongcloud_node_upgrade，
+	// 与版本同表读取 —— 一次查询同时拿到「现在什么版本」和「升到哪一步了」。
+	UpgradeStatus    string `json:"upgrade_status,omitempty"`
+	UpgradeTarget    string `json:"upgrade_target,omitempty"`
+	UpgradeError     string `json:"upgrade_error,omitempty"`
+	UpgradeUpdatedAt string `json:"upgrade_updated_at,omitempty"`
+}
+
+// clawAdminNodeUpgrades 取全部机器的升级/版本行，键是 machine_id。
+// 表量级 = 机器数（一台一行），全量取比在页面循环里逐台查便宜。
+func (h *Handler) clawAdminNodeUpgrades(ctx context.Context) map[string]clawNodeUpgrade {
+	out := make(map[string]clawNodeUpgrade, 4)
+	if h.DB == nil {
+		return out
+	}
+	rows, err := h.DB.Query(ctx, `SELECT `+clawNodeUpgradeColumns+`
+		  FROM rongcloud_node_upgrade`)
+	if err != nil {
+		// 这条吞掉会让「迁移 601 没跑」表现成「全站版本列都是未知」而服务端零信号，
+		// 排起来非常费劲 —— 至少要留一条日志。
+		slog.Warn("claw admin: reading node upgrade rows failed (migration 601 applied?)", "error", err)
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		upgrade, err := scanClawNodeUpgrade(rows)
+		if err != nil {
+			continue
+		}
+		out[upgrade.MachineID] = upgrade
+	}
+	return out
+}
+
+// clawAdminAttachUpgrade 把机器维度的版本/升级信息贴到行投影上。
+//
+// 放在 clawAdminNodeRowFor 之后而不是塞进它的参数里：那个函数的签名被现有单测
+// 钉着（claw_admin_nodes_test.go），多一个参数会让一组与升级无关的投影测试跟着
+// 改；而 attach 是纯附加语义，老行不贴也仍然合法。
+func (h *Handler) clawAdminAttachUpgrade(row clawAdminNodeRow, rec clawAdminNodeRecord, upgrades map[string]clawNodeUpgrade) clawAdminNodeRow {
+	// 机器键必须和设备侧 machineIDForDevice 推导一致：machine_id 为空的旧行用
+	// rongcloud_user_id 剥掉 `rc_node_` 兜底。只按 machine_id 查的话，这类机器
+	// 会正常上报版本却被永远显示成「未知」，还升不了（审查报告 M6）。
+	machineID := rec.MachineID
+	if machineID == "" {
+		machineID = strings.TrimPrefix(rec.RongcloudUserID, "rc_node_")
+	}
+	if machineID == "" {
+		return row
+	}
+	row.MachineID = machineID
+	upgrade, ok := upgrades[machineID]
+	if !ok {
+		return row
+	}
+	row.ExeVersion = upgrade.ReportedVersion
+	row.ExePlatform = upgrade.ReportedPlatform
+	row.UpgradeStatus = upgrade.Status
+	row.UpgradeTarget = upgrade.TargetVersion
+	if upgrade.ErrorCode != "" {
+		row.UpgradeError = upgrade.ErrorCode
+	}
+	if !upgrade.UpdatedAt.IsZero() {
+		row.UpgradeUpdatedAt = upgrade.UpdatedAt.UTC().Format(time.RFC3339)
+	}
+	return row
 }
 
 // clawAdminNodeControl 是 rongcloud_node_control 的一行（运维期望状态）。
@@ -408,11 +484,12 @@ func (h *Handler) ClawAdminListNodes(w http.ResponseWriter, r *http.Request) {
 	claimants := h.clawAdminNodeClaimants(ctx, rcIDs)
 	accountNames, _ := h.clawAdminIMAccounts(ctx)
 	controls := h.clawAdminNodeControls(ctx)
+	upgrades := h.clawAdminNodeUpgrades(ctx)
 
 	items := make([]clawAdminNodeRow, 0, len(pageRecords))
 	for _, rec := range pageRecords {
 		claimant := claimants[rec.RongcloudUserID]
-		items = append(items, h.clawAdminNodeRowFor(
+		row := h.clawAdminNodeRowFor(
 			rec,
 			names[rec.RongcloudUserID],
 			descriptions[rec.NodeID],
@@ -420,7 +497,8 @@ func (h *Handler) ClawAdminListNodes(w http.ResponseWriter, r *http.Request) {
 			accountNames[claimant],
 			reserved[rec.RongcloudUserID] || hostNodes[rec.NodeID],
 			controls[uuidToText(rec.ID)],
-		))
+		)
+		items = append(items, h.clawAdminAttachUpgrade(row, rec, upgrades))
 	}
 	clawAdminOK(w, map[string]interface{}{
 		"items": items, "total": total, "page": page, "page_size": pageSize,
@@ -474,7 +552,7 @@ func (h *Handler) ClawAdminGetNode(w http.ResponseWriter, r *http.Request) {
 		accountNames[claimant], reserved[rec.RongcloudUserID] || hostNodes[rec.NodeID],
 		h.clawAdminNodeControls(ctx)[uuidToText(rec.ID)],
 	)
-	clawAdminOK(w, row)
+	clawAdminOK(w, h.clawAdminAttachUpgrade(row, rec, h.clawAdminNodeUpgrades(ctx)))
 }
 
 func (h *Handler) ClawAdminGetNodeStatus(w http.ResponseWriter, r *http.Request) {

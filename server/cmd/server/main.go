@@ -379,6 +379,14 @@ func main() {
 	if os.Getenv("RESEND_API_KEY") == "" && strings.TrimSpace(os.Getenv("SMTP_HOST")) == "" {
 		slog.Warn("no email backend configured (RESEND_API_KEY and SMTP_HOST both empty) — verification codes will be printed to the log instead of emailed.")
 	}
+	// 设备 exe 升级的下载代理靠这个密钥签短期 token。没配就等于「代理端点 503，
+	// 设备只能直连 GitHub」—— 这是刻意的 fail-closed（绝不回落到 JWT 密钥或源码
+	// 常量，那个端点公网可达且无鉴权）。运维需要知道这条降级。
+	if strings.TrimSpace(os.Getenv("MULTICA_CLAW_UPGRADE_TOKEN_SECRET")) == "" {
+		slog.Warn("MULTICA_CLAW_UPGRADE_TOKEN_SECRET is not set — the device upgrade download proxy will return 503 " +
+			"(devices fall back to downloading straight from GitHub); set it to a random 32+ byte secret to enable the proxy, " +
+			"e.g. `openssl rand -hex 32`")
+	}
 	if os.Getenv("MULTICA_DEV_VERIFICATION_CODE") != "" {
 		if strings.EqualFold(strings.TrimSpace(os.Getenv("APP_ENV")), "production") {
 			slog.Warn("MULTICA_DEV_VERIFICATION_CODE is set but ignored because APP_ENV=production.")

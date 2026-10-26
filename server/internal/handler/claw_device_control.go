@@ -36,6 +36,10 @@ type clawDeviceControlState struct {
 // 主进程，而它不持有融云连接（imlib 是模块级单例，一个 IM 用户只能有一个进程登录），
 // 持连接的是它拉起的每个 agent 子进程；且一旦子进程被停掉，「启动」就没有任何进程能
 // 收到。所以让始终在线的 supervisor 主动来拉，而不是服务端去找它。
+//
+// 同一次往返还带 exe 升级：请求体里的 version/platform 是「这台机器的安装版本」，
+// 响应体里的 upgrade 是「该不该升级、升到哪个版本、从哪下」。合成一次往返的理由见
+// claw_device_upgrade.go 文件头 —— 版本是机器属性，而这是唯一的机器级定时轮询。
 func (h *Handler) ClawDeviceControl(w http.ResponseWriter, r *http.Request) {
 	if h.RongCloudNode == nil {
 		clawJSON(w, 503, 503, "RongCloud 集成未配置", nil)
@@ -45,10 +49,29 @@ func (h *Handler) ClawDeviceControl(w http.ResponseWriter, r *http.Request) {
 		NodeID       string `json:"nodeId"`
 		CredentialID string `json:"credentialId"`
 		Secret       string `json:"secret"`
+		// 旧 CLI 不带这两个字段：那时 version 为空，版本列显示「未知」，
+		// upgrade 分支自然不会被触发（服务端不会给没上报过平台的机器下发
+		// Windows 升级指令）。
+		Version  string `json:"version"`
+		Platform string `json:"platform"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil ||
 		req.NodeID == "" || req.CredentialID == "" || req.Secret == "" {
 		clawJSON(w, 400, 400, "缺少设备凭据", nil)
+		return
+	}
+	// 先拿机器节点：升级行是按机器存的，需要它的 uuid/workspace/machine_id。
+	// 这条查一次与 AgentNodesForDevice 内部的校验重复，但那是已索引的主键查询，
+	// 每 10 秒一次可以接受；把机器维度拆出来比让 AgentNodesForDevice 顺手返回
+	// 一个调用方多半不关心的结构更不容易出错。
+	machineNode, err := h.RongCloudNode.AuthorizeDevice(r.Context(), req.NodeID, req.CredentialID, req.Secret)
+	if err != nil {
+		if errors.Is(err, rongcloud.ErrInvalidDeviceCredential) {
+			clawJSON(w, 401, 401, "设备凭据无效", nil)
+			return
+		}
+		slog.Warn("claw: device control machine lookup failed", "nodeId", req.NodeID, "error", err)
+		clawJSON(w, 500, 500, "查询设备控制状态失败", nil)
 		return
 	}
 	refs, err := h.RongCloudNode.AgentNodesForDevice(r.Context(), req.NodeID, req.CredentialID, req.Secret)
@@ -67,7 +90,27 @@ func (h *Handler) ClawDeviceControl(w http.ResponseWriter, r *http.Request) {
 		clawJSON(w, 500, 500, "查询设备控制状态失败", nil)
 		return
 	}
-	clawJSON(w, 200, 200, "", map[string]interface{}{"agents": states})
+	payload := map[string]interface{}{"agents": states}
+	if h.DB != nil {
+		version := strings.TrimSpace(req.Version)
+		platform := strings.TrimSpace(req.Platform)
+		if version != "" || platform != "" {
+			// 版本上报失败绝不影响启停：下一轮再报就是了。
+			if err := h.clawDeviceRecordUpgradeState(r.Context(), machineNode, version, platform, 0); err != nil {
+				slog.Warn("claw: device version report failed",
+					"machine", machineIDForDevice(machineNode), "error", err)
+			}
+		}
+		intent, err := h.clawDeviceUpgradeIntent(r.Context(), machineNode, version)
+		if err != nil {
+			slog.Warn("claw: device upgrade intent failed",
+				"machine", machineIDForDevice(machineNode), "error", err)
+		}
+		if intent != nil {
+			payload["upgrade"] = intent
+		}
+	}
+	clawJSON(w, 200, 200, "", payload)
 }
 
 func (h *Handler) clawAdminDeviceControlStates(ctx context.Context, refs []rongcloud.AgentNodeRef) ([]clawDeviceControlState, error) {
