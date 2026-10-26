@@ -111,6 +111,15 @@ describe("isSeaExecutable", () => {
     expect(isSeaExecutable("D:\\repo\\packages\\xiachat-cli\\dist\\bin.js")).toBe(false);
     expect(isSeaExecutable("/repo/dist/bin.js")).toBe(false);
   });
+
+  it("rejects the SEA entry bundle (the release pipeline runs it with node)", () => {
+    // scripts/build-exe.mjs 产出 dist/clawmessenger.sea.cjs，发布流水线的版本闸门
+    // 用 `node dist/clawmessenger.sea.cjs --version` 跑它。判成 exe 会让一次版本
+    // 检查去动真实安装目录、并把 node 二进制复制成 ~/.local/bin/clawmessenger。
+    expect(isSeaExecutable("packages/xiachat-cli/dist/clawmessenger.sea.cjs")).toBe(false);
+    expect(isSeaExecutable("/repo/dist/clawmessenger.sea.cjs")).toBe(false);
+    expect(isSeaExecutable("/repo/dist/entry.mjs")).toBe(false);
+  });
 });
 
 describe("samePath", () => {

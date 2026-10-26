@@ -104,28 +104,53 @@ jobs:
       # 取版本号用「按 semver 形状挑行」而不是 `tail -n1`：产物首次运行时会在版本号
       # 之后追加自安装通知，`tail -n1` 拿到的是通知文本，会把正确的包判成版本不对。
       # 通知现在改走 stderr（packages/xiachat-cli/src/bin.ts），这里仍然两道保险。
+      #
+      # 采集方式必须是「重定向到文件」，不能是 `raw="$( ... )"`。命令替换在 POSIX 上
+      # 把 stdout 接到**管道**，而 Node 的 process.stdout 接管道时是异步写、接文件时
+      # 是同步写：异步写会在进程退出时丢掉尚未落地的数据，而 stderr 恰好是同步的
+      # ——于是只有 stdout 丢，命令替换拿到空串、退出码仍然是 0，闸门把一份完全正确
+      # 的产物判成「版本号不对」。v1.3.0 第一次打 tag 就是这么被拦下的：同一份脚本
+      # windows-x64 通过，linux-x64 / linux-arm64 / darwin-arm64 全部上报空版本号。
       - name: Verify the bundle reports the tag version
         shell: bash
+        env:
+          EXPECTED: ${{ steps.version.outputs.value }}
         run: |
           set -euo pipefail
-          expected="${{ steps.version.outputs.value }}"
-          # `set +e` 只为把这个退出码留在日志里：bundle 跑不起来时报错信息比
-          # 「Process completed with exit code 1」有用得多。
-          set +e
-          raw="$(node packages/xiachat-cli/dist/clawmessenger.sea.cjs --version 2>&1)"
-          rc=$?
-          set -e
-          raw="$(printf '%s\n' "$raw" | tr -d '\r')"
-          actual="$(printf '%s\n' "$raw" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | tail -n1 || true)"
-          echo "bundle reports '$actual', tag says '$expected' (exit=$rc)"
-          if [[ "$rc" != "0" ]]; then
-            printf '%s\n' "$raw" | sed 's/^/  bundle> /'
-            echo "::error::the built bundle exited $rc when asked for --version"
+          bundle="packages/xiachat-cli/dist/clawmessenger.sea.cjs"
+          if [[ ! -f "$bundle" ]]; then
+            echo "::error::build:exe did not produce $bundle"
             exit 1
           fi
-          if [[ "$actual" != "$expected" ]]; then
-            printf '%s\n' "$raw" | sed 's/^/  bundle> /'
-            echo "::error::the built bundle reports '$actual' but the tag is '$expected' — refusing to publish a mislabelled release"
+          out="$RUNNER_TEMP/bundle-version.out"
+          err="$RUNNER_TEMP/bundle-version.err"
+          # 失败现场要能直接从注解里读到：注解在任何视图都可见，日志得登进去翻。
+          # 注解里的换行必须写成 %0A、字面 % 必须写成 %25（GitHub 的转义规则）。
+          flatten() {
+            awk 'NR <= 12 { gsub(/\r/, ""); gsub(/%/, "%25"); if (NR > 1) printf "%s", "%0A"; printf "%s", $0 }' "$1" 2>/dev/null || true
+          }
+          dump_io() {
+            echo "---- stdout ----"
+            sed 's/^/  stdout> /' "$out" || true
+            echo "---- stderr ----"
+            sed 's/^/  stderr> /' "$err" || true
+          }
+          # `|| rc=$?` 而不是 `set +e` 再 `set -e`：后者漏一行就会把后续命令的失败
+          # 一起吞掉。set -e 下 rc 的赋值不会中断脚本。
+          rc=0
+          node "$bundle" --version >"$out" 2>"$err" || rc=$?
+          actual="$(tr -d '\r' <"$out" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | tail -n1 || true)"
+          echo "bundle: $bundle ($(wc -c <"$bundle" | tr -d ' ') bytes)"
+          echo "node: $(node --version) at $(command -v node || echo '<missing>')"
+          echo "bundle --version -> '$actual' (tag says '$EXPECTED'), exit=$rc"
+          if [[ "$rc" != "0" ]]; then
+            dump_io
+            echo "::error::the built bundle exited $rc when asked for --version. node=$(node --version) stdout=$(flatten "$out") stderr=$(flatten "$err")"
+            exit 1
+          fi
+          if [[ "$actual" != "$EXPECTED" ]]; then
+            dump_io
+            echo "::error::the built bundle reports '$actual' but the tag is '$EXPECTED' — refusing to publish a mislabelled release. stdout=$(flatten "$out") stderr=$(flatten "$err")"
             exit 1
           fi
 
@@ -135,11 +160,14 @@ jobs:
       # or mutate anything (`ensureInstalled` is best-effort and only copies the
       # binary), and `matrix.source` is the built artifact path
       # (dist/clawmessenger.exe on Windows, dist/clawmessenger elsewhere).
+      #
+      # 采集方式与 Gate 1 相同：重定向到文件，不用命令替换（见上面的注释）。
       - name: Verify embedded version
         shell: bash
+        env:
+          EXPECTED: ${{ steps.version.outputs.value }}
         run: |
           set -euo pipefail
-          expected="${{ steps.version.outputs.value }}"
           artifact="packages/xiachat-cli/${{ matrix.source }}"
           if [[ ! -f "$artifact" ]]; then
             echo "::error::$artifact was not produced by build:exe"
@@ -148,25 +176,32 @@ jobs:
           if [[ "${{ runner.os }}" != "Windows" ]]; then
             chmod +x "$artifact"
           fi
+          out="$RUNNER_TEMP/exe-version.out"
+          err="$RUNNER_TEMP/exe-version.err"
+          flatten() {
+            awk 'NR <= 12 { gsub(/\r/, ""); gsub(/%/, "%25"); if (NR > 1) printf "%s", "%0A"; printf "%s", $0 }' "$1" 2>/dev/null || true
+          }
+          dump_io() {
+            echo "---- stdout ----"
+            sed 's/^/  stdout> /' "$out" || true
+            echo "---- stderr ----"
+            sed 's/^/  stderr> /' "$err" || true
+          }
           # 退出码也是闸门的一部分：`--version` 是成功路径，非 0 就是 bug
           # （`.exitOverride()` 抛的 CommanderError 没被入口翻译时就是这个症状：
           # 版本号打印正确，进程却 exit 1 并把版本号重复打到 stderr）。
-          set +e
-          raw="$("$artifact" --version 2>"$RUNNER_TEMP/exe-version.err")"
-          rc=$?
-          set -e
-          raw="$(printf '%s\n' "$raw" | tr -d '\r')"
-          actual="$(printf '%s\n' "$raw" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | tail -n1 || true)"
-          echo "$artifact --version -> '$actual' (tag says '$expected'), exit=$rc"
+          rc=0
+          "$artifact" --version >"$out" 2>"$err" || rc=$?
+          actual="$(tr -d '\r' <"$out" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | tail -n1 || true)"
+          echo "$artifact --version -> '$actual' (tag says '$EXPECTED'), exit=$rc"
           if [[ "$rc" != "0" ]]; then
-            echo "::error::'$artifact --version' exited $rc — the version gate reads that output, and a non-zero exit also means the binary rejects a flag it should accept"
-            printf '%s\n' "$raw" | sed 's/^/  stdout> /'
-            sed 's/^/  stderr> /' "$RUNNER_TEMP/exe-version.err" 2>/dev/null || true
+            dump_io
+            echo "::error::'$artifact --version' exited $rc — the version gate reads that output, and a non-zero exit also means the binary rejects a flag it should accept. stdout=$(flatten "$out") stderr=$(flatten "$err")"
             exit 1
           fi
-          if [[ "$actual" != "$expected" ]]; then
-            printf '%s\n' "$raw" | sed 's/^/  stdout> /'
-            echo "::error::${{ matrix.source }} reports '$actual' but the tag is '$expected' — refusing to publish a mislabelled release"
+          if [[ "$actual" != "$EXPECTED" ]]; then
+            dump_io
+            echo "::error::${{ matrix.source }} reports '$actual' but the tag is '$EXPECTED' — refusing to publish a mislabelled release. stdout=$(flatten "$out") stderr=$(flatten "$err")"
             exit 1
           fi
 

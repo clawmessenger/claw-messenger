@@ -31,9 +31,19 @@ export function installPaths(platform: string, homedir: string, localAppData?: s
   return { dir, exe: "clawmessenger", target: path.posix.join(dir, "clawmessenger") };
 }
 
-/** True when running as a single-file SEA executable (not `node bundle.js`). */
+/**
+ * True when running as a single-file SEA executable (not `node bundle.js`).
+ *
+ * `.cjs` / `.mjs` count as script entrypoints too: the SEA entry bundle that
+ * `scripts/build-exe.mjs` emits is `dist/clawmessenger.sea.cjs`, and the release
+ * pipeline runs it with plain `node ... --version` to check the baked-in
+ * version. Judging that run as "the exe" is not a harmless over-detection — it
+ * makes a version check heal/swap a real install directory and copy the running
+ * `node` binary (100+ MB) over `~/.local/bin/clawmessenger`.
+ */
 export function isSeaExecutable(argv1: string | undefined): boolean {
-  return !argv1 || !argv1.endsWith(".js");
+  if (!argv1) return true;
+  return !/\.(c|m)?js$/i.test(argv1);
 }
 
 /** Case-insensitive on Windows, exact elsewhere. */
