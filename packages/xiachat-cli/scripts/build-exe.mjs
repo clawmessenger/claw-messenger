@@ -1,9 +1,18 @@
 // Build a self-contained executable via Node SEA (single executable application).
 //
 // Toolchain note: esbuild and postject are NOT devDependencies of this package
-// (they could not be added offline, ERR_PNPM_NO_OFFLINE_META). Both binaries
-// already exist in the workspace root node_modules/.bin (hoisted there by other
-// packages), so we locate them by walking up instead of declaring them.
+// (they could not be added offline, ERR_PNPM_NO_OFFLINE_META). Both already
+// exist in the workspace root node_modules (hoisted there by other packages),
+// so we locate their JS entrypoints by walking up instead of declaring them.
+//
+// 为什么不走 node_modules/.bin：Windows 上 `.bin/esbuild` 是 `.cmd` 批处理，必须
+// `shell: true` 才能起，而一旦过 shell 参数就会被重新解析 —— 这正好是 1.3.0 首次
+// 发布时那个 bug 的土壤：define 的参数被双重 JSON 编码成
+// `--define:__CLAWMESSENGER_VERSION__="\"1.3.0\""`，POSIX 上无 shell 原样交给
+// esbuild，注入进二进制的字符串**自带引号**（`clawmessenger --version` 打印
+// `"1.3.0"`，报给服务端的版本也跟着带引号）；Windows 上 cmd 吃掉一层转义，
+// 反而「碰巧正确」。用 process.execPath 直接跑 JS 入口，两个平台拿到完全相同的
+// argv，没有第二套解析器可以偏离。
 //
 // Usage:
 //   node scripts/build-exe.mjs                          # dist/clawmessenger.exe from src/bin.ts
@@ -16,15 +25,15 @@ import { fileURLToPath } from "node:url";
 const here = dirname(fileURLToPath(import.meta.url));
 const pkgRoot = resolve(here, "..");
 
-const binExt = process.platform === "win32" ? ".CMD" : "";
-function findTool(name) {
+/** Resolve a package-internal file (e.g. `esbuild/bin/esbuild`) up the workspace. */
+function findModuleFile(relative) {
   let dir = pkgRoot;
   for (;;) {
-    const candidate = join(dir, "node_modules", ".bin", name + binExt);
+    const candidate = join(dir, "node_modules", relative);
     if (existsSync(candidate)) return candidate;
     const parent = dirname(dir);
     if (parent === dir) {
-      throw new Error(`${name} not found in any ancestor node_modules/.bin — run from the pnpm workspace`);
+      throw new Error(`node_modules/${relative} not found in any ancestor — run from the pnpm workspace`);
     }
     dir = parent;
   }
@@ -68,22 +77,39 @@ if (injectedVersion !== rawVersion) {
   console.log(`version ${rawVersion} normalized to ${injectedVersion}`);
 }
 const outCjs = join(distDir, `${exeName}.sea.cjs`);
-const esbuild = findTool("esbuild");
+const esbuildCli = findModuleFile(join("esbuild", "bin", "esbuild"));
+// define 的值**只能编码一次**：JSON.stringify 一次得到的 `"1.3.0"`（带引号的
+// JSON 字符串字面量）正是 esbuild 期望的形式。编码两次会得到 `"\"1.3.0\""`，
+// 注入进二进制的字符串自带引号 —— 见文件头关于 1.3.0 首次发布的注释。
+const defineArg = `--define:__CLAWMESSENGER_VERSION__=${JSON.stringify(injectedVersion)}`;
 const bundle = spawnSync(
-  esbuild,
+  process.execPath,
   [
+    esbuildCli,
     entry,
     "--bundle",
     "--platform=node",
     "--format=cjs",
     "--target=node20",
-    `--define:__CLAWMESSENGER_VERSION__=${JSON.stringify(JSON.stringify(injectedVersion))}`,
+    defineArg,
     `--outfile=${outCjs}`,
     "--log-level=warning",
   ],
-  { stdio: "inherit", shell: isWindows },
+  { stdio: "inherit" },
 );
 if (bundle.status !== 0) throw new Error(`esbuild failed (exit ${bundle.status})`);
+
+// 1b. 自检：把刚打出的 bundle 当普通 node 脚本跑一次，确认它答出来的版本**逐字符**
+// 等于注入值。上面那个双重编码的 bug 靠这一步在构建期就断掉，而不是等发版时由
+// 流水线的闸门去发现（那次三个 POSIX job 挂掉、Release 没建出来，代价是两轮 CI）。
+const probe = spawnSync(process.execPath, [outCjs, "--version"], { encoding: "utf8" });
+const probed = (probe.stdout ?? "").trim();
+if (probe.status !== 0 || probed !== injectedVersion) {
+  throw new Error(
+    `the bundle reports ${JSON.stringify(probed)} (exit ${probe.status}) but ${JSON.stringify(injectedVersion)} was injected — ` +
+      `stderr: ${(probe.stderr ?? "").trim() || "<empty>"}`,
+  );
+}
 
 // 2. SEA config → blob.
 const blobPath = join(distDir, `${exeName}.sea.blob`);
@@ -108,11 +134,18 @@ if (sea.status !== 0) throw new Error(`node --experimental-sea-config failed (ex
 // 3. Copy the current node binary and inject the blob.
 rmSync(exePath, { force: true });
 copyFileSync(process.execPath, exePath);
-const postject = findTool("postject");
+const postjectCli = findModuleFile(join("postject", "dist", "cli.js"));
 const inject = spawnSync(
-  postject,
-  [exePath, "NODE_SEA_BLOB", blobPath, "--sentinel-fuse", "NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2"],
-  { stdio: "inherit", shell: isWindows },
+  process.execPath,
+  [
+    postjectCli,
+    exePath,
+    "NODE_SEA_BLOB",
+    blobPath,
+    "--sentinel-fuse",
+    "NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2",
+  ],
+  { stdio: "inherit" },
 );
 if (inject.status !== 0) throw new Error(`postject failed (exit ${inject.status})`);
 
