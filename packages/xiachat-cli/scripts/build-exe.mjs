@@ -145,6 +145,24 @@ function run(label, file, commandArgs) {
   return result;
 }
 
+/**
+ * Best-effort run: log what happened and continue. 用在「失败了也无所谓」的步骤上
+ * （比如给未签名的二进制去签名，本身就会失败），**不能**复用 run()：那会打出一条
+ * `::error::` 注解，把一个正常构建标成有错误。
+ */
+function runOptional(label, file, commandArgs) {
+  let result;
+  try {
+    result = spawnSync(file, commandArgs, { stdio: "inherit" });
+  } catch (err) {
+    console.log(`note: ${label} could not run: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
+  if (result.error) console.log(`note: ${label} could not run: ${result.error.message}`);
+  else if (result.status !== 0) console.log(`note: ${label} exited ${result.status} (ignored)`);
+  return result;
+}
+
 const args = process.argv.slice(2);
 function opt(name, fallback) {
   const i = args.indexOf(name);
@@ -262,8 +280,21 @@ writeFileSync(
 run("sea-blob", process.execPath, ["--experimental-sea-config", configPath]);
 
 // 3. Copy the current node binary and inject the blob.
+//
+// macOS 上还必须处理签名：官方 Node 二进制是带签名的，注入 blob 会改掉文件内容，
+// 签名随之失效 —— 系统不会报「签名无效」，而是直接把进程杀掉（实测 exit 139 /
+// SIGSEGV，stdout 和 stderr 全空）。所以先去掉原签名，注入后再做 ad-hoc 签名
+// （Node SEA 文档里 macOS 的标准步骤）。
+//
+// v1.1.0 的 darwin-arm64 大概一直是坏的：那时发布流水线没有「跑一遍产物」这道闸门，
+// 从来没人执行过它。1.3.0 加上 Gate 2 之后才第一次暴露出来。
 rmSync(exePath, { force: true });
 copyFileSync(process.execPath, exePath);
+const isMac = process.platform === "darwin";
+if (isMac) {
+  // 未签名的二进制会让这一步失败，不算错误。
+  runOptional("codesign-remove", "codesign", ["--remove-signature", exePath]);
+}
 const postjectCli = findModuleFile(join("postject", "dist", "cli.js"));
 runTool("postject", postjectCli, [
   exePath,
@@ -272,5 +303,9 @@ runTool("postject", postjectCli, [
   "--sentinel-fuse",
   "NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2",
 ]);
+if (isMac) {
+  // 这一步必须成功：签不上的产物在任何 Mac 上都起不来。
+  run("codesign-sign", "codesign", ["--sign", "-", "--force", exePath]);
+}
 
 console.log(`built ${exePath} (clawmessenger ${injectedVersion})`);
