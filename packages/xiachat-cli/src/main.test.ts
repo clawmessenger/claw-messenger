@@ -6,7 +6,7 @@ import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { allowDuplicateSupervisor, buildProgram, OPS_SCOPE_ENV, scopeDaemonReport, SUPERVISED_ENV, supervisedSelfKillRejection, wholeMachineActionRejection } from "./main.js";
+import { allowDuplicateSupervisor, buildProgram, commanderExit, OPS_SCOPE_ENV, scopeDaemonReport, SUPERVISED_ENV, supervisedSelfKillRejection, waitForAliveFor, wholeMachineActionRejection } from "./main.js";
 import { Keystore } from "./keystore.js";
 import type { XiachatApi } from "./api.js";
 import { defaultDaemonPaths, type Daemon } from "./daemon.js";
@@ -198,6 +198,56 @@ describe("clawmessenger pair", () => {
   });
 });
 
+describe("commander 控制流异常的退出码", () => {
+  // 发布流水线要用 `<exe> --version` 跟 tag 逐字符比对，所以 `--version` 必须是
+  // **exit 0**。buildProgram 为了在进程内跑测试用了 exitOverride()，commander 于是
+  // 用抛异常表达「已打印、该退出」——生产入口漏翻译的表现就是打印对了版本却 exit 1。
+  it("treats --version / --help as success", () => {
+    expect(commanderExit({ code: "commander.version", exitCode: 0, message: "1.3.0" }))
+      .toEqual({ exitCode: 0, printMessage: false });
+    expect(commanderExit({ code: "commander.helpDisplayed", exitCode: 0, message: "(help)" }))
+      .toEqual({ exitCode: 0, printMessage: false });
+  });
+
+  it("keeps real usage errors failing and prints the message", () => {
+    expect(commanderExit({ code: "commander.unknownOption", exitCode: 1, message: "unknown option" }))
+      .toEqual({ exitCode: 1, printMessage: true });
+  });
+
+  it("ignores ordinary errors", () => {
+    expect(commanderExit(new Error("boom"))).toBeNull();
+  });
+});
+
+describe("waitForAliveFor 的第三个参数是毫秒，不是次数（B1 的根因）", () => {
+  // 老签名是 `(pid, sleep, attempts = 15, intervalMs = 200)`，调用方写 `3_000` 想表达
+  // 「等 3 秒」，实际是 3000 次 × 200ms = 10 分钟：父进程把端口锁捏了十分钟，子进程
+  // 在锁上等 15s 就自杀，于是每次远程升级都「磁盘是新版、设备没 supervisor」。
+  it("按时间窗结束，而不是按传入的那个数字跑那么多次", async () => {
+    const sleeps: number[] = [];
+    const realSleep = async (ms: number): Promise<void> => {
+      sleeps.push(ms);
+      await new Promise<void>((resolve) => setTimeout(resolve, ms));
+    };
+    const started = Date.now();
+    const alive = await waitForAliveFor(process.pid, realSleep, 120, 50);
+    const elapsed = Date.now() - started;
+    expect(alive).toBe(true);
+    // 120ms / 50ms → 2~3 次。若把 120 当成「次数」则是 120 次（约 6 秒）。
+    expect(sleeps.length).toBeLessThanOrEqual(5);
+    expect(elapsed).toBeLessThan(1_000);
+  });
+
+  it("进程已经没了就立刻返回 false，不空等整个窗口", async () => {
+    const sleeps: number[] = [];
+    const started = Date.now();
+    const alive = await waitForAliveFor(999_999, async (ms) => { sleeps.push(ms) }, 5_000, 50);
+    expect(alive).toBe(false);
+    expect(sleeps).toHaveLength(0);
+    expect(Date.now() - started).toBeLessThan(1_000);
+  });
+});
+
 // 后台常驻命令面：这些动作以前只能靠随 Release 分发的守护脚本提供
 // （clawmessenger-daemon.sh / .cmd），现在直接编进 CLI。
 function fakeDaemon(overrides: Partial<Daemon> = {}): { daemon: Daemon; calls: string[] } {
@@ -210,6 +260,8 @@ function fakeDaemon(overrides: Partial<Daemon> = {}): { daemon: Daemon; calls: s
     logs: (o) => { calls.push(`logs:${o?.lines ?? 40}`); },
     installService: async (o) => { calls.push(`install-service:${JSON.stringify(o ?? {})}`); },
     uninstall: async () => { calls.push("uninstall"); },
+    // 登录自启脚本的模板刷新：这里不需要模拟文件系统，记一笔即可。
+    refreshStartupScript: async () => ({ updated: false, path: "/nonexistent/clawmessenger.vbs", reason: "no-logon-script" }),
     ...overrides,
   };
   return { daemon, calls };

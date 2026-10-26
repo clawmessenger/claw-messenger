@@ -7,6 +7,17 @@ export function defaultKeystorePath(): string {
   return join(homedir(), ".clawmessenger", "credentials.json");
 }
 
+// 升级进行中的小账本。
+//
+// 为什么要落盘：升级流程是「下载 → 交换（旧 exe 改名、新 exe 就位）→ 退出 →
+// helper 拉起新 exe」。交换完成到新进程第一次轮询之间，设备会短暂没有进程能
+// 说话；而**新进程自己**正是唯一能确认「我到底是新版还是旧版」的那一方
+// （版本号编译进镜像）。把它写在启动前就好的文件里，重启后的第一个 supervisor
+// 才能回报 succeeded 而不是让页面永远停在「重启中」。
+export function defaultUpgradeInflightPath(): string {
+  return join(homedir(), ".clawmessenger", "upgrade-inflight.json");
+}
+
 // Local record of RongCloud message UIDs the run loop has already acted on.
 // 融云 re-delivers the entire offline history on every reconnect and the Node
 // shim has no IndexDB for the SDK to keep its own sync cursor, so without this

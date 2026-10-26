@@ -55,6 +55,36 @@ export interface AgentControlState {
   version: number;
 }
 
+// 服务端下发的 exe 升级指令（POST /api/claw/device/control 响应里的 upgrade）。
+//
+// mirrors 是有序的下载地址：先 GitHub 直连，失败再回退服务端相对路径
+// （"/api/agent/upgrade/download?..."）。相对路径由设备自己拼上 serverUrl ——
+// 服务端不需要知道自己的公网地址。
+export interface DeviceUpgradeIntent {
+  generation: number;
+  targetVersion: string;
+  assetName: string;
+  sha256: string;
+  force: boolean;
+  mirrors: string[];
+}
+
+/** 一次设备轮询的结果：启停意图 + 可选的升级指令。 */
+export interface DeviceControlSnapshot {
+  agents: AgentControlState[];
+  upgrade?: DeviceUpgradeIntent;
+}
+
+/** 升级阶段（与迁移 601 的 CHECK 一致，设备只能回传这些）。 */
+export type DeviceUpgradeStatus =
+  | "waiting_idle"
+  | "downloading"
+  | "verifying"
+  | "restarting"
+  | "succeeded"
+  | "failed"
+  | "cancelled";
+
 // 一次按账号启停的结果（POST /api/claw/device/control/set）。
 export interface DeviceControlResult {
   agent: string;
@@ -244,21 +274,74 @@ export class XiachatApi {
   // supervisor. The server holds the intent rather than pushing it: the only
   // process that can start or stop an agent is the supervisor, and it holds no
   // IM connection (its children own those), so it has to come and ask.
+  //
+  // 同一次往返还带两件事（见 server/internal/handler/claw_device_upgrade.go）：
+  //   · `report` 把本机 exe 版本与平台报上去 —— 版本是机器属性，而这是唯一的
+  //     机器级定时轮询，不需要再开一条通道或往 30s 心跳里塞字段；
+  //   · 响应里的 `upgrade` 是本机待执行的升级指令（没有就不下发）。
+  // 旧服务端会忽略 report、也不会返回 upgrade：两个字段都是可选的，天然兼容。
   async fetchDeviceControl(
     nodeId: string,
     credentialId: string,
     secret: string,
-  ): Promise<AgentControlState[]> {
-    const raw = await this.request<{ data?: { agents?: AgentControlState[] } }>(
+    report?: { version?: string; platform?: string },
+  ): Promise<DeviceControlSnapshot> {
+    const raw = await this.request<{ data?: { agents?: AgentControlState[]; upgrade?: DeviceUpgradeIntent } }>(
       "POST",
       "/api/claw/device/control",
-      { nodeId, credentialId, secret },
+      {
+        nodeId,
+        credentialId,
+        secret,
+        ...(report?.version ? { version: report.version } : {}),
+        ...(report?.platform ? { platform: report.platform } : {}),
+      },
     );
     const agents = raw.data?.agents;
     if (!Array.isArray(agents)) {
       throw new Error("POST /api/claw/device/control: unexpected response shape");
     }
-    return agents;
+    const upgrade = raw.data?.upgrade;
+    return upgrade && typeof upgrade.generation === "number"
+      ? { agents, upgrade }
+      : { agents };
+  }
+
+  // 回传升级进度（阶段跃迁时调用，不是按百分比刷）。服务端按代次防抖：代次对不上
+  // 的回报会被 409 丢掉，这里把它当成功返回 —— 设备对「这条回传过期了」没有可
+  // 采取的动作，下一轮轮询自然会拿到新代次。
+  async reportDeviceUpgrade(
+    nodeId: string,
+    credentialId: string,
+    secret: string,
+    report: {
+      generation: number;
+      status: DeviceUpgradeStatus;
+      errorCode?: string;
+      errorDetail?: string;
+      reportedVersion?: string;
+      reportedPlatform?: string;
+    },
+  ): Promise<void> {
+    try {
+      await this.request("POST", "/api/claw/device/upgrade/report", {
+        nodeId,
+        credentialId,
+        secret,
+        generation: report.generation,
+        status: report.status,
+        ...(report.errorCode ? { errorCode: report.errorCode } : {}),
+        ...(report.errorDetail ? { errorDetail: report.errorDetail } : {}),
+        ...(report.reportedVersion ? { reportedVersion: report.reportedVersion } : {}),
+        ...(report.reportedPlatform ? { reportedPlatform: report.reportedPlatform } : {}),
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      // 409 = 代次过期，属于正常竞态，不算失败；其余只记日志（进度回传失败绝不
+      // 应该让正在进行的升级中断）。
+      if (message.includes("HTTP 409")) return;
+      throw err;
+    }
   }
 
   // 按账号启停单个智能体。服务端复用管理端的 rongcloud_node_control 表，

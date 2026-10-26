@@ -10,8 +10,10 @@ import {
   cleanupStaleBackups,
   compareVersions,
   findStaged,
+  healInstall,
   parseSha256Sums,
   stageUpdate,
+  stageUpdateFromMirrors,
   stagedPath,
   versionFromTag,
   type ReleaseInfo,
@@ -386,5 +388,122 @@ describe("release lookup fallback", () => {
     await expect(
       checkForUpdate("1.1.0", "win32", "x64", cdnStub({ apiStatus: 403 })),
     ).rejects.toThrow(/API HTTP 403[\s\S]*latest tag/i);
+  });
+});
+
+// ---- 断点自愈（升级交换两步 rename 中间掉电的恢复） -------------------------
+describe("healInstall", () => {
+  it("restores the target from the newest backup when the swap was interrupted", () => {
+    // 交换的第一步已经做完、第二步没做：target 不见了，只剩 .old-<ts>。
+    rmSync(target, { force: true });
+    writeFileSync(`${target}.old-1000`, "OLD-1000");
+    writeFileSync(`${target}.old-2000`, "OLD-2000");
+
+    const healed = healInstall(target);
+
+    expect(healed.healed).toBe(true);
+    expect(readFileSync(target, "utf8")).toBe("OLD-2000");
+  });
+
+  it("prefers a staged file over a backup (it is the version we meant to install)", () => {
+    rmSync(target, { force: true });
+    writeFileSync(`${target}.old-1000`, "OLD");
+    writeFileSync(stagedPath(target, "1.3.0"), "NEW");
+
+    const healed = healInstall(target);
+
+    expect(healed.healed).toBe(true);
+    expect(readFileSync(target, "utf8")).toBe("NEW");
+    // 暂存件被消费掉了，不应该再被 applyStagedUpdate 交换一次。
+    expect(findStaged(target)).toHaveLength(0);
+  });
+
+  it("does nothing when the install is intact", () => {
+    expect(healInstall(target)).toEqual({ healed: false });
+    expect(readFileSync(target, "utf8")).toBe("OLD-BINARY");
+  });
+
+  it("reports failure when there is nothing to restore", () => {
+    rmSync(target, { force: true });
+    expect(healInstall(target)).toEqual({ healed: false });
+    expect(existsSync(target)).toBe(false);
+  });
+
+  it("ignores an empty staged file and falls back to the backup", () => {
+    // 0 字节暂存件（磁盘写满 / 写入被截断）rename 成 target 之后设备就再也起不来
+    // 了 —— 而旁边就躺着一份能用的备份。宁可回滚到旧版，也不能装一个空文件。
+    rmSync(target, { force: true });
+    writeFileSync(`${target}.old-1000`, "OLD-WORKING");
+    writeFileSync(stagedPath(target, "1.3.0"), "");
+
+    const healed = healInstall(target);
+
+    expect(healed.healed).toBe(true);
+    expect(readFileSync(target, "utf8")).toBe("OLD-WORKING");
+  });
+});
+
+// ---- 按 mirrors 下载（GitHub 直连失败 -> 服务端代理） ----------------------
+describe("stageUpdateFromMirrors", () => {
+  const binary = Buffer.from("BRAND-NEW-EXE");
+  const sum = (buf: Buffer): string => createHash("sha256").update(buf).digest("hex");
+
+  const mirrorFetch = (handlers: Record<string, Buffer | Error>) =>
+    (async (url: string) => {
+      const handler = handlers[url];
+      if (!handler) throw new Error(`unexpected url ${url}`);
+      if (handler instanceof Error) throw handler;
+      return { ok: true, status: 200, arrayBuffer: async () => handler } as never;
+    }) as never;
+
+  it("falls back to the server proxy and resolves its relative path against serverUrl", async () => {
+    const plan = {
+      version: "1.3.0",
+      assetName: "clawmessenger-windows-x64.exe",
+      sha256: sum(binary),
+      mirrors: [
+        "https://github.com/clawmessenger/claw-messenger/releases/download/clawmessenger-v1.3.0/clawmessenger-windows-x64.exe",
+        "/api/agent/upgrade/download?version=1.3.0&asset=clawmessenger-windows-x64.exe&token=t",
+      ],
+    };
+    const fetchImpl = mirrorFetch({
+      [plan.mirrors[0]]: new Error("connect ETIMEDOUT"),
+      [`https://srv.example.com${plan.mirrors[1]}`]: binary,
+    });
+
+    const staged = await stageUpdateFromMirrors(plan, target, "https://srv.example.com", fetchImpl as never);
+
+    expect(staged.version).toBe("1.3.0");
+    expect(staged.source).toBe(`https://srv.example.com${plan.mirrors[1]}`);
+    expect(readFileSync(staged.path, "utf8")).toBe("BRAND-NEW-EXE");
+  });
+
+  it("rejects bytes whose sha256 does not match and leaves nothing staged", async () => {
+    const plan = {
+      version: "1.3.0",
+      assetName: "clawmessenger-windows-x64.exe",
+      sha256: sum(Buffer.from("what-we-expected")),
+      mirrors: ["https://example.test/binary"],
+    };
+    const fetchImpl = mirrorFetch({ "https://example.test/binary": binary });
+
+    await expect(
+      stageUpdateFromMirrors(plan, target, "https://srv.example.com", fetchImpl as never),
+    ).rejects.toThrow(/checksum mismatch/);
+    expect(findStaged(target)).toHaveLength(0);
+  });
+
+  it("refuses to install when the server supplied no checksum", async () => {
+    const plan = {
+      version: "1.3.0",
+      assetName: "clawmessenger-windows-x64.exe",
+      sha256: "",
+      mirrors: ["https://example.test/binary"],
+    };
+    const fetchImpl = mirrorFetch({ "https://example.test/binary": binary });
+
+    await expect(
+      stageUpdateFromMirrors(plan, target, "https://srv.example.com", fetchImpl as never),
+    ).rejects.toThrow(/no checksum supplied/);
   });
 });

@@ -26,6 +26,7 @@ import {
   readdirSync,
   readFileSync,
   renameSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -125,7 +126,7 @@ export function assetNameForPlatform(platform: string, arch: string): string {
   return "";
 }
 
-type FetchLike = (url: string, init?: {
+export type FetchLike = (url: string, init?: {
   headers?: Record<string, string>;
   redirect?: "follow" | "manual" | "error";
 }) => Promise<{
@@ -358,12 +359,157 @@ export function applyStagedUpdate(target: string, platform: string): ApplyResult
   }
 }
 
+/** Every `<target>.old-<ts>` backup next to the install, newest first. */
+function findBackups(target: string): { file: string; ts: string }[] {
+  const dir = path.dirname(target);
+  const base = path.basename(target);
+  let entries: string[] = [];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return [];
+  }
+  return entries
+    .filter((f) => f.startsWith(`${base}${BACKUP_SUFFIX}`))
+    .map((f) => ({ file: path.join(dir, f), ts: f.slice(`${base}${BACKUP_SUFFIX}`.length) }))
+    .sort((a, b) => (a.ts < b.ts ? 1 : a.ts > b.ts ? -1 : 0));
+}
+
+export interface HealResult {
+  healed: boolean;
+  /** The backup that was moved back into place, if any. */
+  from?: string;
+  /** The staged file that was restored instead, if any. */
+  staged?: string;
+}
+
+/**
+ * 自愈：安装目录里 target 不见了就把它补回来。
+ *
+ * 为什么必须有：交换是「旧 exe → .old-<ts>」「暂存件 → target」两步 rename，两步
+ * 之间有一个 target 不存在的窗口（毫秒级，但断电/蓝屏就停在那里）。登录自启的
+ * VBS 直指 target（daemon.ts 的 windowsStartupVbs），找不到 exe 就静默什么都不做
+ * —— 设备从此离线，而且没有任何人会收到告警。
+ *
+ * 恢复顺序：优先暂存件（它就是我们要装的新版），其次最近的备份（旧版能跑起来
+ * 比什么都没有强）。__relaunch 与每次正常启动都调用它。
+ */
+/**
+ * 断点自愈：target 不在时（两步 rename 之间断电 / 交换后回滚失败），从暂存件或
+ * 最近一个备份把它补回来。
+ *
+ * 优先暂存件（那是**我们本来想装的那一版**），其次最近备份。找不到就返回
+ * `{healed:false}`，调用方自行决定要不要启动。
+ */
+export function healInstall(target: string): HealResult {
+  if (existsSync(target)) return { healed: false };
+  const staged = findStaged(target)[0];
+  // `size > 0` 是零成本保险：一个 0 字节的暂存件（磁盘写满、被截断）rename 成
+  // target 之后设备就彻底起不来了 —— 而备份就在旁边。这种文件永远不该被信任。
+  if (staged && isUsableFile(staged.file)) {
+    try {
+      renameSync(staged.file, target);
+      return { healed: true, staged: staged.file };
+    } catch {
+      // 落到备份分支
+    }
+  }
+  for (const backup of findBackups(target)) {
+    if (!isUsableFile(backup.file)) continue;
+    try {
+      renameSync(backup.file, target);
+      return { healed: true, from: backup.file };
+    } catch {
+      // 试试更早的备份
+    }
+  }
+  return { healed: false };
+}
+
+/** 文件存在且非空。 */
+function isUsableFile(file: string): boolean {
+  try {
+    return statSync(file).size > 0;
+  } catch {
+    return false;
+  }
+}
+
+export interface MirrorPlan {
+  version: string;
+  assetName: string;
+  /** Expected hex sha256, as handed out by the server. */
+  sha256: string;
+  /**
+   * Ordered download sources. http(s) URLs are used verbatim; entries starting
+   * with "/" are resolved against the device's own server URL (the server hands
+   * out its proxy as a relative path so it never needs to know its public URL).
+   */
+  mirrors: string[];
+}
+
+export interface MirrorStageResult extends StageResult {
+  /** Which mirror produced the file (absolute URL), for the report/logs. */
+  source: string;
+}
+
+/**
+ * 按 mirrors 顺序下载并校验一个指定版本，写成暂存件。
+ *
+ * 与 stageUpdate 的区别：目标不是「GitHub 上的 latest」，而是服务端点名要装的
+ * 那个版本 + 它给的 sha256；下载源也不止一个（先直连 GitHub，失败回退服务端
+ * 代理）。任何一个源拿到的字节 sha256 不符都换下一个源 —— 校验失败可能是镜像
+ * 缓存坏了，不该因为第一个源坏了就放弃整次升级。
+ */
+export async function stageUpdateFromMirrors(
+  plan: MirrorPlan,
+  target: string,
+  serverUrl: string,
+  fetchImpl: FetchLike = fetch as unknown as FetchLike,
+  onStage?: (stage: "downloading" | "verifying", source: string) => void,
+): Promise<MirrorStageResult> {
+  const failures: string[] = [];
+  for (const mirror of plan.mirrors) {
+    if (!mirror) continue;
+    const url = mirror.startsWith("/") ? serverUrl.replace(/\/+$/, "") + mirror : mirror;
+    let bytes: Buffer;
+    try {
+      onStage?.("downloading", url);
+      const res = await fetchImpl(url, { headers: { "User-Agent": "clawmessenger-cli" } });
+      if (!res.ok) {
+        failures.push(`${url}: HTTP ${res.status}`);
+        continue;
+      }
+      bytes = Buffer.from(await res.arrayBuffer());
+    } catch (err) {
+      failures.push(`${url}: ${err instanceof Error ? err.message : String(err)}`);
+      continue;
+    }
+    onStage?.("verifying", url);
+    const actual = createHash("sha256").update(bytes).digest("hex");
+    if (plan.sha256 && actual !== plan.sha256.toLowerCase()) {
+      failures.push(`${url}: checksum mismatch (expected ${plan.sha256}, got ${actual})`);
+      continue;
+    }
+    if (!plan.sha256) {
+      failures.push(`${url}: no checksum supplied, refusing to install`);
+      continue;
+    }
+    const dest = stagedPath(target, plan.version);
+    mkdirSync(path.dirname(dest), { recursive: true });
+    const partial = `${dest}.part`;
+    writeFileSync(partial, bytes);
+    renameSync(partial, dest);
+    return { version: plan.version, asset: plan.assetName, path: dest, bytes: bytes.length, source: url };
+  }
+  throw new Error(failures.length > 0 ? failures.join("; ") : "no download mirrors configured");
+}
+
 /**
  * Delete stale `<target>.old-*` backups, keeping the most recent one. The
  * currently running image cannot be deleted on Windows, so it simply survives
  * until a later start.
- */
-export function cleanupStaleBackups(target: string, keep = 1): string[] {
+ */export function cleanupStaleBackups(target: string, keep = 1): string[] {
   const dir = path.dirname(target);
   const base = path.basename(target);
   let entries: string[] = [];

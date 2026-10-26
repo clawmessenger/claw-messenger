@@ -67,8 +67,108 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # The exe reports its own version to the server, which stores it in the
+      # admin device list and uses it to decide "already up to date". So the
+      # version baked into the binary MUST be the tag version — if it falls back
+      # to package.json instead, every device that upgrades to 1.3.0 keeps
+      # reporting 1.2.0, the post-restart check reports failed/restart_failed,
+      # and the admin page shows the update as broken while it actually worked.
+      # Strip the `clawmessenger-v` prefix (tag = clawmessenger-v1.3.0).
+      # A tag that does not match the expected shape fails the job instead of
+      # silently falling back to package.json — the whole point of this step is
+      # that the version inside the binary is derived from the tag, never
+      # guessed. `GITHUB_REF_NAME` is `clawmessenger-v1.3.0` here (see `on.push.tags`).
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#clawmessenger-v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::tag '$tag' is not clawmessenger-v<major>.<minor>.<patch>"
+            exit 1
+          fi
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+          echo "building clawmessenger $version (tag $tag)"
+
       - name: Build SEA executable
+        env:
+          CLAWMESSENGER_VERSION: ${{ steps.version.outputs.value }}
         run: pnpm --filter @quukk/xiachat-cli build:exe
+
+      # Gate 1, on the entry bundle: deterministic and side-effect free (plain
+      # node, runs the same injected constant the SEA blob carries). Fails fast
+      # before the slower executable is assembled.
+      #
+      # 取版本号用「按 semver 形状挑行」而不是 `tail -n1`：产物首次运行时会在版本号
+      # 之后追加自安装通知，`tail -n1` 拿到的是通知文本，会把正确的包判成版本不对。
+      # 通知现在改走 stderr（packages/xiachat-cli/src/bin.ts），这里仍然两道保险。
+      - name: Verify the bundle reports the tag version
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="${{ steps.version.outputs.value }}"
+          # `set +e` 只为把这个退出码留在日志里：bundle 跑不起来时报错信息比
+          # 「Process completed with exit code 1」有用得多。
+          set +e
+          raw="$(node packages/xiachat-cli/dist/clawmessenger.sea.cjs --version 2>&1)"
+          rc=$?
+          set -e
+          raw="$(printf '%s\n' "$raw" | tr -d '\r')"
+          actual="$(printf '%s\n' "$raw" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | tail -n1 || true)"
+          echo "bundle reports '$actual', tag says '$expected' (exit=$rc)"
+          if [[ "$rc" != "0" ]]; then
+            printf '%s\n' "$raw" | sed 's/^/  bundle> /'
+            echo "::error::the built bundle exited $rc when asked for --version"
+            exit 1
+          fi
+          if [[ "$actual" != "$expected" ]]; then
+            printf '%s\n' "$raw" | sed 's/^/  bundle> /'
+            echo "::error::the built bundle reports '$actual' but the tag is '$expected' — refusing to publish a mislabelled release"
+            exit 1
+          fi
+
+      # Gate 2, on the exact file that gets published: run it. This is the only
+      # check that proves the *shipped* bytes answer `--version` with the tag —
+      # `--version` is handled before any command action, so it cannot install
+      # or mutate anything (`ensureInstalled` is best-effort and only copies the
+      # binary), and `matrix.source` is the built artifact path
+      # (dist/clawmessenger.exe on Windows, dist/clawmessenger elsewhere).
+      - name: Verify embedded version
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="${{ steps.version.outputs.value }}"
+          artifact="packages/xiachat-cli/${{ matrix.source }}"
+          if [[ ! -f "$artifact" ]]; then
+            echo "::error::$artifact was not produced by build:exe"
+            exit 1
+          fi
+          if [[ "${{ runner.os }}" != "Windows" ]]; then
+            chmod +x "$artifact"
+          fi
+          # 退出码也是闸门的一部分：`--version` 是成功路径，非 0 就是 bug
+          # （`.exitOverride()` 抛的 CommanderError 没被入口翻译时就是这个症状：
+          # 版本号打印正确，进程却 exit 1 并把版本号重复打到 stderr）。
+          set +e
+          raw="$("$artifact" --version 2>"$RUNNER_TEMP/exe-version.err")"
+          rc=$?
+          set -e
+          raw="$(printf '%s\n' "$raw" | tr -d '\r')"
+          actual="$(printf '%s\n' "$raw" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | tail -n1 || true)"
+          echo "$artifact --version -> '$actual' (tag says '$expected'), exit=$rc"
+          if [[ "$rc" != "0" ]]; then
+            echo "::error::'$artifact --version' exited $rc — the version gate reads that output, and a non-zero exit also means the binary rejects a flag it should accept"
+            printf '%s\n' "$raw" | sed 's/^/  stdout> /'
+            sed 's/^/  stderr> /' "$RUNNER_TEMP/exe-version.err" 2>/dev/null || true
+            exit 1
+          fi
+          if [[ "$actual" != "$expected" ]]; then
+            printf '%s\n' "$raw" | sed 's/^/  stdout> /'
+            echo "::error::${{ matrix.source }} reports '$actual' but the tag is '$expected' — refusing to publish a mislabelled release"
+            exit 1
+          fi
 
       - name: Stage artifact
         shell: bash
