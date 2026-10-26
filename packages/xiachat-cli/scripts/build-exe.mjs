@@ -260,52 +260,169 @@ if (probe.error || probe.status !== 0 || probed !== injectedVersion) {
   console.log(`::warning::build-exe: the bundle self-check disagrees — ${detail.replace(/%/g, "%25").replace(/\r?\n/g, "%0A")}`);
 }
 
-// 2. SEA config → blob.
+// 2 + 3. SEA config → blob → 注入到一份 node 副本里（macOS 还需签名）。
+//
+// macOS 上必须处理签名：官方 Node 二进制是带签名的，注入 blob 会改掉文件内容，签名
+// 随之失效 —— 系统不报「签名无效」，而是直接把进程杀掉（实测 exit 139 / SIGSEGV，
+// stdout 和 stderr 全空）。所以先去掉原签名，注入后再做 ad-hoc 签名（Node SEA 文档
+// 里 macOS 的标准步骤）。
+//
+// 但只做签名并不足以保证产物能跑（v1.3.0 第 7 次构建就在这一步仍然 139）。所以
+// macOS 上这里做的是「构建 + 实测 + 回退」：注入后先测一次（未签名），签名后再测一次，
+// 还挂就关掉 useCodeCache 重来一遍，每一步的结果都以 `::warning::` 写进注解 ——
+// 一次 CI 就能看到整张对照表，不用一轮一轮试。
+//
+// 顺带一个结论：v1.1.0 的 darwin-arm64 大概一直是坏的。那时流水线没有「跑一遍产物」
+// 这道闸门，从来没人执行过它。
 const blobPath = join(distDir, `${exeName}.sea.blob`);
 const configPath = join(distDir, `${exeName}.sea-config.json`);
-writeFileSync(
-  configPath,
-  JSON.stringify(
-    {
-      main: outCjs,
-      output: blobPath,
-      disableExperimentalSEAWarning: true,
-      useSnapshot: false,
-      useCodeCache: true,
-    },
-    null,
-    2,
-  ),
-);
-run("sea-blob", process.execPath, ["--experimental-sea-config", configPath]);
-
-// 3. Copy the current node binary and inject the blob.
-//
-// macOS 上还必须处理签名：官方 Node 二进制是带签名的，注入 blob 会改掉文件内容，
-// 签名随之失效 —— 系统不会报「签名无效」，而是直接把进程杀掉（实测 exit 139 /
-// SIGSEGV，stdout 和 stderr 全空）。所以先去掉原签名，注入后再做 ad-hoc 签名
-// （Node SEA 文档里 macOS 的标准步骤）。
-//
-// v1.1.0 的 darwin-arm64 大概一直是坏的：那时发布流水线没有「跑一遍产物」这道闸门，
-// 从来没人执行过它。1.3.0 加上 Gate 2 之后才第一次暴露出来。
-rmSync(exePath, { force: true });
-copyFileSync(process.execPath, exePath);
 const isMac = process.platform === "darwin";
-if (isMac) {
-  // 未签名的二进制会让这一步失败，不算错误。
-  runOptional("codesign-remove", "codesign", ["--remove-signature", exePath]);
-}
 const postjectCli = findModuleFile(join("postject", "dist", "cli.js"));
-runTool("postject", postjectCli, [
-  exePath,
-  "NODE_SEA_BLOB",
-  blobPath,
-  "--sentinel-fuse",
-  "NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2",
-]);
+
+function writeSeaConfig(useCodeCache) {
+  writeFileSync(
+    configPath,
+    JSON.stringify(
+      {
+        main: outCjs,
+        output: blobPath,
+        disableExperimentalSEAWarning: true,
+        useSnapshot: false,
+        useCodeCache,
+      },
+      null,
+      2,
+    ),
+  );
+}
+
+/**
+ * 跑一个二进制，结果打到日志；不抛异常、也不判断「对不对」。
+ *
+ * 一定要把 `signal` 单独报出来：被信号杀掉的进程 `status` 是 null，只打 exit 会变成
+ * 「exit null」——而 macOS 上「签名无效」恰恰表现为被信号杀掉（SIGSEGV / SIGKILL），
+ * 空 stdout 空 stderr，看起来像什么都没发生。这行信息是把「崩在哪」和「崩成什么样」
+ * 分开的关键。
+ */
+function probeBinary(label, binary, binArgs) {
+  const out = join(distDir, `.exec-probe-${label}.out`);
+  const err = join(distDir, `.exec-probe-${label}.err`);
+  let result = { status: null, signal: null };
+  try {
+    const outFd = openSync(out, "w");
+    const errFd = openSync(err, "w");
+    try {
+      result = spawnSync(binary, binArgs, { stdio: ["ignore", outFd, errFd] });
+    } finally {
+      closeSync(outFd);
+      closeSync(errFd);
+    }
+  } catch (e) {
+    result = { status: null, signal: null, error: e };
+  }
+  const stdout = (existsSync(out) ? readFileSync(out, "utf8") : "").trim();
+  const stderr = (existsSync(err) ? readFileSync(err, "utf8") : "").trim();
+  rmSync(out, { force: true });
+  rmSync(err, { force: true });
+  const status = result.error ? `error(${result.error.message})` : result.status;
+  const how = result.signal ? `signal ${result.signal}` : `exit ${status}`;
+  console.log(`probe [${label}]: ${how}, stdout ${JSON.stringify(stdout)}`);
+  return { status, signal: result.signal ?? null, how, stdout, stderr };
+}
+
+/** 产物自检：必须答出注入的那个版本，且正常退出。 */
+function probeExecutable(label) {
+  const p = probeBinary(label, exePath, ["--version"]);
+  const ok = p.signal === null && String(p.status) === "0" && p.stdout === injectedVersion;
+  console.log(`exec probe [${label}]: ${p.how}, stdout ${JSON.stringify(p.stdout)}${ok ? "" : " <<< NOT OK"}`);
+  if (!ok) {
+    const detail = `exec probe [${label}] — ${exeName} --version ${p.how}, stdout ${JSON.stringify(p.stdout)}, stderr: ${tail(p.stderr, 8)}`;
+    console.log(`::warning::build-exe: ${detail.replace(/%/g, "%25").replace(/\r?\n/g, "%0A")}`);
+  }
+  return { ...p, ok };
+}
+
+/** 写 config → 生成 blob → 复制 node → [mac 去签名] → 注入 → [mac 签名] */
+function buildExecutable(useCodeCache) {
+  writeSeaConfig(useCodeCache);
+  run("sea-blob", process.execPath, ["--experimental-sea-config", configPath]);
+  rmSync(exePath, { force: true });
+  copyFileSync(process.execPath, exePath);
+  if (isMac) {
+    // 未签名的二进制会让这一步失败，不算错误。
+    runOptional("codesign-remove", "codesign", ["--remove-signature", exePath]);
+  }
+  runTool("postject", postjectCli, [
+    exePath,
+    "NODE_SEA_BLOB",
+    blobPath,
+    "--sentinel-fuse",
+    "NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2",
+    // postject 的 Mach-O 段名默认是 `__POSTJECT`，而 Node 官方 SEA 文档给的是
+    // `--macho-segment-name NODE_SEA`。这是唯一一处只影响 darwin 的偏差 ——
+    // 而 darwin 也正是四个平台里唯一一个「四个版本从头到尾没人跑起来过」的平台。
+    // 段名不对的时候 node 依然能靠 sentinel fuse 判定自己是 SEA，却按错误的布局去
+    // 解那一节，于是启动阶段直接段错误、stdout/stderr 全空（正是实测现象）。
+    ...(isMac ? ["--macho-segment-name", "NODE_SEA"] : []),
+  ]);
+  if (isMac) {
+    const unsigned = probeExecutable("unsigned");
+    // 这一步必须成功：签不上的产物在任何 Mac 上都起不来。
+    run("codesign-sign", "codesign", ["--sign", "-", "--force", exePath]);
+    const info = spawnSync("codesign", ["-dv", "--verbose=2", exePath], { encoding: "utf8" });
+    console.log(`codesign: ${(info.stderr ?? "").trim().split(/\r?\n/).slice(0, 4).join(" | ")}`);
+    return { unsigned, signed: probeExecutable("signed") };
+  }
+  return { signed: probeExecutable("final") };
+}
+
+// macOS 上先做一次「分水岭」实验：**原样复制一份 node**跑不跑得起来。
+//
+// 三种注入结果（未签名 / 已签名 / 关 code cache）如果全挂，光看它们分不清是
+// 「runner 环境本身有问题」还是「注入 + 签名把二进制弄坏了」。而一份纯 node 副本
+// 是这两者的天然分界：它能跑 ⇒ 环境没问题，锅在注入/签名；它不能跑 ⇒ 这个 runner
+// 上复制出来的 node 就不该被 torch，后面的结论全都不算数。
+//
+// 顺手把「去签名后」和「重新 ad-hoc 签名后」也各测一次，于是这一段本身就是一张
+// 完整的对照表：copy / copy-unsigned / copy-resigned。
 if (isMac) {
-  // 这一步必须成功：签不上的产物在任何 Mac 上都起不来。
-  run("codesign-sign", "codesign", ["--sign", "-", "--force", exePath]);
+  const baseline = join(distDir, ".node-baseline");
+  copyFileSync(process.execPath, baseline);
+  const b0 = probeBinary("node-copy", baseline, ["--version"]);
+  runOptional("baseline-remove", "codesign", ["--remove-signature", baseline]);
+  const b1 = probeBinary("node-copy-unsigned", baseline, ["--version"]);
+  const signBaseline = spawnSync("codesign", ["--sign", "-", "--force", baseline], { encoding: "utf8" });
+  const b2 = probeBinary("node-copy-resigned", baseline, ["--version"]);
+  rmSync(baseline, { force: true });
+  console.log(
+    `baseline table: copy=${b0.how}/${JSON.stringify(b0.stdout)} ` +
+      `unsigned=${b1.how}/${JSON.stringify(b1.stdout)} ` +
+      `resigned=${b2.how}/${JSON.stringify(b2.stdout)} (resign exit ${signBaseline.status})`,
+  );
+  if (b1.signal || b2.signal) {
+    // 连一份原样的 node 副本都起不来，那问题不在 SEA 层；别让后面几轮的失败掩盖这件事。
+    console.log(
+      `::warning::build-exe: 连未注入的 node 副本在这台 runner 上都跑不起来 ` +
+        `(unsigned ${b1.how}, resigned ${b2.how}) — 后续 SEA 结论不可信`,
+    );
+  }
+}
+
+let attempt = buildExecutable(true);
+if (isMac && !attempt.signed.ok) {
+  // 代码缓存对签名后的镜像最敏感，先试这一项 —— 它只是启动期的优化，关掉不影响功能。
+  console.log("::warning::build-exe: macOS 产物在签名后仍无法运行，关闭 useCodeCache 重建一次");
+  attempt = buildExecutable(false);
+  console.log(`exec probe [noCodeCache]: ${attempt.signed.how}, ok=${attempt.signed.ok}`);
+}
+
+// macOS 上仍然跑不起来就不要发这个包：一个「下下来就段错误」的资产比没有资产更糟。
+if (isMac && !attempt.signed.ok) {
+  fail(
+    `the macOS executable still fails to run after signing (${attempt.signed.how}, ` +
+      `stdout ${JSON.stringify(attempt.signed.stdout)}, stderr: ${tail(attempt.signed.stderr, 8)}); ` +
+      `refusing to publish a binary that cannot start`,
+  );
 }
 
 console.log(`built ${exePath} (clawmessenger ${injectedVersion})`);
