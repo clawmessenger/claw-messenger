@@ -25,6 +25,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -67,6 +68,39 @@ function tail(text, n = 15) {
   return lines.slice(-n).join(" ⏎ ") || "<empty>";
 }
 
+/**
+ * 工具入口是「要交给 node 跑的脚本」还是「本机可执行文件」？
+ *
+ * 不能按平台猜：`node_modules/esbuild/bin/esbuild` 在 Windows 上是 JS shim，在
+ * Linux 上是**原生 ELF 可执行文件**。用 node 去跑 ELF 得到的报错是
+ * `SyntaxError: Invalid or unexpected token` 加上一行 `\x7fELF` —— v1.3.0 第三次
+ * 构建失败就是这么来的（Windows 通过、三个 POSIX 全挂）。
+ *
+ * 看文件头即可：ELF / PE(MZ) / Mach-O 直接执行，其余（shebang 或普通脚本）交给 node。
+ */
+function isNativeBinary(file) {
+  let fd;
+  try {
+    fd = openSync(file, "r");
+    const head = Buffer.alloc(4);
+    if (readSync(fd, head, 0, 4, 0) < 4) return false;
+    if (head[0] === 0x7f && head[1] === 0x45 && head[2] === 0x4c && head[3] === 0x46) return true; // ELF
+    if (head[0] === 0x4d && head[1] === 0x5a) return true; // PE (MZ)
+    const magic = head.readUInt32BE(0);
+    return [0xfeedface, 0xfeedfacf, 0xcefaedfe, 0xcffaedfe, 0xcafebabe, 0xbebafeca].includes(magic);
+  } catch {
+    return false; // 读不出头就当脚本，交由 node 报出真正的错
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+/** Spawn a build tool whichever way the platform ships it — never through a shell. */
+function runTool(label, toolPath, toolArgs) {
+  return isNativeBinary(toolPath)
+    ? run(label, toolPath, toolArgs)
+    : run(label, process.execPath, [toolPath, ...toolArgs]);
+}
 /**
  * Run a build tool and turn **every** failure mode into an annotation.
  *
@@ -158,8 +192,7 @@ console.log(
 // JSON 字符串字面量）正是 esbuild 期望的形式。编码两次会得到 `"\"1.3.0\""`，
 // 注入进二进制的字符串自带引号 —— 见文件头关于 1.3.0 首次发布的注释。
 const defineArg = `--define:__CLAWMESSENGER_VERSION__=${JSON.stringify(injectedVersion)}`;
-run("esbuild", process.execPath, [
-  esbuildCli,
+runTool("esbuild", esbuildCli, [
   entry,
   "--bundle",
   "--platform=node",
@@ -232,8 +265,7 @@ run("sea-blob", process.execPath, ["--experimental-sea-config", configPath]);
 rmSync(exePath, { force: true });
 copyFileSync(process.execPath, exePath);
 const postjectCli = findModuleFile(join("postject", "dist", "cli.js"));
-run("postject", process.execPath, [
-  postjectCli,
+runTool("postject", postjectCli, [
   exePath,
   "NODE_SEA_BLOB",
   blobPath,
