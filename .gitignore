@@ -84,3 +84,7 @@ perf-report/
 
 # AI team run artifacts (plans, reports, verification evidence)
 .agent-runs/
+
+# Local agent scratch (探针脚本、临时解包目录)。不是项目数据，别进历史。
+.workbuddy/
+.workbuddy-tmp/
