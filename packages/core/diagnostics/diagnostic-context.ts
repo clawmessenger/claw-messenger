@@ -78,6 +78,8 @@ const WORKSPACE_ROUTES: readonly RoutePattern[] = [
   ["runtimes", ":id", "runtime", ":runtimeId"],
   ["skills"],
   ["skills", ":id"],
+  // docs 的详情用查询参数（/docs?doc=<slug>），路径段只有 docs 本身。
+  ["docs"],
   ["settings"],
   ["attachments", ":id", "preview"],
 ];
