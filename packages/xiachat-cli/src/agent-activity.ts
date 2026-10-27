@@ -54,6 +54,8 @@ const TOOL_LABELS: Readonly<Record<string, { kind: ActivityKind; label: string }
   bash: { kind: "command", label: "执行命令" },
   // hermes 的 shell 工具叫 terminal（execute_code 跑代码片段）
   terminal: { kind: "command", label: "执行命令" },
+  // opencode 2.x 的 shell 工具就叫 shell（实测 session.tool.* 的 name 字段）
+  shell: { kind: "command", label: "执行命令" },
   execute_code: { kind: "command", label: "执行代码" },
   command_execution: { kind: "command", label: "执行命令" },
   exec_command: { kind: "command", label: "执行命令" },

@@ -8,6 +8,7 @@ import {
   createServeEventState,
   isServeStartupFailure,
   parseServeListeningUrl,
+  parseServePassword,
   runServerSession,
   toRequestModel,
 } from "./opencode-server.js";
@@ -34,6 +35,29 @@ describe("parseServeListeningUrl", () => {
   it("没有监听行就返回 null（启动失败靠它判定，不能猜）", () => {
     expect(parseServeListeningUrl("opencode 1.19.0")).toBeNull();
     expect(parseServeListeningUrl("listening")).toBeNull();
+  });
+});
+
+describe("parseServePassword", () => {
+  /** 2.x 实测的密码行：43 位 base64url。 */
+  const PW = "r5iAZPoENlJxmCQUx86Qa5ylLNxrn3eJcK4Rl1tCYQ4";
+
+  it("密码行被非 SGR 的 CSI 序列包裹（\\u001b[K、\\u001b[?25l）时仍取出 43 位干净密码", () => {
+    const out = `\u001b[K\u001b[?25lserver password ${PW}\u001b[K\n`;
+    const parsed = parseServePassword(out);
+    // 转义字节不能混进 Basic 头：混进去就是 401，且 isServeStartupFailure 不认 401。
+    expect(parsed).toBe(PW);
+    expect(parsed).toHaveLength(43);
+  });
+
+  it("密码行紧跟在 OSC 标题序列后面时仍取出干净密码", () => {
+    const out = `\u001b]0;opencode serve\u0007server password ${PW}\n`;
+    expect(parseServePassword(out)).toBe(PW);
+  });
+
+  it("1.x 的 server listening on 输出里没有密码行 → null（回退判据靠它）", () => {
+    expect(parseServePassword("opencode server listening on http://127.0.0.1:49882\n")).toBeNull();
+    expect(parseServePassword("server listening on http://127.0.0.1:5238\n")).toBeNull();
   });
 });
 
@@ -261,6 +285,53 @@ describe("runServerSession", () => {
   });
 });
 
+describe("serve 路径的 401 降级判据（2.x 鉴权失败要退 run）", () => {
+  /** `/api/*` 一律 401 的假 2.x serve：模拟「密码抓错」（格式合法但内容错）。 */
+  async function startFakeV2Rejecting(): Promise<string> {
+    const server = createServer((req, res) => {
+      const url = req.url ?? "";
+      req.resume();
+      if (url.startsWith("/api/")) {
+        res.writeHead(401, { "content-type": "application/json" });
+        res.end("unauthorized");
+        return;
+      }
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end("{}");
+    });
+    servers.push(server);
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+    const { port } = server.address() as AddressInfo;
+    return `http://127.0.0.1:${port}`;
+  }
+
+  it("POST /api/session 返 401 → 端到端抛出的错误命中 isServeStartupFailure", async () => {
+    const baseUrl = await startFakeV2Rejecting();
+    const err = await runServerSession({
+      baseUrl,
+      prompt: "hi",
+      timeoutMs: 5_000,
+      // 有 password 就走 2.x 的 /api/* 分支（见 runServerSession:376）。
+      password: "wrong-password",
+    }).then(
+      () => null,
+      (e: unknown) => e,
+    );
+
+    expect(err).toBeInstanceOf(Error);
+    expect(String((err as Error).message)).toMatch(/POST \/api\/session -> HTTP 401/);
+    // 这条必须是「可降级」：退成 run --format json，用户至少能拿到整段（不流式）答案。
+    expect(isServeStartupFailure(err)).toBe(true);
+  });
+
+  it("判据只认我们这两条路径：其它地方的 401 不算 serve 起不来", () => {
+    // 只锁 401 会误伤：模型/供应商的 401 说明 serve 跑得好好的，退 run 只会放大失败。
+    expect(isServeStartupFailure(new Error("opencode session failed: 401 Unauthorized: invalid api key"))).toBe(false);
+    // 1.x 消息阶段的 401 同样不算（既有语义，不能被这次的改动放宽）。
+    expect(isServeStartupFailure(new Error("POST /session/ses_x/message -> HTTP 401: bad key"))).toBe(false);
+  });
+});
+
 describe("isServeStartupFailure", () => {
   it("只把「serve 起不来」这类错误认作可回退", () => {
     expect(isServeStartupFailure(new Error("opencode serve did not report its listening URL within 25000ms: "))).toBe(true);
@@ -269,6 +340,10 @@ describe("isServeStartupFailure", () => {
     expect(isServeStartupFailure(new Error("connect ECONNREFUSED 127.0.0.1:1"))).toBe(true);
     expect(isServeStartupFailure(new Error("GET /event -> HTTP 404"))).toBe(true);
     expect(isServeStartupFailure(new Error("POST /session -> HTTP 404: {}"))).toBe(true);
+    // opencode 2.x（实测 2.1.4）：serve 起来了，但它是「v2 API + Web UI」共用端口，
+    // 1.x 的 `POST /session` 变成 Web UI 的 catch-all → 405，真 API 在 `/api/*`
+    // 且要启动时打印的 server password。这种情况必须回退到 run，否则整轮空正文。
+    expect(isServeStartupFailure(new Error("POST /session -> HTTP 405: <!doctype html>"))).toBe(true);
     // 超时与模型报错发生在 serve 已经在跑之后，回退只会把失败放大。
     expect(isServeStartupFailure(new Error("agent turn timeout after 1000ms"))).toBe(false);
     expect(isServeStartupFailure(new Error("POST /session/ses_x/message -> HTTP 401: bad key"))).toBe(false);

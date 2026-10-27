@@ -20,6 +20,7 @@ import {
 import {
   isServeStartupFailure,
   parseServeListeningUrl,
+  parseServePassword,
   runServerSession,
 } from "./opencode-server.js";
 import { TurnIncompleteError } from "./turn-error.js";
@@ -892,9 +893,22 @@ export function extractStreamJsonFinalText(raw: string): string | undefined {
 // （同一 prompt 实测 12,620 条、平均 1.7 字/片、持续 101 秒）。所以 opencode 默认
 // 走 serve，run 退化为「旧版本兜底」。
 //
+// opencode 2.x 换了协议但同样是真增量：serve 会多打一行 `server password`，
+// 会话 API 挪到 `/api/*` 并要 Basic 鉴权，增量事件变成 `session.text.delta` /
+// `session.reasoning.delta`（见 opencode-v2.ts）。判据就是那行密码 —— 有它就走
+// 2.x，没有就是 1.x。
+//
 //   CLAWMESSENGER_OPENCODE_SERVER=0        关掉，回到 run --format json
 //   CLAWMESSENGER_OPENCODE_FULL_CONFIG=1   不派生精简配置（保留 plugin / MCP）
 const SERVE_STARTUP_TIMEOUT_MS = 25_000;
+// 拿到 listening 行之后再等密码行的窗口。2.x 这两行是先后打出来的（实测相隔
+// 几毫秒），但**别按实测值去压这个窗口**：Windows 冷启动、首次加载配置、杀软
+// 扫描 stdout 时，密码行晚到 300ms 是常态。窗口一旦错过，`password` 就为空 →
+// 走 1.x 协议 → `POST /session` 405 → 整轮退化成 `run --format json` 的「整段
+// 落地」（实测一轮 12,620 事件、101 秒才一次蹦出），而且是**静默**退化：功能还
+// 能用，用户只会觉得「1.3.5 变慢了」。1200ms 是这轮取舍的结果 —— 1.x 每轮白等
+// 这点时间，换 2.x 稳定命中真流式。
+const SERVE_PASSWORD_GRACE_MS = 1200;
 
 export function opencodeServerEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   const raw = (env.CLAWMESSENGER_OPENCODE_SERVER ?? "").trim();
@@ -983,13 +997,18 @@ async function runOpenCodeServerTurn(
     stderr = (stderr + buf.toString("utf8")).slice(-2000);
   });
 
-  const baseUrl = await new Promise<string>((resolve, reject) => {
+  const serve = await new Promise<{ baseUrl: string; password?: string }>((resolve, reject) => {
     let tail = "";
     let done = false;
+    // 2.x 的启动输出是「listening 行在前、password 行在后」，只等着 URL 会漏掉
+    // 密码，因此拿到 URL 后再给它一个很短的窗口把密码行收进来；窗口过了就当
+    // 1.x 处理（1.x 永远不打这行）。
+    let passwordTimer: NodeJS.Timeout | undefined;
     const finish = (fn: () => void) => {
       if (done) return;
       done = true;
       clearTimeout(startTimer);
+      if (passwordTimer) clearTimeout(passwordTimer);
       opts.signal?.removeEventListener("abort", onAbort);
       fn();
     };
@@ -1003,9 +1022,15 @@ async function runOpenCodeServerTurn(
     child.stdout.on("data", (buf: Buffer) => {
       tail += buf.toString("utf8");
       const url = parseServeListeningUrl(tail);
-      if (url) {
-        finish(() => resolve(url));
+      const password = parseServePassword(tail);
+      if (url && password) {
+        finish(() => resolve({ baseUrl: url, password }));
         return;
+      }
+      if (url && !passwordTimer) {
+        passwordTimer = setTimeout(() => {
+          finish(() => resolve({ baseUrl: url }));
+        }, SERVE_PASSWORD_GRACE_MS);
       }
       // 启动期会打若干行日志；只留尾部，别让长跑把内存吃满。
       if (tail.length > 4000) tail = tail.slice(-2000);
@@ -1018,7 +1043,8 @@ async function runOpenCodeServerTurn(
 
   try {
     const result = await runServerSession({
-      baseUrl,
+      baseUrl: serve.baseUrl,
+      password: serve.password,
       prompt: opts.prompt,
       model: opts.model,
       timeoutMs,
@@ -1031,8 +1057,10 @@ async function runOpenCodeServerTurn(
     });
     if (!result.sawDelta) {
       // serve 起来了但没有增量事件：多半是旧版 opencode。内容不丢，只是不流。
+      // 正文事件的两种形态都要点到：1.x 的 serve 发 `message.part.delta`，
+      // 2.x 的 /api/* 发 `session.text.delta` —— 只写前者会把排查方向带偏。
       console.warn(
-        `opencode serve 未上报 message.part.delta（正文 ${result.text.length} 字）——`
+        `opencode serve 未上报增量正文事件（message.part.delta / session.text.delta，正文 ${result.text.length} 字）——`
         + " 该版本可能不支持增量事件，本轮按整段返回。",
       );
     }

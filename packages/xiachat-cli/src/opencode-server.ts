@@ -23,6 +23,7 @@
 import { Agent as HttpAgent, request as httpRequest, type IncomingMessage } from "node:http";
 
 import { createActivityTracker, type ActivityStep, type ActivityTracker } from "./agent-activity.js";
+import { runV2Session } from "./opencode-v2.js";
 
 // 单条 SSE 帧里 data 的最大长度：超长的多半是工具输出回显，不需要整段解析。
 const MAX_EVENT_LINE = 1_000_000;
@@ -44,6 +45,29 @@ export function parseServeListeningUrl(line: string): string | null {
   const match = /listening on (https?:\/\/[^\s\u001b]+)/i.exec(line);
   if (!match) return null;
   return match[1].replace(/[),.;]+$/, "");
+}
+
+/** 从 `opencode serve` 的 stdout 里抓 2.x 的鉴权密码（`server password <pw>`）。 */
+export function parseServePassword(text: string): string | null {
+  // 2.x 实测输出：`server password r5iAZPoENlJxmCQUx86Qa5ylLNxrn3eJcK4Rl1tCYQ4`
+  //
+  // 三道防线，缺一不可：
+  //   0. **先剥 OSC**（`ESC ] … BEL` / `ESC ] … ESC \`：窗口标题、任务栏进度这类）。
+  //      OSC 与密码行在同一行时（抓包里出现过 `\u001b]0;opencode serve\u0007server
+  //      password …`），它会占住行首，导致 `^server password` 匹配不上 → 返回
+  //      null → `password` 为空 → 静默退化成 1.x/run 的「整段落地」。注意 CSI
+  //      的剥法对这种序列**无能为力**（`ESC ]` 不是 `ESC [`），必须单独处理。
+  //   1. 再剥全 CSI（不只是 SGR 的 `…m`）：opencode 用进度条/TUI 时还会发
+  //      `\u001b[K`、`\u001b[?25l`，而转义字节里没有空白 —— 只剥 SGR 的话
+  //      `\S+` 会把它们吃进密码，Basic 头里带上垃圾 → 401 → 不回退 run，整轮硬失败。
+  //   2. 捕获收紧到密码字符集（43 位 base64url 风格）。就算还有没剥干净的装饰
+  //      字符，也匹配不上，宁可返回 null 走 1.x 分支，也不要拿一串脏密码去试。
+  /* eslint-disable no-control-regex -- 要剥掉的就是 ESC / BEL 本身 */
+  const withoutOsc = text.replace(/\u001b\][^\u0007\u001b\r\n]*(?:\u0007|\u001b\\)?/g, "");
+  const plain = withoutOsc.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "");
+  /* eslint-enable no-control-regex */
+  const match = /^server password ([A-Za-z0-9+/=_-]+)\s*$/m.exec(plain);
+  return match ? match[1] : null;
 }
 
 /** `provider/model` → 请求体的 model 字段。解析失败返回 null（用配置默认）。 */
@@ -292,6 +316,11 @@ function requestJson(
 export interface RunServerSessionOpts {
   /** `http://127.0.0.1:<port>`（来自 serve 的 stdout）。 */
   baseUrl: string;
+  /**
+   * 2.x serve 启动时打印的 `server password`。**有它就说明是 2.x**
+   * （1.x 的 serve 不打这行），本轮直接走 `/api/*` 协议。
+   */
+  password?: string;
   prompt: string;
   model?: string;
   timeoutMs: number;
@@ -341,6 +370,35 @@ function extractReplyText(body: unknown): string | undefined {
  * 调用方负责起停进程；这里只保证「收完就断开 SSE」。
  */
 export async function runServerSession(opts: RunServerSessionOpts): Promise<RunServerSessionResult> {
+  // opencode 2.x：serve 会打一行 `server password`，说明它跑的是「v2 API + Web UI」
+  // 那套（1.x 的 serve 没有这行）。1.x 的 `POST /session` 在 2.x 上是 405，SSE 也
+  // 只会读到 Web UI 的 HTML，所以这里直接切 /api/* 协议，不要先撞一遍 405。
+  if (opts.password) {
+    const v2 = await runV2Session({
+      baseUrl: opts.baseUrl,
+      password: opts.password,
+      prompt: opts.prompt,
+      model: opts.model,
+      timeoutMs: opts.timeoutMs,
+      signal: opts.signal,
+      onText: opts.onText,
+      onReasoning: opts.onReasoning,
+      onActivity: opts.onActivity,
+      maxTextChars: opts.maxTextChars,
+    });
+    return {
+      text: v2.text,
+      sawDelta: v2.sawDelta,
+      deltaCount: v2.deltaCount,
+      reasoningChars: v2.reasoningChars,
+      idleSeen: true,
+      // 2.x 的工具步骤走 session.tool.*，已在 opencode-v2.ts 里接进过程流，
+      // 所以「半句话」判定与 1.x / run 模式同口径。
+      endedOnFailedTool: v2.endedOnFailedTool,
+      failedStep: v2.failedStep,
+    };
+  }
+
   const agent = new HttpAgent({ keepAlive: true, maxSockets: 8 });
   const abort = new AbortController();
   let timedOut = false;
@@ -537,9 +595,29 @@ export async function abortServerSession(baseUrl: string, sessionID: string): Pr
 /** 供 agents.ts 判定「这条错误是不是 serve 路径自己放弃、该退回 run 模式」。 */
 export function isServeStartupFailure(err: unknown): boolean {
   const message = err instanceof Error ? err.message : String(err);
-  // 只认「serve 根本没起来」这一类：没打监听地址、进程退出、端口连不上、
-  // 端点 404（旧版没有 serve）。**不认**超时与模型报错 —— 那些说明 serve
-  // 已经在跑了，退回 run 只会把同一次失败再放大一遍。
-  return /opencode serve (?:did not report its listening URL|exited with code)|ECONNREFUSED|GET \/event -> HTTP|POST \/session -> HTTP 404/
+  // 只认「serve 这条路给不了 1.x 会话 API」这一类：没打监听地址、进程退出、
+  // 端口连不上、端点不认 POST（404 = 旧版根本没有 serve；405 = opencode 2.x，
+  // 见下）。**不认**超时与模型报错 —— 那些说明 serve 已经在跑了，退回 run 只会
+  // 把同一次失败再放大一遍。
+  //
+  // 405 是 2026-10-27 在 opencode v2.1.4 上实测加进来的：2.x 的 `serve` 变成了
+  // 「v2 API + Web UI」共用一个端口，`POST /session` 返回 405 Method Not Allowed，
+  // 而真正的 API 挪到 `/api/*` 且要 serve 启动时打印的 server password 鉴权。
+  // 只认 404 时这条错误会漏出降级判据，整轮直接失败、正文为空 —— 设备端看到的
+  // 就是「提示失败、消息是空的」。
+  //
+  // 401 是这一轮补进来的，**只认我们自己这两条路径**（`POST /api/session`、
+  // `GET /api/event`）：2.x 的 `/api/*` 要 serve 启动时打印的 server password，
+  // 本机 401 只可能是我们的 Basic 头没对上（`parseServePassword` 抓脏，或者密码
+  // 行压根没抓到），属于「serve 这条路走不通」，与「模型/供应商报错」不同类。
+  // 这种时候退成 `run --format json`，用户还能拿到整段（不流式）答案，比整轮失败
+  // 好得多 —— 后者正是用户报的「提示失败、消息是空的」。
+  //
+  // 但**不能**写成「任意 401」：供应商的鉴权/余额错误会以
+  // `opencode session failed: <原话里带 401>…` 冒出来，那是真正要报给用户的模型
+  // 错误，被降级吃掉就等于掩盖了它。
+  // （`POST /api/session/{id}/prompt` 的 401 不单列：密码不对时在建会话那步就已经
+  //  401 了，走不到 prompt。）
+  return /opencode serve (?:did not report its listening URL|exited with code)|ECONNREFUSED|GET \/event -> HTTP|POST \/session -> HTTP (?:404|405)|(?:POST \/api\/session|GET \/api\/event) -> HTTP 401/
     .test(message);
 }
