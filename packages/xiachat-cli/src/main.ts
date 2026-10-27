@@ -12,7 +12,7 @@ import {
   type DeviceUpgradeStatus,
   type MachineAgentCredential,
 } from "./api.js";
-import { discoverAgents } from "./agents.js";
+import { discoverAgents, type AgentInfo } from "./agents.js";
 import { DEFAULT_SERVER_URL, machineId, defaultAnsweredTurnsPath, defaultProcessedUidsPath, defaultUpgradeInflightPath } from "./config.js";
 import { agentNameFromRcUser, ensureOpencodeInstalled, OPS_AGENT_NAME, OPS_TURN_TIMEOUT_MS, setupOpsWorkdir } from "./ops.js";
 import {
@@ -161,6 +161,12 @@ export interface BuildProgramOpts {
   ensureOpencode?: () => Promise<unknown>;
   // Injectable for tests; defaults to child_process.spawn.
   spawnChild?: typeof spawn;
+  // Injectable for tests; defaults to discoverAgents (a real PATH scan). The
+  // supervisor skips any bound agent whose CLI is not installed, so a test
+  // exercising a bound agent set must not depend on what the host happens to
+  // have on PATH — on a bare CI runner nothing is installed and every agent is
+  // skipped, ending in "none of the bound agent CLIs is available".
+  discoverAgents?: (opts: { extraPath?: string }) => Promise<AgentInfo[]>;
   // Injectable for tests; defaults to registering the supervisor's shutdown on
   // process SIGINT/SIGTERM.
   onSupervisorSignal?: (shutdown: () => void) => void;
@@ -1628,7 +1634,7 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
   if (bound.length === 0) {
     throw new Error("no agents bound to this device; select and bind agents in the web binding dialog first");
   }
-  const found = await discoverAgents({});
+  const found = await (opts.discoverAgents ?? discoverAgents)({});
   // SEA single-file exe: re-invoke the exe itself. Node script mode: re-run
   // the bundle entry so argv keeps the [execPath, script, ...] shape.
   const spawnArgvPrefix = supervisorSpawnArgv();

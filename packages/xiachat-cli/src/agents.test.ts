@@ -1083,7 +1083,10 @@ describe("runAgentTurn", () => {
   });
 });
 
-describe("Windows .cmd shim 穿透（cmd.exe 会截断多行提示词）", () => {
+// 被测的 resolveWindowsShim 只在 win32 上生效（其它平台第 300 行直接返回
+// false），所以这组用例在 Linux/macOS 上必然失败——按平台跳过，而不是让它
+// 在 CI 里装成一个真实的回归。
+describe.skipIf(process.platform !== "win32")("Windows .cmd shim 穿透（cmd.exe 会截断多行提示词）", () => {
   it("能认出 npm shim 的真实目标：真 exe 直接跑，脚本交给同目录 node.exe", async () => {
     const { mkdtemp, mkdir, writeFile } = await import("node:fs/promises");
     const { tmpdir } = await import("node:os");

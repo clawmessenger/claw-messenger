@@ -108,6 +108,13 @@ function makeHarness(
     apiFactory: () => api,
     stdout: { write: (chunk: unknown) => { output.push(String(chunk)); return true } } as unknown as NodeJS.WriteStream,
     ensureOpencode: async () => ({}),
+    // supervisor 会跳过「本机 PATH 上没有」的 agent。CI runner 上一个 agent CLI
+    // 都没装，bound 里的会全被跳过，run 直接抛 "none of the bound agent CLIs"。
+    // 这里按 bound 伪造一份 PATH 扫描结果，用例只关心启停逻辑，不该依赖宿主机。
+    discoverAgents: async () => [...new Set((bound as Array<{ agent?: string }>)
+      .map((entry) => entry?.agent)
+      .filter((name): name is string => typeof name === "string"))]
+      .map((name) => ({ name, path: join(dir, "bin", name) })),
     spawnChild: ((_command: string, args: string[], options: { env: NodeJS.ProcessEnv }) => {
       const child = fakeChild();
       spawned.push({ args, env: options.env, child });
