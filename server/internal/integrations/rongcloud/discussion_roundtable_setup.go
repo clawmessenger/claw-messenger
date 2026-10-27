@@ -42,6 +42,10 @@ const (
 	setupRecFailIdemPrefix = "setup-recfail:"
 )
 
+// recommendRoleCountCap 讨论组推荐角色数上限：产品口径 3-5 个角色，
+// 下限天然受「一个 agent 只能演一个角色」约束（候选节点数）。
+const recommendRoleCountCap = 5
+
 // setupPromptPayload 是 setup_prompt 事件的 data 形状（v3 契约，见 web
 // lib/discussion-v3.ts 的 eventData.setup_prompt）。
 func setupPromptPayload(step, prompt string) map[string]interface{} {
@@ -410,7 +414,7 @@ func (rt *discussionRuntime) recommendForSetupAsync(ctx context.Context, discuss
 		RecommendationPrompt: rt.roundtable.recommendationPrompt(ctx),
 		TimeoutSeconds:       timeout,
 		ConfigVersion:        configVersionInt(host.configVersion),
-	}, d.Topic, d.Goal, len(candidates), "")
+	}, d.Topic, d.Goal, min(recommendRoleCountCap, len(candidates)), "")
 	if code != "" {
 		fail(code, "角色推荐失败，请重试")
 		return

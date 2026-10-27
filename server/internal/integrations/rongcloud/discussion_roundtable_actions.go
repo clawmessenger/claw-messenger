@@ -83,7 +83,9 @@ func (rt *discussionRuntime) actionRecommendRoles(ctx context.Context, cmd Comma
 			return errResult(400, candCode)
 		}
 		candidates = nodeIDs
-		maxRoles = len(candidates)
+		// 与 web 首推/换一批（discussion_roundtable_setup.go）同一个上限，避免
+		// 同一产品口径下 web 推 5 个、小程序（传 node_ids 走本命令）推 8 个。
+		maxRoles = min(recommendRoleCountCap, len(candidates))
 	}
 
 	// broker 往返（真实调设备端 agent）。等待上限由 host.TimeoutSeconds 决定。
