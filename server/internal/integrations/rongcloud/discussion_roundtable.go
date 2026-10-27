@@ -518,7 +518,7 @@ func roundtableRoleEntryFromMember(row db.ListRongCloudChatroomMembersWithNodeRo
 	if row.RoleInstructions.Valid {
 		instructions = row.RoleInstructions.String
 	}
-	return map[string]interface{}{
+	entry := map[string]interface{}{
 		"memberId":         row.NodeRcUserID.String,
 		"nodeId":           row.BusinessNodeID.String,
 		"nickname":         roleName,
@@ -528,7 +528,19 @@ func roundtableRoleEntryFromMember(row db.ListRongCloudChatroomMembersWithNodeRo
 		"capabilities":     roundtableRequiredRoleCaps,
 		"isHost":           false,
 		"speakingOrder":    order,
-	}, true
+	}
+	// model 只在非空时写键（与 roundtableHostRoleEntry 同一约定，空串的讨论与改造前
+	// 逐字节一致）。取值的优先级和 relayModel 一致：成员设置里的「讨论模型」
+	// （discussion_model）优先，没有才退回节点级 model。缺了这个键，中途加进来的
+	// 成员会静默使用设备默认模型 —— 用户在成员设置里配的模型等于没配。
+	model := row.DiscussionModel.String
+	if !row.DiscussionModel.Valid || model == "" {
+		model = row.Model.String
+	}
+	if model != "" {
+		entry["model"] = model
+	}
+	return entry, true
 }
 
 // roundtableHostSnapshotFields 是 host_config_snapshot 的内容。

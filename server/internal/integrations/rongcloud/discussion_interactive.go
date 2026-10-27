@@ -34,6 +34,8 @@ package rongcloud
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -656,6 +658,22 @@ func (rt *discussionRuntime) interactiveRoundDone(ctx context.Context, d Discuss
 }
 
 // interactiveMemberEnabled 判定角色板里的成员此刻是否仍是该聊天室的启用 AI 成员。
+//
+// 身份判据**必须同时认两个账号列**：角色板里的 memberId 是节点融云账号
+// （rongcloud_node.rongcloud_user_id）。两条成员写入链路填的账号列不一样 ——
+// `setDiscussionTeam`（C 端成员设置）走 UpsertRongCloudChatroomMemberByMemberID，
+// member_id 有值；运维后台的 ChatroomService.SetMembers 走
+// CreateRongCloudChatroomMember，那条 SQL 的列清单里没有 member_id，重建出来的行
+// member_id 是 NULL。
+//
+// 只认 member_id 的后果（线上形态）：管理员在后台改一遍成员 → 本房间所有 AI 行
+// member_id 变 NULL → 角色板照常（同步按 node_rc_user_id 认人）→ 但派发前这里对
+// 每个人返回 false → 全员只落 member_skipped → 本轮产出为 0 → 讨论被判 failed
+// （dispatch_failed）。用户看到的是「我刚调完成员，讨论就失败了」，而 reason 文案
+// 完全指不出是 member_id 为 NULL。
+//
+// 两个分支比的是同一个身份域（融云账号），所以放宽不会带来误判。根治仍是让
+// SetMembers 补写 member_id / nickname / portrait_uri（另开 PR）。
 func (rt *discussionRuntime) interactiveMemberEnabled(ctx context.Context, d DiscussionRecord, memberID string) bool {
 	room, err := rt.queries.GetRongCloudChatroomViewByRongCloudID(ctx, d.ChatroomID)
 	if err != nil {
@@ -666,7 +684,12 @@ func (rt *discussionRuntime) interactiveMemberEnabled(ctx context.Context, d Dis
 		return false
 	}
 	for _, m := range members {
-		if m.Enabled && m.MemberType == "ai" && m.MemberID.Valid && m.MemberID.String == memberID {
+		if !m.Enabled || m.MemberType != "ai" {
+			continue
+		}
+		sameAccount := (m.MemberID.Valid && m.MemberID.String == memberID) ||
+			(m.NodeRcUserID.Valid && m.NodeRcUserID.String == memberID)
+		if sameAccount {
 			return true
 		}
 	}
@@ -722,24 +745,43 @@ func (rt *discussionRuntime) syncDiscussionRoles(ctx context.Context, d Discussi
 	// data **必须是空对象**：前端 discussion-v3.ts 里 `discussion_progress:
 	// shape({})`，而 shape 会否掉任何 fields/optional 之外的键 —— 塞进 round /
 	// reason / added 任何一个都会让整段讨论历史判为无效。角色名只进下面的日志。
-	event, _, emitErr := rt.interactiveEmit(ctx, updated, interactiveEvent{
+	//
+	// 幂等键用增删集的 sha1 前 16 位，而不是直接拼角色名：角色名上限 80 字符，
+	// 中文明文按 UTF-8 是 3 字节/字，一轮增删十来个就能超过 btree 索引单条
+	// ~2704 字节的上限（uq_rongcloud_discussion_event_idem），于是这条事件写不进去
+	// 还白跑三次重试。摘要对同一组增删是确定的，重放去重能力不变。
+	event, created, emitErr := rt.interactiveEmit(ctx, updated, interactiveEvent{
 		EventType: "discussion_progress", ActorID: "system",
 		Payload: map[string]interface{}{},
-		Key: fmt.Sprintf("role-sync:%d:%s:%s", round,
-			strings.Join(added, ","), strings.Join(removed, ",")),
+		Key: fmt.Sprintf("role-sync:%d:%s", round,
+			roleSyncDigest(added, removed)),
 		RequestID: uuid.NewString(), StateVer: updated.Version,
 		Round: round, Revision: updated.RoundRevision,
 	})
-	if emitErr != nil {
+	switch {
+	case emitErr != nil:
 		rt.logger.Warn("discussion: role snapshot synced but event emit failed",
 			"discussionId", d.DiscussionID, "error", emitErr)
-	} else {
+	case created:
 		rt.interactiveBroadcast(ctx, updated, event)
+	default:
+		// 幂等键命中（同一组增删已经落过事件）：不要重复广播既存事件，
+		// 否则 C 端会收到两条同 seq 的 discussion_progress。与
+		// interjection_applied 的 `if created { broadcast }` 对齐。
 	}
 	// 可观测性走日志而不是事件 payload：事件侧受前端严格 shape 校验，装不下这些字段。
 	rt.logger.Info("discussion: role snapshot synced",
 		"discussionId", d.DiscussionID, "round", round, "added", added, "removed", removed)
 	return updated, true, nil
+}
+
+// roleSyncDigest 把一次角色板增删压成固定长度的幂等键后缀（16 位 hex）。
+//
+// 入参顺序参与摘要：added 按成员表顺序、removed 已排序，所以同一组变化永远得到
+// 同一个值（重放去重靠它），不同的变化几乎不会撞。
+func roleSyncDigest(added, removed []string) string {
+	sum := sha1.Sum([]byte("+" + strings.Join(added, "\x1f") + "\x1e-" + strings.Join(removed, "\x1f")))
+	return hex.EncodeToString(sum[:8])
 }
 
 // discussionRolesRebased 以成员表为权威重建角色板：
