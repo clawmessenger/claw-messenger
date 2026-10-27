@@ -1325,6 +1325,22 @@ func (h *Handler) DeleteWorkspace(w http.ResponseWriter, r *http.Request) {
 			run:  func() error { return qtx.DeleteWorkspaceAdministration(ctx, requester.WorkspaceID) },
 		},
 		{
+			// rongcloud_node_upgrade（migrations/601）是**机器维度**的 exe 版本与
+			// 升级进度，主键是 machine_id 而不是 workspace：机器解绑后可以重绑到
+			// 另一个工作区，所以删工作区只能摘掉它的 workspace 关联，不能删掉这份
+			// 机器状态（否则重绑后页面第一帧版本列全是「未知」，直到下一次 10 秒
+			// 轮询）。601 刻意没有给 workspace_id 建 FK —— 解绑节点不该连带清版本
+			// —— 于是 CASCADE 也不会替我们清理，必须在这里显式置空，否则
+			// workspace_delete_manifest_test 里的 detach 只是文档。
+			name: "detach machine upgrade state",
+			run: func() error {
+				_, err := tx.Exec(ctx,
+					`UPDATE rongcloud_node_upgrade SET workspace_id = NULL WHERE workspace_id = $1`,
+					requester.WorkspaceID)
+				return err
+			},
+		},
+		{
 			// At this point workspaceMember has resolved → workspaceID is a
 			// valid UUID, so reuse the resolved value. The existing final
 			// statement also sweeps any expand-phase compatibility leftovers.

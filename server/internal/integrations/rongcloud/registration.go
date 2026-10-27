@@ -112,12 +112,15 @@ func newRongCloudFactory(deps ChannelDeps) channel.Factory {
 			// Web 扫码登录的确认表（migrations/604）。签发/兑换在 HTTP 侧
 			// （internal/handler/claw_web_qr_login.go），移动端确认走这里。
 			systemHandler.webLoginSessions = NewWebLoginSessionStore(deps.DB, logger)
+			// 融云会话号映射（migrations/605）。客户端「个人资料 → 发消息」会
+			// 先 save 一次，没有它每次都 404（见 conversation_command.go）。
+			systemHandler.conversations = NewConversationStore(deps.DB)
 			// 运行时可观测的装配证据：这一行出现，才说明 service=user/friend/
-			// lobster 走的是真表而不是 503 兜底（见 im_service_commands_test.go
-			// 的 TestFactoryAttachesTheLocalStoresOnlyWhenDBIsProvided）。
-			logger.Info("rongcloud: local IM services enabled (service=user/friend/lobster)")
+			// lobster/conversation 走的是真表而不是 503 兜底（见
+			// im_service_commands_test.go 的 TestFactoryAttachesTheLocalStoresOnlyWhenDBIsProvided）。
+			logger.Info("rongcloud: local IM services enabled (service=user/friend/lobster/conversation)")
 		} else {
-			logger.Warn("rongcloud: local IM services disabled (ChannelDeps.DB is nil) — service=user/friend/lobster will reply 503")
+			logger.Warn("rongcloud: local IM services disabled (ChannelDeps.DB is nil) — service=user/friend/lobster/conversation will reply 503")
 		}
 		return &rongcloudChannel{
 			cfg:           cfg,

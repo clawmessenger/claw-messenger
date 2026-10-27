@@ -36,6 +36,10 @@ type systemHandler struct {
 	// 与 friendStore 分开：前者是审批过程的状态，后者是好友边归属的投影。
 	friendRequests *FriendRequestStore
 	userStore      *UserStore
+	// conversations 是「融云会话号映射」表的读写（migrations/605，移植自旧
+	// Python 的 service=conversation）。客户端「个人资料 → 发消息」会调用，
+	// 缺了它每次都收到 404「未知的服务或操作」（见 conversation_command.go）。
+	conversations *ConversationStore
 	// webLoginSessions 是 Web 扫码登录的确认表读写（migrations/604）。与
 	// userStore 分开：它只服务「一次性票据」这一个生命周期，不与账号表耦合。
 	webLoginSessions *WebLoginSessionStore
@@ -109,6 +113,8 @@ func (h *systemHandler) handleCommand(ctx context.Context, msg NormalizedMessage
 		return h.handleFriendCommand(ctx, msg, cmd)
 	case "lobster":
 		return h.handleLobsterCommand(ctx, msg, cmd)
+	case "conversation":
+		return h.handleConversationCommand(ctx, msg, cmd)
 	default:
 		h.logger.Warn("rongcloud: unknown service", "service", cmd.Service, "msgUID", msg.MsgUID)
 		return h.replyErr(ctx, msg, cmd, 404, unknownServiceOrActionMessage(cmd))

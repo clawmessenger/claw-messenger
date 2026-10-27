@@ -238,6 +238,16 @@ func isMachineNode(n db.RongcloudNode) bool {
 	return n.RongcloudUserID == "rc_node_"+machineIdentityKey(n.MachineID)
 }
 
+// IsMachineNode 是 isMachineNode 的导出形式，给管理端复用。
+//
+// 管理端需要它来挑出「机器主节点」并从它的昵称里取机器名。判定必须与设备侧
+// 完全同源：在 SQL 里重写一遍 `rc_node_ || machine_id` 会与 machineIdentityKey
+// 的归一化（MAC 大小写、.local 后缀）漂移，结果就是部分机器永远没有名字。
+func IsMachineNode(n db.RongcloudNode) bool { return isMachineNode(n) }
+
+// MachineDisplayName 是 machineDisplayName 的导出形式，给管理端复用。
+func MachineDisplayName(name, aiType string) string { return machineDisplayName(name, aiType) }
+
 // isHiddenNode reports whether n must be excluded from the user-facing device
 // list and friend list. Two kinds of nodes are internal plumbing: the
 // per-machine infrastructure node and the built-in ops maintenance agent.

@@ -284,7 +284,7 @@ export class XiachatApi {
     nodeId: string,
     credentialId: string,
     secret: string,
-    report?: { version?: string; platform?: string },
+    report?: { version?: string; platform?: string; hostname?: string },
   ): Promise<DeviceControlSnapshot> {
     const raw = await this.request<{ data?: { agents?: AgentControlState[]; upgrade?: DeviceUpgradeIntent } }>(
       "POST",
@@ -295,6 +295,7 @@ export class XiachatApi {
         secret,
         ...(report?.version ? { version: report.version } : {}),
         ...(report?.platform ? { platform: report.platform } : {}),
+        ...(report?.hostname ? { hostname: report.hostname } : {}),
       },
     );
     const agents = raw.data?.agents;
@@ -321,6 +322,7 @@ export class XiachatApi {
       errorDetail?: string;
       reportedVersion?: string;
       reportedPlatform?: string;
+      reportedHostname?: string;
     },
   ): Promise<void> {
     try {
@@ -334,6 +336,7 @@ export class XiachatApi {
         ...(report.errorDetail ? { errorDetail: report.errorDetail } : {}),
         ...(report.reportedVersion ? { reportedVersion: report.reportedVersion } : {}),
         ...(report.reportedPlatform ? { reportedPlatform: report.reportedPlatform } : {}),
+        ...(report.reportedHostname ? { reportedHostname: report.reportedHostname } : {}),
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

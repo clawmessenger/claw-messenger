@@ -33,8 +33,8 @@ const (
 	// clawUpgradeReleasesRepo 与 CLI 内置自更新同源（self-update.ts 的 RELEASES_REPO），
 	// 不新增发布方式。
 	clawUpgradeReleasesRepo = "clawmessenger/claw-messenger"
-	// clawUpgradeWindowsAsset 是本期唯一支持的资产。其它平台照常上报版本，
-	// 但不给升级指令（assetNameForPlatform 在服务端只有这一支）。
+	// clawUpgradeWindowsAsset 是 Windows-x64 的资产名。保号是因为测试、提示文案
+	// 与历史 token 都按它写；平台到资产的映射统一走 clawUpgradeAssetForPlatform。
 	clawUpgradeWindowsAsset = "clawmessenger-windows-x64.exe"
 	// clawUpgradePlatformWindows 是设备上报的 "<os>-<arch>" 值。
 	clawUpgradePlatformWindows = "win32-x64"
@@ -379,27 +379,76 @@ func mustHexDecode(s string) []byte {
 //
 // token 为空（服务端没配 MULTICA_CLAW_UPGRADE_TOKEN_SECRET）时只给直连地址：
 // 代理端点此刻是 503，把它排在 mirrors 里只会让设备多等一次必然失败的尝试。
-func clawUpgradeMirrors(release *clawUpgradeRelease, token string) (mirrors []string, directURL string) {
-	direct := release.Assets[clawUpgradeWindowsAsset]
+func clawUpgradeMirrors(release *clawUpgradeRelease, asset, token string) (mirrors []string, directURL string) {
+	direct := release.Assets[asset]
 	if direct == "" {
-		direct = clawUpgradeAssetURL(release.Tag, clawUpgradeWindowsAsset)
+		direct = clawUpgradeAssetURL(release.Tag, asset)
+	}
+	if direct == "" {
+		// 资产名不在发布矩阵里：连直连地址都拼不出来，此处返回空列表让调用方
+		// 按「没有可下载地址」处理，而不是给设备一个 404 的 URL。
+		return nil, ""
 	}
 	mirrors = []string{direct}
 	if token == "" {
 		return mirrors, direct
 	}
 	mirrors = append(mirrors, fmt.Sprintf("/api/agent/upgrade/download?version=%s&asset=%s&token=%s",
-		release.Version, clawUpgradeWindowsAsset, token))
+		release.Version, asset, token))
 	return mirrors, direct
 }
 
-// clawUpgradePlatformSupported 本期只做 Windows-x64：其它平台的「重启生效」
-// 走 systemd / LaunchAgent，与设备端 __relaunch 的实现不同，不在这一期。
+// clawUpgradeAssetsByPlatform 是「设备上报的 <os>-<arch>」→ Release 资产名的唯一
+// 映射，必须与 CLI 的 assetNameForPlatform（self-update.ts）逐字一致。
 //
-// **未知平台 = 不支持**（fail closed）。空串表示「设备从没上报过平台」——那多半是
-// 1.3.0 之前的版本，它的 supervisor 根本没有领取升级指令的代码。把它当成可升级
-// 会让这一行永远停在 pending，而波次闸会因此把后面所有机器一起卡死（审查报告
-// S3）。宁可当场说「平台未知，先手动装一次」。
+// 两处漂移的后果是静默的：服务端按 A 名签 token，设备按 B 名去下载，结果是
+// download_failed（404），而页面上只会显示「下载失败」—— 看不出是名字错了。
+// 发布矩阵（.github/workflows/clawmessenger-release.yml）是唯一真相。
+var clawUpgradeAssetsByPlatform = map[string]string{
+	clawUpgradePlatformWindows: "clawmessenger-windows-x64.exe",
+	"linux-x64":                "clawmessenger-linux-x64",
+	"linux-arm64":              "clawmessenger-linux-arm64",
+	"darwin-arm64":             "clawmessenger-darwin-arm64",
+}
+
+// clawUpgradeAssetForPlatform 返回该平台要下载的资产名；空串 = 该平台不在发布
+// 矩阵内（含平台未知）。
+func clawUpgradeAssetForPlatform(platform string) string {
+	return clawUpgradeAssetsByPlatform[strings.TrimSpace(platform)]
+}
+
+// clawUpgradeAssetSupported 判断资产名是否属于发布矩阵。下载代理的白名单用它：
+// 端点公开，资产名进 URL，不做白名单就等于开了一个「按名字回源任意 release
+// 资产」的代理。
+func clawUpgradeAssetSupported(asset string) bool {
+	asset = strings.TrimSpace(asset)
+	if asset == "" {
+		return false
+	}
+	for _, known := range clawUpgradeAssetsByPlatform {
+		if known == asset {
+			return true
+		}
+	}
+	return false
+}
+
+// clawUpgradePlatformSupported 判定该平台能否在后台下发升级。
+//
+// 非 Windows 的「重启生效」不再是阻碍：设备端的 __relaunch 本来就是
+// 「拿端口锁 → spawn 新进程 → 确认站起来 → 放锁」的跨平台交接，与 systemd /
+// LaunchAgent 无关；Windows 只是需要额外处理「运行中的 exe 不能删、但能改名」。
+//
+// **未知平台仍然 = 不支持**（fail closed）。空串表示「设备从没上报过平台」——那
+// 多半是 1.3.0 之前的版本，它的 supervisor 根本没有领取升级指令的代码。把它当成
+// 可升级会让这一行永远停在 pending，而波次闸会因此把后面所有机器一起卡死（审查
+// 报告 S3）。宁可当场说「平台未知，先手动装一次」。
 func clawUpgradePlatformSupported(platform string) bool {
-	return platform == clawUpgradePlatformWindows
+	return clawUpgradeAssetForPlatform(platform) != ""
+}
+
+// clawUpgradeSupportedPlatformsText 把可升级平台列成人话，供页面/日志解释
+// 「为什么这台不行」。顺序固定，避免每次渲染顺序漂移。
+func clawUpgradeSupportedPlatformsText() string {
+	return "Windows-x64 / Linux-x64 / Linux-arm64 / macOS-arm64"
 }

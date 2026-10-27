@@ -7,6 +7,7 @@ import {
   nextPathValue,
   parseRegPathQuery,
   samePath,
+  upgradeTargetPath,
 } from "./install.js";
 
 // Self-install tests need a virtual filesystem: the assertions are about what
@@ -119,6 +120,56 @@ describe("isSeaExecutable", () => {
     expect(isSeaExecutable("packages/xiachat-cli/dist/clawmessenger.sea.cjs")).toBe(false);
     expect(isSeaExecutable("/repo/dist/clawmessenger.sea.cjs")).toBe(false);
     expect(isSeaExecutable("/repo/dist/entry.mjs")).toBe(false);
+  });
+});
+
+describe("upgradeTargetPath", () => {
+  it("overwrites the running SEA executable, not the platform's install path", () => {
+    // Linux 上 systemd unit 跑 /usr/local/bin/clawmessenger，installPaths 给的是
+    // ~/.local/bin/clawmessenger。按平台猜会把「没人用的副本」换成新版，unit 重启
+    // 后仍在跑旧版 —— 页面版本 / 磁盘文件 / 实际进程三方不一致。
+    expect(
+      upgradeTargetPath("linux", "/usr/local/bin/clawmessenger", "/usr/local/bin/clawmessenger", "/root"),
+    ).toBe("/usr/local/bin/clawmessenger");
+    expect(
+      upgradeTargetPath("linux", "/opt/cm/clawmessenger", "/opt/cm/clawmessenger", "/root"),
+    ).toBe("/opt/cm/clawmessenger");
+  });
+
+  it("uses execPath on windows SEA and darwin SEA alike", () => {
+    expect(
+      upgradeTargetPath(
+        "win32",
+        "C:\\Users\\u\\AppData\\Local\\clawmessenger\\clawmessenger.exe",
+        "C:\\Users\\u\\AppData\\Local\\clawmessenger\\clawmessenger.exe",
+        "C:\\Users\\u",
+        "C:\\Users\\u\\AppData\\Local",
+      ),
+    ).toBe("C:\\Users\\u\\AppData\\Local\\clawmessenger\\clawmessenger.exe");
+    expect(
+      upgradeTargetPath("darwin", "/usr/local/bin/clawmessenger", "/usr/local/bin/clawmessenger", "/Users/u"),
+    ).toBe("/usr/local/bin/clawmessenger");
+  });
+
+  it("falls back to the install path when running a node script (execPath is node itself)", () => {
+    // 非 SEA 时 process.execPath 是 node 本体，覆盖它等于把 node 换成 CLI 二进制。
+    expect(
+      upgradeTargetPath("linux", "/repo/dist/bin.js", "/usr/bin/node", "/home/u"),
+    ).toBe("/home/u/.local/bin/clawmessenger");
+    expect(
+      upgradeTargetPath("linux", "/repo/dist/clawmessenger.sea.cjs", "/usr/bin/node", "/home/u"),
+    ).toBe("/home/u/.local/bin/clawmessenger");
+    expect(
+      upgradeTargetPath("win32", "D:\\repo\\dist\\bin.js", "C:\\node\\node.exe", "C:\\Users\\u", "C:\\Users\\u\\AppData\\Local"),
+    ).toBe("C:\\Users\\u\\AppData\\Local\\clawmessenger\\clawmessenger.exe");
+  });
+
+  it("still returns the install path when argv1 is missing (no script entrypoint)", () => {
+    // argv1 缺失时 isSeaExecutable 返回 true，走 execPath 分支；这里用 execPath 明确
+    // 表示「跑的就是这个二进制」，避免退回按平台猜出来的路径。
+    expect(upgradeTargetPath("linux", undefined, "/usr/local/bin/clawmessenger", "/root")).toBe(
+      "/usr/local/bin/clawmessenger",
+    );
   });
 });
 

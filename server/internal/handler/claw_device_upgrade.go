@@ -59,11 +59,14 @@ var clawUpgradeDeviceReportable = map[string]bool{
 
 // clawNodeUpgrade 是 rongcloud_node_upgrade 的一行（机器维度）。
 type clawNodeUpgrade struct {
-	MachineID          string
-	NodeID             pgtype.UUID
-	WorkspaceID        pgtype.UUID
-	ReportedVersion    string
-	ReportedPlatform   string
+	MachineID        string
+	NodeID           pgtype.UUID
+	WorkspaceID      pgtype.UUID
+	ReportedVersion  string
+	ReportedPlatform string
+	// ReportedHostname 是设备操作系统的 hostname（人可读的机器标识）。与「机器名」
+	// 的区别：机器名取自机器主节点的昵称（可被人改），hostname 是系统事实。
+	ReportedHostname   string
 	ReportedAt         pgtype.Timestamptz
 	ReportedGeneration int64
 	TargetVersion      string
@@ -103,13 +106,16 @@ func machineIDForDevice(machineNode db.RongcloudNode) string {
 	return strings.TrimPrefix(machineNode.RongcloudUserID, "rc_node_")
 }
 
-// clawDeviceRecordUpgradeState 把设备上报的版本/平台写进机器行，同时把
+// clawDeviceRecordUpgradeState 把设备上报的版本/平台/主机名写进机器行，同时把
 // reported_generation 单调推进（GREATEST：乱序到达的旧轮询不能把它退回去）。
 // 不碰 status/target —— 那是管理端与设备进度的领域，版本上报只负责版本。
+//
+// hostname 传空表示「这次没带」（老版本设备），此时**保留库里已有的值**：否则
+// 一台已上报过主机名的机器会被它自己的旧版本心跳擦成空。
 func (h *Handler) clawDeviceRecordUpgradeState(
 	ctx context.Context,
 	machineNode db.RongcloudNode,
-	version, platform string,
+	version, platform, hostname string,
 	generation int64,
 ) error {
 	if h.DB == nil {
@@ -118,18 +124,22 @@ func (h *Handler) clawDeviceRecordUpgradeState(
 	_, err := h.DB.Exec(ctx, `
 		INSERT INTO rongcloud_node_upgrade
 			(machine_id, node_id, workspace_id, reported_version, reported_platform,
-			 reported_at, reported_generation, updated_at)
-		VALUES ($1, $2, $3, $4, $5, now(), $6, now())
+			 reported_hostname, reported_at, reported_generation, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, now(), $7, now())
 		ON CONFLICT (machine_id) DO UPDATE
 		   SET node_id = EXCLUDED.node_id,
 		       workspace_id = EXCLUDED.workspace_id,
 		       reported_version = EXCLUDED.reported_version,
 		       reported_platform = EXCLUDED.reported_platform,
+		       reported_hostname = COALESCE(
+		           NULLIF(EXCLUDED.reported_hostname, ''),
+		           rongcloud_node_upgrade.reported_hostname),
 		       reported_at = now(),
 		       reported_generation = GREATEST(
 		           rongcloud_node_upgrade.reported_generation, EXCLUDED.reported_generation),
 		       updated_at = now()`,
-		machineIDForDevice(machineNode), machineNode.ID, machineNode.WorkspaceID, version, platform, generation)
+		machineIDForDevice(machineNode), machineNode.ID, machineNode.WorkspaceID,
+		version, platform, hostname, generation)
 	return err
 }
 
@@ -137,7 +147,7 @@ func (h *Handler) clawDeviceRecordUpgradeState(
 // 必须逐字一致，否则 scanClawNodeUpgrade 会在某一处静默错位。
 const clawNodeUpgradeColumns = `
 	machine_id, node_id, workspace_id,
-	reported_version, reported_platform, reported_at, reported_generation,
+	reported_version, reported_platform, reported_hostname, reported_at, reported_generation,
 	target_version, desired_generation, status, error_code, error_detail,
 	force, batch_id, wave, requested_by, requested_at, updated_at`
 
@@ -161,7 +171,8 @@ func (h *Handler) clawNodeUpgradeByMachine(ctx context.Context, machineID string
 func scanClawNodeUpgrade(row pgx.Row) (clawNodeUpgrade, error) {
 	var up clawNodeUpgrade
 	err := row.Scan(&up.MachineID, &up.NodeID, &up.WorkspaceID,
-		&up.ReportedVersion, &up.ReportedPlatform, &up.ReportedAt, &up.ReportedGeneration,
+		&up.ReportedVersion, &up.ReportedPlatform, &up.ReportedHostname, &up.ReportedAt,
+		&up.ReportedGeneration,
 		&up.TargetVersion, &up.DesiredGeneration, &up.Status, &up.ErrorCode, &up.ErrorDetail,
 		&up.Force, &up.BatchID, &up.Wave, &up.RequestedBy, &up.RequestedAt, &up.UpdatedAt)
 	return up, err
@@ -248,7 +259,7 @@ func (h *Handler) clawDeviceUpgradeFailPlatform(ctx context.Context, machineID s
 		return
 	}
 	code := "platform_unsupported"
-	detail := fmt.Sprintf("本期只支持 Windows-x64，本机上报的是 %s", upgrade.ReportedPlatform)
+	detail := fmt.Sprintf("支持的是 %s，本机上报的是 %s", clawUpgradeSupportedPlatformsText(), upgrade.ReportedPlatform)
 	if upgrade.ReportedPlatform == "" {
 		code = "platform_unknown"
 		detail = "设备还没有上报 exe 平台（1.3.0 之前的版本不会上报），需要先在设备上手动安装一次"
@@ -360,18 +371,30 @@ func (h *Handler) clawDeviceUpgradeIntent(
 			"machine", machineID, "target", upgrade.TargetVersion, "latest", release.Version)
 		return nil, nil
 	}
-	sum, ok := release.SHA256[clawUpgradeWindowsAsset]
-	if !ok || len(sum) != 64 {
-		slog.Warn("claw: release has no sha256 for the windows asset",
-			"version", release.Version, "machine", machineID)
+	// 资产按**这台机器上报的平台**取：同一次批量下发里可能同时有 Windows 和
+	// Linux，各自的文件名与摘要都不同，用同一个常量会让非 Windows 那批 404。
+	asset := clawUpgradeAssetForPlatform(upgrade.ReportedPlatform)
+	sum, ok := release.SHA256[asset]
+	if asset == "" || !ok || len(sum) != 64 {
+		slog.Warn("claw: release has no sha256 for the platform asset",
+			"version", release.Version, "machine", machineID,
+			"platform", upgrade.ReportedPlatform, "asset", asset)
 		return nil, nil
 	}
-	token := signClawUpgradeToken(release.Version, clawUpgradeWindowsAsset, time.Now().Add(clawUpgradeTokenTTL))
-	mirrors, _ := clawUpgradeMirrors(release, token)
+	token := signClawUpgradeToken(release.Version, asset, time.Now().Add(clawUpgradeTokenTTL))
+	mirrors, direct := clawUpgradeMirrors(release, asset, token)
+	if len(mirrors) == 0 {
+		// 连直连地址都拼不出来（资产不在发布矩阵 / release 里没有这条资产）。
+		// 下发出去只会让设备报一个看不懂的 download_failed，这里先按「本轮不下发」
+		// 处理，等下一次 release 补齐资产。
+		slog.Warn("claw: no download url for the platform asset",
+			"version", release.Version, "machine", machineID, "asset", asset, "direct", direct)
+		return nil, nil
+	}
 	return &clawDeviceUpgradeIntent{
 		Generation:    upgrade.DesiredGeneration,
 		TargetVersion: upgrade.TargetVersion,
-		AssetName:     clawUpgradeWindowsAsset,
+		AssetName:     asset,
 		SHA256:        sum,
 		Force:         upgrade.Force,
 		Mirrors:       mirrors,
@@ -417,6 +440,7 @@ func (h *Handler) ClawDeviceUpgradeReport(w http.ResponseWriter, r *http.Request
 		ErrorDetail      string `json:"errorDetail"`
 		ReportedVersion  string `json:"reportedVersion"`
 		ReportedPlatform string `json:"reportedPlatform"`
+		ReportedHostname string `json:"reportedHostname"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil ||
 		req.NodeID == "" || req.CredentialID == "" || req.Secret == "" {
@@ -435,8 +459,8 @@ func (h *Handler) ClawDeviceUpgradeReport(w http.ResponseWriter, r *http.Request
 		return
 	}
 	machineID := machineIDForDevice(machineNode)
-	if req.ReportedVersion != "" || req.ReportedPlatform != "" {
-		if err := h.clawDeviceRecordUpgradeState(ctx, machineNode, req.ReportedVersion, req.ReportedPlatform, req.Generation); err != nil {
+	if req.ReportedVersion != "" || req.ReportedPlatform != "" || req.ReportedHostname != "" {
+		if err := h.clawDeviceRecordUpgradeState(ctx, machineNode, req.ReportedVersion, req.ReportedPlatform, req.ReportedHostname, req.Generation); err != nil {
 			slog.Warn("claw: upgrade version report failed", "machine", machineID, "error", err)
 		}
 	}

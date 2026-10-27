@@ -184,7 +184,7 @@ func TestClawUpgradeMirrorsPreferGitHubThenServerProxy(t *testing.T) {
 		Tag:     "clawmessenger-v1.3.0",
 		Assets:  map[string]string{clawUpgradeWindowsAsset: "https://github.example/asset"},
 	}
-	mirrors, direct := clawUpgradeMirrors(release, "tok")
+	mirrors, direct := clawUpgradeMirrors(release, clawUpgradeWindowsAsset, "tok")
 
 	if len(mirrors) != 2 {
 		t.Fatalf("mirrors = %v", mirrors)
@@ -209,7 +209,7 @@ func TestClawUpgradeMirrorsDropTheProxyWithoutASecret(t *testing.T) {
 		Tag:     "clawmessenger-v1.3.0",
 		Assets:  map[string]string{clawUpgradeWindowsAsset: "https://github.example/asset"},
 	}
-	mirrors, direct := clawUpgradeMirrors(release, "")
+	mirrors, direct := clawUpgradeMirrors(release, clawUpgradeWindowsAsset, "")
 	if len(mirrors) != 1 || mirrors[0] != direct {
 		t.Fatalf("without a token only the direct GitHub URL may remain, got %v", mirrors)
 	}
@@ -273,8 +273,21 @@ func TestClawUpgradeProxyAvailableFollowsTheSecret(t *testing.T) {
 }
 
 func TestClawUpgradePlatformSupported(t *testing.T) {
-	if !clawUpgradePlatformSupported(clawUpgradePlatformWindows) {
-		t.Fatal("win32-x64 must be supported")
+	// 发布矩阵里的四个平台都必须可升级，且每个都能映射到一个资产名。
+	// 这份清单要和 CLI 的 assetNameForPlatform 以及 CI matrix 三处一致。
+	for _, platform := range []string{
+		clawUpgradePlatformWindows, "linux-x64", "linux-arm64", "darwin-arm64",
+	} {
+		if !clawUpgradePlatformSupported(platform) {
+			t.Fatalf("%s must be upgradable", platform)
+		}
+		asset := clawUpgradeAssetForPlatform(platform)
+		if asset == "" {
+			t.Fatalf("%s must map to a release asset", platform)
+		}
+		if !clawUpgradeAssetSupported(asset) {
+			t.Fatalf("asset %q of %s must pass the download allow-list", asset, platform)
+		}
 	}
 	// 空 = 还没上报过平台（多半是 1.3.0 之前的版本，它根本没有领取升级指令的代
 	// 码）。**必须判成不支持**：放它进波次会让这一行永远 pending，而波次闸会把
@@ -282,9 +295,17 @@ func TestClawUpgradePlatformSupported(t *testing.T) {
 	if clawUpgradePlatformSupported("") {
 		t.Fatal("an empty platform must fail closed, not be treated as upgradable")
 	}
-	for _, platform := range []string{"linux-x64", "darwin-arm64", "win32-arm64", "WIN32-X64"} {
+	// 矩阵里没有构建产物的组合必须 fail closed，不能因为「长得像」就放行：
+	// 放行的后果是设备按一个不存在的资产名去下载，全部 download_failed。
+	for _, platform := range []string{"win32-arm64", "darwin-x64", "WIN32-X64", "linux"} {
 		if clawUpgradePlatformSupported(platform) {
-			t.Fatalf("%s must not be upgradable in this phase", platform)
+			t.Fatalf("%s has no release asset and must not be upgradable", platform)
+		}
+	}
+	// 下载代理是公开端点，资产名进 URL：白名单之外的名字一个都不能过。
+	for _, asset := range []string{"clawmessenger-linux-riscv64", "clawmessenger.exe", "../SHA256SUMS", ""} {
+		if clawUpgradeAssetSupported(asset) {
+			t.Fatalf("asset %q must be rejected by the download allow-list", asset)
 		}
 	}
 }
@@ -566,21 +587,25 @@ func TestClawAdminMachineWorkspacesTakesOneWorkspacePerMachine(t *testing.T) {
 }
 
 // TestClawUpgradeResolveSkipsUnsupportedPlatformSoItCannotStallLaterWaves 钉住 S3：
-// 一个批次里混进一台非 win32 的机器，它**不参与**波次放行 —— 后面那波照常升完。
+// 一个批次里混进一台**无法升级**的机器（这里是 win32-arm64 —— 发布矩阵里没有
+// 这个产物），它**不参与**波次放行 —— 后面那波照常升完。
+//
+// 注意：这条用例过去用 linux-x64 当反例。1.3.4 起 Linux 已经能自动升级，反例
+// 必须换成一个真的没有产物的平台，否则测的就不是「不可升级」而是「非 Windows」。
 func TestClawUpgradeResolveSkipsUnsupportedPlatformSoItCannotStallLaterWaves(t *testing.T) {
 	if testPool == nil || testHandler == nil {
 		t.Skip("handler test database is not available")
 	}
 	ctx := context.Background()
 	machineA := clawUpgradeTestMachine("upgrade-s3-a") // win32-x64，会进第 1 波
-	machineB := clawUpgradeTestMachine("upgrade-s3-b") // linux-x64，必须被跳过
+	machineB := clawUpgradeTestMachine("upgrade-s3-b") // win32-arm64，必须被跳过
 	machineC := clawUpgradeTestMachine("upgrade-s3-c") // win32-x64，必须能进第 2 波
 	rcs := []string{"rc_node_" + machineA, "rc_node_" + machineB, "rc_node_" + machineC}
 	cleanupClawUpgradeTestRows(t, []string{machineA, machineB, machineC}, rcs)
 
 	for _, item := range []struct{ machine, platform, rc string }{
 		{machineA, clawUpgradePlatformWindows, rcs[0]},
-		{machineB, "linux-x64", rcs[1]},
+		{machineB, "win32-arm64", rcs[1]},
 		{machineC, clawUpgradePlatformWindows, rcs[2]},
 	} {
 		insertClawUpgradeTestNode(t, testWorkspaceID, item.machine, item.rc)
@@ -588,7 +613,7 @@ func TestClawUpgradeResolveSkipsUnsupportedPlatformSoItCannotStallLaterWaves(t *
 	}
 
 	targets, skips, err := testHandler.clawAdminResolveUpgradeTargets(ctx,
-		[]string{machineA, machineB, machineC}, "1.3.0")
+		[]string{machineA, machineB, machineC}, "1.3.0", clawUpgradeTestSHA())
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -614,7 +639,7 @@ func TestClawUpgradeResolveSkipsUnsupportedPlatformSoItCannotStallLaterWaves(t *
 	}
 
 	// 反向：只有 B 的时候也必须被跳过，与「有没有 A/C 在旁边」无关。
-	alone, aloneSkips, err := testHandler.clawAdminResolveUpgradeTargets(ctx, []string{machineB}, "1.3.0")
+	alone, aloneSkips, err := testHandler.clawAdminResolveUpgradeTargets(ctx, []string{machineB}, "1.3.0", clawUpgradeTestSHA())
 	if err != nil {
 		t.Fatalf("resolve single: %v", err)
 	}
@@ -624,13 +649,64 @@ func TestClawUpgradeResolveSkipsUnsupportedPlatformSoItCannotStallLaterWaves(t *
 
 	// 反向：去掉干扰项后 A、C 仍然都被接受（证明不是「因为 B 存在才通过」）。
 	pair, pairSkips, err := testHandler.clawAdminResolveUpgradeTargets(ctx,
-		[]string{machineA, machineC}, "1.3.0")
+		[]string{machineA, machineC}, "1.3.0", clawUpgradeTestSHA())
 	if err != nil {
 		t.Fatalf("resolve pair: %v", err)
 	}
 	if len(pair) != 2 || len(pairSkips) != 0 {
 		t.Fatalf("without the interferer both machines must be accepted, got %v skipped=%#v",
 			machineIDsOf(pair), pairSkips)
+	}
+}
+
+// clawUpgradeTestSHA 造一份「每个资产都有摘要」的 SHA256SUMS 投影。
+func clawUpgradeTestSHA() map[string]string {
+	out := make(map[string]string, len(clawUpgradeAssetsByPlatform))
+	for _, asset := range clawUpgradeAssetsByPlatform {
+		out[asset] = strings.Repeat("a", 64)
+	}
+	return out
+}
+
+// TestClawUpgradeResolveAcceptsLinuxAndRequiresItsOwnChecksum 钉住两件事：
+//  1. Linux 机器现在能进升级计划（系统保留节点跑在 Linux 上，过去按钮是灰的）；
+//  2. 摘要按**这台机器要下载的那个资产**取 —— 只有 Windows 的摘要时，Linux 机器
+//     必须跳过并说明原因，不能拿 Windows 的摘要去校验一个 Linux 二进制。
+func TestClawUpgradeResolveAcceptsLinuxAndRequiresItsOwnChecksum(t *testing.T) {
+	if testPool == nil || testHandler == nil {
+		t.Skip("handler test database is not available")
+	}
+	ctx := context.Background()
+	machine := clawUpgradeTestMachine("upgrade-linux-ok")
+	rc := "rc_node_" + machine
+	cleanupClawUpgradeTestRows(t, []string{machine}, []string{rc})
+	insertClawUpgradeTestNode(t, testWorkspaceID, machine, rc)
+	insertClawUpgradeTestReport(t, testWorkspaceID, machine, "linux-x64", "1.2.0")
+
+	targets, skips, err := testHandler.clawAdminResolveUpgradeTargets(ctx,
+		[]string{machine}, "1.3.0", clawUpgradeTestSHA())
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if len(targets) != 1 || targets[0].MachineID != machine || targets[0].ReportedPlatform != "linux-x64" {
+		t.Fatalf("a linux-x64 machine must now be upgradable, got targets=%#v skips=%#v", targets, skips)
+	}
+	if len(skips) != 0 {
+		t.Fatalf("unexpected skips for the linux machine: %#v", skips)
+	}
+
+	// 只给 Windows 资产的摘要：Linux 机器拿不到自己的校验和，必须跳过。
+	onlyWindows := map[string]string{clawUpgradeWindowsAsset: strings.Repeat("a", 64)}
+	none, skipMissing, err := testHandler.clawAdminResolveUpgradeTargets(ctx,
+		[]string{machine}, "1.3.0", onlyWindows)
+	if err != nil {
+		t.Fatalf("resolve without the linux checksum: %v", err)
+	}
+	if len(none) != 0 {
+		t.Fatalf("a machine whose asset has no checksum must not be issued, got %#v", machineIDsOf(none))
+	}
+	if len(skipMissing) != 1 || skipMissing[0].Reason != "asset_missing" {
+		t.Fatalf("want one asset_missing skip, got %#v", skipMissing)
 	}
 }
 
@@ -696,7 +772,7 @@ func TestClawUpgradeProgressKeepsRequestedAtAcrossHeartbeats(t *testing.T) {
 		Scan(&node.ID, &node.WorkspaceID, &node.RongcloudUserID, &node.MachineID); err != nil {
 		t.Fatalf("load node: %v", err)
 	}
-	if err := testHandler.clawDeviceRecordUpgradeState(ctx, node, "1.2.0", clawUpgradePlatformWindows, 0); err != nil {
+	if err := testHandler.clawDeviceRecordUpgradeState(ctx, node, "1.2.0", clawUpgradePlatformWindows, "", 0); err != nil {
 		t.Fatalf("heartbeat upsert: %v", err)
 	}
 

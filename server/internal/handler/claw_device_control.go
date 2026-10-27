@@ -54,6 +54,9 @@ func (h *Handler) ClawDeviceControl(w http.ResponseWriter, r *http.Request) {
 		// Windows 升级指令）。
 		Version  string `json:"version"`
 		Platform string `json:"platform"`
+		// Hostname 是设备操作系统的主机名。1.3.4 起随这次 10 秒轮询一起上报，
+		// 后台「机器名称」在昵称为空时用它兜底（老版本不带，保持库里已有值）。
+		Hostname string `json:"hostname"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil ||
 		req.NodeID == "" || req.CredentialID == "" || req.Secret == "" {
@@ -94,9 +97,10 @@ func (h *Handler) ClawDeviceControl(w http.ResponseWriter, r *http.Request) {
 	if h.DB != nil {
 		version := strings.TrimSpace(req.Version)
 		platform := strings.TrimSpace(req.Platform)
-		if version != "" || platform != "" {
+		hostname := strings.TrimSpace(req.Hostname)
+		if version != "" || platform != "" || hostname != "" {
 			// 版本上报失败绝不影响启停：下一轮再报就是了。
-			if err := h.clawDeviceRecordUpgradeState(r.Context(), machineNode, version, platform, 0); err != nil {
+			if err := h.clawDeviceRecordUpgradeState(r.Context(), machineNode, version, platform, hostname, 0); err != nil {
 				slog.Warn("claw: device version report failed",
 					"machine", machineIDForDevice(machineNode), "error", err)
 			}

@@ -71,6 +71,10 @@ var workspaceDeletionManifest = map[string]workspaceDeleteAction{
 	// 会把全站待审批的节点申请清空）。
 	"im_friend_request":                  workspaceDeleteKeep,
 	"im_web_login_sessions":              workspaceDeleteKeep,
+	// 融云会话号映射（605）：旧 Python 的同名表，唯一键是 (target_id,
+	// conversation_type)，没有 workspace_id，全站共用一份副本。删掉某个工作区
+	// 只会让其它工作区的会话号缓存失效，所以归 installation 级。
+	"im_conversations":                   workspaceDeleteKeep,
 	"client_usage_daily":                 workspaceDeleteDetach,
 	"comment":                            workspaceDelete,
 	"comment_reaction":                   workspaceDelete,
@@ -158,6 +162,11 @@ var workspaceDeletionManifest = map[string]workspaceDeleteAction{
 	"rongcloud_node_control":              workspaceDelete,
 	"rongcloud_node_model_catalog":        workspaceDelete,
 	"rongcloud_node_request":              workspaceDelete,
+	// rongcloud_node_upgrade（601）是机器维度的 exe 版本/升级进度，主键是
+	// machine_id，机器解绑后可重绑到别的工作区 —— teardown 只置空 workspace_id，
+	// 保留机器状态（见 workspace.go 的 "detach machine upgrade state" 步骤）。
+	"rongcloud_node_upgrade": workspaceDeleteDetach,
+
 	"rongcloud_pairing_session":           workspaceDelete,
 	"rongcloud_role_recommendation":       workspaceDelete,
 	"rongcloud_roundtable_create_request": workspaceDelete,

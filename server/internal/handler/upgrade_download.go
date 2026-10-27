@@ -85,7 +85,9 @@ func (h *Handler) ClawUpgradeDownload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "版本号不合法", http.StatusBadRequest)
 		return
 	}
-	if asset != clawUpgradeWindowsAsset {
+	// 白名单按发布矩阵校验，而不是「只允许 Windows 那一个名字」：端点公开，
+	// 资产名进 URL，不设白名单就等于开了一个「按名字回源任意 release 资产」的代理。
+	if !clawUpgradeAssetSupported(asset) {
 		http.Error(w, "不支持的资产", http.StatusBadRequest)
 		return
 	}

@@ -128,3 +128,71 @@ func TestClawAdminNodeStatusExplainsItsSource(t *testing.T) {
 		t.Fatal("detail must explain where the status came from")
 	}
 }
+
+// 机器名只能来自机器主节点的昵称，且必须去掉 CLI 拼上去的 " <aiType>" 后缀。
+//
+// 这条钉住的是一个很容易退化的行为：如果哪天有人图省事用 agent 节点自己的昵称
+// 当机器名，三台机器上各自的 opencode 会全部显示成「opencode」，列表又回到
+// 「三行一模一样」—— 而这正是本次需求要解决的问题。
+func TestClawAdminMachineNamesComeFromTheMachineNode(t *testing.T) {
+	records := []clawAdminNodeRecord{
+		// 机器主节点：rc 必须等于 "rc_node_" + machineIdentityKey(machine_id)。
+		testNodeRecord("node_m", "rc_node_3300776275", "opencode", "3300776275"),
+		testNodeRecord("node_a", "rc_node_3300776275_hermes", "hermes", "3300776275"),
+		testNodeRecord("node_b", "rc_node_3300776275_opencode", "opencode", "3300776275"),
+	}
+	names := map[string]string{
+		"rc_node_3300776275":          "小久 opencode",
+		"rc_node_3300776275_hermes":   "hermes",
+		"rc_node_3300776275_opencode": "opencode",
+	}
+	h := &Handler{}
+
+	got := h.clawAdminMachineNames(records, names)
+	if got["3300776275"] != "小久" {
+		t.Fatalf("machine name = %q, want 小久 (the aiType suffix must be stripped)", got["3300776275"])
+	}
+	if len(got) != 1 {
+		t.Fatalf("only the machine node may contribute a machine name, got %#v", got)
+	}
+
+	// 没有机器主节点行时**不能**凭空造名字：宁可显示机器键，也不能把某个 agent
+	// 的昵称当成整台机器的名字（那会让「升级」按错误的机器归并）。
+	withoutMachineNode := h.clawAdminMachineNames(records[1:], names)
+	if len(withoutMachineNode) != 0 {
+		t.Fatalf("agent rows must never name the machine, got %#v", withoutMachineNode)
+	}
+
+	// 机器主节点的 aiType 为空（早期注册/探针行）：昵称原样保留，不要瞎截。
+	probe := []clawAdminNodeRecord{testNodeRecord("node_p", "rc_node_02:95:06:48:f0:dc", "", "02:95:06:48:f0:dc")}
+	probeNames := map[string]string{"rc_node_02:95:06:48:f0:dc": "bind-probe-node"}
+	if name := h.clawAdminMachineNames(probe, probeNames)["02:95:06:48:f0:dc"]; name != "bind-probe-node" {
+		t.Fatalf("a machine node without an aiType must keep its full nickname, got %q", name)
+	}
+}
+
+// 机器名与设备主机名都要贴到行上，且主机名缺失时不能把机器名顶掉。
+func TestClawAdminAttachUpgradeCarriesMachineNameAndHostname(t *testing.T) {
+	h := &Handler{}
+	rec := testNodeRecord("node_a", "rc_node_3300776275_hermes", "hermes", "3300776275")
+	machineNames := map[string]string{"3300776275": "小久"}
+
+	row := h.clawAdminAttachUpgrade(clawAdminNodeRow{}, rec, map[string]clawNodeUpgrade{
+		"3300776275": {
+			MachineID:        "3300776275",
+			ReportedVersion:  "1.3.3",
+			ReportedPlatform: "linux-x64",
+			ReportedHostname: "SHGuoZiWei-10.1.1.225",
+		},
+	}, machineNames)
+	if row.MachineName != "小久" || row.Hostname != "SHGuoZiWei-10.1.1.225" {
+		t.Fatalf("row = %#v, want machine_name=小久 hostname=SHGuoZiWei-10.1.1.225", row)
+	}
+
+	// 机器还没上报过任何升级信息（没有行）：机器名仍然要给，否则列表第一屏
+	// 全是「-」，管理员根本判断不出这行属于哪台机器。
+	bare := h.clawAdminAttachUpgrade(clawAdminNodeRow{}, rec, map[string]clawNodeUpgrade{}, machineNames)
+	if bare.MachineName != "小久" || bare.Hostname != "" {
+		t.Fatalf("without an upgrade row the machine name must survive, got %#v", bare)
+	}
+}

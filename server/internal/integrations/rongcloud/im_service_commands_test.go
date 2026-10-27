@@ -994,6 +994,14 @@ func TestFactoryAttachesTheLocalStoresOnlyWhenDBIsProvided(t *testing.T) {
 			t.Fatalf("stores must all be attached: lobster=%v friend=%v user=%v",
 				handler.lobsterStore != nil, handler.friendStore != nil, handler.userStore != nil)
 		}
+		// service=conversation（migrations/605）同理：漏装配的话客户端点
+		// 「发消息」会重新收到 404「未知的服务或操作」。
+		if handler.conversations == nil {
+			t.Fatal("conversation store must be attached when a DBTX is provided")
+		}
+		if _, found, err := handler.conversations.Get(context.Background(), "u-absent", 1); err != nil || found {
+			t.Errorf("conversation Get = (found %v, err %v), want (false, nil)", found, err)
+		}
 
 		// 存储层真的接到了这个 DBTX 上：零行 → (not found, 无错误)。
 		if _, found, err := handler.userStore.FindByOpenID(context.Background(), "openid-absent"); err != nil || found {
@@ -1016,6 +1024,9 @@ func TestFactoryAttachesTheLocalStoresOnlyWhenDBIsProvided(t *testing.T) {
 		if handler.lobsterStore != nil || handler.friendStore != nil || handler.userStore != nil {
 			t.Fatalf("stores must stay nil without a DBTX: lobster=%v friend=%v user=%v",
 				handler.lobsterStore != nil, handler.friendStore != nil, handler.userStore != nil)
+		}
+		if handler.conversations != nil {
+			t.Fatal("conversation store must stay nil without a DBTX (service replies 503)")
 		}
 	})
 }

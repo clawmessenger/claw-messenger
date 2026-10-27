@@ -212,13 +212,9 @@ func (h *Handler) ClawAdminRequestNodeUpgrade(w http.ResponseWriter, r *http.Req
 		clawAdminFail(w, 503, err.Error())
 		return
 	}
-	sum, ok := release.SHA256[clawUpgradeWindowsAsset]
-	if !ok || len(sum) != 64 {
-		clawAdminFail(w, 502, fmt.Sprintf("版本 %s 没有可用的 SHA256SUMS，拒绝下发未校验的升级", release.Version))
-		return
-	}
-
-	targets, skips, err := h.clawAdminResolveUpgradeTargets(ctx, machineIDs, release.Version)
+	// 摘要校验下沉到 per-target：一次批量里可能同时有 Windows 与 Linux，两者对应
+	// 不同资产名与不同 sha256，只有按目标机器自己上报的平台取才能真校验。
+	targets, skips, err := h.clawAdminResolveUpgradeTargets(ctx, machineIDs, release.Version, release.SHA256)
 	if err != nil {
 		clawAdminFail(w, 500, "查询设备状态失败")
 		return
@@ -239,6 +235,9 @@ func (h *Handler) ClawAdminRequestNodeUpgrade(w http.ResponseWriter, r *http.Req
 		byMachine[target.MachineID] = target
 	}
 	issued := make([]clawAdminUpgradeProgress, 0, len(planned))
+	// 本批各平台实际用到的摘要：同一次下发可能混合 Windows 与 Linux，
+	// 它们下载的是不同文件，摘要也就不是同一个值。
+	issuedSHA := make(map[string]string, 2)
 	for _, item := range planned {
 		target := byMachine[item.MachineID]
 		target.Wave = item.Wave
@@ -269,13 +268,25 @@ func (h *Handler) ClawAdminRequestNodeUpgrade(w http.ResponseWriter, r *http.Req
 			Wave:             target.Wave,
 			BatchID:          batchID,
 		})
+		if asset := clawUpgradeAssetForPlatform(target.ReportedPlatform); asset != "" {
+			issuedSHA[asset] = release.SHA256[asset]
+		}
+	}
+	// 顶层 sha256 只在「本批只有一个平台」时有意义（历史字段，前端已不读）；
+	// 混平台时留空，真正的值按资产放在 sha256_by_asset 里。
+	singleSHA := ""
+	if len(issuedSHA) == 1 {
+		for _, digest := range issuedSHA {
+			singleSHA = digest
+		}
 	}
 	clawAdminOK(w, map[string]interface{}{
-		"batch_id":       batchID,
-		"target_version": release.Version,
-		"sha256":         sum,
-		"stale_release":  stale,
-		"wave_size":      clawUpgradeWaveSize(),
+		"batch_id":        batchID,
+		"target_version":  release.Version,
+		"sha256":          singleSHA,
+		"sha256_by_asset": issuedSHA,
+		"stale_release":   stale,
+		"wave_size":       clawUpgradeWaveSize(),
 		// 服务端下载代理是否可用。没配 MULTICA_CLAW_UPGRADE_TOKEN_SECRET 时它是
 		// false，mirrors 里就只剩直连 GitHub —— 设备出口打不通时全部 download_failed，
 		// 而 error_detail 只有 GitHub 的报错。那 503 在「忘配 secret」的场景里**永远
@@ -294,10 +305,11 @@ func clawUpgradeSkipSummary(skips []clawUpgradeSkip) string {
 		"unknown_machine":      "服务端没有节点记录",
 		"platform_unsupported": "平台不支持自动升级",
 		"platform_unknown":     "还没上报 exe 平台（旧版本）",
+		"asset_missing":        "该平台资产缺少校验和",
 		"already_current":      "已是最新版本",
 		"write_failed":         "写入升级任务失败",
 	}
-	order := []string{"platform_unknown", "platform_unsupported", "already_current", "unknown_machine", "write_failed"}
+	order := []string{"platform_unknown", "platform_unsupported", "asset_missing", "already_current", "unknown_machine", "write_failed"}
 	counts := make(map[string]int, len(order))
 	for _, skip := range skips {
 		counts[skip.Reason]++
@@ -360,6 +372,7 @@ func (h *Handler) clawAdminResolveUpgradeTargets(
 	ctx context.Context,
 	machineIDs []string,
 	targetVersion string,
+	sha256ByAsset map[string]string,
 ) (targets []clawUpgradeTarget, skips []clawUpgradeSkip, err error) {
 	workspaces, err := h.clawAdminMachineWorkspaces(ctx, machineIDs)
 	if err != nil {
@@ -391,7 +404,18 @@ func (h *Handler) clawAdminResolveUpgradeTargets(
 		if !clawUpgradePlatformSupported(upgrade.ReportedPlatform) {
 			skips = append(skips, clawUpgradeSkip{
 				MachineID: machineID, Reason: "platform_unsupported",
-				Detail: fmt.Sprintf("本期只支持 Windows-x64，本机上报的是 %s", upgrade.ReportedPlatform),
+				Detail: fmt.Sprintf("支持的是 %s，本机上报的是 %s", clawUpgradeSupportedPlatformsText(), upgrade.ReportedPlatform),
+			})
+			continue
+		}
+		// 摘要必须按这台机器要下载的那个资产去取（Windows 与 Linux 是不同文件）。
+		// 缺摘要就不下发：宁可当场说「这个版本的校验和还没齐」，也不能让设备装
+		// 一个无法校验的二进制 —— 校验失败那一步在设备侧是不可恢复的。
+		asset := clawUpgradeAssetForPlatform(upgrade.ReportedPlatform)
+		if sum := sha256ByAsset[asset]; len(sum) != 64 {
+			skips = append(skips, clawUpgradeSkip{
+				MachineID: machineID, Reason: "asset_missing",
+				Detail: fmt.Sprintf("版本 %s 的 SHA256SUMS 里没有 %s", targetVersion, asset),
 			})
 			continue
 		}

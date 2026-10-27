@@ -261,6 +261,18 @@ func (h *systemHandler) handleFriendDelete(ctx context.Context, msg NormalizedMe
 		h.logger.Error("rongcloud: friend delete", "error", err, "user_id", userID, "friend_id", friendID)
 		return h.replyErr(ctx, msg, cmd, 500, "failed to delete the friend")
 	}
+	// 反向边也要删：建边时（绑定流程、审批链路 completeFriendRequest）两个方向各
+	// 建一条，删的时候只删自己那条会留下「对方好友列表里仍然有你」。客户端 SDK 的
+	// 兜底路径用的是 DirectionType.BOTH（web contacts.deleteFriend），服务端语义
+	// 必须与它一致，否则同一个操作在「服务端可用 / 只能走 SDK」两种情况下结果不同。
+	//
+	// 融云对「本来就不存在的边」回非 200，而 RemoveFriends 只把 postForm 的错误
+	// 原样返回（拿不到可区分的结构码，见 removeNodeEdges 的注释），所以这条只记
+	// Debug：记 Warn 会变成每次删好友一条的固定噪音。
+	if err := h.client.RemoveFriends(ctx, friendID, userID); err != nil {
+		h.logger.Debug("rongcloud: reverse friend edge removal did not apply",
+			"error", err, "user", friendID, "target", userID)
+	}
 	// 写路径 ⑤：好友边删掉之后，本地投影列必须同步清空，否则 getDeviceOwner
 	// 会一直答一个「已经不是好友」的账号 —— 脏列不像 15s 缓存那样会自己过期。
 	// 只清「认领者正好是本次调用者」的那一行：任何人都能加/删别人的好友边，

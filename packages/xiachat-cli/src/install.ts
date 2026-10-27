@@ -46,6 +46,30 @@ export function isSeaExecutable(argv1: string | undefined): boolean {
   return !/\.(c|m)?js$/i.test(argv1);
 }
 
+/**
+ * 一次自更新该覆盖哪个文件。
+ *
+ * 单文件 exe 跑起来时，答案只有一个：**正在运行的自己**（`process.execPath`）。
+ * 按平台去猜安装路径会在 Linux 上直接猜错 —— systemd 的 unit 可能指向
+ * `/usr/local/bin/clawmessenger`，而 `installPaths` 给的是 `~/.local/bin/...`。
+ * 换错的后果不是「升级没生效」这么简单：unit 重启后仍跑旧版，而那份没人用的
+ * 副本变成了新版，于是「页面显示的版本 / 磁盘上的文件 / 实际在跑的东西」三方
+ * 对不上，且下一次升级又会去改同一个错文件。
+ *
+ * 只有在用 node 跑脚本（非 SEA）时才退回安装路径 —— 那时 `process.execPath`
+ * 是 node 本体，覆盖它等于把开发机的 node 换成一个 CLI 二进制。
+ */
+export function upgradeTargetPath(
+  platform: string,
+  argv1: string | undefined,
+  execPath: string,
+  homedir: string,
+  localAppData?: string,
+): string {
+  if (isSeaExecutable(argv1)) return execPath;
+  return installPaths(platform, homedir, localAppData).target;
+}
+
 /** Case-insensitive on Windows, exact elsewhere. */
 export function samePath(a: string, b: string, platform: string): boolean {
   const p = platform === "win32" ? path.win32 : path.posix;

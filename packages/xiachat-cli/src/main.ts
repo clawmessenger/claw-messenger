@@ -27,9 +27,10 @@ import {
   type Daemon,
   type DaemonPaths,
 } from "./daemon.js";
-import { installPaths, isSeaExecutable } from "./install.js";
+import { installPaths, isSeaExecutable, upgradeTargetPath } from "./install.js";
 import {
   applyStagedUpdate,
+  assetNameForPlatform,
   checkForUpdate,
   healInstall,
   stageUpdate,
@@ -1764,8 +1765,16 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
   const devicePlatform = supervisor.platform ?? process.platform;
   const deviceArch = supervisor.arch ?? process.arch;
   const platformTag = `${devicePlatform}-${deviceArch}`;
-  const platformSupportsUpgrade = devicePlatform === "win32" && deviceArch === "x64";
-  const upgradeTarget = supervisor.upgradeTarget ?? installPaths(devicePlatform, os.homedir()).target;
+  // 能不能升级，取决于发布矩阵里有没有这个平台的产物 —— 与资产名映射同源，
+  // 与服务端的 clawUpgradeAssetForPlatform 也必须一致。平台未知/未构建的组合
+  // 仍然拒绝：收下了也只会去下一个不存在的资产（404）。
+  const platformSupportsUpgrade = assetNameForPlatform(devicePlatform, deviceArch) !== "";
+  // 升级目标必须是**正在运行的这个文件**，不是按平台猜出来的安装路径 ——
+  // Linux 上 systemd 的 unit 指向 /usr/local/bin，而 installPaths 指向
+  // ~/.local/bin，换错文件会变成「unit 跑旧版 / 另一个副本是新版」的三角谜题。
+  // 判定细节与理由见 install.ts 的 upgradeTargetPath。
+  const upgradeTarget = supervisor.upgradeTarget
+    ?? upgradeTargetPath(devicePlatform, process.argv[1], process.execPath, os.homedir());
   const inflightPath = supervisor.upgradeInflightPath ?? defaultUpgradeInflightPath();
   const upgradeFetch: UpgradeFetch = supervisor.upgradeFetch
     ?? ((url) => fetch(url, { headers: { "User-Agent": "clawmessenger-cli" } }) as unknown as ReturnType<FetchLike>);
@@ -1859,6 +1868,7 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
         status,
         reportedVersion: currentVersion,
         reportedPlatform: platformTag,
+        reportedHostname: os.hostname(),
         ...(extra?.errorCode ? { errorCode: extra.errorCode } : {}),
         ...(extra?.errorDetail ? { errorDetail: extra.errorDetail.slice(0, 800) } : {}),
       });
@@ -2008,7 +2018,7 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
       claimedGeneration = intent.generation;
       void reportUpgrade(intent.generation, "failed", {
         errorCode: "platform_unsupported",
-        errorDetail: `exe 升级本期只支持 win32-x64，本机是 ${platformTag}`,
+        errorDetail: `本机平台 ${platformTag} 不在发布矩阵里（支持 win32-x64 / linux-x64 / linux-arm64 / darwin-arm64）`,
       });
       return;
     }
@@ -2034,6 +2044,9 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
       const snapshot = await api.fetchDeviceControl(nodeID, credentialID, deviceSecret, {
         version: currentVersion,
         platform: platformTag,
+        // 后台「机器名称」在机器昵称为空时用它兜底。同一次 10 秒轮询顺带上报，
+        // 不额外开通道；老服务端会忽略这个字段。
+        hostname: os.hostname(),
       });
       for (const state of snapshot.agents) {
         if (!state.agent) continue;

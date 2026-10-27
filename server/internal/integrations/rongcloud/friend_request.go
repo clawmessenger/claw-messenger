@@ -422,9 +422,11 @@ func (h *systemHandler) decideFriendRequest(ctx context.Context, msg NormalizedM
 	return h.replyOK(ctx, msg, cmd, h.friendDecisionPayload(ctx, approved))
 }
 
-// completeFriendRequest 是审批链路的唯一收尾点：复核拥有者 → 建三条好友边 →
-// 复核拥有者 → 置为已通过。幂等，且**先建边后改状态**：边没建成就保持待审批，
-// 重试还能补上（反过来会留下「已通过但节点边不存在」的死状态）。
+// completeFriendRequest 是审批链路的唯一收尾点：复核拥有者 → 建四条好友边
+// （拥有者↔请求方两个方向 + 节点两个方向）→ 复核拥有者 → 置为已通过。幂等，
+// 且**先建边后改状态**：边没建成就保持待审批，重试还能补上（反过来会留下
+// 「已通过但节点边不存在」的死状态）；任何一步建边失败都会把本次已建出的边撤掉，
+// 不留半成品。
 func (h *systemHandler) completeFriendRequest(ctx context.Context, request FriendRequest) (FriendRequest, error) {
 	ownerID, found, err := h.friendStore.NodeOwner(ctx, request.DeviceNodeID)
 	if err != nil {
@@ -436,24 +438,54 @@ func (h *systemHandler) completeFriendRequest(ctx context.Context, request Frien
 		return request, errFriendRequestOwnerChanged
 	}
 	// 1) 拥有者 ↔ 请求方：让两人成为好友（若不存在）。
-	//    拥有者在融云侧同意过、之后再来 web 补批时，这条边通常已存在；
+	//
+	//    **必须两个方向都建**：融云的 /friend/add.json 是单向边，只建
+	//    拥有者→请求方 时，拥有者的列表里有了请求方，请求方的列表里却没有拥有者
+	//    —— 而客户端「好友 / 通讯录」读的是**自己**的 friend/get，于是扫码加设备
+	//    审批通过后，请求方只看到那台设备、看不到拥有者（线上就是这么报的）。
+	//    先私下在融云侧同意过、之后再来 web 补批时，两个方向通常都已存在；
 	//    融云回 25460 时 addFriendWithOptType 会按 alreadyFriends 成功返回。
 	//
 	//    这条边**是不是本来就存在**决定了收尾能不能撤它：请求方与拥有者原本就是
 	//    好友（与本次申请无关）时，撤掉等于替两个用户删好友。所以只在「本次真的
-	//    新建了这条边」时才允许撤；建边本身报错时也不知道原状态，一律当「不撤」。
-	removeOwnerEdge := false
-	if ownerEdgeAlready, edgeErr := h.client.addFriendWithOptType(ctx, ownerID, request.FromUserID, "", friendOptTypeDirect); edgeErr != nil {
-		h.logger.Warn("rongcloud: approve request owner edge failed",
-			"error", edgeErr, "owner", ownerID, "from", request.FromUserID)
-	} else {
-		removeOwnerEdge = !ownerEdgeAlready
+	//    新建了这条边」时才记下来；建边本身报错时也不知道原状态，一律当「不撤」。
+	//
+	//    建边失败只告警不中断：节点边才是「把智能体加为好友」的实体，人际边失败
+	//    不该把整次审批回成 500（否则拥有者会卡在一个永远批不下来的申请上）。
+	createdOwnerEdges := make([]string, 0, 2)
+	for _, edge := range [][2]string{
+		{ownerID, request.FromUserID},
+		{request.FromUserID, ownerID},
+	} {
+		alreadyFriends, edgeErr := h.client.addFriendWithOptType(ctx, edge[0], edge[1], "", friendOptTypeDirect)
+		if edgeErr != nil {
+			h.logger.Warn("rongcloud: approve request owner edge failed",
+				"error", edgeErr, "user", edge[0], "target", edge[1])
+			continue
+		}
+		if !alreadyFriends {
+			createdOwnerEdges = append(createdOwnerEdges, edge[0]+"->"+edge[1])
+		}
 	}
 	// 2) 请求方 ↔ 节点 双向边 —— 这才是「把智能体加为好友」的实体。
+	//
+	//    建边失败时必须把**本次已经建出来的边一起撤掉**（上面那两条人际边 + 可能
+	//    已建好的单向节点边）。不撤的后果是「半成品」：申请仍是待审批，请求方却
+	//    已经能在好友列表里看到这台节点（或拥有者），而拥有者从没批准过；这条路
+	//    只有重试或 reject 才会被清理，一条没人再碰的申请就永远留着。
+	//
+	//    节点边走「带审批兜底」的撤法：这对关系若早有一条已通过的申请（重复申请），
+	//    刚建的边属于那条已生效的关系，撤掉等于替用户删好友。
+	rollback := func() {
+		h.revokeCreatedOwnerEdges(ctx, createdOwnerEdges)
+		h.revokeNodeEdgesUnlessApproved(ctx, request.FromUserID, request.DeviceNodeID, request.ToUserID)
+	}
 	if _, err := h.client.addFriendWithOptType(ctx, request.FromUserID, request.DeviceNodeID, "", friendOptTypeDirect); err != nil {
+		rollback()
 		return request, fmt.Errorf("requester to node edge: %w", err)
 	}
 	if _, err := h.client.addFriendWithOptType(ctx, request.DeviceNodeID, request.FromUserID, "", friendOptTypeDirect); err != nil {
+		rollback()
 		return request, fmt.Errorf("node to requester edge: %w", err)
 	}
 	// 3) 落状态之前再复核一次拥有者：上面那次检查与建边之间没有任何事务/锁保护，
@@ -464,7 +496,7 @@ func (h *systemHandler) completeFriendRequest(ctx context.Context, request Frien
 		return request, ownerErr
 	}
 	if !stillFound || latestOwner != request.ToUserID {
-		h.revokeApprovedEdges(ctx, ownerID, request.FromUserID, request.DeviceNodeID, removeOwnerEdge)
+		h.revokeApprovedEdges(ctx, createdOwnerEdges, request.FromUserID, request.DeviceNodeID)
 		_, _, _ = h.friendRequests.Decide(ctx, request.ID, request.ToUserID, friendRequestRejected)
 		return request, errFriendRequestOwnerChanged
 	}
@@ -557,20 +589,32 @@ func (h *systemHandler) revokeNodeEdgesUnlessApproved(ctx context.Context, fromU
 	h.removeNodeEdges(ctx, fromUserID, deviceNodeID)
 }
 
-// revokeApprovedEdges 撤销 approve 刚建出的边（拥有者↔请求方 + 节点双向边），
+// revokeApprovedEdges 撤销 approve 刚建出的边（拥有者↔请求方两个方向 + 节点双向边），
 // 用于「建边期间设备换了主人」的收尾。同样是 best-effort。
 //
-// removeOwnerEdge 只在那条边**由本次 approve 建出**时为 true：请求方与拥有者本来
-// 就是好友时（addFriendWithOptType 回 alreadyFriends，或建边报错不知道原状态），
-// 撤掉它等于替两个用户删好友。节点那两条边不用区分，它们只可能由本次申请建出。
-func (h *systemHandler) revokeApprovedEdges(ctx context.Context, ownerID, fromUserID, deviceNodeID string, removeOwnerEdge bool) {
-	if removeOwnerEdge && strings.TrimSpace(ownerID) != "" && strings.TrimSpace(fromUserID) != "" {
-		if err := h.client.RemoveFriends(ctx, ownerID, fromUserID); err != nil {
+// createdOwnerEdges 只包含**由本次 approve 真正建出**的「拥有者↔请求方」方向：
+// 请求方与拥有者本来就是好友时（addFriendWithOptType 回 alreadyFriends，或建边
+// 报错不知道原状态），那一方向不在列表里 —— 撤掉它等于替两个用户删好友。
+// 节点那两条边不用区分，它们只可能由本次申请建出。
+func (h *systemHandler) revokeApprovedEdges(ctx context.Context, createdOwnerEdges []string, fromUserID, deviceNodeID string) {
+	h.revokeCreatedOwnerEdges(ctx, createdOwnerEdges)
+	h.removeNodeEdges(ctx, fromUserID, deviceNodeID)
+}
+
+// revokeCreatedOwnerEdges 只撤「本次建出来的」拥有者↔请求方 方向。
+// 单独拆出来是给「节点边建到一半失败」的回滚用：那条路径上节点边要过
+// HasApproved 兜底（见 revokeNodeEdgesUnlessApproved），人际边却是确定的本次产物。
+func (h *systemHandler) revokeCreatedOwnerEdges(ctx context.Context, createdOwnerEdges []string) {
+	for _, edge := range createdOwnerEdges {
+		userID, targetID, ok := strings.Cut(edge, "->")
+		if !ok || strings.TrimSpace(userID) == "" || strings.TrimSpace(targetID) == "" {
+			continue
+		}
+		if err := h.client.RemoveFriends(ctx, userID, targetID); err != nil {
 			h.logger.Warn("rongcloud: revoke owner edge failed",
-				"error", err, "owner", ownerID, "from", fromUserID)
+				"error", err, "user", userID, "target", targetID)
 		}
 	}
-	h.removeNodeEdges(ctx, fromUserID, deviceNodeID)
 }
 
 // ---- 回包与辅助 ----
