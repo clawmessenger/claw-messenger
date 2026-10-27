@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/multica-ai/multica/server/internal/integrations/rongcloud"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
 // clawDeviceControlState is one bound agent's run-state, as squeezed out of
@@ -26,6 +27,17 @@ type clawDeviceControlState struct {
 	NodeID       string `json:"nodeId"`
 	DesiredState string `json:"desiredState"`
 	Version      int64  `json:"version"`
+	// 绑定智能体的使用权限（迁移 607）。随同一次 10s 轮询下发，设备端据此做三件事：
+	//   1. allowPrivate 与响应顶层的 ownerUserId 一起构成私聊闸门 —— 服务端没有
+	//      私聊派发点（CLI 直接收到 P2P 文本就执行），这道闸门只能在设备端；
+	//   2. allowFs 决定 agent 子进程能不能读写本机文件（服务端只下发，不强制）；
+	//   3. behaviorPrompt 是每轮注入的行为准则（已是**生效值**，空则填默认模板）。
+	AllowPrivate    bool   `json:"allowPrivate"`
+	AllowGroup      bool   `json:"allowGroup"`
+	AllowDiscussion bool   `json:"allowDiscussion"`
+	AllowChatroom   bool   `json:"allowChatroom"`
+	AllowFs         bool   `json:"allowFs"`
+	BehaviorPrompt  string `json:"behaviorPrompt"`
 }
 
 // ClawDeviceControl POST /api/claw/device/control —— clawmessenger supervisor 轮询
@@ -93,7 +105,21 @@ func (h *Handler) ClawDeviceControl(w http.ResponseWriter, r *http.Request) {
 		clawJSON(w, 500, 500, "查询设备控制状态失败", nil)
 		return
 	}
-	payload := map[string]interface{}{"agents": states}
+	// 权限与认领者单独查一次（一条按 rc id 的批量查询），失败按「设备控制状态
+	// 读不出来」同等级处理：这一屏的每一项都是设备端用来决定「怎么干活」的输入，
+	// 少下发比下发错更危险 —— 500 会让设备保留上一轮的认知，二进制默认值
+	// （全 false）会让在用 agent 集体不响应。
+	perms, ownerUserID, err := h.clawAgentPermissionRows(r.Context(), refs, machineNode)
+	if err != nil {
+		slog.Warn("claw: device agent permission read failed", "nodeId", req.NodeID, "error", err)
+		clawJSON(w, 500, 500, "查询智能体权限失败", nil)
+		return
+	}
+	applyDevicePermissions(states, refs, perms)
+	// ownerUserId 是 CLI 判定「这条私聊是不是主人发的」的唯一依据（私聊派发不经
+	// 服务端，见上方 allowPrivate 的说明）。未认领时给空串：CLI 对空串按「不是
+	// 主人」处理，也就是私聊闸门默认关闭 —— 与新绑定 agent 权限默认全关一致。
+	payload := map[string]interface{}{"agents": states, "ownerUserId": ownerUserID}
 	if h.DB != nil {
 		version := strings.TrimSpace(req.Version)
 		platform := strings.TrimSpace(req.Platform)
@@ -187,6 +213,84 @@ func applyDeviceControlOverrides(refs []rongcloud.AgentNodeRef, overrides map[st
 	}
 	return states
 }
+
+// clawAgentPermissionRows 一次查出本机全部 agent 的权限位与认领者，并算出响应
+// 顶层的 ownerUserId。
+//
+// 为什么不复用 AgentNodesForDevice 顺带返回：那个方法在 rongcloud 包里、只服务
+// 设备认证，把权限塞进 AgentNodeRef 会让「凭证校验」和「权限下发」这两个变更
+// 节奏不同的东西绑在一起。这里一次索引查询（rc id 数组）就够，10s 一次的开销
+// 可以忽略。
+//
+// ownerUserId 优先取机器主节点的认领者 —— 整台设备的归属就是它。机器节点未认领
+// 时退到第一个已认领的 agent：绑定流程里 agent 与机器节点共享同一个认领者，只取
+// 机器节点会让「机器节点没写过投影、agent 写过」的历史数据把私聊闸门全关掉。
+func (h *Handler) clawAgentPermissionRows(
+	ctx context.Context,
+	refs []rongcloud.AgentNodeRef,
+	machineNode db.RongcloudNode,
+) (map[string]db.ListRongCloudNodePermissionsByRcUserIDsRow, string, error) {
+	perms := make(map[string]db.ListRongCloudNodePermissionsByRcUserIDsRow, len(refs))
+	ownerUserID := ""
+	if machineNode.ClaimedByUserID.Valid {
+		ownerUserID = machineNode.ClaimedByUserID.String
+	}
+	ids := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		if ref.RongcloudUserID != "" {
+			ids = append(ids, ref.RongcloudUserID)
+		}
+	}
+	if len(ids) == 0 || h.Queries == nil {
+		return perms, ownerUserID, nil
+	}
+	rows, err := h.Queries.ListRongCloudNodePermissionsByRcUserIDs(ctx, ids)
+	if err != nil {
+		return nil, "", err
+	}
+	for _, row := range rows {
+		perms[row.RongcloudUserID] = row
+	}
+	if ownerUserID == "" {
+		for _, ref := range refs {
+			if row, ok := perms[ref.RongcloudUserID]; ok && row.ClaimedByUserID.Valid && row.ClaimedByUserID.String != "" {
+				ownerUserID = row.ClaimedByUserID.String
+				break
+			}
+		}
+	}
+	return perms, ownerUserID, nil
+}
+
+// applyDevicePermissions 按 rc id 把权限位贴到 states 上。
+//
+// states 与 refs 由 applyDeviceControlOverrides 按同一顺序产出（同一份 refs、同一
+// 个循环），所以按下标对齐即可；长度不一致时只贴能对齐的部分，绝不 panic ——
+// 这条路径跑在每 10s 一次的轮询里，崩一次就是整台设备的智能体全部失联。
+//
+// 纯函数（不发查询），便于单测：权限缺失（map 里没有这个 rc id，或节点行还没
+// 迁移）时保持零值 = 全关 + 默认模板，即 fail-closed。
+func applyDevicePermissions(states []clawDeviceControlState, refs []rongcloud.AgentNodeRef, perms map[string]db.ListRongCloudNodePermissionsByRcUserIDsRow) {
+	for i := range states {
+		if i >= len(refs) {
+			return
+		}
+		row, ok := perms[refs[i].RongcloudUserID]
+		if !ok {
+			states[i].BehaviorPrompt = rongcloud.EffectiveAgentBehaviorPrompt("")
+			continue
+		}
+		states[i].AllowPrivate = row.AllowPrivate
+		states[i].AllowGroup = row.AllowGroup
+		states[i].AllowDiscussion = row.AllowDiscussion
+		states[i].AllowChatroom = row.AllowChatroom
+		states[i].AllowFs = row.AllowFs
+		// 下发的是**生效值**：设备端不该知道「默认模板」这个概念，也不该各自
+		// 维护一份文案（三端漂移会让同一个 agent 在不同场景有两套准则）。
+		states[i].BehaviorPrompt = rongcloud.EffectiveAgentBehaviorPrompt(row.BehaviorPrompt)
+	}
+}
+
 
 // ---- 按账号启停（设备端 / 运维助手） ---------------------------------------
 //

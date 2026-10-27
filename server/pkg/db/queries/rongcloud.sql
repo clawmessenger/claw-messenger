@@ -250,3 +250,35 @@ RETURNING *;
 
 -- name: GetRongCloudPairingSessionByUserCode :one
 SELECT * FROM rongcloud_pairing_session WHERE user_code = @user_code;
+
+-- =====================
+-- 绑定智能体权限（607）
+-- =====================
+
+-- 权限读取：批量按融云 id 取。派发侧（群聊 / 聊天室 / 讨论组 v3）每轮只需要
+-- **一次**这样的查询就够，不能按成员逐个查 —— 讨论组是「每轮每人」，逐个查
+-- 会把 8 人 × 10 轮放大成 80 次往返。
+--
+-- claimed_by_user_id 一起带出来是给设备轮询用的：/api/claw/device/control 要在
+-- 同一次往返里下发 ownerUserId（CLI 靠它判定「这条私聊是不是主人发的」），
+-- 单独再查一遍是白跑一趟。
+-- name: ListRongCloudNodePermissionsByRcUserIDs :many
+SELECT rongcloud_user_id, allow_private, allow_group, allow_discussion,
+       allow_chatroom, allow_fs, behavior_prompt, claimed_by_user_id
+FROM rongcloud_node
+WHERE rongcloud_user_id = ANY(@rongcloud_user_ids::text[]);
+
+-- 权限写入：owner 在设备名片里改自己的 agent。WHERE 只认 node_id，
+-- 归属校验在 handler 层（claimed_by_user_id == 当前登录用户）做，
+-- 因为这一层没有「当前用户」的概念。
+-- name: UpdateRongCloudNodeAgentPermission :one
+UPDATE rongcloud_node
+SET allow_private    = @allow_private,
+    allow_group      = @allow_group,
+    allow_discussion = @allow_discussion,
+    allow_chatroom   = @allow_chatroom,
+    allow_fs         = @allow_fs,
+    behavior_prompt  = @behavior_prompt,
+    updated_at       = now()
+WHERE node_id = @node_id
+RETURNING *;

@@ -10,7 +10,16 @@ import {
   classifyTool,
   createActivityTracker,
 } from "./agent-activity.js";
-import { ensureCodexOutputStyle } from "./agent-instructions.js";
+import { ensureCodexBehaviorPrompt, ensureCodexOutputStyle } from "./agent-instructions.js";
+import {
+  fsGateExempt,
+  fsRestriction,
+  loadPermissionSnapshot,
+  opencodeBehaviorPath,
+  sanitizeAgentId,
+  writeOpencodeBehaviorFile,
+  type PermissionSnapshot,
+} from "./agent-permissions.js";
 import {
   buildDeviceOpencodeConfig,
   discoverOpencodeConfigPath,
@@ -72,6 +81,20 @@ export interface RunAgentTurnOpts {
   // 所问。支持显式会话键的 agent（当前只有 openclaw 的 --session-key）按
   // 「会话形态 + 会话 id」分桶；不支持的 agent 忽略此参数。
   sessionKey?: string;
+  /**
+   * 本轮要注入的**行为规范**（仅私聊非空）。
+   *
+   * 群聊/讨论组/聊天室的行为准则由服务端拼进 role_prompt，设备端不能再注入一遍；
+   * 私聊没有服务端注入点，所以只有私聊轮次会带上它。落在**指令层**（codex 的
+   * AGENTS.md 标记块 / opencode 的 instructions 文件），绝不拼进用户消息 ——
+   * 见 agent-instructions.ts 顶部的设计说明。
+   */
+  behaviorPrompt?: string;
+  /**
+   * 内部用：本轮是否处于「文件读写禁止」限制态。由 runAgentTurn 从权限快照算出，
+   * 递归回退（disableServerMode）时沿用同一个值。
+   */
+  fsRestricted?: boolean;
   // 内部用：serve 模式起不来时退回 run --format json，递归进来时置 true，
   // 避免二次分流。外部调用方不该传。
   disableServerMode?: boolean;
@@ -87,7 +110,16 @@ export interface RunAgentTurnOpts {
 //             log lines with the answer — see parseOpenclawJsonOutput)
 //   hermes:   `-z` one-shot prompt (stdin-mode unsupported)
 // Keep in sync with agentArgvArgs in server discussion_bridge.go.
-type AgentArgvStrategy = (prompt: string, model?: string, sessionKey?: string) => string[];
+export interface AgentArgvContext {
+  /** 本轮处于「文件读写禁止」限制态（见 agent-permissions.ts fsRestriction）。 */
+  fsRestricted?: boolean;
+}
+type AgentArgvStrategy = (
+  prompt: string,
+  model?: string,
+  sessionKey?: string,
+  ctx?: AgentArgvContext,
+) => string[];
 
 // The web stores a model as a `provider/model` route. Most agent CLIs take
 // that verbatim, but two split it:
@@ -219,12 +251,17 @@ const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
     "--output-format", "stream-json", "--verbose",
     ...buildModelArgs("claude", model),
   ],
-  codex: (prompt, model) => [
+  codex: (prompt, model, _sessionKey, ctx) => [
     "exec", prompt,
     // --json：JSONL 事件流（reasoning.item_start/delta 等可解析）。实测
     // codex 0.144：未信任目录需 --skip-git-repo-check；stdin 模式会挂起
     // 等输入，必须保持 argv 模式（runAgentTurn argvMode 下 stdin 已 end）。
     "--json", "--skip-git-repo-check",
+    // 文件读写禁止：codex 的 `-s/--sandbox read-only` 是**官方**沙箱策略
+    // （0.144.6 的 `codex exec --help` 实测：read-only / workspace-write /
+    // danger-full-access）。read-only 挡写入与联网，但**仍允许读取** ——
+    // 这是 codex 侧能做到的最强限制，做不到「连读都不许」，报告里如实写了。
+    ...(ctx?.fsRestricted ? ["--sandbox", "read-only"] : []),
     ...buildModelArgs("codex", model),
   ],
   // --format json --thinking：opencode 1.19 起支持逐行 JSON 事件（reasoning /
@@ -273,10 +310,11 @@ export function buildAgentArgs(
   prompt: string,
   model?: string,
   sessionKey?: string,
+  ctx?: AgentArgvContext,
 ): string[] {
   const strategy = agentArgvStrategies[name];
   if (!strategy || prompt.length > ARGV_PROMPT_MAX_CHARS) return [];
-  return strategy(prompt, model, sessionKey);
+  return strategy(prompt, model, sessionKey, ctx);
 }
 
 const DEFAULT_TIMEOUT_MS = 120_000;
@@ -920,8 +958,38 @@ function envFlag(raw: string | undefined): boolean {
   return /^(1|true|yes|on)$/i.test((raw ?? "").trim());
 }
 
+/** 设备端派生的 opencode 配置落盘位置（per-agent：里面的 instructions 指向本 agent 的行为规范）。 */
+export function deviceOpencodeConfigPath(
+  agentName: string | undefined,
+  home: string = homedir(),
+): string {
+  const base = join(home, ".clawmessenger");
+  // 没有 agent 名（老调用方 / 手工探测）时退回整机一份的老路径，行为与升级前一致。
+  if (!agentName) return join(base, "opencode-device.json");
+  return join(base, `opencode-device-${sanitizeAgentId(agentName)}.json`);
+}
+
+interface DeviceConfigInput {
+  agentName?: string;
+  /**
+   * 该轮要注入的行为规范（仅私聊轮次非空）。
+   *
+   * - 非空串：写文件并让 `instructions` 指向它；
+   * - 空串：**显式清掉**（删文件 + 不写 instructions），用于群聊/讨论组轮
+   *   （服务端已拼 role_prompt，设备端不能重复注入）；
+   * - `undefined`：**不要动**既有文件，存在就继续用。轮询侧的
+   *   `syncAgentPermissionConfig` 走这条 —— 它只重算限制键，不能用空串把
+   *   用户既有的行为规范删掉（审查 G10）。
+   */
+  behaviorPrompt?: string;
+  /** 整机是否处于「文件读写禁止」限制态。 */
+  fsRestricted?: boolean;
+  home?: string;
+}
+
 /**
- * serve 进程的环境：**派生一份设备端专用 opencode 配置**，去掉 plugin 与 mcp。
+ * serve 进程的环境：**派生一份设备端专用 opencode 配置**，去掉 plugin 与 mcp，
+ * 并按权限快照写入工具限制与行为规范指令。
  *
  * 为什么（2026-10-26 实测）：用户配置里的 `superpowers@git+https://…` 插件与两个
  * `uvx --from git+https://…` 的 MCP 会让 opencode 在 `message=init` 上卡七十秒
@@ -931,12 +999,12 @@ function envFlag(raw: string | undefined): boolean {
  * 用户显式指定过 OPENCODE_CONFIG（或 CLAWMESSENGER_OPENCODE_CONFIG）时不动 ——
  * 那说明他自己管这份配置。
  */
-function opencodeServeEnv(): NodeJS.ProcessEnv {
+function opencodeServeEnv(input: DeviceConfigInput = {}): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   if (!envFlag(env.CLAWMESSENGER_OPENCODE_FULL_CONFIG)
     && !env.OPENCODE_CONFIG
     && !env.CLAWMESSENGER_OPENCODE_CONFIG) {
-    const config = ensureDeviceOpencodeConfig(env);
+    const config = ensureDeviceOpencodeConfig(env, input);
     if (config) env.OPENCODE_CONFIG = config;
   }
   // serve 只绑 127.0.0.1、端口随机；带着密码只会让本地请求全部 401。
@@ -944,7 +1012,10 @@ function opencodeServeEnv(): NodeJS.ProcessEnv {
   return env;
 }
 
-function ensureDeviceOpencodeConfig(env: NodeJS.ProcessEnv): string | null {
+function ensureDeviceOpencodeConfig(
+  env: NodeJS.ProcessEnv,
+  input: DeviceConfigInput = {},
+): string | null {
   let source: string | null = null;
   try {
     source = discoverOpencodeConfigPath({ env });
@@ -958,9 +1029,21 @@ function ensureDeviceOpencodeConfig(env: NodeJS.ProcessEnv): string | null {
   } catch {
     return null;
   }
-  const built = buildDeviceOpencodeConfig(raw);
+  const home = input.home ?? homedir();
+  // 行为规范先落盘，再让配置指向它：顺序反了会出现「配置指向一个还不存在的文件」。
+  //
+  // undefined = 不要动既有文件（轮询侧重算限制时走这条）；空串 = 显式清掉。
+  // 二者的区别见 DeviceConfigInput.behaviorPrompt 的注释（审查 G10）。
+  const behaviorPath = opencodeBehaviorPath(input.agentName, home);
+  const behaviorFile = input.behaviorPrompt === undefined
+    ? (existsSync(behaviorPath) ? behaviorPath : null)
+    : writeOpencodeBehaviorFile(input.agentName, input.behaviorPrompt, home);
+  const built = buildDeviceOpencodeConfig(raw, {
+    fsRestricted: input.fsRestricted === true,
+    instructions: behaviorFile ? [behaviorFile] : [],
+  });
   if (!built) return null;
-  const target = join(homedir(), ".clawmessenger", "opencode-device.json");
+  const target = deviceOpencodeConfigPath(input.agentName, home);
   try {
     const existing = existsSync(target) ? readFileSync(target, "utf8") : null;
     // 内容没变就不重写：既省 IO，也避免每轮都触发 opencode 重新加载配置。
@@ -971,6 +1054,43 @@ function ensureDeviceOpencodeConfig(env: NodeJS.ProcessEnv): string | null {
     return null;
   }
   return target;
+}
+
+/**
+ * 权限快照变化时重算并落盘派生配置（supervisor 在轮询里调）。
+ *
+ * 为什么要有这个显式入口：配置原本只在 `runOpenCodeServerTurn` 前算 —— 那意味着
+ * 「用户在界面关掉读写」要等到该 agent 下一轮真的开口才落盘，中间这段时间磁盘上
+ * 的配置仍是旧的可读写版本。轮询侧主动重算把生效点提前到「下一次轮询」。
+ *
+ * 只处理 opencode：其它 agent 的限制靠 spawn 时的 argv/env 表达，没有落盘的派生配置。
+ *
+ * @returns 写入的配置路径；不需要/失败返回 null。
+ */
+export function syncAgentPermissionConfig(
+  agentName: string | undefined,
+  snapshot: PermissionSnapshot | null,
+  opts: { env?: NodeJS.ProcessEnv; home?: string } = {},
+): string | null {
+  if (agentName !== "opencode") return null;
+  // 运维 agent 不被 allowFs 限制（默认新建绑定就是 false，否则运维一上线就废）。
+  // 它的派生配置要保持「无限制键」。
+  if (fsGateExempt(agentName)) return null;
+  const env = opts.env ?? process.env;
+  if (envFlag(env.CLAWMESSENGER_OPENCODE_FULL_CONFIG)
+    || env.OPENCODE_CONFIG
+    || env.CLAWMESSENGER_OPENCODE_CONFIG) {
+    return null;
+  }
+  const restriction = fsRestriction(snapshot);
+  // 行为规范是**私聊轮次**才注入的，重算时不知道下一轮是什么会话形态，所以这里
+  // 只重算限制键：**不传 behaviorPrompt**（undefined = 不要动既有指令文件，见
+  // DeviceConfigInput 的说明）。传空串会把用户的行为规范文件删掉（审查 G10）。
+  return ensureDeviceOpencodeConfig(env, {
+    agentName,
+    fsRestricted: restriction.restricted,
+    ...(opts.home ? { home: opts.home } : {}),
+  });
 }
 
 /** 起 `opencode serve` 并等它把监听地址打到 stdout，然后跑完一轮。 */
@@ -989,7 +1109,14 @@ async function runOpenCodeServerTurn(
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
     cwd: opts.cwd,
-    env: opencodeServeEnv(),
+    env: opencodeServeEnv({
+      ...(opts.agentName ? { agentName: opts.agentName } : {}),
+      // 一律传（可能为空串）：serve 每轮都会重写派生配置，空串表示「这一轮不该
+      // 有行为规范」（群聊/讨论组），要显式摘掉上一轮私聊写进去的指令文件；
+      // 传 undefined 会被理解成「不要动」，那份指令就会在群聊里重复生效。
+      behaviorPrompt: opts.behaviorPrompt ?? "",
+      ...(opts.fsRestricted ? { fsRestricted: true } : {}),
+    }),
   });
 
   let stderr = "";
@@ -1084,6 +1211,39 @@ async function runOpenCodeServerTurn(
   }
 }
 
+// 「文件读写限制态」的日志只在该状态**变化**时打一行：限制是整机级的，每轮都
+// 打会把 agent 日志淹掉；但状态翻转（管理员刚关掉/打开读写）必须留痕，否则现场
+// 只能看到「工具突然不能用了」。
+//
+// 日志里必须带「谁触发 + 谁参与了判定」：运维 agent 是豁免的，运维看日志时要能
+// 一眼判断「不是限我」还是「限的是对话 agent，但我在豁免名单里」。
+let lastFsRestrictionLog = "";
+function logFsRestrictionOnce(
+  restricted: boolean,
+  restriction: { because: readonly string[]; participating: readonly string[]; exempt: boolean },
+): void {
+  const key = restricted
+    ? `on:${restriction.because.join(",")}|${restriction.participating.join(",")}`
+    : `off:${restriction.exempt ? "exempt" : "clear"}`;
+  if (key === lastFsRestrictionLog) return;
+  lastFsRestrictionLog = key;
+  if (restriction.exempt) {
+    console.log(
+      "agent fs gate: 运维 agent 豁免（不受 allowFs 限制，也不参与「有一个人关就都不给」的判定；"
+      + `参与判定的 agent=[${restriction.participating.join(", ") || "无"}]）。`
+      + " 残留：同机「受限对话 agent + 运维」并存时运维修复能力不降级，见报告 known issues。",
+    );
+    return;
+  }
+  if (!restricted) return;
+  console.warn(
+    `agent fs restricted: allowFs=false on [${restriction.because.join(", ") || "?"}] — `
+    + `参与判定的 agent=[${restriction.participating.join(", ") || "无"}]（运维 agent 已豁免）；`
+    + "同一台设备的派生配置是整机一份，按「有一个人关就都不给」处理。"
+    + "bash 已一并禁用，但本轮没有 OS 级沙箱，见 implementer-report-cli.md 的残留风险。",
+  );
+}
+
 export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const hardLimit = opts.hardOutputBytes ?? HARD_OUTPUT_BYTES;
@@ -1095,19 +1255,40 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
 
   if (opts.signal?.aborted) return Promise.reject(new Error("agent turn aborted"));
 
+  // 权限快照 → 本轮的两条限制：文件读写是否禁止、要不要注入行为规范。
+  //
+  // 快照读的是 supervisor 轮询落盘的那一份（带 5s 缓存，见 agent-permissions.ts），
+  // 不是每条消息现查服务端 —— 私聊轮次很密，不能在这里加网络往返。
+  // 只在**快照真的变了**的时候打一行日志，避免每轮刷屏。
+  const restriction = fsRestriction(loadPermissionSnapshot(), opts.agentName);
+  const fsRestricted = opts.fsRestricted ?? restriction.restricted;
+  logFsRestrictionOnce(fsRestricted, restriction);
+
   // codex 会把执行过程写进正文（2026-10-26 现场：「我先核对每段字数…这里没有
   // 安装 Python，我改用 PowerShell 直接按字符计数」就是正文第一段）。这类内容
   // 属于思考。约束落在**指令层**（$CODEX_HOME/AGENTS.md）而不是 prompt：私聊的
   // prompt 就是用户原话，往里塞一句会污染输入，而且 agent 可能复述它。
   // 幂等且失败静默 —— 写不了指令文件不该让这一轮答不出来。
-  if (opts.agentName === "codex") ensureCodexOutputStyle();
+  if (opts.agentName === "codex") {
+    ensureCodexOutputStyle();
+    // 行为规范只在私聊轮次存在：群聊/讨论组由服务端拼进 role_prompt，这里传空
+    // 表示「摘掉上一轮私聊写进去的那一节」，避免同一段话在群聊里出现两遍。
+    ensureCodexBehaviorPrompt(opts.behaviorPrompt ?? "");
+  }
 
   // opencode：默认走 serve + SSE（真 token 级增量）。只有 argv 策略成立时
   // 才走这条路 —— 超长 prompt 会退回 stdin 模式，那条路沿用 run 的老实现。
   if (opts.agentName === "opencode" && !opts.disableServerMode && opencodeServerEnabled()) {
-    const strategyArgs = buildAgentArgs(opts.agentName, opts.prompt, opts.model, opts.sessionKey);
+    const strategyArgs = buildAgentArgs(opts.agentName, opts.prompt, opts.model, opts.sessionKey, {
+      fsRestricted,
+    });
     if (strategyArgs.length > 0) {
-      return runOpenCodeServerTurn(opts, timeoutMs, hardLimit).catch((err: unknown) => {
+      // ⚠️ fsRestricted 是本轮算出来的**局部**值，必须合并进 opts 再往下传：
+      // serve 侧的 opencodeServeEnv 只认 `opts.fsRestricted`，不合并就会恒 false
+      // —— 受限配置不会被写进 OPENCODE_CONFIG 指向的文件，而上面的日志已经打了
+      // 「fs restricted」（日志与事实相反），且 supervisor 写好的受限配置会被这一轮
+      // 用同路径的无限制内容覆盖（审查 B1 阻断项）。
+      return runOpenCodeServerTurn({ ...opts, fsRestricted }, timeoutMs, hardLimit).catch((err: unknown) => {
         if (!isServeStartupFailure(err)) throw err;
         // 起不来（旧版 opencode 没有 serve / 端口被占 / 配置坏）就退回 run：
         // 内容仍然拿得到，只是回到「整段落地」。绝不因为流式改造让一轮失败。
@@ -1129,13 +1310,27 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
     // agent, or a prompt past the argv length cap) keeps the legacy stdin
     // invocation with the model flag as the only argument.
     const strategyArgs = opts.agentName
-      ? buildAgentArgs(opts.agentName, opts.prompt, opts.model, opts.sessionKey)
+      ? buildAgentArgs(opts.agentName, opts.prompt, opts.model, opts.sessionKey, { fsRestricted })
       : [];
     const argvMode = strategyArgs.length > 0;
     const agentArgs = argvMode
       ? strategyArgs
       : buildModelArgs(opts.agentName ?? "", opts.model);
-    const spawnEnv = agentRuntimeEnv(opts.agentName, opts.model);
+    // opencode 的 `run` 路径原本完全不碰派生配置（只有 serve 路径设 OPENCODE_CONFIG）。
+    // 权限限制要靠配置表达，所以**只在需要时**补上：没有限制、也没有行为规范时
+    // 保持老行为不变（不引入「run 也会剥 plugin/mcp」这种副作用）。
+    const deviceConfig = opts.agentName === "opencode" && (fsRestricted || opts.behaviorPrompt)
+      ? ensureDeviceOpencodeConfig(process.env, {
+        ...(opts.agentName ? { agentName: opts.agentName } : {}),
+        // 与 serve 路径同口径：空串 = 这一轮不该有行为规范（显式清掉），
+        // 不能传 undefined（那会保留上一轮私聊写进去的指令，群聊里就重复了）。
+        behaviorPrompt: opts.behaviorPrompt ?? "",
+        ...(fsRestricted ? { fsRestricted: true } : {}),
+      })
+      : null;
+    const spawnEnv = deviceConfig
+      ? { ...process.env, OPENCODE_CONFIG: deviceConfig }
+      : agentRuntimeEnv(opts.agentName, opts.model);
     const { file, args } = buildSpawnInvocation(opts.execPath, agentArgs);
     const child = spawn(file, args, {
       stdio: ["pipe", "pipe", "pipe"],

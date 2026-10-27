@@ -802,6 +802,29 @@ func (h *systemHandler) actionChatroomCreate(ctx context.Context, cmd CommandCon
 		if missing := missingCapabilities(node.Capabilities, roundtableMembCaps); len(missing) > 0 {
 			return errResult(422, fmt.Sprintf("AI 节点缺少能力: %s", strings.Join(missing, ", ")))
 		}
+		// 配置期权限校验（迁移 607）：拉人进讨论组时就挡住，别等派发时才静默跳过。
+		//
+		// 为什么非要在这一步：派发侧的 fail-closed 只保证「不说话」，而用户的观感
+		// 是「人拉进来了、图标也在，就是不吭声」—— 无从判断是权限还是故障。在
+		// 配置期回 422 并说清「让主人去开」，用户才知道下一步点哪里。
+		//
+		// 只校验普通成员，不校验主持人：派发侧同样不对主持人做权限闸门（主持工作
+		// 由创建者显式选定），两侧口径必须一致，否则会出现「能建不能跑」。
+		//
+		// **未认领节点放行**：权限位是「主人对自己 agent 的授权」，而
+		// claimed_by_user_id 为空意味着这台节点还没有 C 端主人 —— 没有能点「开启」
+		// 的人。对它回 422 会把节点永久锁在讨论组之外（用户手上没有任何可操作的
+		// 入口）。这类节点沿用迁移前的准入口径：能力 + 在线 + 注册即通过；真正
+		// 需要保护的是「已认领」的 agent —— 那正是被分享出去、主人以为还在自己
+		// 手里的那些。
+		//
+		// 判据是「聊天室 ∪ 讨论组 至少开一个」，不是单看讨论组：加人的这一刻还
+		// 不知道这个房间以后会不会被用作讨论组（讨论组是房间建好之后才由
+		// createRoundtableShell 起的），只认 allow_discussion 会误拒一大批「只想
+		// 在聊天室里聊」的 agent。派发侧仍按房间当时的实际用途分别判定。
+		if !node.AllowChatroom && !node.AllowDiscussion && nodeIsClaimed(node) {
+			return errResult(422, agentPermissionDeniedMessage("聊天室/讨论组", m.NodeID))
+		}
 		if m.RoleName == "" {
 			return errResult(422, "AI 成员角色不能为空")
 		}
@@ -1076,6 +1099,12 @@ func (h *systemHandler) actionChatroomSetDiscussionTeam(ctx context.Context, cmd
 		if missing := missingCapabilities(node.Capabilities, roundtableMembCaps); len(missing) > 0 {
 			return errResult(422, fmt.Sprintf("AI 节点缺少能力: %s", strings.Join(missing, ", ")))
 		}
+		// 同 actionChatroomCreate：配置讨论团队时就挡住一个权限都没开的 agent。
+		// 判据同样是「聊天室 ∪ 讨论组 至少开一个」（理由见上）。
+		// 未认领节点放行，理由见 actionChatroomCreate 里的长注释。
+		if !node.AllowChatroom && !node.AllowDiscussion && nodeIsClaimed(node) {
+			return errResult(422, agentPermissionDeniedMessage("聊天室/讨论组", m.NodeID))
+		}
 		if m.RoleName == "" {
 			return errResult(422, "AI 成员角色不能为空")
 		}
@@ -1152,4 +1181,22 @@ func (h *systemHandler) resolveNode(ctx context.Context, nodeID string) (db.Rong
 // business node_id when the rongcloud_user name is unset.
 func hostNodeNickname(node db.RongcloudNode) string {
 	return node.NodeID
+}
+
+// agentPermissionDeniedMessage 是「智能体权限没开」的统一 422 文案。
+//
+// 必须点名场景（群聊/讨论组/聊天室）与节点：主人可能同时有多台设备，只说
+// 「权限不足」等于让用户自己去猜是哪个 agent 的哪个开关。后半句给出动作
+// （去设备名片里开），否则用户只会看到一条无法处理的错误。
+func agentPermissionDeniedMessage(scene, nodeID string) string {
+	return fmt.Sprintf("该智能体未开启%s权限，请让主人在设备名片里开启: %s", scene, nodeID)
+}
+
+// nodeIsClaimed 报告这个节点是否已经有 C 端主人（claimed_by_user_id 非空）。
+//
+// 权限位是「主人对自己 agent 的授权」，没有认领者就没有能点开关的人：这类节点
+// （历史数据、或绑定流程还没走完的中间态）在配置期不做权限拦截，否则它会被永久
+// 锁在讨论组之外，而用户手上没有任何可操作的入口。
+func nodeIsClaimed(node db.RongcloudNode) bool {
+	return node.ClaimedByUserID.Valid && node.ClaimedByUserID.String != ""
 }

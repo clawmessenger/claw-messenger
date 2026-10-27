@@ -269,7 +269,7 @@ const createRongCloudNode = `-- name: CreateRongCloudNode :one
 
 INSERT INTO rongcloud_node (workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, machine_id)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-RETURNING id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id, claimed_by_user_id
+RETURNING id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id, claimed_by_user_id, allow_private, allow_group, allow_discussion, allow_chatroom, allow_fs, behavior_prompt
 `
 
 type CreateRongCloudNodeParams struct {
@@ -314,6 +314,12 @@ func (q *Queries) CreateRongCloudNode(ctx context.Context, arg CreateRongCloudNo
 		&i.UpdatedAt,
 		&i.MachineID,
 		&i.ClaimedByUserID,
+		&i.AllowPrivate,
+		&i.AllowGroup,
+		&i.AllowDiscussion,
+		&i.AllowChatroom,
+		&i.AllowFs,
+		&i.BehaviorPrompt,
 	)
 	return i, err
 }
@@ -726,7 +732,7 @@ func (q *Queries) GetRongCloudDeviceByNodeID(ctx context.Context, nodeID pgtype.
 }
 
 const getRongCloudNodeByID = `-- name: GetRongCloudNodeByID :one
-SELECT id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id, claimed_by_user_id FROM rongcloud_node WHERE id = $1
+SELECT id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id, claimed_by_user_id, allow_private, allow_group, allow_discussion, allow_chatroom, allow_fs, behavior_prompt FROM rongcloud_node WHERE id = $1
 `
 
 func (q *Queries) GetRongCloudNodeByID(ctx context.Context, id pgtype.UUID) (RongcloudNode, error) {
@@ -746,12 +752,18 @@ func (q *Queries) GetRongCloudNodeByID(ctx context.Context, id pgtype.UUID) (Ron
 		&i.UpdatedAt,
 		&i.MachineID,
 		&i.ClaimedByUserID,
+		&i.AllowPrivate,
+		&i.AllowGroup,
+		&i.AllowDiscussion,
+		&i.AllowChatroom,
+		&i.AllowFs,
+		&i.BehaviorPrompt,
 	)
 	return i, err
 }
 
 const getRongCloudNodeByNodeID = `-- name: GetRongCloudNodeByNodeID :one
-SELECT id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id, claimed_by_user_id FROM rongcloud_node WHERE node_id = $1
+SELECT id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id, claimed_by_user_id, allow_private, allow_group, allow_discussion, allow_chatroom, allow_fs, behavior_prompt FROM rongcloud_node WHERE node_id = $1
 `
 
 func (q *Queries) GetRongCloudNodeByNodeID(ctx context.Context, nodeID string) (RongcloudNode, error) {
@@ -771,12 +783,18 @@ func (q *Queries) GetRongCloudNodeByNodeID(ctx context.Context, nodeID string) (
 		&i.UpdatedAt,
 		&i.MachineID,
 		&i.ClaimedByUserID,
+		&i.AllowPrivate,
+		&i.AllowGroup,
+		&i.AllowDiscussion,
+		&i.AllowChatroom,
+		&i.AllowFs,
+		&i.BehaviorPrompt,
 	)
 	return i, err
 }
 
 const getRongCloudNodeByRongCloudUserID = `-- name: GetRongCloudNodeByRongCloudUserID :one
-SELECT id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id, claimed_by_user_id FROM rongcloud_node WHERE rongcloud_user_id = $1
+SELECT id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id, claimed_by_user_id, allow_private, allow_group, allow_discussion, allow_chatroom, allow_fs, behavior_prompt FROM rongcloud_node WHERE rongcloud_user_id = $1
 `
 
 func (q *Queries) GetRongCloudNodeByRongCloudUserID(ctx context.Context, rongcloudUserID string) (RongcloudNode, error) {
@@ -796,6 +814,12 @@ func (q *Queries) GetRongCloudNodeByRongCloudUserID(ctx context.Context, rongclo
 		&i.UpdatedAt,
 		&i.MachineID,
 		&i.ClaimedByUserID,
+		&i.AllowPrivate,
+		&i.AllowGroup,
+		&i.AllowDiscussion,
+		&i.AllowChatroom,
+		&i.AllowFs,
+		&i.BehaviorPrompt,
 	)
 	return i, err
 }
@@ -1218,8 +1242,66 @@ func (q *Queries) ListRongCloudNodeModelCatalogsByNode(ctx context.Context, node
 	return items, nil
 }
 
+const listRongCloudNodePermissionsByRcUserIDs = `-- name: ListRongCloudNodePermissionsByRcUserIDs :many
+
+SELECT rongcloud_user_id, allow_private, allow_group, allow_discussion,
+       allow_chatroom, allow_fs, behavior_prompt, claimed_by_user_id
+FROM rongcloud_node
+WHERE rongcloud_user_id = ANY($1::text[])
+`
+
+type ListRongCloudNodePermissionsByRcUserIDsRow struct {
+	RongcloudUserID string      `json:"rongcloud_user_id"`
+	AllowPrivate    bool        `json:"allow_private"`
+	AllowGroup      bool        `json:"allow_group"`
+	AllowDiscussion bool        `json:"allow_discussion"`
+	AllowChatroom   bool        `json:"allow_chatroom"`
+	AllowFs         bool        `json:"allow_fs"`
+	BehaviorPrompt  string      `json:"behavior_prompt"`
+	ClaimedByUserID pgtype.Text `json:"claimed_by_user_id"`
+}
+
+// =====================
+// 绑定智能体权限（607）
+// =====================
+// 权限读取：批量按融云 id 取。派发侧（群聊 / 聊天室 / 讨论组 v3）每轮只需要
+// **一次**这样的查询就够，不能按成员逐个查 —— 讨论组是「每轮每人」，逐个查
+// 会把 8 人 × 10 轮放大成 80 次往返。
+//
+// claimed_by_user_id 一起带出来是给设备轮询用的：/api/claw/device/control 要在
+// 同一次往返里下发 ownerUserId（CLI 靠它判定「这条私聊是不是主人发的」），
+// 单独再查一遍是白跑一趟。
+func (q *Queries) ListRongCloudNodePermissionsByRcUserIDs(ctx context.Context, rongcloudUserIds []string) ([]ListRongCloudNodePermissionsByRcUserIDsRow, error) {
+	rows, err := q.db.Query(ctx, listRongCloudNodePermissionsByRcUserIDs, rongcloudUserIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListRongCloudNodePermissionsByRcUserIDsRow{}
+	for rows.Next() {
+		var i ListRongCloudNodePermissionsByRcUserIDsRow
+		if err := rows.Scan(
+			&i.RongcloudUserID,
+			&i.AllowPrivate,
+			&i.AllowGroup,
+			&i.AllowDiscussion,
+			&i.AllowChatroom,
+			&i.AllowFs,
+			&i.BehaviorPrompt,
+			&i.ClaimedByUserID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listRongCloudNodesByMachineID = `-- name: ListRongCloudNodesByMachineID :many
-SELECT id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id, claimed_by_user_id FROM rongcloud_node WHERE machine_id = $1 ORDER BY created_at ASC
+SELECT id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id, claimed_by_user_id, allow_private, allow_group, allow_discussion, allow_chatroom, allow_fs, behavior_prompt FROM rongcloud_node WHERE machine_id = $1 ORDER BY created_at ASC
 `
 
 func (q *Queries) ListRongCloudNodesByMachineID(ctx context.Context, machineID string) ([]RongcloudNode, error) {
@@ -1245,6 +1327,12 @@ func (q *Queries) ListRongCloudNodesByMachineID(ctx context.Context, machineID s
 			&i.UpdatedAt,
 			&i.MachineID,
 			&i.ClaimedByUserID,
+			&i.AllowPrivate,
+			&i.AllowGroup,
+			&i.AllowDiscussion,
+			&i.AllowChatroom,
+			&i.AllowFs,
+			&i.BehaviorPrompt,
 		); err != nil {
 			return nil, err
 		}
@@ -1257,7 +1345,7 @@ func (q *Queries) ListRongCloudNodesByMachineID(ctx context.Context, machineID s
 }
 
 const listRongCloudNodesByOwner = `-- name: ListRongCloudNodesByOwner :many
-SELECT id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id, claimed_by_user_id FROM rongcloud_node WHERE owner_user_id = $1 ORDER BY created_at ASC
+SELECT id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id, claimed_by_user_id, allow_private, allow_group, allow_discussion, allow_chatroom, allow_fs, behavior_prompt FROM rongcloud_node WHERE owner_user_id = $1 ORDER BY created_at ASC
 `
 
 func (q *Queries) ListRongCloudNodesByOwner(ctx context.Context, ownerUserID pgtype.UUID) ([]RongcloudNode, error) {
@@ -1283,6 +1371,12 @@ func (q *Queries) ListRongCloudNodesByOwner(ctx context.Context, ownerUserID pgt
 			&i.UpdatedAt,
 			&i.MachineID,
 			&i.ClaimedByUserID,
+			&i.AllowPrivate,
+			&i.AllowGroup,
+			&i.AllowDiscussion,
+			&i.AllowChatroom,
+			&i.AllowFs,
+			&i.BehaviorPrompt,
 		); err != nil {
 			return nil, err
 		}
@@ -1295,7 +1389,7 @@ func (q *Queries) ListRongCloudNodesByOwner(ctx context.Context, ownerUserID pgt
 }
 
 const listRongCloudNodesByWorkspace = `-- name: ListRongCloudNodesByWorkspace :many
-SELECT id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id, claimed_by_user_id FROM rongcloud_node WHERE workspace_id = $1 ORDER BY created_at ASC
+SELECT id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id, claimed_by_user_id, allow_private, allow_group, allow_discussion, allow_chatroom, allow_fs, behavior_prompt FROM rongcloud_node WHERE workspace_id = $1 ORDER BY created_at ASC
 `
 
 func (q *Queries) ListRongCloudNodesByWorkspace(ctx context.Context, workspaceID pgtype.UUID) ([]RongcloudNode, error) {
@@ -1321,6 +1415,12 @@ func (q *Queries) ListRongCloudNodesByWorkspace(ctx context.Context, workspaceID
 			&i.UpdatedAt,
 			&i.MachineID,
 			&i.ClaimedByUserID,
+			&i.AllowPrivate,
+			&i.AllowGroup,
+			&i.AllowDiscussion,
+			&i.AllowChatroom,
+			&i.AllowFs,
+			&i.BehaviorPrompt,
 		); err != nil {
 			return nil, err
 		}
@@ -1476,8 +1576,69 @@ func (q *Queries) UpdateRongCloudChatroom(ctx context.Context, arg UpdateRongClo
 	return i, err
 }
 
+const updateRongCloudNodeAgentPermission = `-- name: UpdateRongCloudNodeAgentPermission :one
+UPDATE rongcloud_node
+SET allow_private    = $1,
+    allow_group      = $2,
+    allow_discussion = $3,
+    allow_chatroom   = $4,
+    allow_fs         = $5,
+    behavior_prompt  = $6,
+    updated_at       = now()
+WHERE node_id = $7
+RETURNING id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id, claimed_by_user_id, allow_private, allow_group, allow_discussion, allow_chatroom, allow_fs, behavior_prompt
+`
+
+type UpdateRongCloudNodeAgentPermissionParams struct {
+	AllowPrivate    bool   `json:"allow_private"`
+	AllowGroup      bool   `json:"allow_group"`
+	AllowDiscussion bool   `json:"allow_discussion"`
+	AllowChatroom   bool   `json:"allow_chatroom"`
+	AllowFs         bool   `json:"allow_fs"`
+	BehaviorPrompt  string `json:"behavior_prompt"`
+	NodeID          string `json:"node_id"`
+}
+
+// 权限写入：owner 在设备名片里改自己的 agent。WHERE 只认 node_id，
+// 归属校验在 handler 层（claimed_by_user_id == 当前登录用户）做，
+// 因为这一层没有「当前用户」的概念。
+func (q *Queries) UpdateRongCloudNodeAgentPermission(ctx context.Context, arg UpdateRongCloudNodeAgentPermissionParams) (RongcloudNode, error) {
+	row := q.db.QueryRow(ctx, updateRongCloudNodeAgentPermission,
+		arg.AllowPrivate,
+		arg.AllowGroup,
+		arg.AllowDiscussion,
+		arg.AllowChatroom,
+		arg.AllowFs,
+		arg.BehaviorPrompt,
+		arg.NodeID,
+	)
+	var i RongcloudNode
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.OwnerUserID,
+		&i.RongcloudUserID,
+		&i.NodeID,
+		&i.AiType,
+		&i.Capabilities,
+		&i.DeployStatus,
+		&i.BindingVersion,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.MachineID,
+		&i.ClaimedByUserID,
+		&i.AllowPrivate,
+		&i.AllowGroup,
+		&i.AllowDiscussion,
+		&i.AllowChatroom,
+		&i.AllowFs,
+		&i.BehaviorPrompt,
+	)
+	return i, err
+}
+
 const updateRongCloudNodeBindingVersion = `-- name: UpdateRongCloudNodeBindingVersion :one
-UPDATE rongcloud_node SET binding_version = $2, updated_at = now() WHERE id = $1 RETURNING id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id, claimed_by_user_id
+UPDATE rongcloud_node SET binding_version = $2, updated_at = now() WHERE id = $1 RETURNING id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id, claimed_by_user_id, allow_private, allow_group, allow_discussion, allow_chatroom, allow_fs, behavior_prompt
 `
 
 type UpdateRongCloudNodeBindingVersionParams struct {
@@ -1502,12 +1663,18 @@ func (q *Queries) UpdateRongCloudNodeBindingVersion(ctx context.Context, arg Upd
 		&i.UpdatedAt,
 		&i.MachineID,
 		&i.ClaimedByUserID,
+		&i.AllowPrivate,
+		&i.AllowGroup,
+		&i.AllowDiscussion,
+		&i.AllowChatroom,
+		&i.AllowFs,
+		&i.BehaviorPrompt,
 	)
 	return i, err
 }
 
 const updateRongCloudNodeCapabilities = `-- name: UpdateRongCloudNodeCapabilities :one
-UPDATE rongcloud_node SET capabilities = $2, updated_at = now() WHERE id = $1 RETURNING id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id, claimed_by_user_id
+UPDATE rongcloud_node SET capabilities = $2, updated_at = now() WHERE id = $1 RETURNING id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id, claimed_by_user_id, allow_private, allow_group, allow_discussion, allow_chatroom, allow_fs, behavior_prompt
 `
 
 type UpdateRongCloudNodeCapabilitiesParams struct {
@@ -1532,12 +1699,18 @@ func (q *Queries) UpdateRongCloudNodeCapabilities(ctx context.Context, arg Updat
 		&i.UpdatedAt,
 		&i.MachineID,
 		&i.ClaimedByUserID,
+		&i.AllowPrivate,
+		&i.AllowGroup,
+		&i.AllowDiscussion,
+		&i.AllowChatroom,
+		&i.AllowFs,
+		&i.BehaviorPrompt,
 	)
 	return i, err
 }
 
 const updateRongCloudNodeDeployStatus = `-- name: UpdateRongCloudNodeDeployStatus :one
-UPDATE rongcloud_node SET deploy_status = $2, updated_at = now() WHERE id = $1 RETURNING id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id, claimed_by_user_id
+UPDATE rongcloud_node SET deploy_status = $2, updated_at = now() WHERE id = $1 RETURNING id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id, claimed_by_user_id, allow_private, allow_group, allow_discussion, allow_chatroom, allow_fs, behavior_prompt
 `
 
 type UpdateRongCloudNodeDeployStatusParams struct {
@@ -1562,6 +1735,12 @@ func (q *Queries) UpdateRongCloudNodeDeployStatus(ctx context.Context, arg Updat
 		&i.UpdatedAt,
 		&i.MachineID,
 		&i.ClaimedByUserID,
+		&i.AllowPrivate,
+		&i.AllowGroup,
+		&i.AllowDiscussion,
+		&i.AllowChatroom,
+		&i.AllowFs,
+		&i.BehaviorPrompt,
 	)
 	return i, err
 }

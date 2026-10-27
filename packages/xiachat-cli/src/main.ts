@@ -12,7 +12,15 @@ import {
   type DeviceUpgradeStatus,
   type MachineAgentCredential,
 } from "./api.js";
-import { discoverAgents, type AgentInfo } from "./agents.js";
+import { discoverAgents, syncAgentPermissionConfig, type AgentInfo } from "./agents.js";
+import {
+  loadPermissionSnapshot,
+  mergePermissionSnapshot,
+  parseControlPermissions,
+  permissionSignature,
+  writePermissionSnapshot,
+  type PermissionSnapshot,
+} from "./agent-permissions.js";
 import { DEFAULT_SERVER_URL, machineId, defaultAnsweredTurnsPath, defaultProcessedUidsPath, defaultUpgradeInflightPath } from "./config.js";
 import { agentNameFromRcUser, ensureOpencodeInstalled, OPS_AGENT_NAME, OPS_TURN_TIMEOUT_MS, setupOpsWorkdir } from "./ops.js";
 import {
@@ -2039,6 +2047,42 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
     void executeUpgrade(intent);
   };
 
+  /** 上一份权限快照的签名：只有变了才重写配置，避免每 10s 都动派生配置。 */
+  let lastPermissionSignature = "";
+
+  /**
+   * 把轮询结果里的权限快照落盘，并在签名变化时重算派生配置。
+   *
+   * 为什么要落盘：私聊闸门与文件读写闸门都在**子进程**里判定（supervisor 不跑
+   * agent），子进程读不到 supervisor 的内存，只能读文件 —— 见
+   * agent-permissions.ts 顶部对这条设计的说明。
+   *
+   * 为什么要「签名变了才写」：轮询 10s 一次，无脑写盘既是无谓 IO，也会让
+   * opencode 每轮都重载配置。签名只含权限与行为规范，不含 desiredState。
+   */
+  const applyPermissionSnapshot = (snapshot: unknown): void => {
+    const parsed: PermissionSnapshot | null = parseControlPermissions(snapshot);
+    // 整份响应里连 agents 数组都没有（非预期形状）→ 保留磁盘上那一份，绝不主动
+    // 删除：删了等于把上一轮管理员设的限制悄悄打开。
+    if (!parsed) return;
+    // 再合并一层（审查 S4）：服务端回滚到旧版本时，响应里的每一行都**没有权限
+    // 字段**。直接覆盖会把这些字段写成 undefined —— 等于一次回滚把所有限制抹掉。
+    // 合并规则是「只有明确 true/false 才更新」，详见 mergePermissionSnapshot。
+    const merged = mergePermissionSnapshot(loadPermissionSnapshot(), parsed);
+    const signature = permissionSignature(merged);
+    if (signature === lastPermissionSignature) return;
+    lastPermissionSignature = signature;
+    if (!writePermissionSnapshot(merged)) {
+      console.error("supervisor: 权限快照落盘失败，闸门将沿用上一份");
+      return;
+    }
+    // 权限变了就重算派生配置：原本配置只在 agent 开口那一轮前算，管理员关掉
+    // 读写后要等该 agent 下一次发言才落盘，这段窗口里磁盘上仍是可读写版本。
+    for (const agent of bound) {
+      syncAgentPermissionConfig(agent.agent, merged);
+    }
+  };
+
   /** 上次看到的期望状态与版本。失败时返回空 Map，applyControlStates 读作
    * 「什么都别改」—— 服务端抖动绝不能把操作员留着运行的 agent 停掉。 */
   const fetchControlSnapshot = async (): Promise<{
@@ -2054,6 +2098,9 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
         // 不额外开通道；老服务端会忽略这个字段。
         hostname: os.hostname(),
       });
+      // 权限快照：先落盘，再收敛启停 —— 闸门依赖它，落盘失败只记日志（最坏
+      // 结果是沿用上一份，不能因为写不了文件就把轮询判失败）。
+      applyPermissionSnapshot(snapshot);
       for (const state of snapshot.agents) {
         if (!state.agent) continue;
         // 只认识 running / stopped 两个动作；其它值（服务端以后新增的动作）
