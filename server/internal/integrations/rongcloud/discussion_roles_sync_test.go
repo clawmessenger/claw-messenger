@@ -746,3 +746,92 @@ func TestRoleSync_ContinuePathSyncsBeforeNewRound(t *testing.T) {
 		t.Errorf("新成员派发 round/speakingOrder = %d/%d，期望 2/1", task.Round, task.SpeakingOrder)
 	}
 }
+
+// TestRoleSync_DispatchesMemberWithNullMemberID 是 b87f55e8d 那条修复的回归防线，
+// 也正好长在「中途改成员要生效」这条路径上。
+//
+// 运维后台的 ChatroomService.SetMembers 走 CreateRongCloudChatroomMember，那条 SQL 的
+// 列清单里没有 member_id —— 管理员在后台改一遍成员，本房间所有 AI 行的 member_id 变成
+// NULL。可用性判据若只认 member_id，就会全员判不可用 → 全员 member_skipped → 本轮零产出
+// → 讨论被判 failed（dispatch_failed），而 reason 文案完全指不出是 member_id 为 NULL。
+//
+// 这里把「member_id 为 NULL 的行」造出来，断言它照样被同步进角色板、照样被派发。
+// 变异（把判据改回只认 member_id）会让这条用例变红 —— 已在 pristine 生产代码上验过。
+func TestRoleSync_DispatchesMemberWithNullMemberID(t *testing.T) {
+	f := setupDiscussionFixture(t)
+	f.rt.interactiveEnabled = true
+	ctx := context.Background()
+
+	memberA := f.memberNode
+	newcomer := seedNode(t, f.queries, f.wsID, "ai-node-nullmid-"+uniqueID("t"), `["discussion_participant"]`)
+	t.Cleanup(func() {
+		_, _ = f.pool.Exec(context.Background(), "DELETE FROM rongcloud_node WHERE id=$1", newcomer.ID)
+	})
+	addAIMemberToRoom(t, f, newcomer, "补充者")
+	// 复制运维后台 SetMembers 的产物：member_id 为 NULL。
+	if _, err := f.pool.Exec(ctx, `
+		UPDATE rongcloud_chatroom_member SET member_id = NULL
+		WHERE node_id=$1
+		  AND chatroom_id=(SELECT id FROM rongcloud_chatroom WHERE rongcloud_chatroom_id=$2)`,
+		newcomer.ID, f.roomRCID); err != nil {
+		t.Fatalf("把 member_id 置 NULL: %v", err)
+	}
+	// 前置断言：这一行真的变成 NULL 了，否则这条用例会退化成普通的「中途加人」。
+	var storedMemberID pgtype.Text
+	if err := f.pool.QueryRow(ctx, `
+		SELECT member_id FROM rongcloud_chatroom_member
+		WHERE node_id=$1
+		  AND chatroom_id=(SELECT id FROM rongcloud_chatroom WHERE rongcloud_chatroom_id=$2)`,
+		newcomer.ID, f.roomRCID).Scan(&storedMemberID); err != nil {
+		t.Fatalf("读回 member_id: %v", err)
+	}
+	if storedMemberID.Valid {
+		t.Fatalf("前置条件不成立：member_id 仍为 %q", storedMemberID.String)
+	}
+
+	d := newWindowFixtureDiscussion(t, f, 1, [][2]string{{memberA.RongcloudUserID, "分析者"}})
+	appendFixtureEvent(t, f, d.DiscussionID, "contribution_completed", memberA.RongcloudUserID,
+		map[string]interface{}{"round": 1, "content": "甲第一轮"})
+
+	current, err := f.rt.repo.Get(ctx, d.DiscussionID)
+	if err != nil {
+		t.Fatalf("get discussion: %v", err)
+	}
+	if err := f.rt.interactiveNext(ctx, current); err != nil {
+		t.Fatalf("interactiveNext（第 1 轮结束，应同步进角色板）: %v", err)
+	}
+	afterSync, err := f.rt.repo.Get(ctx, d.DiscussionID)
+	if err != nil {
+		t.Fatalf("get after sync: %v", err)
+	}
+	if _, exists := parseRoleSnapshot(t, afterSync.RoleSnapshot)[newcomer.RongcloudUserID]; !exists {
+		t.Fatalf("member_id 为 NULL 的成员没被同步进角色板: %s", afterSync.RoleSnapshot)
+	}
+
+	// 第 2 轮：分析者说完后轮到他 —— 派发前那道可用性判据必须认 node_rc_user_id。
+	round2, err := f.rt.repo.AdvanceState(ctx, AdvanceDiscussionParams{
+		DiscussionID: afterSync.DiscussionID, ExpectedVersion: afterSync.Version,
+		Status: DiscussionStatusRunning, CurrentRound: 2, RoundRevision: 0,
+	})
+	if err != nil {
+		t.Fatalf("进入第 2 轮: %v", err)
+	}
+	appendFixtureEvent(t, f, d.DiscussionID, "contribution_completed", memberA.RongcloudUserID,
+		map[string]interface{}{"round": 2, "content": "甲第二轮"})
+	if round2, err = f.rt.repo.Get(ctx, round2.DiscussionID); err != nil {
+		t.Fatalf("get round2: %v", err)
+	}
+	if err := f.rt.interactiveNext(ctx, round2); err != nil {
+		t.Fatalf("interactiveNext（第 2 轮应派发新成员）: %v", err)
+	}
+
+	tasks := dispatchTasksByTarget(t, f, d.DiscussionID)
+	task, dispatched := tasks[newcomer.RongcloudUserID]
+	if !dispatched {
+		t.Fatalf("member_id 为 NULL 的成员被判不可用、没拿到 your_turn；本次 outbox 目标 = %v",
+			dispatchTargets(tasks))
+	}
+	if task.SpeakingOrder != 1 || task.Round != 2 {
+		t.Errorf("派发 round/speakingOrder = %d/%d，期望 2/1", task.Round, task.SpeakingOrder)
+	}
+}
