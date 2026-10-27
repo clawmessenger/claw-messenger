@@ -269,7 +269,7 @@ const createRongCloudNode = `-- name: CreateRongCloudNode :one
 
 INSERT INTO rongcloud_node (workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, machine_id)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-RETURNING id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id
+RETURNING id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id, claimed_by_user_id
 `
 
 type CreateRongCloudNodeParams struct {
@@ -313,6 +313,7 @@ func (q *Queries) CreateRongCloudNode(ctx context.Context, arg CreateRongCloudNo
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.MachineID,
+		&i.ClaimedByUserID,
 	)
 	return i, err
 }
@@ -725,7 +726,7 @@ func (q *Queries) GetRongCloudDeviceByNodeID(ctx context.Context, nodeID pgtype.
 }
 
 const getRongCloudNodeByID = `-- name: GetRongCloudNodeByID :one
-SELECT id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id FROM rongcloud_node WHERE id = $1
+SELECT id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id, claimed_by_user_id FROM rongcloud_node WHERE id = $1
 `
 
 func (q *Queries) GetRongCloudNodeByID(ctx context.Context, id pgtype.UUID) (RongcloudNode, error) {
@@ -744,12 +745,13 @@ func (q *Queries) GetRongCloudNodeByID(ctx context.Context, id pgtype.UUID) (Ron
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.MachineID,
+		&i.ClaimedByUserID,
 	)
 	return i, err
 }
 
 const getRongCloudNodeByNodeID = `-- name: GetRongCloudNodeByNodeID :one
-SELECT id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id FROM rongcloud_node WHERE node_id = $1
+SELECT id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id, claimed_by_user_id FROM rongcloud_node WHERE node_id = $1
 `
 
 func (q *Queries) GetRongCloudNodeByNodeID(ctx context.Context, nodeID string) (RongcloudNode, error) {
@@ -768,12 +770,13 @@ func (q *Queries) GetRongCloudNodeByNodeID(ctx context.Context, nodeID string) (
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.MachineID,
+		&i.ClaimedByUserID,
 	)
 	return i, err
 }
 
 const getRongCloudNodeByRongCloudUserID = `-- name: GetRongCloudNodeByRongCloudUserID :one
-SELECT id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id FROM rongcloud_node WHERE rongcloud_user_id = $1
+SELECT id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id, claimed_by_user_id FROM rongcloud_node WHERE rongcloud_user_id = $1
 `
 
 func (q *Queries) GetRongCloudNodeByRongCloudUserID(ctx context.Context, rongcloudUserID string) (RongcloudNode, error) {
@@ -792,6 +795,7 @@ func (q *Queries) GetRongCloudNodeByRongCloudUserID(ctx context.Context, rongclo
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.MachineID,
+		&i.ClaimedByUserID,
 	)
 	return i, err
 }
@@ -1215,7 +1219,7 @@ func (q *Queries) ListRongCloudNodeModelCatalogsByNode(ctx context.Context, node
 }
 
 const listRongCloudNodesByMachineID = `-- name: ListRongCloudNodesByMachineID :many
-SELECT id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id FROM rongcloud_node WHERE machine_id = $1 ORDER BY created_at ASC
+SELECT id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id, claimed_by_user_id FROM rongcloud_node WHERE machine_id = $1 ORDER BY created_at ASC
 `
 
 func (q *Queries) ListRongCloudNodesByMachineID(ctx context.Context, machineID string) ([]RongcloudNode, error) {
@@ -1240,6 +1244,7 @@ func (q *Queries) ListRongCloudNodesByMachineID(ctx context.Context, machineID s
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.MachineID,
+			&i.ClaimedByUserID,
 		); err != nil {
 			return nil, err
 		}
@@ -1252,7 +1257,7 @@ func (q *Queries) ListRongCloudNodesByMachineID(ctx context.Context, machineID s
 }
 
 const listRongCloudNodesByOwner = `-- name: ListRongCloudNodesByOwner :many
-SELECT id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id FROM rongcloud_node WHERE owner_user_id = $1 ORDER BY created_at ASC
+SELECT id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id, claimed_by_user_id FROM rongcloud_node WHERE owner_user_id = $1 ORDER BY created_at ASC
 `
 
 func (q *Queries) ListRongCloudNodesByOwner(ctx context.Context, ownerUserID pgtype.UUID) ([]RongcloudNode, error) {
@@ -1277,6 +1282,7 @@ func (q *Queries) ListRongCloudNodesByOwner(ctx context.Context, ownerUserID pgt
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.MachineID,
+			&i.ClaimedByUserID,
 		); err != nil {
 			return nil, err
 		}
@@ -1289,7 +1295,7 @@ func (q *Queries) ListRongCloudNodesByOwner(ctx context.Context, ownerUserID pgt
 }
 
 const listRongCloudNodesByWorkspace = `-- name: ListRongCloudNodesByWorkspace :many
-SELECT id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id FROM rongcloud_node WHERE workspace_id = $1 ORDER BY created_at ASC
+SELECT id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id, claimed_by_user_id FROM rongcloud_node WHERE workspace_id = $1 ORDER BY created_at ASC
 `
 
 func (q *Queries) ListRongCloudNodesByWorkspace(ctx context.Context, workspaceID pgtype.UUID) ([]RongcloudNode, error) {
@@ -1314,6 +1320,7 @@ func (q *Queries) ListRongCloudNodesByWorkspace(ctx context.Context, workspaceID
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.MachineID,
+			&i.ClaimedByUserID,
 		); err != nil {
 			return nil, err
 		}
@@ -1470,7 +1477,7 @@ func (q *Queries) UpdateRongCloudChatroom(ctx context.Context, arg UpdateRongClo
 }
 
 const updateRongCloudNodeBindingVersion = `-- name: UpdateRongCloudNodeBindingVersion :one
-UPDATE rongcloud_node SET binding_version = $2, updated_at = now() WHERE id = $1 RETURNING id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id
+UPDATE rongcloud_node SET binding_version = $2, updated_at = now() WHERE id = $1 RETURNING id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id, claimed_by_user_id
 `
 
 type UpdateRongCloudNodeBindingVersionParams struct {
@@ -1494,12 +1501,13 @@ func (q *Queries) UpdateRongCloudNodeBindingVersion(ctx context.Context, arg Upd
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.MachineID,
+		&i.ClaimedByUserID,
 	)
 	return i, err
 }
 
 const updateRongCloudNodeCapabilities = `-- name: UpdateRongCloudNodeCapabilities :one
-UPDATE rongcloud_node SET capabilities = $2, updated_at = now() WHERE id = $1 RETURNING id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id
+UPDATE rongcloud_node SET capabilities = $2, updated_at = now() WHERE id = $1 RETURNING id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id, claimed_by_user_id
 `
 
 type UpdateRongCloudNodeCapabilitiesParams struct {
@@ -1523,12 +1531,13 @@ func (q *Queries) UpdateRongCloudNodeCapabilities(ctx context.Context, arg Updat
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.MachineID,
+		&i.ClaimedByUserID,
 	)
 	return i, err
 }
 
 const updateRongCloudNodeDeployStatus = `-- name: UpdateRongCloudNodeDeployStatus :one
-UPDATE rongcloud_node SET deploy_status = $2, updated_at = now() WHERE id = $1 RETURNING id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id
+UPDATE rongcloud_node SET deploy_status = $2, updated_at = now() WHERE id = $1 RETURNING id, workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type, capabilities, deploy_status, binding_version, created_at, updated_at, machine_id, claimed_by_user_id
 `
 
 type UpdateRongCloudNodeDeployStatusParams struct {
@@ -1552,6 +1561,7 @@ func (q *Queries) UpdateRongCloudNodeDeployStatus(ctx context.Context, arg Updat
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.MachineID,
+		&i.ClaimedByUserID,
 	)
 	return i, err
 }

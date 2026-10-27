@@ -606,6 +606,7 @@ type ClawImUser struct {
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
 	PlanID         pgtype.Int4        `json:"plan_id"`
+	WechatOpenid   pgtype.Text        `json:"wechat_openid"`
 }
 
 type ClawImUserQuotum struct {
@@ -615,6 +616,18 @@ type ClawImUserQuotum struct {
 	ChatroomLimit   pgtype.Int4        `json:"chatroom_limit"`
 	UpdatedBy       string             `json:"updated_by"`
 	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+}
+
+type ClawLobster struct {
+	ID        string             `json:"id"`
+	UserID    string             `json:"user_id"`
+	Name      string             `json:"name"`
+	Variety   string             `json:"variety"`
+	Weight    float64            `json:"weight"`
+	Status    string             `json:"status"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+	DeletedAt pgtype.Timestamptz `json:"deleted_at"`
 }
 
 type ClientUsageDaily struct {
@@ -837,6 +850,42 @@ type GithubPullRequestCheckSuite struct {
 	Conclusion pgtype.Text        `json:"conclusion"`
 	Status     string             `json:"status"`
 	UpdatedAt  pgtype.Timestamptz `json:"updated_at"`
+}
+
+// 融云会话号映射：target_id（对方融云 id / 群号）+ conversation_type → conversation_id。
+type ImConversation struct {
+	ID               int64  `json:"id"`
+	TargetID         string `json:"target_id"`
+	ConversationType int32  `json:"conversation_type"`
+	ConversationID   string `json:"conversation_id"`
+	// 首次/最近一次写入时间（旧实现 ON CONFLICT 时刷新本列）。
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
+// AI 节点好友申请（拥有者审批）。申请人/审批人是 claw_im_users.user_id，device_node_id 是节点的融云 id。
+type ImFriendRequest struct {
+	ID         pgtype.UUID `json:"id"`
+	FromUserID string      `json:"from_user_id"`
+	ToUserID   string      `json:"to_user_id"`
+	// 被申请的 AI 节点融云 id。审批通过后据此补建 请求方↔节点 双向好友边。
+	DeviceNodeID string             `json:"device_node_id"`
+	Message      string             `json:"message"`
+	Status       int16              `json:"status"`
+	DecidedAt    pgtype.Timestamptz `json:"decided_at"`
+	DecidedBy    pgtype.Text        `json:"decided_by"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+}
+
+type ImWebLoginSession struct {
+	ID          int64              `json:"id"`
+	TicketHash  string             `json:"ticket_hash"`
+	Status      string             `json:"status"`
+	UserID      pgtype.Text        `json:"user_id"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	ExpiresAt   pgtype.Timestamptz `json:"expires_at"`
+	ConfirmedAt pgtype.Timestamptz `json:"confirmed_at"`
+	ConsumedAt  pgtype.Timestamptz `json:"consumed_at"`
 }
 
 type InboxItem struct {
@@ -1611,6 +1660,8 @@ type RongcloudNode struct {
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
 	MachineID       string             `json:"machine_id"`
+	// C 端认领者（claw_im_users.user_id / 融云 id）。设备归属的本地投影，权威真相仍是融云好友边。
+	ClaimedByUserID pgtype.Text `json:"claimed_by_user_id"`
 }
 
 type RongcloudNodeControl struct {
@@ -1648,6 +1699,29 @@ type RongcloudNodeRequest struct {
 	ExpiresAt       pgtype.Timestamptz `json:"expires_at"`
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+}
+
+type RongcloudNodeUpgrade struct {
+	MachineID          string             `json:"machine_id"`
+	NodeID             pgtype.UUID        `json:"node_id"`
+	WorkspaceID        pgtype.UUID        `json:"workspace_id"`
+	ReportedVersion    string             `json:"reported_version"`
+	ReportedPlatform   string             `json:"reported_platform"`
+	ReportedAt         pgtype.Timestamptz `json:"reported_at"`
+	ReportedGeneration int64              `json:"reported_generation"`
+	TargetVersion      string             `json:"target_version"`
+	DesiredGeneration  int64              `json:"desired_generation"`
+	Status             string             `json:"status"`
+	ErrorCode          string             `json:"error_code"`
+	ErrorDetail        string             `json:"error_detail"`
+	Force              bool               `json:"force"`
+	BatchID            string             `json:"batch_id"`
+	Wave               int32              `json:"wave"`
+	RequestedBy        string             `json:"requested_by"`
+	RequestedAt        pgtype.Timestamptz `json:"requested_at"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
+	ReportedHostname   string             `json:"reported_hostname"`
 }
 
 type RongcloudPairingSession struct {
