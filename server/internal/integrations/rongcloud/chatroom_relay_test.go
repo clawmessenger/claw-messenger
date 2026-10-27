@@ -21,6 +21,10 @@ type relayRecorder struct {
 	mu       sync.Mutex
 	privates []map[string]string
 	group    []map[string]string
+	// chatroom 单独记账：讨论组的 v3 事件广播走 /message/chatroom/publish.json
+	// （interactiveBroadcast → sendChatroomJSON → sendChatroomMessage）。不把它
+	// 和 group 混在一起，否则「聊天室广播了几次」就没法独立断言。
+	chatroom []map[string]string
 }
 
 func newRelayRecorder(t *testing.T) (*relayRecorder, *rongcloudAPIClient) {
@@ -40,6 +44,8 @@ func newRelayRecorder(t *testing.T) (*relayRecorder, *rongcloudAPIClient) {
 			rec.privates = append(rec.privates, entry)
 		case "/message/group/publish.json":
 			rec.group = append(rec.group, entry)
+		case "/message/chatroom/publish.json":
+			rec.chatroom = append(rec.chatroom, entry)
 		}
 		rec.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
@@ -54,6 +60,13 @@ func (r *relayRecorder) snapshot() (privates, group []map[string]string) {
 	defer r.mu.Unlock()
 	return append([]map[string]string(nil), r.privates...),
 		append([]map[string]string(nil), r.group...)
+}
+
+// chatroomSnapshot 只取聊天室广播（讨论组 v3 事件走 /message/chatroom/publish.json）。
+func (r *relayRecorder) chatroomSnapshot() []map[string]string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]map[string]string(nil), r.chatroom...)
 }
 
 // broadcastTexts 解出所有群/聊天室广播的正文（按发生顺序）。
