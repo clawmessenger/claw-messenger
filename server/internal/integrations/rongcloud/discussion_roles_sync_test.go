@@ -493,3 +493,256 @@ func eventTypesOf(events []DiscussionEventRecord) []string {
 	}
 	return out
 }
+
+// ---- 补充：移除成员 / 重复同步幂等 / continue 路径（审查员 Ray 提的 3 个缺口） ----
+
+// roleSyncProgressEvents 取出该讨论的 role-sync 事件（借 discussion_progress 承载）。
+func roleSyncProgressEvents(t *testing.T, f *discussionFixture, discussionID string) []DiscussionEventRecord {
+	t.Helper()
+	events, err := f.rt.repo.ListEventsAfter(context.Background(), discussionID, 0)
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	out := make([]DiscussionEventRecord, 0, 1)
+	for _, event := range events {
+		if event.EventType == "discussion_progress" {
+			out = append(out, event)
+		}
+	}
+	return out
+}
+
+// removeAIMemberFromRoom 把一棵 AI 成员从成员表摘掉（模拟用户在轮中途踢人）。
+func removeAIMemberFromRoom(t *testing.T, f *discussionFixture, rcID string) {
+	t.Helper()
+	if _, err := f.pool.Exec(context.Background(), `
+		DELETE FROM rongcloud_chatroom_member
+		WHERE member_id=$1
+		  AND chatroom_id=(SELECT id FROM rongcloud_chatroom WHERE rongcloud_chatroom_id=$2)`,
+		rcID, f.roomRCID); err != nil {
+		t.Fatalf("移除成员 %s: %v", rcID, err)
+	}
+}
+
+// TestRoleSync_RemovedMemberNotDispatchedNextRound 是「中途移除」的引擎级用例：
+// 被移除者下一轮不再收到 your_turn，其余成员的 speaking_order 压缩为 0..n-1
+// （不跳号）—— 跳号会让设备端的 speaking_order 与角色板对不上。
+func TestRoleSync_RemovedMemberNotDispatchedNextRound(t *testing.T) {
+	f := setupDiscussionFixture(t)
+	f.rt.interactiveEnabled = true
+	ctx := context.Background()
+
+	memberA := f.memberNode
+	memberB := seedNode(t, f.queries, f.wsID, "ai-node-rm-b-"+uniqueID("t"), `["discussion_participant"]`)
+	memberC := seedNode(t, f.queries, f.wsID, "ai-node-rm-c-"+uniqueID("t"), `["discussion_participant"]`)
+	t.Cleanup(func() {
+		_, _ = f.pool.Exec(context.Background(), "DELETE FROM rongcloud_node WHERE id IN ($1,$2)", memberB.ID, memberC.ID)
+	})
+	addAIMemberToRoom(t, f, memberB, "质疑者")
+	addAIMemberToRoom(t, f, memberC, "补充者")
+
+	d := newWindowFixtureDiscussion(t, f, 1, [][2]string{
+		{memberA.RongcloudUserID, "分析者"},
+		{memberB.RongcloudUserID, "质疑者"},
+		{memberC.RongcloudUserID, "补充者"},
+	})
+	for _, member := range []db.RongcloudNode{memberA, memberB, memberC} {
+		appendFixtureEvent(t, f, d.DiscussionID, "contribution_completed", member.RongcloudUserID,
+			map[string]interface{}{"round": 1, "content": member.NodeID + " 第一轮"})
+	}
+
+	// 轮中途踢掉中间那位（speaking_order = 1）。
+	removeAIMemberFromRoom(t, f, memberB.RongcloudUserID)
+
+	current, err := f.rt.repo.Get(ctx, d.DiscussionID)
+	if err != nil {
+		t.Fatalf("get discussion: %v", err)
+	}
+	if err := f.rt.interactiveNext(ctx, current); err != nil {
+		t.Fatalf("interactiveNext（第 1 轮结束，应触发角色板同步）: %v", err)
+	}
+
+	afterSync, err := f.rt.repo.Get(ctx, d.DiscussionID)
+	if err != nil {
+		t.Fatalf("get after sync: %v", err)
+	}
+	board := parseRoleSnapshot(t, afterSync.RoleSnapshot)
+	if _, exists := board[memberB.RongcloudUserID]; exists {
+		t.Fatalf("被移除的成员仍在角色板里: %s", afterSync.RoleSnapshot)
+	}
+	if got := speakingOrderOf(t, board[memberA.RongcloudUserID]); got != 0 {
+		t.Errorf("分析者 speakingOrder = %d，期望 0", got)
+	}
+	if got := speakingOrderOf(t, board[memberC.RongcloudUserID]); got != 1 {
+		t.Errorf("补充者 speakingOrder = %d，期望压缩后的 1（原先 2，不许跳号）", got)
+	}
+
+	// 第 2 轮：分析者说完后，下一位必须是补充者（顺序 1），且被移除者拿不到任何派发。
+	round2, err := f.rt.repo.AdvanceState(ctx, AdvanceDiscussionParams{
+		DiscussionID: afterSync.DiscussionID, ExpectedVersion: afterSync.Version,
+		Status: DiscussionStatusRunning, CurrentRound: 2, RoundRevision: 0,
+	})
+	if err != nil {
+		t.Fatalf("进入第 2 轮: %v", err)
+	}
+	appendFixtureEvent(t, f, d.DiscussionID, "contribution_completed", memberA.RongcloudUserID,
+		map[string]interface{}{"round": 2, "content": "分析者 第二轮"})
+	if round2, err = f.rt.repo.Get(ctx, round2.DiscussionID); err != nil {
+		t.Fatalf("get round2: %v", err)
+	}
+	if err := f.rt.interactiveNext(ctx, round2); err != nil {
+		t.Fatalf("interactiveNext（第 2 轮应派发补充者）: %v", err)
+	}
+
+	tasks := dispatchTasksByTarget(t, f, d.DiscussionID)
+	task, dispatched := tasks[memberC.RongcloudUserID]
+	if !dispatched {
+		t.Fatalf("补充者没有被派发 your_turn；本次 outbox 目标 = %v", dispatchTargets(tasks))
+	}
+	if task.SpeakingOrder != 1 {
+		t.Errorf("补充者派发 speakingOrder = %d，期望压缩后的 1", task.SpeakingOrder)
+	}
+	if _, ghost := tasks[memberB.RongcloudUserID]; ghost {
+		t.Errorf("被移除的成员仍收到 your_turn：%v", dispatchTargets(tasks))
+	}
+}
+
+// TestRoleSync_RepeatedSyncIsIdempotent：syncDiscussionRoles 在 begin / continue / 轮末
+// 三处都会被调用，成员表没变的第二次同步必须是**无操作** —— 不写快照、不落事件
+// （否则前端会看到一串无意义的 discussion_progress，且幂等键同名会撞唯一索引）。
+func TestRoleSync_RepeatedSyncIsIdempotent(t *testing.T) {
+	f := setupDiscussionFixture(t)
+	f.rt.interactiveEnabled = true
+	ctx := context.Background()
+
+	member := f.memberNode
+	newcomer := seedNode(t, f.queries, f.wsID, "ai-node-idem-"+uniqueID("t"), `["discussion_participant"]`)
+	t.Cleanup(func() {
+		_, _ = f.pool.Exec(context.Background(), "DELETE FROM rongcloud_node WHERE id=$1", newcomer.ID)
+	})
+	d := newWindowFixtureDiscussion(t, f, 1, [][2]string{{member.RongcloudUserID, "分析者"}})
+	appendFixtureEvent(t, f, d.DiscussionID, "contribution_completed", member.RongcloudUserID,
+		map[string]interface{}{"round": 1, "content": "甲第一轮"})
+	addAIMemberToRoom(t, f, newcomer, "补充者")
+
+	current, err := f.rt.repo.Get(ctx, d.DiscussionID)
+	if err != nil {
+		t.Fatalf("get discussion: %v", err)
+	}
+	synced, changed, err := f.rt.syncDiscussionRoles(ctx, current)
+	if err != nil {
+		t.Fatalf("首次同步: %v", err)
+	}
+	if !changed {
+		t.Fatal("成员表加了人，首次同步必须报告 changed")
+	}
+	if got := len(roleSyncProgressEvents(t, f, d.DiscussionID)); got != 1 {
+		t.Fatalf("首次同步后 role-sync 事件 = %d 条，期望 1", got)
+	}
+
+	// 成员表不变，再同步一次。
+	again, changedAgain, err := f.rt.syncDiscussionRoles(ctx, synced)
+	if err != nil {
+		t.Fatalf("二次同步: %v", err)
+	}
+	if changedAgain {
+		t.Error("成员表没有变化，二次同步不该报告 changed")
+	}
+	if got := len(roleSyncProgressEvents(t, f, d.DiscussionID)); got != 1 {
+		t.Errorf("二次同步多落了事件：role-sync = %d 条，期望仍为 1", got)
+	}
+	if string(again.RoleSnapshot) != string(synced.RoleSnapshot) {
+		t.Errorf("二次同步改写了角色板：\n got %s\nwant %s", again.RoleSnapshot, synced.RoleSnapshot)
+	}
+	if again.Version != synced.Version {
+		t.Errorf("二次同步改了 version：%d → %d", synced.Version, again.Version)
+	}
+}
+
+// TestRoleSync_ContinuePathSyncsBeforeNewRound 覆盖三处调用点里的 continue 通道
+// （`interactiveControl` → 进入新轮前同步）——它是「新成员从下一轮生效」的主路径。
+//
+// 断言：continue 之后新成员已在角色板里，且**本轮首位仍是原 speaking_order=0 的老
+// 成员**（不插队）；老成员说完后新成员才被派发。只测 interactiveNext 那处调用点
+// 无法证明 continue 通道也同步了。
+func TestRoleSync_ContinuePathSyncsBeforeNewRound(t *testing.T) {
+	f := setupDiscussionFixture(t)
+	f.rt.interactiveEnabled = true
+	ctx := context.Background()
+
+	memberA := f.memberNode
+	newcomer := seedNode(t, f.queries, f.wsID, "ai-node-cont-"+uniqueID("t"), `["discussion_participant"]`)
+	t.Cleanup(func() {
+		_, _ = f.pool.Exec(context.Background(), "DELETE FROM rongcloud_node WHERE id=$1", newcomer.ID)
+	})
+	d := newWindowFixtureDiscussion(t, f, 1, [][2]string{{memberA.RongcloudUserID, "分析者"}})
+	appendFixtureEvent(t, f, d.DiscussionID, "contribution_completed", memberA.RongcloudUserID,
+		map[string]interface{}{"round": 1, "content": "甲第一轮"})
+	appendFixtureEvent(t, f, d.DiscussionID, "round_summary_completed", "host-rc",
+		map[string]interface{}{"round": 1, "content": "第一轮纪要"})
+
+	// 轮中途加人，然后把讨论推到「等人确认」（主持人已出纪要）。
+	addAIMemberToRoom(t, f, newcomer, "补充者")
+	awaiting, err := f.rt.repo.AdvanceState(ctx, AdvanceDiscussionParams{
+		DiscussionID: d.DiscussionID, ExpectedVersion: d.Version,
+		Status: DiscussionStatusAwaitingUser, CurrentRound: 1, RoundRevision: 0,
+	})
+	if err != nil {
+		t.Fatalf("推进到 awaiting_user: %v", err)
+	}
+
+	result := f.rt.interactiveControl(ctx, CommandContent{
+		Service: "discussion", Action: "continue",
+		Params: map[string]interface{}{
+			"requestId":    "req-continue-" + uniqueID("t"),
+			"stateVersion": awaiting.Version,
+		},
+	}, awaiting, "", f.ownerRCID, false)
+	if result.code != 200 {
+		t.Fatalf("continue = %d %s", result.code, result.message)
+	}
+
+	afterContinue, err := f.rt.repo.Get(ctx, d.DiscussionID)
+	if err != nil {
+		t.Fatalf("get after continue: %v", err)
+	}
+	if afterContinue.CurrentRound != 2 {
+		t.Fatalf("continue 后 currentRound = %d，期望 2", afterContinue.CurrentRound)
+	}
+	board := parseRoleSnapshot(t, afterContinue.RoleSnapshot)
+	if got := speakingOrderOf(t, board[newcomer.RongcloudUserID]); got != 1 {
+		t.Errorf("continue 后新成员 speakingOrder = %d，期望 1（角色板没同步）", got)
+	}
+
+	// 本轮首位仍是老成员（order 0），新成员不插队。
+	tasks := dispatchTasksByTarget(t, f, d.DiscussionID)
+	first, ok := tasks[memberA.RongcloudUserID]
+	if !ok {
+		t.Fatalf("continue 后应派发 order=0 的老成员；outbox 目标 = %v", dispatchTargets(tasks))
+	}
+	if first.Round != 2 || first.SpeakingOrder != 0 {
+		t.Errorf("首位派发 round/speakingOrder = %d/%d，期望 2/0", first.Round, first.SpeakingOrder)
+	}
+	if _, jumped := tasks[newcomer.RongcloudUserID]; jumped {
+		t.Error("新成员本轮就插队了（应从下一轮开始生效）")
+	}
+
+	// 老成员说完后，新成员在同一轮被派发 —— 证明它确实「从这一轮起」生效。
+	appendFixtureEvent(t, f, d.DiscussionID, "contribution_completed", memberA.RongcloudUserID,
+		map[string]interface{}{"round": 2, "content": "甲第二轮"})
+	round2, err := f.rt.repo.Get(ctx, d.DiscussionID)
+	if err != nil {
+		t.Fatalf("get round2: %v", err)
+	}
+	if err := f.rt.interactiveNext(ctx, round2); err != nil {
+		t.Fatalf("interactiveNext（第 2 轮应派发新成员）: %v", err)
+	}
+	task, dispatched := dispatchTasksByTarget(t, f, d.DiscussionID)[newcomer.RongcloudUserID]
+	if !dispatched {
+		t.Fatalf("新成员在老成员之后没有被派发；outbox 目标 = %v",
+			dispatchTargets(dispatchTasksByTarget(t, f, d.DiscussionID)))
+	}
+	if task.SpeakingOrder != 1 || task.Round != 2 {
+		t.Errorf("新成员派发 round/speakingOrder = %d/%d，期望 2/1", task.Round, task.SpeakingOrder)
+	}
+}

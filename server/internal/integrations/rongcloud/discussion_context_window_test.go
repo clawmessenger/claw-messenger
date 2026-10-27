@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/google/uuid"
 )
 
 // 讨论组上下文窗口（按智能体自身发言截断）的测试（task 2026-10-27/task-005）。
@@ -231,7 +233,10 @@ func appendFixtureEvent(t *testing.T, f *discussionFixture, discussionID, eventT
 	if _, err := f.rt.repo.AppendEvent(ctx, AppendDiscussionEventParams{
 		DiscussionID: discussionID, Seq: seq, EventType: eventType,
 		ActorID: actor, TargetID: actor, Payload: mustJSON(payload),
-		IdempotencyKey: eventType + ":" + actor + ":" + uniqueID("k"),
+		// 幂等键必须真的唯一：uniqueID() 的 time.Now().UnixNano() 在 Windows 上
+		// 只有 ~15.6ms 粒度，同一 tick 内两次同 actor 的 append 会撞
+		// uq_rongcloud_discussion_event_idem（整包跑侥幸绿、单跑一条会红）。
+		IdempotencyKey: eventType + ":" + actor + ":" + uuid.NewString(),
 	}); err != nil {
 		t.Fatalf("append %s: %v", eventType, err)
 	}
