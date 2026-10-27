@@ -424,6 +424,7 @@ function utf8SequenceLength(lead: number): number {
 
 // ANSI CSI/SGR escape sequences (colors, cursor moves) — openclaw colors
 // its log lines even when piped.
+// eslint-disable-next-line no-control-regex -- 这里匹配的就是 ESC/BEL 控制符本身
 const ANSI_ESCAPE_RE = /\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\))/g;
 
 export function stripAnsiCodes(text: string): string {
@@ -1122,7 +1123,7 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
     const chunks: Buffer[] = [];
     let totalBytes = 0;
     let bufferedBytes = 0;
-    let decoder = new StringDecoder("utf8");
+    const decoder = new StringDecoder("utf8");
     let stderr = "";
     /** 原始缓冲已满（只影响 chunks，不影响解析）。 */
     let capped = false;

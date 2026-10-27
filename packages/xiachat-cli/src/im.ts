@@ -817,7 +817,7 @@ export class MessageDispatcher {
       // （新的一段思考——工具之后又思考——新开条目）；工具步骤只存 id 引用
       // （内容在 activitySnapshot 里），这样同一份信息不会在帧里存两遍。
       // web 端按它渲染「思考卡片 ↔ 工具卡片」交错的流式时间线。
-      let timeline: ChatStreamTimelineEntry[] = [];
+      const timeline: ChatStreamTimelineEntry[] = [];
       const activeReasoningEntry = (): number | null => {
         const last = timeline[timeline.length - 1];
         return last && last[0] === "r" ? timeline.length - 1 : null;

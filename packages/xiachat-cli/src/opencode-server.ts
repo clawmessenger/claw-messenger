@@ -40,6 +40,7 @@ const SETTLE_MIN_MS = 120;
 export function parseServeListeningUrl(line: string): string | null {
   // 实测行：`opencode server listening on http://127.0.0.1:49882`
   // Windows 上可能带 ANSI 颜色码，所以匹配到空白或 ESC 为止。
+  // eslint-disable-next-line no-control-regex -- 要停下来的就是 ESC 本身
   const match = /listening on (https?:\/\/[^\s\u001b]+)/i.exec(line);
   if (!match) return null;
   return match[1].replace(/[),.;]+$/, "");

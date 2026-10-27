@@ -1181,6 +1181,9 @@ importers:
         specifier: ^14.0.0
         version: 14.0.3
     devDependencies:
+      '@multica/eslint-config':
+        specifier: workspace:*
+        version: link:../eslint-config
       '@types/node':
         specifier: 'catalog:'
         version: 25.5.0
