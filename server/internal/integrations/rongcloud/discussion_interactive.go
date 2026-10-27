@@ -716,16 +716,15 @@ func (rt *discussionRuntime) syncDiscussionRoles(ctx context.Context, d Discussi
 	}
 	// 事件类型必须落在 v3 白名单里：前端对讨论事件是严格 shape 校验，一条不合规
 	// 就让整段讨论历史响应无效（见 interactiveV3EventTypes / discussionEventView）。
-	// 所以不新增事件类型，借既有的 discussion_progress 承载「角色板变了」，
-	// 把新增 / 移出的角色名放进 payload。
+	// 所以既不新增事件类型，也不扩协议，只借既有的 discussion_progress 承载
+	// 「角色板变了」这个信号。
+	//
+	// data **必须是空对象**：前端 discussion-v3.ts 里 `discussion_progress:
+	// shape({})`，而 shape 会否掉任何 fields/optional 之外的键 —— 塞进 round /
+	// reason / added 任何一个都会让整段讨论历史判为无效。角色名只进下面的日志。
 	event, _, emitErr := rt.interactiveEmit(ctx, updated, interactiveEvent{
 		EventType: "discussion_progress", ActorID: "system",
-		Payload: map[string]interface{}{
-			"round":   round,
-			"reason":  "role_snapshot_synced",
-			"added":   added,
-			"removed": removed,
-		},
+		Payload: map[string]interface{}{},
 		Key: fmt.Sprintf("role-sync:%d:%s:%s", round,
 			strings.Join(added, ","), strings.Join(removed, ",")),
 		RequestID: uuid.NewString(), StateVer: updated.Version,
@@ -737,6 +736,7 @@ func (rt *discussionRuntime) syncDiscussionRoles(ctx context.Context, d Discussi
 	} else {
 		rt.interactiveBroadcast(ctx, updated, event)
 	}
+	// 可观测性走日志而不是事件 payload：事件侧受前端严格 shape 校验，装不下这些字段。
 	rt.logger.Info("discussion: role snapshot synced",
 		"discussionId", d.DiscussionID, "round", round, "added", added, "removed", removed)
 	return updated, true, nil
@@ -750,10 +750,10 @@ func (rt *discussionRuntime) syncDiscussionRoles(ctx context.Context, d Discussi
 //   - 新增成员：追加到 speaking_order 末尾；
 //   - 已被移除 / 禁用的成员：从快照剔除，剩余成员的 speaking_order 压缩为 0..n-1。
 //
-// 返回新快照、新增与被移除成员的角色名（给事件用）以及 ok。ok=false 表示这次同步
-// **不该生效**：快照读不出来，或成员表里一个可用普通成员都没有。一次读空不该把
-// 整块角色板清掉 —— 那会让讨论直接失去推进依据（interactiveRoles 会判 ok=false，
-// 整场讨论停在原地）。
+// 返回新快照、新增与被移除成员的角色名（给调用方的日志用）以及 ok。ok=false 表示
+// 这次同步 **不该生效**：快照读不出来，或成员表里一个可用普通成员都没有。一次读空
+// 不该把整块角色板清掉 —— 那会让讨论直接失去推进依据（interactiveRoles 会判
+// ok=false，整场讨论停在原地）。
 func discussionRolesRebased(d DiscussionRecord, rows []db.ListRongCloudChatroomMembersWithNodeRow) (json.RawMessage, []string, []string, bool) {
 	var raw map[string]map[string]interface{}
 	if len(d.RoleSnapshot) == 0 || json.Unmarshal(d.RoleSnapshot, &raw) != nil || len(raw) == 0 {
