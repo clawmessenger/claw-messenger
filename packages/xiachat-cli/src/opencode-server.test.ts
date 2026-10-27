@@ -286,7 +286,21 @@ describe("runServerSession", () => {
 });
 
 describe("serve 路径的 401 降级判据（2.x 鉴权失败要退 run）", () => {
-  /** `/api/*` 一律 401 的假 2.x serve：模拟「密码抓错」（格式合法但内容错）。 */
+  /**
+   * `/api/*` 一律 401 的假 2.x serve。
+   *
+   * **这条用例模拟的是什么**（半年后回看别猜）：服务端收到了我们带的 Basic 头但
+   * 不认 —— 也就是「`parseServePassword` 抓到了一个**格式合法、内容不对**的密码」
+   * （opencode 改了密码行格式、serve 重启后 stdout 尾巴里残留旧密码、端口复用连到
+   * 别人的 serve）。走的是 `runServerSession` 的 2.x 分支 → `POST /api/session`
+   * 401 → 整轮硬失败。
+   *
+   * **它不模拟什么**：不模拟「供应商/模型返回 401」（那种错误从 SSE 的
+   * `session.execution.failed` 来，serve 本身是健康的，不该降级 —— 见下面
+   * `判据只认我们这两条路径` 与 opencode-v2.test.ts 里那条防误伤用例），
+   * 也不模拟「密码行压根没抓到」（那种情况 `password` 为空，压根不进 2.x 分支，
+   * 走 1.x → `POST /session` 405 → 回退 run，本来就会降级）。
+   */
   async function startFakeV2Rejecting(): Promise<string> {
     const server = createServer((req, res) => {
       const url = req.url ?? "";
