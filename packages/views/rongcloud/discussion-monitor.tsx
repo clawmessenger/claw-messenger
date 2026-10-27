@@ -170,7 +170,7 @@ export function DiscussionMonitor({ chatroomId }: { chatroomId: string }) {
                 key={i}
                 className="flex items-start gap-2 text-caption text-muted-foreground"
               >
-                <span className="shrink-0 text-micro text-muted-foreground/60">
+                <span className="shrink-0 text-micro text-faint-foreground">
                   {new Date(event.created_at).toLocaleTimeString()}
                 </span>
                 <span className="font-medium">
