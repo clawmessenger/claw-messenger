@@ -506,6 +506,12 @@ func roundtableHostRoleEntry(host roundtableHostConfig) map[string]interface{} {
 //
 // **主持节点的排除留给调用方**：重开讨论时权威来源是管理端配置（按 node_id 排），
 // 中途加人时权威来源是已在快照里的 host 条目（按融云账号排），两者不能合并。
+//
+// **已知唯一例外**：ensureDiscussion（discussion_roundtable_stages.go，
+// 「引导式确认创建」路径）仍自己拼普通成员条目，且**不写 model**。也就是说同一成员
+// 经「引导式确认创建」建出来的角色板没有 model 键（设备端回落到默认模型），经
+// 老式创建 / 重开讨论 / 中途加人进来的则有。收敛它要改 stages 那条创建路径，不在
+// 上下文窗口这次改动范围内，留作后续单独立项 —— 别以为三处写入点已经全部统一。
 func roundtableRoleEntryFromMember(row db.ListRongCloudChatroomMembersWithNodeRow, order int) (map[string]interface{}, bool) {
 	if row.MemberType != "ai" || !row.Enabled || !row.NodeRcUserID.Valid || row.NodeRcUserID.String == "" {
 		return nil, false
