@@ -370,31 +370,14 @@ func (rt *discussionRuntime) actionRestartRoundtable(ctx context.Context, cmd Co
 	roles := map[string]interface{}{}
 	order := 0
 	for _, row := range rows {
-		if row.MemberType != "ai" || !row.Enabled || !row.NodeRcUserID.Valid {
-			continue
-		}
 		if row.BusinessNodeID.Valid && row.BusinessNodeID.String == host.nodeID {
 			continue // 主持节点不是角色
 		}
-		roleName := row.Nickname
-		if row.RoleName.Valid && row.RoleName.String != "" {
-			roleName = row.RoleName.String
+		entry, ok := roundtableRoleEntryFromMember(row, order)
+		if !ok {
+			continue
 		}
-		instructions := ""
-		if row.RoleInstructions.Valid {
-			instructions = row.RoleInstructions.String
-		}
-		roles[row.NodeRcUserID.String] = map[string]interface{}{
-			"memberId":         row.NodeRcUserID.String,
-			"nodeId":           row.BusinessNodeID.String,
-			"nickname":         roleName,
-			"portraitUri":      "",
-			"roleName":         roleName,
-			"roleInstructions": instructions,
-			"capabilities":     roundtableRequiredRoleCaps,
-			"isHost":           false,
-			"speakingOrder":    order,
-		}
+		roles[row.NodeRcUserID.String] = entry
 		order++
 	}
 	if len(roles) == 0 {

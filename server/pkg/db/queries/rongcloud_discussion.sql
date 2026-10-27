@@ -52,6 +52,19 @@ WHERE discussion_id = @discussion_id
   AND version = @expected_version
 RETURNING *;
 
+-- name: UpdateRongCloudDiscussionRoleSnapshot :one
+-- 轮边界把角色板与聊天室成员表对齐（中途加人/移人）。
+--
+-- 刻意**不碰 version**：role_snapshot 不在乐观锁的范围内（UpdateRongCloudDiscussionState
+-- 的 version 只守 status 与轮次指针）。把它算进 CAS 会让同一次用户动作里的
+-- 「先同步角色板、再推进轮次」互相打架 —— 客户端带来的 stateVersion 在同步之后
+-- 就已经过期，continue 会莫名 409。
+UPDATE rongcloud_discussion
+SET role_snapshot = @role_snapshot,
+    updated_at    = now()
+WHERE discussion_id = @discussion_id
+RETURNING *;
+
 -- name: DeleteRongCloudDiscussion :exec
 DELETE FROM rongcloud_discussion WHERE discussion_id = $1;
 

@@ -1311,6 +1311,55 @@ func (q *Queries) TransitionRoundtableCreateRequest(ctx context.Context, arg Tra
 	return i, err
 }
 
+const updateRongCloudDiscussionRoleSnapshot = `-- name: UpdateRongCloudDiscussionRoleSnapshot :one
+UPDATE rongcloud_discussion
+SET role_snapshot = $1,
+    updated_at    = now()
+WHERE discussion_id = $2
+RETURNING discussion_id, chatroom_id, workspace_id, created_by, topic, goal, max_rounds, mode, status, current_round, version, role_snapshot, host_config_snapshot, recommendation_id, client_request_id, round_policy, round_revision, created_at, updated_at, setup_step, last_interaction_at, cancel_reason
+`
+
+type UpdateRongCloudDiscussionRoleSnapshotParams struct {
+	RoleSnapshot []byte `json:"role_snapshot"`
+	DiscussionID string `json:"discussion_id"`
+}
+
+// 轮边界把角色板与聊天室成员表对齐（中途加人/移人）。
+//
+// 刻意**不碰 version**：role_snapshot 不在乐观锁的范围内（UpdateRongCloudDiscussionState
+// 的 version 只守 status 与轮次指针）。把它算进 CAS 会让同一次用户动作里的
+// 「先同步角色板、再推进轮次」互相打架 —— 客户端带来的 stateVersion 在同步之后
+// 就已经过期，continue 会莫名 409。
+func (q *Queries) UpdateRongCloudDiscussionRoleSnapshot(ctx context.Context, arg UpdateRongCloudDiscussionRoleSnapshotParams) (RongcloudDiscussion, error) {
+	row := q.db.QueryRow(ctx, updateRongCloudDiscussionRoleSnapshot, arg.RoleSnapshot, arg.DiscussionID)
+	var i RongcloudDiscussion
+	err := row.Scan(
+		&i.DiscussionID,
+		&i.ChatroomID,
+		&i.WorkspaceID,
+		&i.CreatedBy,
+		&i.Topic,
+		&i.Goal,
+		&i.MaxRounds,
+		&i.Mode,
+		&i.Status,
+		&i.CurrentRound,
+		&i.Version,
+		&i.RoleSnapshot,
+		&i.HostConfigSnapshot,
+		&i.RecommendationID,
+		&i.ClientRequestID,
+		&i.RoundPolicy,
+		&i.RoundRevision,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.SetupStep,
+		&i.LastInteractionAt,
+		&i.CancelReason,
+	)
+	return i, err
+}
+
 const updateRongCloudDiscussionState = `-- name: UpdateRongCloudDiscussionState :one
 UPDATE rongcloud_discussion
 SET status         = $1,

@@ -714,7 +714,9 @@ func (h *chatroomRelayHub) buildPrompt(s *relaySession, member relayMember) stri
 		contextBlock += block
 		budget -= used
 	}
-	contextBlock += relayHistoryBlock(s.history, budget)
+	// 更早轮次按 viewer 自己的上下文窗口裁剪：只带「自己上次发言（含）→ 现在」，
+	// 新入群成员（无锚点）带 N 条最近发言（N = 群内 AI 成员数）。
+	contextBlock += relayHistoryBlock(s.history, budget, member.roleName, len(s.members))
 
 	return "[group chat] " + scope + opening + contextBlock + turn + tail
 }
@@ -850,15 +852,97 @@ func relayReplyLine(reply relayReply, limit int) string {
 	return fmt.Sprintf("- %s：%s", reply.roleName, clipRelayText(reply.content, limit))
 }
 
+// relayHistoryWindow 把「最近若干轮」裁成 viewer 自己的上下文窗口。
+//
+// 产品口径与讨论组的 interactiveHistory.windowFor 一致（两条链路必须同口径，
+// 否则同一个 AI 在群聊与讨论组里看到的「自己」判若两人）：
+//
+//   - 有锚点：从 viewer 自己最后一次发言所在的轮开始，该轮只带锚点及其之后的
+//     reply（含锚点那条），之后的轮整轮纳入；
+//   - 无锚点（新入群 / 首次发言）：尾部 fallbackN 条 reply 折成的窗口，同样允许
+//     半轮；fallbackN <= 0 时至少 1 条；
+//   - 结果至少 1 条 reply，保证窗口不退化（viewer 自己就是最后一位发言者时，
+//     窗口就只剩他那一条）。
+//
+// 数据结构是**轮粒度**（一轮 = 一条用户消息 + 该轮各位的回应），所以必然要允许
+// 「半轮截取」：按轮整体取舍会把锚点之前几十条发言全带回来，等于没裁。
+// silent 占位不会进历史（见 closeRoundLocked），这里不必再过滤。
+//
+// 窗口的**尾部恒等于 history 的尾部**，这正是 buildPrompt 那条「接住「X」的话」
+// 能成立的前提：X = 最后一条发言者，永远落在窗口里。
+//
+// 返回新切片，不改动传入的 history。
+func relayHistoryWindow(history []relayRound, viewerRole string, fallbackN int) []relayRound {
+	if len(history) == 0 {
+		return nil
+	}
+	startRound, startReply := -1, -1
+	// 反序找 viewer 最后一次发言：它就是窗口起点。
+	if viewerRole != "" {
+		for i := len(history) - 1; i >= 0 && startRound < 0; i-- {
+			replies := history[i].replies
+			for j := len(replies) - 1; j >= 0; j-- {
+				if replies[j].roleName == viewerRole {
+					startRound, startReply = i, j
+					break
+				}
+			}
+		}
+	}
+	if startRound < 0 {
+		if fallbackN <= 0 {
+			fallbackN = 1
+		}
+		remaining := fallbackN
+		// 空轮不占条数，但也不能成为起点：从最近一轮往前数 reply，数满为止。
+		for i := len(history) - 1; i >= 0 && startRound < 0; i-- {
+			n := len(history[i].replies)
+			if n == 0 {
+				continue
+			}
+			if n >= remaining {
+				startRound, startReply = i, n-remaining
+				break
+			}
+			remaining -= n
+		}
+		if startRound < 0 {
+			// 整段历史加起来都不够 fallbackN 条：全带上。
+			startRound, startReply = 0, 0
+		}
+	}
+	out := make([]relayRound, 0, len(history)-startRound)
+	for i := startRound; i < len(history); i++ {
+		from := 0
+		if i == startRound {
+			from = startReply
+		}
+		round := relayRound{userText: history[i].userText}
+		if from < len(history[i].replies) {
+			round.replies = append([]relayReply(nil), history[i].replies[from:]...)
+		}
+		out = append(out, round)
+	}
+	return out
+}
+
 // relayHistoryBlock 把最近若干轮已完成对话渲染成提示词里的上下文段。空历史、
 // 零预算返回空串（整段省略）。只渲染装得进 budget 的**最新**轮次：装不下的旧
 // 轮次直接丢弃 —— 宁可少给上下文，也不能把提示词撑过 CLI 的 argv 上限（见
 // relayPromptContextLimit）。
 //
+// viewerRole / fallbackN 决定**看到哪一段**：先按 relayHistoryWindow 裁出
+// viewer 自己的窗口，再做预算取舍。顺序不能反 —— 窗口是「该不该看到」，预算是
+// 「装不装得下」；先按预算装完再裁窗口，会把别人轮次的话头算进额度里。
+//
 // 措辞是「把话头往下带」而不是「不要复述」：接龙本来就要求承接前文，明说
 // 「仅作背景、不要复述」会把 agent 推回「各自表态」的老路。
-func relayHistoryBlock(history []relayRound, budget int) string {
+func relayHistoryBlock(history []relayRound, budget int, viewerRole string, fallbackN int) string {
 	if len(history) == 0 || budget <= 0 {
+		return ""
+	}
+	history = relayHistoryWindow(history, viewerRole, fallbackN)
+	if len(history) == 0 {
 		return ""
 	}
 	blocks := make([]string, 0, len(history))

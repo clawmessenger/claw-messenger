@@ -21,6 +21,10 @@ type relayRecorder struct {
 	mu       sync.Mutex
 	privates []map[string]string
 	group    []map[string]string
+	// chatroom 单独记账：讨论组的 v3 事件广播走 /message/chatroom/publish.json
+	// （interactiveBroadcast → sendChatroomJSON → sendChatroomMessage）。不把它
+	// 和 group 混在一起，否则「聊天室广播了几次」就没法独立断言。
+	chatroom []map[string]string
 }
 
 func newRelayRecorder(t *testing.T) (*relayRecorder, *rongcloudAPIClient) {
@@ -40,6 +44,8 @@ func newRelayRecorder(t *testing.T) (*relayRecorder, *rongcloudAPIClient) {
 			rec.privates = append(rec.privates, entry)
 		case "/message/group/publish.json":
 			rec.group = append(rec.group, entry)
+		case "/message/chatroom/publish.json":
+			rec.chatroom = append(rec.chatroom, entry)
 		}
 		rec.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
@@ -54,6 +60,13 @@ func (r *relayRecorder) snapshot() (privates, group []map[string]string) {
 	defer r.mu.Unlock()
 	return append([]map[string]string(nil), r.privates...),
 		append([]map[string]string(nil), r.group...)
+}
+
+// chatroomSnapshot 只取聊天室广播（讨论组 v3 事件走 /message/chatroom/publish.json）。
+func (r *relayRecorder) chatroomSnapshot() []map[string]string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]map[string]string(nil), r.chatroom...)
 }
 
 // broadcastTexts 解出所有群/聊天室广播的正文（按发生顺序）。
@@ -410,10 +423,12 @@ func TestBuildPrompt_NoHistoryKeepsLegacyShape(t *testing.T) {
 
 func TestRelayHistoryBlock_TruncatesLongReply(t *testing.T) {
 	long := strings.Repeat("很", relayHistoryReplyClip+50)
+	// viewerRole="" + fallbackN=len(rounds 的 reply 数)：不裁窗口，用整段历史
+	// 验证「单条超长发言被截断」这条与窗口无关的行为。
 	block := relayHistoryBlock([]relayRound{{
 		userText: "问",
 		replies:  []relayReply{{roleName: "A", content: long}},
-	}}, relayPromptContextLimit)
+	}}, relayPromptContextLimit, "", 1)
 	if !strings.Contains(block, "（已截断）") {
 		t.Fatalf("long reply must be clipped: %q", block)
 	}
@@ -421,7 +436,7 @@ func TestRelayHistoryBlock_TruncatesLongReply(t *testing.T) {
 		t.Fatalf("history block over budget: %d runes", len([]rune(block)))
 	}
 	// 零/负预算不渲染任何东西 —— 提示词预算必须能被上层收紧。
-	if relayHistoryBlock([]relayRound{{userText: "问"}}, 0) != "" {
+	if relayHistoryBlock([]relayRound{{userText: "问"}}, 0, "", 1) != "" {
 		t.Fatal("zero budget must render nothing")
 	}
 }
@@ -435,7 +450,8 @@ func TestRelayHistoryBlock_BudgetDropsOldestRounds(t *testing.T) {
 			replies:  []relayReply{{roleName: "A", content: strings.Repeat("答", 180)}},
 		})
 	}
-	block := relayHistoryBlock(rounds, 420)
+	// fallbackN 给满 6 条 = 不裁窗口，把「预算丢最旧轮次」单独测出来。
+	block := relayHistoryBlock(rounds, 420, "", 6)
 	if len([]rune(block)) > 420+8 {
 		t.Fatalf("block must respect the budget: %d runes", len([]rune(block)))
 	}
