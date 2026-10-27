@@ -288,6 +288,24 @@ func (r *DiscussionRepository) AdvanceState(ctx context.Context, p AdvanceDiscus
 	return DiscussionRecord{}, ErrDiscussionVersionConflict
 }
 
+// UpdateRoleSnapshot 落一份新的角色板（中途加人/移人的轮边界同步）。
+//
+// 刻意**不用 CAS**：role_snapshot 不参与乐观锁（AdvanceState 的 version 只守
+// status 与轮次指针）。把它算进 CAS 会让同一次用户动作里的「先同步角色板、
+// 再推进轮次」互相打架 —— 客户端带来的 stateVersion 在同步之后就已经过期，
+// 用户点「继续」会莫名拿到 409。并发写者算的都是成员表的同一份投影，重复写
+// 是无害的。
+func (r *DiscussionRepository) UpdateRoleSnapshot(ctx context.Context, discussionID string, snapshot json.RawMessage) (DiscussionRecord, error) {
+	row, err := r.queries.UpdateRongCloudDiscussionRoleSnapshot(ctx, db.UpdateRongCloudDiscussionRoleSnapshotParams{
+		DiscussionID: discussionID,
+		RoleSnapshot: rawOrEmptyObject(snapshot),
+	})
+	if err != nil {
+		return DiscussionRecord{}, fmt.Errorf("rongcloud: update role snapshot for %s: %w", discussionID, err)
+	}
+	return discussionRecordFromRow(row), nil
+}
+
 func (r *DiscussionRepository) Delete(ctx context.Context, discussionID string) error {
 	if err := r.queries.DeleteRongCloudDiscussion(ctx, discussionID); err != nil {
 		return fmt.Errorf("rongcloud: delete discussion %s: %w", discussionID, err)

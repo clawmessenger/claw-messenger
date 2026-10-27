@@ -418,6 +418,15 @@ func (rt *discussionRuntime) interactiveBegin(ctx context.Context, discussionID 
 	} else if !errors.Is(err, ErrDiscussionEventNotFound) {
 		return err
 	}
+	// 开局前先对齐一次角色板：从创建到开局之间（planning / 引导式配置）用户可能
+	// 已经改过聊天室成员。同步失败不阻断开局 —— 用旧快照照样能跑，下个轮边界
+	// 还会再试。
+	if synced, changed, syncErr := rt.syncDiscussionRoles(ctx, d); syncErr != nil {
+		rt.logger.Warn("discussion: role snapshot sync failed at begin",
+			"discussionId", discussionID, "error", syncErr)
+	} else if changed {
+		d = synced
+	}
 	if _, _, ok := interactiveRoles(d); !ok {
 		return fmt.Errorf("rongcloud: interactive discussion %s has no host/participants", discussionID)
 	}
@@ -512,6 +521,19 @@ func (rt *discussionRuntime) interactiveNext(ctx context.Context, d DiscussionRe
 			continue
 		}
 		return rt.interactiveDispatch(ctx, d, role, 1)
+	}
+	// 本轮成员发言阶段到此结束（全员完成、或全被跳过）：这是一个**轮边界**，
+	// 把中途加入 / 移出的成员同步进角色板。新成员从下一轮开始被派发，本轮不插队
+	// （本轮谁还没说是按事件判的，半路插进来的人没听过本轮任何发言）。
+	synced, changed, syncErr := rt.syncDiscussionRoles(ctx, d)
+	if syncErr != nil {
+		rt.logger.Warn("discussion: role snapshot sync failed at round end",
+			"discussionId", d.DiscussionID, "round", d.CurrentRound, "error", syncErr)
+	} else if changed {
+		d = synced
+		if _, freshHost, ok := interactiveRoles(d); ok {
+			host = freshHost // 同步保留了主持条目，这里重取只是不去假设它
+		}
 	}
 	// 本轮全员完成 → 主持人汇总。但「全员完成」有两种含义：真说完了，和**全被跳光了**
 	// （成员节点超时/异常，两次尝试都失败）。后者绝不能请主持人写纪要 —— 它手里一条
@@ -649,6 +671,215 @@ func (rt *discussionRuntime) interactiveMemberEnabled(ctx context.Context, d Dis
 		}
 	}
 	return false
+}
+
+// ---- 角色板同步（中途加人 / 移人） -----------------------------------------
+
+// syncDiscussionRoles 在**轮边界**把角色板（role_snapshot）与聊天室成员表对齐，
+// 让中途加入 / 被移出的 AI 成员从下一轮开始生效。
+//
+// 为什么需要它：role_snapshot 只在创建 / 重开讨论时写一次，之后没有任何 UPDATE
+// 路径，而派发只认快照 —— 中途拉进聊天室的新成员永远拿不到 your_turn，用户看到的
+// 是「人加进来了，讨论里一次都没说过话」。
+//
+// 为什么只在轮边界做：派发是按 speaking_order 单线推进的顺序状态机。本轮中途插入
+// 一个成员，interactiveRoundDone 会认为它「本轮还没说」而立刻派发 —— 但它没听过
+// 本轮任何人的发言，只能凭空表态，插到队首还会打乱轮次推进的判定。轮边界同步让
+// 新成员的第一次发言天然落在「完整的一轮」里。
+//
+// 返回 (record, changed, err)：changed=true 表示角色板变了并且已经落库，调用方必须
+// 用返回的 record 继续推进。**Version 不变**（role_snapshot 不在乐观锁范围内，见
+// DiscussionRepository.UpdateRoleSnapshot）。
+func (rt *discussionRuntime) syncDiscussionRoles(ctx context.Context, d DiscussionRecord) (DiscussionRecord, bool, error) {
+	if !rt.interactiveReady() || d.ChatroomID == "" || d.DiscussionID == "" {
+		return d, false, nil
+	}
+	room, err := rt.queries.GetRongCloudChatroomViewByRongCloudID(ctx, d.ChatroomID)
+	if err != nil {
+		return d, false, err
+	}
+	rows, err := rt.queries.ListRongCloudChatroomMembersWithNode(ctx, room.ID)
+	if err != nil {
+		return d, false, err
+	}
+	snapshot, added, removed, ok := discussionRolesRebased(d, rows)
+	if !ok || (len(added) == 0 && len(removed) == 0) {
+		return d, false, nil
+	}
+	updated, err := rt.repo.UpdateRoleSnapshot(ctx, d.DiscussionID, snapshot)
+	if err != nil {
+		return d, false, err
+	}
+	round := updated.CurrentRound
+	if round < 1 {
+		round = 1 // planning 开局前同步：信封里的 round 不能是 0
+	}
+	// 事件类型必须落在 v3 白名单里：前端对讨论事件是严格 shape 校验，一条不合规
+	// 就让整段讨论历史响应无效（见 interactiveV3EventTypes / discussionEventView）。
+	// 所以不新增事件类型，借既有的 discussion_progress 承载「角色板变了」，
+	// 把新增 / 移出的角色名放进 payload。
+	event, _, emitErr := rt.interactiveEmit(ctx, updated, interactiveEvent{
+		EventType: "discussion_progress", ActorID: "system",
+		Payload: map[string]interface{}{
+			"round":   round,
+			"reason":  "role_snapshot_synced",
+			"added":   added,
+			"removed": removed,
+		},
+		Key: fmt.Sprintf("role-sync:%d:%s:%s", round,
+			strings.Join(added, ","), strings.Join(removed, ",")),
+		RequestID: uuid.NewString(), StateVer: updated.Version,
+		Round: round, Revision: updated.RoundRevision,
+	})
+	if emitErr != nil {
+		rt.logger.Warn("discussion: role snapshot synced but event emit failed",
+			"discussionId", d.DiscussionID, "error", emitErr)
+	} else {
+		rt.interactiveBroadcast(ctx, updated, event)
+	}
+	rt.logger.Info("discussion: role snapshot synced",
+		"discussionId", d.DiscussionID, "round", round, "added", added, "removed", removed)
+	return updated, true, nil
+}
+
+// discussionRolesRebased 以成员表为权威重建角色板：
+//
+//   - 已有成员：保留原 role_name / role_instructions / speaking_order（相对顺序不变，
+//     不拿成员表里的 speaking_order 覆盖 —— 讨论内的发言顺序是创建/推荐时定下的，
+//     之后别人在成员设置页改顺序不该把进行中的讨论打乱）；
+//   - 新增成员：追加到 speaking_order 末尾；
+//   - 已被移除 / 禁用的成员：从快照剔除，剩余成员的 speaking_order 压缩为 0..n-1。
+//
+// 返回新快照、新增与被移除成员的角色名（给事件用）以及 ok。ok=false 表示这次同步
+// **不该生效**：快照读不出来，或成员表里一个可用普通成员都没有。一次读空不该把
+// 整块角色板清掉 —— 那会让讨论直接失去推进依据（interactiveRoles 会判 ok=false，
+// 整场讨论停在原地）。
+func discussionRolesRebased(d DiscussionRecord, rows []db.ListRongCloudChatroomMembersWithNodeRow) (json.RawMessage, []string, []string, bool) {
+	var raw map[string]map[string]interface{}
+	if len(d.RoleSnapshot) == 0 || json.Unmarshal(d.RoleSnapshot, &raw) != nil || len(raw) == 0 {
+		return nil, nil, nil, false
+	}
+	next := map[string]interface{}{}
+	existing := map[string]map[string]interface{}{}
+	hostMemberID, hostNodeID := "", ""
+	for key, entry := range raw {
+		if entry == nil {
+			continue
+		}
+		if isHost, _ := entry["isHost"].(bool); isHost {
+			// 主持条目原样保留：主持人豁免上下文裁剪，也不参与 speaking_order。
+			next[key] = entry
+			hostMemberID = key
+			if value, ok := entry["memberId"].(string); ok && value != "" {
+				hostMemberID = value
+			}
+			if value, ok := entry["nodeId"].(string); ok {
+				hostNodeID = value
+			}
+			continue
+		}
+		if key == "" {
+			continue
+		}
+		existing[key] = entry
+	}
+	if hostMemberID == "" {
+		// 快照里没有主持条目：不动它。补一个主持人不是这里该做的事（主持配置在
+		// host_config_snapshot 与创建编排里），猜错会把讨论派给错误的节点。
+		return nil, nil, nil, false
+	}
+	if hostNodeID == "" {
+		// 退一步用主持快照里的 node_id（role_snapshot 缺 nodeId 的老数据）：只靠
+		// 融云账号排除主持也够用，node_id 这一路是补强。
+		var host map[string]interface{}
+		if json.Unmarshal(d.HostConfigSnapshot, &host) == nil {
+			hostNodeID, _ = host["node_id"].(string)
+		}
+	}
+
+	kept := make([]string, 0, len(existing))
+	fresh := make([]map[string]interface{}, 0, len(rows))
+	seen := map[string]bool{}
+	for _, row := range rows {
+		entry, ok := roundtableRoleEntryFromMember(row, 0)
+		if !ok {
+			continue
+		}
+		memberID := row.NodeRcUserID.String
+		if memberID == hostMemberID {
+			continue // 主持节点不是普通成员
+		}
+		if row.BusinessNodeID.Valid && hostNodeID != "" && row.BusinessNodeID.String == hostNodeID {
+			continue
+		}
+		if seen[memberID] {
+			continue
+		}
+		seen[memberID] = true
+		if _, isExisting := existing[memberID]; isExisting {
+			kept = append(kept, memberID)
+			continue
+		}
+		fresh = append(fresh, entry)
+	}
+	// 已有成员按快照里的原顺序排（rows 已经是成员表顺序，作为并列时的稳定兜底）。
+	sort.SliceStable(kept, func(i, j int) bool {
+		return roleSpeakingOrder(existing[kept[i]]) < roleSpeakingOrder(existing[kept[j]])
+	})
+
+	order := 0
+	for _, memberID := range kept {
+		entry := make(map[string]interface{}, len(existing[memberID])+1)
+		for key, value := range existing[memberID] {
+			entry[key] = value
+		}
+		// 有人被移除时顺序要压缩成 0..n-1，否则 interactiveRoles 的排序会在
+		// 中间留下空洞（排序本身没错，但下发到设备端的 speaking_order 会跳号）。
+		entry["speakingOrder"] = order
+		next[memberID] = entry
+		order++
+	}
+	added := make([]string, 0, len(fresh))
+	for _, entry := range fresh {
+		entry["speakingOrder"] = order
+		next[entry["memberId"].(string)] = entry
+		order++
+		added = append(added, roleEntryLabel(entry))
+	}
+	if order == 0 {
+		return nil, nil, nil, false
+	}
+	removed := make([]string, 0, len(existing)-len(kept))
+	for memberID, entry := range existing {
+		if !seen[memberID] {
+			removed = append(removed, roleEntryLabel(entry))
+		}
+	}
+	sort.Strings(removed) // map 迭代顺序随机会让事件 payload 抖动
+	snapshot, err := json.Marshal(next)
+	if err != nil {
+		return nil, nil, nil, false
+	}
+	return snapshot, added, removed, true
+}
+
+// roleSpeakingOrder 读角色板条目的 speaking_order（JSON 解出来是 float64）。
+func roleSpeakingOrder(entry map[string]interface{}) int {
+	if value, ok := entry["speakingOrder"].(float64); ok {
+		return int(value)
+	}
+	return 0
+}
+
+// roleEntryLabel 取角色板条目的展示名（事件 payload 用）：优先角色名，退化昵称，
+// 最后才是融云账号 —— 与 interactiveStatement.label 同一套优先级。
+func roleEntryLabel(entry map[string]interface{}) string {
+	for _, key := range []string{"roleName", "nickname", "memberId"} {
+		if value, ok := entry[key].(string); ok && strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 // interactiveBuildPrompt 拼出私发给设备的你的角色提示词：人设 + 本轮上下文
@@ -908,6 +1139,58 @@ func (h interactiveHistory) roundStatements(round int) []interactiveStatement {
 			out = append(out, statement)
 		}
 	}
+	return out
+}
+
+// lastContributionIndex 返回该成员最后一次发言在 contributions 里的下标，-1 表示没有。
+//
+// contributions 是事件顺序升序（同轮同人只留最后一次，见 interactivePromptInputs），
+// 所以反序扫到的第一处就是该成员的最新一条 —— 它正是上下文窗口的锚点。
+func (h interactiveHistory) lastContributionIndex(memberID string) int {
+	if memberID == "" {
+		return -1
+	}
+	for i := len(h.contributions) - 1; i >= 0; i-- {
+		if h.contributions[i].MemberID == memberID {
+			return i
+		}
+	}
+	return -1
+}
+
+// windowFor 返回「按该成员自身发言截断」后的 history 副本：
+//
+//   - 有锚点：contributions = contributions[idx:]（含自己那条）；
+//   - 无锚点（新入组 / 首次发言）：contributions = 尾部 fallbackCount 条，至少 1 条；
+//   - summaries / focus 原样保留 —— 纪要本来只取最近一条，不属于累计型上下文；
+//   - 结果至少 1 条，保证窗口不退化。
+//
+// 为什么按「自己最后一次发言」截断：上下文全量累计时，每位成员看到的都是同一份
+// 全文，模型会把别人前几轮的立场当成自己说过的话复述（表现为「越聊越像同一个人」
+// 与「第 N 轮还在回应第 1 轮」）。从自己上次开口处起算，既保住了「我说过什么」的
+// 连续性，也保住了这段区间里别人真正推进过的内容。
+//
+// 返回的 contributions 是**新切片**：直接对共享底层数组做 append 会写到别人的窗口里。
+func (h interactiveHistory) windowFor(memberID string, fallbackCount int) interactiveHistory {
+	out := h
+	total := len(h.contributions)
+	if total == 0 {
+		return out
+	}
+	start := h.lastContributionIndex(memberID)
+	if start < 0 {
+		if fallbackCount <= 0 {
+			fallbackCount = 1
+		}
+		start = total - fallbackCount
+	}
+	if start < 0 {
+		start = 0
+	}
+	if start >= total {
+		start = total - 1
+	}
+	out.contributions = append([]interactiveStatement(nil), h.contributions[start:]...)
 	return out
 }
 
@@ -1222,6 +1505,17 @@ func (rt *discussionRuntime) interactiveDispatch(ctx context.Context, d Discussi
 				"你手上没有可依据的发言。请只输出一段简短说明 —— 本轮无成员发言记录、"+
 				"无法复述立场与分歧，建议检查成员节点后重开讨论。不要索要材料，也不要编造成员观点。",
 				d.CurrentRound)
+		}
+	}
+	// 上下文窗口：普通成员只带「自己上次发言（含）→ 现在」，主持人**豁免**
+	// （他要写本轮纪要 + 上一版产物全文，靠的就是本轮全员发言的完整素材）。
+	//
+	// 裁剪必须放在 stalled 判定**之后**：停滞检测是引擎级判断（第 N 轮是否在重述
+	// 第 N-1 轮），要看全量；拿裁剪后的窗口去比，上一轮发言可能整段不在窗口里，
+	// 相似度恒为 0，停滞协议永远不触发。
+	if !role.IsHost {
+		if ordinary, _, ok := interactiveRoles(d); ok {
+			history = history.windowFor(role.MemberID, len(ordinary))
 		}
 	}
 	prompt := rt.interactiveBuildPrompt(d, role, extra, opinions, history)
@@ -1925,10 +2219,21 @@ func (rt *discussionRuntime) interactiveControl(ctx context.Context, cmd Command
 		}
 		rt.interactiveBroadcast(ctx, advanced, interjection)
 	}
-	if err := rt.interactiveNext(ctx, advanced); err != nil {
+	// 进入新轮前对齐角色板：新成员从刚开始的这一轮起被派发（轮边界，不插队）。
+	// 同步失败不阻断继续 —— 用旧快照照样能跑完这一轮，本轮结束时还会再同步一次。
+	dispatched := advanced
+	if synced, changed, syncErr := rt.syncDiscussionRoles(ctx, advanced); syncErr != nil {
+		rt.logger.Warn("discussion: role snapshot sync failed on continue",
+			"discussionId", advanced.DiscussionID, "round", nextRound, "error", syncErr)
+	} else if changed {
+		dispatched = synced
+	}
+	if err := rt.interactiveNext(ctx, dispatched); err != nil {
 		rt.logger.Warn("discussion: dispatch after continue failed", "error", err)
 	}
-	return okResult(discussionSnapshotView(advanced, rt.latestArtifactPtr(ctx, advanced.DiscussionID)))
+	// 回包用 dispatched：角色板刚同步过，前端要立刻看到新成员在板上（版本号没变，
+	// 所以这里不存在乐观锁语义上的冲突）。
+	return okResult(discussionSnapshotView(dispatched, rt.latestArtifactPtr(ctx, dispatched.DiscussionID)))
 }
 
 // interactiveInterject 记录一次用户插话（v3）：不重置轮次指针、不打断在跑的发言，

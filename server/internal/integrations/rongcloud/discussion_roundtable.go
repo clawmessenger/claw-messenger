@@ -497,6 +497,40 @@ func roundtableHostRoleEntry(host roundtableHostConfig) map[string]interface{} {
 	return entry
 }
 
+// roundtableRoleEntryFromMember 把聊天室成员表的一行拼成角色板里的**普通成员**条目；
+// ok=false 表示这一行不该进角色板（不是 AI 成员 / 已禁用 / 没有节点的融云账号）。
+//
+// 抽出这个函数的理由与 roundtableHostRoleEntry 相同：普通成员条目有两个写入点
+// （重开讨论、轮边界的中途加人同步），字段形状必须唯一 —— 漏写 capabilities 会让
+// 设备端拒掉这条 your_turn，漏写 speakingOrder 会让派发顺序退化成随机。
+//
+// **主持节点的排除留给调用方**：重开讨论时权威来源是管理端配置（按 node_id 排），
+// 中途加人时权威来源是已在快照里的 host 条目（按融云账号排），两者不能合并。
+func roundtableRoleEntryFromMember(row db.ListRongCloudChatroomMembersWithNodeRow, order int) (map[string]interface{}, bool) {
+	if row.MemberType != "ai" || !row.Enabled || !row.NodeRcUserID.Valid || row.NodeRcUserID.String == "" {
+		return nil, false
+	}
+	roleName := row.Nickname
+	if row.RoleName.Valid && row.RoleName.String != "" {
+		roleName = row.RoleName.String
+	}
+	instructions := ""
+	if row.RoleInstructions.Valid {
+		instructions = row.RoleInstructions.String
+	}
+	return map[string]interface{}{
+		"memberId":         row.NodeRcUserID.String,
+		"nodeId":           row.BusinessNodeID.String,
+		"nickname":         roleName,
+		"portraitUri":      "",
+		"roleName":         roleName,
+		"roleInstructions": instructions,
+		"capabilities":     roundtableRequiredRoleCaps,
+		"isHost":           false,
+		"speakingOrder":    order,
+	}, true
+}
+
 // roundtableHostSnapshotFields 是 host_config_snapshot 的内容。
 //
 // 除了 interactiveHostPrompt 读的 discussion_host_prompt，其余字段是留档：

@@ -518,17 +518,40 @@ func TestInteractiveHistoryBlock_FeedsHostThisRound(t *testing.T) {
 	}
 }
 
-// TestInteractiveHistoryBlock_ContinuesPreviousRound 第二轮成员必须同时看到上一轮
-// 纪要与上一轮发言 —— 只给纪要会把第 1 轮的具体观点丢掉，成员照样从头重开。
-func TestInteractiveHistoryBlock_ContinuesPreviousRound(t *testing.T) {
+// TestInteractiveHistoryBlock_ContinuesPreviousRound_Scoped 第二轮成员必须同时看到
+// 上一轮纪要与上一轮发言 —— 只给纪要会把上一轮的具体观点丢掉，成员照样从头重开。
+//
+// 新语义（按智能体自身发言截断）：窗口起点是该成员**自己最后一次发言**，更早的
+// 轮次不再进入提示词。所以这里断言的是「上一轮（= 自己上次开口那一轮）在、更早的
+// 一轮不在」，而不是旧语义的「所有轮次全在」。
+func TestInteractiveHistoryBlock_ContinuesPreviousRound_Scoped(t *testing.T) {
 	history := interactiveHistory{
-		contributions: []interactiveStatement{{Round: 1, MemberID: "m1", RoleName: "观看着", Content: "第一轮的观点"}},
-		summaries:     []interactiveStatement{{Round: 1, MemberID: "h", RoleName: "中立主持人", Content: "第一轮纪要：共识是 X"}},
+		contributions: []interactiveStatement{
+			{Round: 1, MemberID: "m1", RoleName: "观看着", Content: "第一轮的观点"},
+			{Round: 1, MemberID: "m2", RoleName: "提问者", Content: "第一轮的质疑"},
+			{Round: 2, MemberID: "m1", RoleName: "观看着", Content: "第二轮的观点"},
+			{Round: 2, MemberID: "m2", RoleName: "提问者", Content: "第二轮的质疑"},
+		},
+		summaries: []interactiveStatement{
+			{Round: 1, MemberID: "h", RoleName: "中立主持人", Content: "第一轮纪要：共识是 X"},
+			{Round: 2, MemberID: "h", RoleName: "中立主持人", Content: "第二轮纪要：共识是 Y"},
+		},
 	}
-	block := interactiveHistoryBlock(history, 2, false, interactivePromptContextLimit)
-	for _, want := range []string{"上一轮主持纪要", "第一轮纪要：共识是 X", "第 1 轮成员发言", "第一轮的观点"} {
+	// m1 在第 2 轮说过话 → 窗口从「第二轮的观点」起，第 1 轮被裁掉。
+	scoped := history.windowFor("m1", 2)
+	if len(scoped.contributions) != 2 || scoped.contributions[0].Content != "第二轮的观点" {
+		t.Fatalf("window must start at the member's own last turn: %+v", scoped.contributions)
+	}
+	block := interactiveHistoryBlock(scoped, 3, false, interactivePromptContextLimit)
+	for _, want := range []string{"上一轮主持纪要", "第二轮纪要：共识是 Y", "第 2 轮成员发言", "第二轮的观点"} {
 		if !strings.Contains(block, want) {
-			t.Errorf("round-2 member context missing %q: %q", want, block)
+			t.Errorf("round-3 member context missing %q: %q", want, block)
+		}
+	}
+	// 旧语义的残留：被裁掉的更早轮次不能再出现在上下文里。
+	for _, gone := range []string{"第 1 轮成员发言", "第一轮纪要：共识是 X", "第一轮的观点"} {
+		if strings.Contains(block, gone) {
+			t.Errorf("scoped context must not carry %q: %q", gone, block)
 		}
 	}
 }
@@ -578,9 +601,13 @@ func TestInteractiveHistoryBlock_HonoursBudget(t *testing.T) {
 	}
 }
 
-// TestInteractiveBuildPrompt_StaysWithinRuneBudget 超长发言不会把上下文顶过上限，
-// 也不能按字节切片切出乱码（旧实现 block[:limit] 就干过这件事）。
-func TestInteractiveBuildPrompt_StaysWithinRuneBudget(t *testing.T) {
+// TestInteractiveBuildPrompt_StaysWithinRuneBudget_Scoped 超长发言不会把上下文顶过
+// 上限，也不能按字节切片切出乱码（旧实现 block[:limit] 就干过这件事）。
+//
+// 新语义（按智能体自身发言截断）：提问者 m2 自己上次发言在第 2 轮，窗口里只有
+// 那一条 → 第 1 轮成员的发言段整段消失。旧断言「第 1 轮成员发言必须出现」正是
+// 全量累计时代的残留，这里反过来钉住它不该出现。
+func TestInteractiveBuildPrompt_StaysWithinRuneBudget_Scoped(t *testing.T) {
 	long := strings.Repeat("很长的发言内容", 2000)
 	history := interactiveHistory{
 		contributions: []interactiveStatement{
@@ -589,6 +616,7 @@ func TestInteractiveBuildPrompt_StaysWithinRuneBudget(t *testing.T) {
 		},
 		summaries: []interactiveStatement{{Round: 1, MemberID: "h", RoleName: "主持", Content: long}},
 	}
+	history = history.windowFor("m2", 2)
 	d := DiscussionRecord{Topic: strings.Repeat("话题", 50), Goal: "目标", CurrentRound: 2}
 	rt := &discussionRuntime{}
 	prompt := rt.interactiveBuildPrompt(d, interactiveRole{MemberID: "m2", RoleName: "提问者"},
@@ -603,10 +631,13 @@ func TestInteractiveBuildPrompt_StaysWithinRuneBudget(t *testing.T) {
 	if got := len([]rune(contextBlock)); got > interactivePromptContextLimit {
 		t.Fatalf("context block = %d runes, want <= %d", got, interactivePromptContextLimit)
 	}
-	for _, want := range []string{"讨论话题：", "上一轮主持纪要", "第 1 轮成员发言", "本轮已发言成员的观点"} {
+	for _, want := range []string{"讨论话题：", "上一轮主持纪要", "本轮已发言成员的观点"} {
 		if !strings.Contains(contextBlock, want) {
 			t.Errorf("context block missing %q", want)
 		}
+	}
+	if strings.Contains(contextBlock, "第 1 轮成员发言") {
+		t.Errorf("scoped context must not reach back to round 1: %q", contextBlock)
 	}
 }
 
