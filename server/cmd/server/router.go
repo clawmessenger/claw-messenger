@@ -1671,6 +1671,17 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	r.Post("/api/claw/nodes/{nodeId}", h.ClawUpdateNode)
 	r.Delete("/api/claw/nodes/{nodeId}", h.ClawDeleteNode)
 	r.Get("/api/claw/nodes", h.ClawListNodes)
+	// 通讯录分组（运维 / 我的 Agent / 用户自建），账号级偏好，跨设备同步。
+	// 「运维」是视图不存成员，「我的 Agent」是兜底分组 —— 语义见
+	// internal/handler/claw_contact_group.go 顶部。
+	//
+	// 静态段 /assignment 必须写在 /{id} 之前？chi 不需要（它按最长静态前缀
+	// 优先匹配），但保持这个顺序可读性更好。
+	r.Get("/api/claw/contact-groups", h.ClawListContactGroups)
+	r.Post("/api/claw/contact-groups", h.ClawCreateContactGroup)
+	r.Put("/api/claw/contact-groups/assignment", h.ClawAssignContactGroup)
+	r.Put("/api/claw/contact-groups/{id}", h.ClawUpdateContactGroup)
+	r.Delete("/api/claw/contact-groups/{id}", h.ClawDeleteContactGroup)
 
 	// ClawMessenger (虾说) compatibility API — 移植自旧 Python 后端的公开契约，
 	// 供 clawmessenger-web / clawmessenger-uniapp 前端直连。
