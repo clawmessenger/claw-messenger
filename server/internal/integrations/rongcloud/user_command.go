@@ -86,6 +86,9 @@ type UserStore struct {
 	// 的行 —— 那一次必须回 false，否则回包 isNewUser 会误报 true（DEF-4）。
 	CreateWeChatUser   func(ctx context.Context, params CreateWeChatUserParams) (WeChatUser, bool, error)
 	SaveRongCloudToken func(ctx context.Context, userID, token string) error
+	// SearchUsers 按关键字搜账号（service=user/action=search，见
+	// user_search_command.go）。limit 由调用方给定，生产值是 userSearchLimit。
+	SearchUsers func(ctx context.Context, keyword string, limit int) ([]UserSummary, error)
 }
 
 // wechatAPIError 表示微信侧返回的业务错误（errcode != 0），属于调用方问题。
@@ -116,6 +119,9 @@ func (h *systemHandler) handleUserCommand(ctx context.Context, msg NormalizedMes
 		// Web 扫码登录的移动端确认（web_login_command.go）。前端两处扫码入口
 		// （会话页、搜索页）用它把 pending 票据置成 confirmed。
 		return h.handleConfirmWebLogin(ctx, msg, cmd)
+	case "search":
+		// web「添加好友」的账号搜索（user_search_command.go）。
+		return h.handleUserSearch(ctx, msg, cmd)
 	default:
 		// user 服务的其余 action（login/getInfo/getProfiles/…）没有 IM 实现：
 		// 走 404 契约，客户端据此降级到 HTTP（/api/login、/api/user/info）。
@@ -293,6 +299,11 @@ func NewUserStore(dbtx db.DBTX) *UserStore {
 			`UPDATE claw_im_users SET rongcloud_token = $1, updated_at = now() WHERE user_id = $2`,
 			token, userID)
 		return err
+	}
+
+	// 搜索的 SQL 与过滤口径都在 user_search_command.go（一个 action 一个文件）。
+	store.SearchUsers = func(ctx context.Context, keyword string, limit int) ([]UserSummary, error) {
+		return searchClawIMUsers(ctx, dbtx, keyword, limit)
 	}
 
 	return store
