@@ -182,9 +182,39 @@ func TestMapNodeError(t *testing.T) {
 			t.Errorf("mapNodeError(%v) = %q, want timeout", value, got)
 		}
 	}
-	for _, value := range []interface{}{nil, "boom", 42} {
+	// 设备端 CLI 的真实超时原文（packages/xiachat-cli/src/agents.ts）：轮次跑满
+	// 设备上限就抛这句。只认精确串时它会落到 INVALID，前端于是把「主持设备没
+	// 产出」显示成「角色推荐失败，请重试」。
+	for _, value := range []interface{}{
+		"agent turn timeout after 300000ms",
+		"Agent turn timeout after 600000ms",
+		"request timed out",
+	} {
+		if got := mapNodeError(value); got != NodeRequestCodeRecommendTimeout {
+			t.Errorf("mapNodeError(%q) = %q, want timeout", value, got)
+		}
+	}
+	for _, value := range []interface{}{nil, "boom", 42, "agent turn failed"} {
 		if got := mapNodeError(value); got != NodeRequestCodeRecommendInvalid {
 			t.Errorf("mapNodeError(%v) = %q, want invalid", value, got)
+		}
+	}
+}
+
+// TestSetupRecommendFailureMessage 钉住「失败码 → 文案」的口径：不同内因不能
+// 收敛成同一句话，否则用户看到「角色推荐失败，请重试」时无法判断该等、该查
+// 主持设备，还是该换个议题重试。
+func TestSetupRecommendFailureMessage(t *testing.T) {
+	cases := map[string]string{
+		"ROLE_RECOMMENDATION_TIMEOUT": "主持设备在限定时间内没有返回推荐结果，请确认主持设备上的智能体与模型可用后重试",
+		"ROLE_RECOMMENDATION_INVALID": "主持设备返回的推荐结果无法解析，请重试",
+		"SYSTEM_HOST_OFFLINE":         "系统主持 AI 当前不可用，请确认主持设备上的 clawmessenger 正在运行",
+		"NO_ELIGIBLE_USER_DEVICES":    "没有可用于讨论的在线设备",
+		"WHATEVER_ELSE":               "角色推荐失败，请重试",
+	}
+	for code, want := range cases {
+		if got := setupRecommendFailureMessage(code); got != want {
+			t.Errorf("setupRecommendFailureMessage(%q) = %q, want %q", code, got, want)
 		}
 	}
 }

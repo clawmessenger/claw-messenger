@@ -682,6 +682,13 @@ func (b *NodeRequestBroker) AcceptResponse(senderID, content string) bool {
 		return true
 	}
 
+	// 设备回的原文必须留痕：对外只暴露两个码（TIMEOUT / INVALID），没有这条
+	// 日志时「设备卡住」「模型报错」「应答格式坏」在服务端看起来完全一样。
+	b.logger.Warn("role recommendation: node reported an error",
+		"request_id", result.RequestID,
+		"node", senderID,
+		"error", result.Payload["error"])
+
 	b.settle(result.RequestID, "", mapNodeError(result.Payload["error"]), nil)
 	return true
 }
@@ -882,10 +889,23 @@ func roleOrder(value interface{}) (int, bool) {
 
 // mapNodeError collapses everything a node can report into the two codes the
 // admin page understands, exactly like NodeRequestBroker._map_node_error.
+//
+// 除了三个历史精确串，还必须认设备端自己生成的两类超时原文：
+//   - `agent turn timeout after 300000ms`（packages/xiachat-cli/src/agents.ts，
+//     轮次跑到设备端上限就抛这句）；
+//   - 各家 agent 转上来的 `timed out` / `ETIMEDOUT`。
+//
+// 它们过去全部落到 INVALID，前端于是把「主持设备 300 秒没产出」显示成
+// 「角色推荐失败，请重试」—— 与真正的原因（设备端智能体卡住 / 模型不可用）
+// 差着一整个排查方向，用户只能反复点重试。
 func mapNodeError(value interface{}) string {
 	text, _ := value.(string)
-	switch strings.ToLower(strings.TrimSpace(text)) {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	switch lower {
 	case "timeout", "model_timeout", "role_recommendation_timeout":
+		return NodeRequestCodeRecommendTimeout
+	}
+	if strings.Contains(lower, "timeout") || strings.Contains(lower, "timed out") {
 		return NodeRequestCodeRecommendTimeout
 	}
 	return NodeRequestCodeRecommendInvalid

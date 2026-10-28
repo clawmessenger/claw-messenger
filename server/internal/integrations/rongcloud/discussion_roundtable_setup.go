@@ -353,13 +353,37 @@ func (rt *discussionRuntime) setupRecommendAttempt(ctx context.Context, discussi
 	return attempt
 }
 
+// setupRecommendFailureMessage 把失败码翻成一句人能读懂、能据以行动的话。
+//
+// 「主持设备在线」和「主持设备能产出推荐」是两回事：进程连着融云只说明
+// command 发得出去，agent 卡住 / 模型网关不通 / 应答不合协议都会在往返阶段
+// 失败，而它们对用户意味着完全不同的下一步（等、去查设备、点重试）。
+func setupRecommendFailureMessage(code string) string {
+	switch code {
+	case "ROLE_RECOMMENDATION_TIMEOUT":
+		return "主持设备在限定时间内没有返回推荐结果，请确认主持设备上的智能体与模型可用后重试"
+	case "ROLE_RECOMMENDATION_INVALID":
+		return "主持设备返回的推荐结果无法解析，请重试"
+	case "SYSTEM_HOST_OFFLINE", "SYSTEM_HOST_NOT_CONFIGURED", "SYSTEM_HOST_DISABLED":
+		return "系统主持 AI 当前不可用，请确认主持设备上的 clawmessenger 正在运行"
+	case "NO_ELIGIBLE_USER_DEVICES":
+		return "没有可用于讨论的在线设备"
+	}
+	return "角色推荐失败，请重试"
+}
+
 // recommendForSetupAsync 是 S1/S2 共用的后台推荐管线：host 校验 → 候选设备 →
 // broker 往返 → 角色绑定设备 → 落 recommendation（TTL 7 天）→ emit
 // setup_prompt(roles)。任何一步失败都落 setup_recommend_failed（前端据以展示
 // 重试入口），不再回写命令回调（它早已 200）。
 func (rt *discussionRuntime) recommendForSetupAsync(ctx context.Context, discussionID string, attempt int) {
 	logger := rt.logger
-	fail := func(code, message string) {
+	// code 是唯一权威，文案由它派生：主持设备「在线但跑不出推荐」有三种完全
+	// 不同的内因（设备端轮次超时 / 应答无法解析 / 通道未装配），过去全部落在
+	// 同一句「角色推荐失败，请重试」上，用户只能反复点重试。见
+	// setupRecommendFailureMessage。
+	fail := func(code string) {
+		message := setupRecommendFailureMessage(code)
 		d, err := rt.repo.Get(ctx, discussionID)
 		if err != nil || d.Status != DiscussionStatusConfiguring {
 			return
@@ -375,7 +399,7 @@ func (rt *discussionRuntime) recommendForSetupAsync(ctx context.Context, discuss
 			rt.interactiveBroadcast(ctx, d, rec)
 		}
 		logger.Warn("discussion: setup 角色推荐失败",
-			"discussionId", discussionID, "attempt", attempt, "code", code)
+			"discussionId", discussionID, "attempt", attempt, "code", code, "message", message)
 	}
 
 	d, err := rt.repo.Get(ctx, discussionID)
@@ -388,17 +412,17 @@ func (rt *discussionRuntime) recommendForSetupAsync(ctx context.Context, discuss
 	}
 	host, hostErr := rt.roundtable.resolveHost(ctx)
 	if hostErr != "" {
-		fail(hostErr, "系统主持 AI 当前不可用")
+		fail(hostErr)
 		return
 	}
 	candidates, candCode := rt.roundtable.roleCandidateNodesFor(ctx, d.CreatedBy, host, nil, false)
 	if candCode != "" {
-		fail(candCode, "没有可用于讨论的在线设备")
+		fail(candCode)
 		return
 	}
 	if rt.nodeRequests == nil {
 		logger.Warn("discussion: setup 推荐无法下发 —— node request broker 未装配")
-		fail("SYSTEM_HOST_OFFLINE", "系统主持 AI 当前离线")
+		fail("SYSTEM_HOST_OFFLINE")
 		return
 	}
 	timeout := host.timeoutSeconds
@@ -416,7 +440,7 @@ func (rt *discussionRuntime) recommendForSetupAsync(ctx context.Context, discuss
 		ConfigVersion:        configVersionInt(host.configVersion),
 	}, d.Topic, d.Goal, min(recommendRoleCountCap, len(candidates)), "")
 	if code != "" {
-		fail(code, "角色推荐失败，请重试")
+		fail(code)
 		return
 	}
 	// 推荐回来时讨论可能已推进/回收：落事件前再确认一次。
