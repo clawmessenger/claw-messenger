@@ -767,6 +767,11 @@ type BackfillFriendsOptions struct {
 	// 命中这些值的行。CLI 的 -user 走它，否则一次「只补某个用户」会顺手刷全部
 	// workspace 的 rongcloud_user —— 那既是越权写也是不可控的融云调用量。
 	OnlyRCUserIDs []string
+	// AgentPortraits 把「融云 id 能解析出 agent 类型」的行刷成该类型的品牌头像
+	// （`<base>/<kind>-256.png`，见 agent_portrait.go），用于存量 agent 一次性
+	// 换图。与统一默认图那套语义互斥：开着它时机器主节点 / ops / 真人镜像行
+	// 一律 skipped，不会被顺手重刷。用户自选的头像两种模式都不会覆盖。
+	AgentPortraits bool
 }
 
 // BackfillFriendOutcome records one owner->agent friend attempt.
@@ -976,14 +981,63 @@ func (s *NodeService) SyncUserPortraits(ctx context.Context, workspaceID pgtype.
 			}
 		}
 		current := strings.TrimSpace(u.PortraitUri.String)
+		target := DefaultUserPortrait()
+		// 品牌头像（`<kind>-256.png`）也是我们自己写进去的，不是用户自选 ——
+		// 统一默认图这一路把它一并纳入可覆盖集合，`-sync-portraits` 就成了
+		// 「批量换回灰人形」的现成回滚命令。用户自选的头像仍然永不覆盖。
+		overridable := NeedsDefaultPortrait(current) || IsAgentPortraitURI(current)
+		if opts.AgentPortraits {
+			// 品牌头像这一路只认「融云 id 能解析出 agent 类型」的行：机器主节点、
+			// ops 节点、真人镜像行保持统一默认图 —— 目标是给 agent 换图，不是重刷全表。
+			kind, isAgent := AgentKindFromRCUserID(u.RongcloudUserID)
+			brand, hasBrand := "", false
+			if isAgent {
+				brand, hasBrand = AgentPortraitURI(kind)
+			}
+			if !hasBrand {
+				outcomes = append(outcomes, PortraitSyncOutcome{
+					Scope:  "rongcloud_user",
+					RCUser: u.RongcloudUserID,
+					Name:   u.Name.String,
+					From:   current,
+					To:     "",
+					Status: "skipped",
+				})
+				continue
+			}
+			target = brand
+			// 幂等：已经是目标值就跳过，一轮重跑零融云调用。
+			if current == target {
+				outcomes = append(outcomes, PortraitSyncOutcome{
+					Scope:  "rongcloud_user",
+					RCUser: u.RongcloudUserID,
+					Name:   u.Name.String,
+					From:   current,
+					To:     target,
+					Status: "skipped",
+				})
+				continue
+			}
+			// 可覆盖 = 空 / 历史默认图 / **当前统一默认图** / 上一轮我们自己写进去的
+			// 品牌图（换过图、或 id 解析出的类型变了都要能重刷）。
+			//
+			// 注意 `NeedsDefaultPortrait` 对「已经是统一默认图」返回 false（那是给
+			// 幂等复跑用的），但在换品牌图这一路，统一默认图正是**最该被覆盖**的那种，
+			// 所以必须单独判一次 `current == DefaultUserPortrait()`——漏掉它整批都会 skip。
+			//
+			// 用户自选的头像不属于以上任何一类，永不覆盖。
+			overridable = NeedsDefaultPortrait(current) ||
+				current == DefaultUserPortrait() ||
+				IsAgentPortraitURI(current)
+		}
 		outcome := PortraitSyncOutcome{
 			Scope:  "rongcloud_user",
 			RCUser: u.RongcloudUserID,
 			Name:   u.Name.String,
 			From:   current,
-			To:     DefaultUserPortrait(),
+			To:     target,
 		}
-		if !NeedsDefaultPortrait(current) {
+		if !overridable {
 			outcome.Status = "skipped"
 			outcomes = append(outcomes, outcome)
 			continue
