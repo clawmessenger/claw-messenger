@@ -175,9 +175,10 @@ func (h *systemHandler) handleGroupCreate(ctx context.Context, msg NormalizedMes
 	}
 
 	memberIDs := getStringSlice(cmd.Params, "memberIds")
-	// 建群头像非必填（web 的 CreateGroupDialog 初始就是空串）。空值落统一默认图，
-	// 否则融云群资料头像为空，各端只能各显示各的兜底图。
-	portraitURI := DefaultPortraitIfEmpty(getString(cmd.Params, "portraitUri"))
+	// 建群头像非必填（web 的 CreateGroupDialog 初始就是空串）。空值落**群聊**默认图
+	// （两人剪影），不是真人那张灰人形 —— 移动端读的就是融云群资料的 portraitUri，
+	// 全平台都落同一张图的话，会话列表里一排群长得一模一样。
+	portraitURI := GroupPortraitIfEmpty(GroupPortraitKindGroup, getString(cmd.Params, "portraitUri"))
 	description := strings.TrimSpace(getString(cmd.Params, "description"))
 	maxRounds := groupMaxRounds(cmd.Params["openclawMaxRounds"])
 

@@ -157,8 +157,8 @@ func (s *roundtableCreationService) ensureChatroom(ctx context.Context, request 
 		Status:              "active",
 		Name:                canonical.ChatroomName,
 		// 融云聊天室 API 没有头像字段，讨论组头像纯本地数据；不写就会恒为空串，
-		// 各端只能各显各的兜底图。
-		PortraitUri: DefaultUserPortrait(),
+		// 各端只能各显各的兜底图。按类型落「圆桌三席」，与群聊 / 聊天室区分开。
+		PortraitUri: GroupPortraitURI(GroupPortraitKindDiscussion),
 	})
 	if err != nil {
 		// 重复到达（chatroom 行已存在）→ 幂等继续；融云侧房间无需重建。

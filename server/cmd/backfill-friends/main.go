@@ -9,9 +9,11 @@
 // portraits are never touched — the match is exact, never a LIKE pattern.
 // Coverage: rongcloud_user + claw_im_users (pushed to RongCloud, because
 // getToken never updates an existing user), rongcloud_group (pushed via
-// /group/refresh.json — group/create takes no portrait), and the local-only
-// portrait columns of rongcloud_chatroom / rongcloud_chatroom_member (the
-// RongCloud chatroom API has no portrait field at all).
+// /group/refresh.json — group/create takes no portrait; target is the 群聊
+// default image, not the human one), and the local-only portrait columns of
+// rongcloud_chatroom (target picked from conversation_kind: discussion /
+// chatroom) and rongcloud_chatroom_member (unified default; the RongCloud
+// chatroom API has no portrait field at all).
 //
 // The web client's 好友列表 (contact list) reads the RongCloud friend list, so a
 // device bound before BindAgents called /friend/add.json never showed up there.
@@ -66,7 +68,7 @@ func run() error {
 	includeOps := flag.Bool("include-ops", false, "also friend the internal ops node (hidden from the friend list by default)")
 	bidirectional := flag.Bool("both", false, "also write the reverse edge (agent -> owner)")
 	syncNames := flag.Bool("sync-names", false, "push every node's database nickname to RongCloud (/user/refresh.json) instead of, or in addition to, friending")
-	syncPortraits := flag.Bool("sync-portraits", false, "unify default portraits (empty or exact legacy default) to the platform default for claw_im_users and rongcloud_user; custom portraits are never overwritten")
+	syncPortraits := flag.Bool("sync-portraits", false, "unify default portraits for claw_im_users and rongcloud_user, and switch group / chatroom default images to the per-kind group art (群聊 / 讨论组 / 聊天室); custom portraits are never overwritten")
 	dsnFlag := flag.String("dsn", "", "postgres DSN (default: $DATABASE_URL, then $MULTICA_DATABASE_URL)")
 	envFile := flag.String("env-file", "", "load KEY=VALUE environment variables from this file before reading configuration")
 	flag.Parse()
@@ -200,21 +202,19 @@ func run() error {
 				return fmt.Errorf("sync group portraits: %w", err)
 			}
 			summary.merge(groupSummary)
-			// rongcloud_chatroom / rongcloud_chatroom_member：融云聊天室 API 没有头像
-			// 字段，只回写本地列。
-			for _, target := range []struct {
-				table   string
-				display string
-			}{
-				{"rongcloud_chatroom", "rongcloud_chatroom_id"},
-				{"rongcloud_chatroom_member", "member_id"},
-			} {
-				localSummary, err := syncLocalPortraitColumn(ctx, pool, target.table, target.display, opts.DryRun)
-				if err != nil {
-					return fmt.Errorf("sync %s portraits: %w", target.table, err)
-				}
-				summary.merge(localSummary)
+			// rongcloud_chatroom：按 conversation_kind 落讨论组 / 聊天室两种默认图
+			// （融云聊天室 API 没有头像字段，只回写本地列）。
+			chatroomSummary, err := syncChatroomPortraits(ctx, pool, opts.DryRun)
+			if err != nil {
+				return fmt.Errorf("sync chatroom portraits: %w", err)
 			}
+			summary.merge(chatroomSummary)
+			// rongcloud_chatroom_member：成员是人和 AI 节点，继续落统一默认图。
+			localSummary, err := syncLocalPortraitColumn(ctx, pool, "rongcloud_chatroom_member", "member_id", opts.DryRun)
+			if err != nil {
+				return fmt.Errorf("sync rongcloud_chatroom_member portraits: %w", err)
+			}
+			summary.merge(localSummary)
 		}
 		failed += summary.failed
 		fmt.Printf("portrait summary: planned=%d updated=%d skipped=%d failed=%d\n", summary.planned, summary.updated, summary.skipped, summary.failed)
@@ -431,10 +431,33 @@ func portraitFixCandidates() []interface{} {
 	return []interface{}{legacy, len(path), path}
 }
 
+// groupPortraitNeedsFixWhere 是群 / 聊天室两路的预筛：比 portraitNeedsFixWhere
+// 多认一档 —— 「统一默认图 default_user.png 与三张群类图」。换图之前所有群都落在
+// default_user.png 上，不做这档等值匹配，CLI 永远选不到最主要的存量。
+//
+// 依然只是预筛：逐行由 rongcloud.NeedsGroupPortraitFix 复核（要求「不等于目标」），
+// 所以用户自定义头像不会被写，已经是目标图的行也不会重复推融云。
+// 参数固定为 ($1 legacy URIs, $2 path 长度, $3 path, $4 可改写的默认图全集)。
+const groupPortraitNeedsFixWhere = `(portrait_uri IS NULL
+	OR btrim(portrait_uri) = ''
+	OR portrait_uri = ANY($1)
+	OR right(btrim(portrait_uri), $2::int) = $3
+	OR btrim(portrait_uri) = ANY($4))`
+
+// groupPortraitFixCandidates 返回群 / 聊天室预筛参数。
+func groupPortraitFixCandidates() []interface{} {
+	legacy := rongcloud.LegacyDefaultPortraitURIs()
+	path := rongcloud.LegacyDefaultPortraitPath
+	return []interface{}{legacy, len(path), path, rongcloud.GroupDefaultPortraitURIs()}
+}
+
 // syncGroupPortraits 补齐群头像（rongcloud_group）：融云 /group/create.json 不
 // 收 portraitUri，群头像只能事后用 /group/refresh.json 补写 —— 所以这一路必须
 // 真的调融云。顺序是「先推融云成功，再回写本地列」，失败只计数（best-effort），
 // 库内保留旧值以便下次重试。
+//
+// 目标是**群聊专用**默认图（两人剪影），不是真人那张统一默认图：移动端会话列表
+// 读的就是融云群资料的 portraitUri，全落在同一张灰人形上的话，一排群长得一样。
 //
 // 先把候选行全部读出来再逐条处理：refreshGroupInfo 是外网调用，不能占着连接池
 // 的游标不放。
@@ -443,8 +466,8 @@ func syncGroupPortraits(ctx context.Context, pool *pgxpool.Pool, svc *rongcloud.
 	rows, err := pool.Query(ctx, `
 		SELECT id::text, group_id, COALESCE(portrait_uri, '')
 		FROM rongcloud_group
-		WHERE `+portraitNeedsFixWhere+`
-		ORDER BY group_id`, portraitFixCandidates()...)
+		WHERE `+groupPortraitNeedsFixWhere+`
+		ORDER BY group_id`, groupPortraitFixCandidates()...)
 	if err != nil {
 		return summary, fmt.Errorf("list groups: %w", err)
 	}
@@ -460,7 +483,7 @@ func syncGroupPortraits(ctx context.Context, pool *pgxpool.Pool, svc *rongcloud.
 			rows.Close()
 			return summary, fmt.Errorf("scan group: %w", err)
 		}
-		if !rongcloud.NeedsDefaultPortrait(r.portrait) {
+		if !rongcloud.NeedsGroupPortraitFix(r.portrait, rongcloud.GroupPortraitURI(rongcloud.GroupPortraitKindGroup)) {
 			summary.skipped++
 			continue
 		}
@@ -471,7 +494,7 @@ func syncGroupPortraits(ctx context.Context, pool *pgxpool.Pool, svc *rongcloud.
 		return summary, err
 	}
 
-	target := rongcloud.DefaultUserPortrait()
+	target := rongcloud.GroupPortraitURI(rongcloud.GroupPortraitKindGroup)
 	for _, r := range pending {
 		if dryRun {
 			summary.planned++
@@ -496,10 +519,79 @@ func syncGroupPortraits(ctx context.Context, pool *pgxpool.Pool, svc *rongcloud.
 	return summary, nil
 }
 
-// syncLocalPortraitColumn 回写只存在于本地读模型的头像列（rongcloud_chatroom /
-// rongcloud_chatroom_member）：融云聊天室 API 没有头像字段，所以**不推融云**，
-// 只按同一套精确判定逐行改本地库。display 是日志里可读的业务键（成员表用
-// member_id，聊天室用 rongcloud_chatroom_id），table/display 只接受本文件内的常量。
+// syncChatroomPortraits 按房间类型回写聊天室头像（rongcloud_chatroom）：
+// conversation_kind = discussion → 圆桌三席，其余（chatroom / 空）→ 两个气泡。
+//
+// 只写本地库：融云聊天室 API 没有头像字段，这一列是各端读头像的唯一来源
+// （web 会话列表、小程序聊天室列表都读它）。
+//
+// onlyRoomIDs 非空时只处理这些房间（测试必须只碰自己种下的行，不能把共享库里的
+// 存量房间顺手刷一遍；线上调用不传，语义仍是全量）。
+func syncChatroomPortraits(ctx context.Context, pool *pgxpool.Pool, dryRun bool, onlyRoomIDs ...string) (portraitSummary, error) {
+	var summary portraitSummary
+	query := `
+		SELECT id::text, rongcloud_chatroom_id, COALESCE(conversation_kind, ''), COALESCE(portrait_uri, '')
+		FROM rongcloud_chatroom
+		WHERE ` + groupPortraitNeedsFixWhere
+	args := groupPortraitFixCandidates()
+	if len(onlyRoomIDs) > 0 {
+		query += ` AND rongcloud_chatroom_id = ANY($5::text[])`
+		args = append(args, onlyRoomIDs)
+	}
+	query += ` ORDER BY rongcloud_chatroom_id`
+	rows, err := pool.Query(ctx, query, args...)
+	if err != nil {
+		return summary, fmt.Errorf("list chatrooms: %w", err)
+	}
+	type chatroomRow struct {
+		id       string
+		rcID     string
+		kind     string
+		portrait string
+		target   string
+	}
+	var pending []chatroomRow
+	for rows.Next() {
+		var r chatroomRow
+		if err := rows.Scan(&r.id, &r.rcID, &r.kind, &r.portrait); err != nil {
+			rows.Close()
+			return summary, fmt.Errorf("scan chatroom: %w", err)
+		}
+		r.target = rongcloud.GroupPortraitURI(rongcloud.ChatroomPortraitKind(r.kind))
+		if !rongcloud.NeedsGroupPortraitFix(r.portrait, r.target) {
+			summary.skipped++
+			continue
+		}
+		pending = append(pending, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return summary, err
+	}
+
+	for _, r := range pending {
+		if dryRun {
+			summary.planned++
+			printPortrait("rongcloud_chatroom", "planned", r.rcID, r.portrait, r.target, "")
+			continue
+		}
+		if _, err := pool.Exec(ctx,
+			`UPDATE rongcloud_chatroom SET portrait_uri = $2, updated_at = now() WHERE id = $1::uuid`,
+			r.id, r.target); err != nil {
+			summary.failed++
+			printPortrait("rongcloud_chatroom", "failed", r.rcID, r.portrait, r.target, err.Error())
+			continue
+		}
+		summary.updated++
+		printPortrait("rongcloud_chatroom", "updated", r.rcID, r.portrait, r.target, "")
+	}
+	return summary, nil
+}
+
+// syncLocalPortraitColumn 回写只存在于本地读模型的头像列（rongcloud_chatroom_member）：
+// 融云聊天室 API 没有头像字段，所以**不推融云**，只按同一套精确判定逐行改本地库。
+// display 是日志里可读的业务键（成员表用 member_id），table/display 只接受本文件内
+// 的常量。
 func syncLocalPortraitColumn(ctx context.Context, pool *pgxpool.Pool, table, display string, dryRun bool) (portraitSummary, error) {
 	var summary portraitSummary
 	rows, err := pool.Query(ctx, fmt.Sprintf(`

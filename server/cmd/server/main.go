@@ -913,10 +913,12 @@ func main() {
 		}
 	}()
 
-	// 默认头像图源：全平台（真人 / AI 节点 / 群 / 讨论组 / 聊天室成员）共用一张图。
+	// 默认头像图源：真人 / AI 节点 / 群成员共用一张图。
 	// 取值与 env 覆盖情况在启动日志里显式打出来，避免「线上到底推的是哪张图」只能靠
 	// 翻代码推断。
 	rongcloud.LogDefaultPortraitSource(slog.Default())
+	// 群类会话（群聊 / 讨论组 / 聊天室）走另外三张图，同样打出实际图源。
+	rongcloud.LogGroupPortraitSource(slog.Default())
 
 	go func() {
 		slog.Info("server starting", "port", port)
