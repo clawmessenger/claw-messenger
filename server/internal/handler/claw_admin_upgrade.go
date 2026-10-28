@@ -222,6 +222,28 @@ func (h *Handler) ClawAdminRequestNodeUpgrade(w http.ResponseWriter, r *http.Req
 	if len(targets) == 0 {
 		// 别只说「都不需要升级」：原因可能是平台未知、平台不支持、已是最新，三件
 		// 事的处置完全不同，管理员得知道是哪一件。
+		//
+		// 同一件事也要进日志：页面上那句 400 转瞬即逝（关掉弹窗就没了），而「某个
+		// 版本的所有平台都缺校验和」这类问题得能事后回答「哪个版本、多少台、为什么」。
+		// 响应体这轮不加 skipped[]，前端契约不动 —— 只是把已有信息抄一份到日志。
+		//
+		// summary 是按原因聚合的（「该平台资产缺少校验和 1 台」），只有数量、不含
+		// 资产名。asset_missing 的 Detail 本来就写着版本与资产名，取第一条抄进同一
+		// 条日志，运维才答得出「缺的是哪个资产的校验和」；没有就留空串，不额外打日志。
+		firstAssetMissingDetail := ""
+		for _, skip := range skips {
+			if skip.Reason == "asset_missing" && skip.Detail != "" {
+				firstAssetMissingDetail = skip.Detail
+				break
+			}
+		}
+		slog.Warn("claw admin: 所选设备全部跳过，未下发任何升级",
+			"target_version", release.Version,
+			"requested", len(machineIDs),
+			"skipped", len(skips),
+			"summary", clawUpgradeSkipSummary(skips),
+			"asset_detail", firstAssetMissingDetail,
+			"stale_release", stale)
 		clawAdminFail(w, 400, "所选设备都不能升级："+clawUpgradeSkipSummary(skips))
 		return
 	}
@@ -411,11 +433,15 @@ func (h *Handler) clawAdminResolveUpgradeTargets(
 		// 摘要必须按这台机器要下载的那个资产去取（Windows 与 Linux 是不同文件）。
 		// 缺摘要就不下发：宁可当场说「这个版本的校验和还没齐」，也不能让设备装
 		// 一个无法校验的二进制 —— 校验失败那一步在设备侧是不可恢复的。
+		//
+		// 摘要有两个来源（SHA256SUMS 优先，Releases API 的 digest 兜底，见
+		// upgrade_release.go），所以文案不再点名 SHA256SUMS —— 两条都拿不到时
+		// 说「SUMS 里没有」会把运维指向一个错的地方。
 		asset := clawUpgradeAssetForPlatform(upgrade.ReportedPlatform)
 		if sum := sha256ByAsset[asset]; len(sum) != 64 {
 			skips = append(skips, clawUpgradeSkip{
 				MachineID: machineID, Reason: "asset_missing",
-				Detail: fmt.Sprintf("版本 %s 的 SHA256SUMS 里没有 %s", targetVersion, asset),
+				Detail: fmt.Sprintf("版本 %s 的 %s 拿不到校验和（SHA256SUMS 与 Release 资产 digest 都没有）", targetVersion, asset),
 			})
 			continue
 		}
