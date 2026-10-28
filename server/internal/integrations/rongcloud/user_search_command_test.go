@@ -15,8 +15,12 @@ package rongcloud
 //   A. 命令通道行为（脚手架：im_service_commands_test.go 的 newIMServiceServer /
 //      newIMServiceHandler / sendWebCommand / wantWebError）
 //   B. SQL 形状（假 pgx.Rows 范式照 friend_device_owner_claim_test.go 的 claimRows）
-//   C. 纯函数 clawIMLikePattern
+//   C. 收口的反面：昵称/邮箱/手机号不得再参与命中、关键字不得被包成 %kw%
 //   D. 边界（按实现事实写预期：nickname 可为空串、不排除发送者自己）
+//
+// 2026-10-28 口径变更：加好友只允许按虾说号精确查找，`username ILIKE $1 OR
+// user_id = $1`，$1 是**原样关键字**。此前是五列 `%kw%` 模糊匹配，所以这里
+// 原本有一批「email/phone 是命中列」的断言 —— 那些现在全部反过来，见 C 组。
 //
 // 刻意不用既有 userFixture.store()：它的 SearchUsers 是 nil，本题要精确控制
 // store 的返回/错误，所以直接手搓 &UserStore{SearchUsers: ...}，
@@ -102,10 +106,9 @@ func userSearchList(t *testing.T, reply map[string]interface{}) []interface{} {
 // 是 camelCase。字段名不是小事 —— web 的 UserInfo 读 `portraitUri`，
 // 少一个字母就一直显示默认头像；`user_id` 这种 snake_case 漏出则读不到。
 //
-// 同时钉住**回包只有 4 个字段**（M2 的隐私收窄）：`email`/`phone` 仍参与 WHERE
-// 命中（按手机号/邮箱能搜到人，保留旧实现的产品能力），但**不回给搜索者** ——
-// 把别人的手机号回给任意搜索者本身就是个泄漏面。所以这里对 email/phone 是
-// 「必须不存在」的断言，而不是「值对不对」。
+// 同时钉住**回包只有 4 个字段**：`email`/`phone` 既不参与命中也不回传
+// （2026-10-28 收口）。旧实现把别人的手机号/邮箱回给任意搜索者本身就是个泄漏面，
+// 所以这里对 email/phone 是「必须不存在」的断言，而不是「值对不对」。
 func TestUserSearchReturnsCamelCaseSummaries(t *testing.T) {
 	stub := &userSearchStub{result: []UserSummary{
 		{
@@ -152,13 +155,13 @@ func TestUserSearchReturnsCamelCaseSummaries(t *testing.T) {
 				snake, first)
 		}
 	}
-	// 隐私收窄（M2）：命中列比回包宽，email/phone 只参与 WHERE、绝不回传。
+	// 隐私收窄：email/phone 既不参与命中、也绝不回传（2026-10-28 收口）。
 	// 这条不是「锦上添花」——把手机号回给任意搜索者是一个泄漏面，且两端 UI
 	// 都不消费这两个字段，没有任何理由留在回包里。
 	for _, forbidden := range []string{"email", "phone"} {
 		if _, exists := first[forbidden]; exists {
-			t.Errorf("list[0] exposes %q to the caller: %#v — email/phone are hit-only columns "+
-				"and must not be returned (M2)", forbidden, first)
+			t.Errorf("list[0] exposes %q to the caller: %#v — email/phone must not be "+
+				"returned at all", forbidden, first)
 		}
 	}
 	if len(first) != 4 {
@@ -230,7 +233,7 @@ func TestUserSearchRejectsAnEmptyKeyword(t *testing.T) {
 			wantWebError(t, rec.last(t), 400, "keyword")
 			if calls := stub.callCount(); calls != 0 {
 				t.Errorf("SearchUsers called %d times for a blank keyword, want 0 — "+
-					"clawIMLikePattern(\"\") is \"%%\", i.e. the whole table", calls)
+					"a blank keyword must never reach the store", calls)
 			}
 		})
 	}
@@ -301,12 +304,12 @@ func TestUserSearchHidesStoreErrorsFromTheClient(t *testing.T) {
 }
 
 // 关键字透传：handler 必须先 TrimSpace 再交给 store，limit 必须是 userSearchLimit。
-// 传空白进 SQL 等于没有任何过滤条件（`%   %`）；limit 漂了就是一次把全表下发。
+// 传空白进 SQL 等于没有任何过滤条件；limit 漂了就是一次把全表下发。
 func TestUserSearchTrimsTheKeywordAndAppliesTheLimit(t *testing.T) {
 	t.Run("keyword is trimmed and the limit is the service cap", func(t *testing.T) {
 		if userSearchLimit != 20 {
-			t.Fatalf("userSearchLimit = %d, want 20 — the web UI and the旧实现's无上限 are both pinned to 20",
-				userSearchLimit)
+			t.Fatalf("userSearchLimit = %d, want 20 — the old implementation's unbounded "+
+				"result set is pinned to 20", userSearchLimit)
 		}
 		stub := &userSearchStub{}
 		rec, handler := newUserSearchHandler(t, stub)
@@ -492,9 +495,9 @@ func userSearchILikeColumn(column string) *regexp.Regexp {
 // 「Scan 按顺序吃夹具的 4 个值」，证明不了「SQL 的列序与 Scan 的列序一致」，
 // 所以这一条只能从 SQL 文本上守。
 //
-// 注意 WHERE 与 SELECT 的列集合**故意不同**（M2 隐私收窄）：WHERE 里 ILIKE 的是
-// 5 列（含 email / phone），SELECT 只取 4 列。所以「SELECT 里又出现 email/phone」
-// 本身就是这条检查要防的东西 —— 下面的整段列清单正则锚在 FROM 上，多一列即红。
+// 注意 WHERE 与 SELECT 的列集合**故意不同**（2026-10-28 收口）：SELECT 只取 4 列，
+// WHERE 只命中 username / user_id 两列。所以「SELECT 里又出现 email/phone」本身
+// 就是这条检查要防的东西 —— 下面的整段列清单正则锚在 FROM 上，多一列即红。
 //
 // 抽成一处单独的切片（而不是散在断言里）：将来回包字段再变时（例如再去掉
 // nickname），只改这里一处 —— SELECT 列表与 Scan 目标必须同时改，这条契约就
@@ -537,14 +540,14 @@ type userSearchSQLCheck struct {
 //   - 逗号/括号周围的空白可选：`LEFT(username,3)` 与 `LEFT(username, 3)` 等价；
 //   - `<>` 与 `!=` 等价（左侧两条 om_ 排除用角色类 `(?:<>|!=)` 表达）。
 //
-// 反过来，只要**语义**变了（少一个过滤条件、列名拼错、改用 `= $1`、`ORDER BY`
+// 反过来，只要**语义**变了（少一个过滤条件、列名拼错、把等值改回模糊、`ORDER BY`
 // 翻方向、LIMIT 写成字面量、表名改了）就一定会红 —— 这条由
 // TestUserSearchQueryChecksRejectBrokenSQL 逐个变体反证。
 func userSearchSQLChecks() []userSearchSQLCheck {
 	return []userSearchSQLCheck{
 		// 第一条就盯 SELECT 列表的顺序与列集合：这是「值被静默串到别的字段」的
 		// 唯一防线（位置参数 + Scan 都按列序走，列序错了 Go 侧不会报错），同时
-		// 也是「email/phone 不得回传」（M2 隐私收窄）的防线 —— 正则锚在 FROM 上，
+		// 也是「email/phone 不得回传」（隐私收窄）的防线 —— 正则锚在 FROM 上，
 		// 往 SELECT 里加回 email/phone 会立刻红。
 		{"the SELECT list in column order (userId, username, nickname, portraitUri)",
 			userSearchSelectListPattern()},
@@ -555,15 +558,16 @@ func userSearchSQLChecks() []userSearchSQLCheck {
 			regexp.MustCompile(`(?i)LEFT\(\s*username\s*,\s*3\s*\)\s*(?:<>|!=)\s*'om_'`)},
 		{"the om_ user_id exclusion `LEFT(user_id, 3) <> 'om_'",
 			regexp.MustCompile(`(?i)LEFT\(\s*user_id\s*,\s*3\s*\)\s*(?:<>|!=)\s*'om_'`)},
-		{"a `username ILIKE $1` hit column", userSearchILikeColumn("username")},
-		{"a `nickname ILIKE $1` hit column", userSearchILikeColumn("nickname")},
-		{"an `email ILIKE $1` hit column", userSearchILikeColumn("email")},
-		{"a `phone ILIKE $1` hit column", userSearchILikeColumn("phone")},
-		{"a `user_id ILIKE $1` hit column (the web shows userId as the account)",
-			userSearchILikeColumn("user_id")},
+		{"a `username ILIKE $1` exact hit column (虾说号)", userSearchILikeColumn("username")},
+		{"the exact `user_id = $1` hit column (legacy accounts without a username)",
+			regexp.MustCompile(`(?i)\buser_id\s*=\s*\$1\b`)},
 		{"the ordering `ORDER BY created_at DESC`",
 			regexp.MustCompile(`(?i)ORDER\s+BY\s+created_at\s+DESC`)},
 		{"the row cap `LIMIT $2`", regexp.MustCompile(`(?i)LIMIT\s+\$2`)},
+		// 精确匹配的「形状指纹」：这条 SQL 里一个 `%` 都不该有。把 `%kw%` 包回来
+		// （写成 `'%' || $1 || '%'` 或字面量 `%alice%`）都会立刻踩中这条。
+		{"no `%` wildcard anywhere (exact match, not LIKE-prefix)",
+			regexp.MustCompile(`^[^%]*$`)},
 	}
 }
 
@@ -603,6 +607,93 @@ func TestUserSearchQueryShape(t *testing.T) {
 	if strings.Contains(raw, "alice") {
 		t.Errorf("the keyword must be bound as a parameter, never interpolated into the SQL: %s", raw)
 	}
+
+	// 精确匹配下这条 SQL 里不该出现任何 `%`（`userSearchSQLChecks` 最后那条
+	// 「no `%` wildcard」负责断言）—— 所以这里不再重复写一份。
+}
+
+// userSearchForbiddenHits 返回 WHERE 子句里仍然出现的「不该参与命中」的列。
+//
+// SELECT 列表里的 nickname 是**回包字段**（合法），所以判定只从 WHERE 起算 ——
+// 这也是它不能写成「整条 SQL 不含 nickname」的原因。
+func userSearchForbiddenHits(sql string) []string {
+	whereClause := sql
+	if idx := strings.Index(strings.ToUpper(sql), "WHERE"); idx >= 0 {
+		whereClause = sql[idx:]
+	}
+	var hits []string
+	for _, column := range []string{"nickname", "email", "phone"} {
+		if strings.Contains(strings.ToLower(whereClause), column) {
+			hits = append(hits, column)
+		}
+	}
+	return hits
+}
+
+// 收口的反面断言：昵称 / 邮箱 / 手机号不得再参与命中。
+//
+// 为什么单独列在这、不进 userSearchSQLChecks：那张表断言的是「必须出现什么」，
+// 而这里断言的是「必须不出现什么」，混在一张表里会让 reject 反证那套机制变形
+// （一条「必须不出现」的检查没有可逐段改坏的对应片段，反证会退化成空断言）。
+// 所以这里自己带一组反证：把禁用的列塞回 WHERE，helper 必须点出来。
+func TestUserSearchStopsHittingNicknameEmailAndPhone(t *testing.T) {
+	sql, _ := userSearchCapturedSQL(t)
+
+	if hits := userSearchForbiddenHits(sql); len(hits) != 0 {
+		t.Errorf("the WHERE clause still mentions %v — 加好友只允许按虾说号精确查找，"+
+			"昵称/邮箱/手机号必须彻底退出命中条件\n--- normalized SQL ---\n%s", hits, sql)
+	}
+
+	// 反证：三种「加回来」的写法都必须被点出来，否则上面那条是空断言。
+	mutations := []struct {
+		name   string
+		mutate func(string) string
+		want   []string
+	}{
+		{
+			name: "nickname is hit again",
+			mutate: func(s string) string {
+				return strings.Replace(s, "user_id = $1", "user_id = $1 OR COALESCE(nickname, '') ILIKE $1", 1)
+			},
+			want: []string{"nickname"},
+		},
+		{
+			name: "email is hit again",
+			mutate: func(s string) string {
+				return strings.Replace(s, "user_id = $1", "user_id = $1 OR COALESCE(email, '') ILIKE $1", 1)
+			},
+			want: []string{"email"},
+		},
+		{
+			name: "phone is hit again",
+			mutate: func(s string) string {
+				return strings.Replace(s, "user_id = $1", "user_id = $1 OR COALESCE(phone, '') ILIKE $1", 1)
+			},
+			want: []string{"phone"},
+		},
+		{
+			name: "all three are added back at once",
+			mutate: func(s string) string {
+				return strings.Replace(s, "user_id = $1",
+					"user_id = $1 OR COALESCE(nickname, '') ILIKE $1 OR COALESCE(email, '') ILIKE $1"+
+						" OR COALESCE(phone, '') ILIKE $1", 1)
+			},
+			want: []string{"nickname", "email", "phone"},
+		},
+	}
+	for _, tc := range mutations {
+		t.Run(tc.name, func(t *testing.T) {
+			mutated := tc.mutate(sql)
+			if mutated == sql {
+				t.Fatalf("the mutation did not change the SQL, so this reverse test proves nothing")
+			}
+			got := userSearchForbiddenHits(mutated)
+			if strings.Join(got, ",") != strings.Join(tc.want, ",") {
+				t.Errorf("forbidden hits = %v, want %v — the guard must name every column "+
+					"that is hit again\n--- mutated SQL ---\n%s", got, tc.want, mutated)
+			}
+		})
+	}
 }
 
 // 反证：把真实 SQL 逐段改坏，对应的检查必须变红。
@@ -640,7 +731,7 @@ func TestUserSearchQueryChecksRejectBrokenSQL(t *testing.T) {
 			name: "email is added back to the SELECT list",
 			what: "the SELECT list in column order (userId, username, nickname, portraitUri)",
 			mutate: func(s string) string {
-				// M2 的隐私收窄：email/phone 只许参与 WHERE，回传就要拦。
+				// 隐私收窄：email/phone 连 WHERE 都不许进，回传更要拦。
 				return strings.Replace(s,
 					"COALESCE(portrait_uri, '')", "COALESCE(portrait_uri, ''), COALESCE(email, '')", 1)
 			},
@@ -682,38 +773,26 @@ func TestUserSearchQueryChecksRejectBrokenSQL(t *testing.T) {
 			},
 		},
 		{
-			name: "username stops being a hit column",
-			what: "a `username ILIKE $1` hit column",
+			name: "username stops being a case-insensitive hit column",
+			what: "a `username ILIKE $1` exact hit column (虾说号)",
 			mutate: func(s string) string {
+				// 换回大小写敏感的 `= $1`：虾说号输入大小写不一致就搜不到自己。
 				return strings.Replace(s, "username ILIKE $1", "username = $1", 1)
 			},
 		},
 		{
-			name: "nickname stops being a hit column",
-			what: "a `nickname ILIKE $1` hit column",
+			name: "the legacy user_id exact match is dropped",
+			what: "the exact `user_id = $1` hit column (legacy accounts without a username)",
 			mutate: func(s string) string {
-				return strings.Replace(s, "COALESCE(nickname, '') ILIKE $1", "COALESCE(nickname, '') = $1", 1)
+				return strings.Replace(s, "user_id = $1", "user_id ILIKE $1", 1)
 			},
 		},
 		{
-			name: "email stops being a hit column",
-			what: "an `email ILIKE $1` hit column",
+			// 收口回退的典型写法：又把关键字包成 `%kw%`（前缀/模糊匹配回来了）。
+			name: "the keyword gets wrapped in % wildcards again",
+			what: "no `%` wildcard anywhere (exact match, not LIKE-prefix)",
 			mutate: func(s string) string {
-				return strings.Replace(s, "COALESCE(email, '') ILIKE $1", "COALESCE(email, '') = $1", 1)
-			},
-		},
-		{
-			name: "phone stops being a hit column",
-			what: "a `phone ILIKE $1` hit column",
-			mutate: func(s string) string {
-				return strings.Replace(s, "COALESCE(phone, '') ILIKE $1", "COALESCE(phone, '') = $1", 1)
-			},
-		},
-		{
-			name: "user_id stops being a hit column",
-			what: "a `user_id ILIKE $1` hit column (the web shows userId as the account)",
-			mutate: func(s string) string {
-				return strings.Replace(s, "user_id ILIKE $1", "user_id = $1", 1)
+				return strings.Replace(s, "username ILIKE $1", "username ILIKE '%' || $1 || '%'", 1)
 			},
 		},
 		{
@@ -828,18 +907,24 @@ func TestUserSearchQueryChecksSurviveFormattingReflow(t *testing.T) {
 	}
 }
 
-// 绑定参数：$1 是转义后的 %kw%，$2 是 20。
-func TestUserSearchBindsTheEscapedPatternAndTheLimit(t *testing.T) {
+// 绑定参数：$1 是**原样关键字**（不包 `%`、也不转义），$2 是 20。
+//
+// 这条是收口的参数侧半边（SQL 文本侧由 `no % wildcard` 那条形状检查守）：
+// 只要有人把关键字包成 `%kw%` 或给它加上 LIKE 转义，这里立刻红。特意挑一个
+// 带 `%`、`_`、`\` 的关键字 —— 精确匹配下它们就是普通字符，一个都不该被改写。
+func TestUserSearchBindsTheKeywordVerbatim(t *testing.T) {
+	const keyword = `a%b_c\d`
 	d := &userSearchDB{rows: &userSearchRows{}}
 
-	if _, err := searchClawIMUsers(context.Background(), d, `a%b_c\d`, userSearchLimit); err != nil {
+	if _, err := searchClawIMUsers(context.Background(), d, keyword, userSearchLimit); err != nil {
 		t.Fatalf("searchClawIMUsers: %v", err)
 	}
 	if len(d.args) != 2 {
-		t.Fatalf("bound args = %#v, want exactly 2 ($1 pattern, $2 limit) — $1/$2 must not drift", d.args)
+		t.Fatalf("bound args = %#v, want exactly 2 ($1 keyword, $2 limit) — $1/$2 must not drift", d.args)
 	}
-	if got, want := fmt.Sprint(d.args[0]), `%a\%b\_c\\d%`; got != want {
-		t.Errorf("$1 = %q, want %q (LIKE metacharacters must be escaped, backslash first)", got, want)
+	if got := fmt.Sprint(d.args[0]); got != keyword {
+		t.Errorf("$1 = %q, want the verbatim keyword %q — wrapping it in %% (or escaping it) "+
+			"turns the exact match back into a LIKE pattern", got, keyword)
 	}
 	if got := d.args[1]; got != userSearchLimit {
 		t.Errorf("$2 = %#v, want %d", got, userSearchLimit)
@@ -866,10 +951,10 @@ func TestUserSearchDefaultsANonPositiveLimit(t *testing.T) {
 	}
 }
 
-// 空关键字守卫（R1 补丁，`searchClawIMUsers:106-117`）：`clawIMLikePattern("")` 是
-// `%%`，在 SQL 语义上等于「匹配全表」。handler 的 400 是对外契约（A3 已覆盖），
-// 但那是长在调用方身上的防线；这一层守卫的职责是「就算有人绕过 handler 直接调
-// SearchUsers，也不能把前 N 条账号当搜索结果吐出去」。
+// 空关键字守卫（R1 补丁，`searchClawIMUsers` 开头）：精确匹配下空串虽然只可能
+// 命中 user_id 为空的脏数据，但守卫不寄希望于上游。handler 的 400 是对外契约
+// （A3 已覆盖），可那是长在调用方身上的防线；这一层守卫的职责是「就算有人绕过
+// handler 直接调 SearchUsers，也不能把前 N 条账号当搜索结果吐出去」。
 //
 // 因此这里断言的不是「返回空」，而是**一次 Query 都没发**：
 // 用 userSearchDB（会数 query 次数）证明这一点，再用 stubDBTX（Query 故意报错）
@@ -891,8 +976,8 @@ func TestUserSearchBlankKeywordNeverTouchesTheDatabase(t *testing.T) {
 				t.Fatalf("searchClawIMUsers(%q) = %v, want nil — a blank keyword is not an error", tc.keyword, err)
 			}
 			if d.queries != 0 {
-				t.Fatalf("Query calls = %d for keyword %q, want 0 — a blank keyword must not reach the database "+
-					"(clawIMLikePattern(\"\") is \"%%\", i.e. the whole table)", d.queries, tc.keyword)
+				t.Fatalf("Query calls = %d for keyword %q, want 0 — the guard must return "+
+					"before Query", d.queries, tc.keyword)
 			}
 			if users == nil {
 				t.Fatal("users = nil, want an empty non-nil slice — null and [] serialize differently downstream")
@@ -1058,35 +1143,6 @@ func TestUserSearchPropagatesQueryScanAndIterateErrors(t *testing.T) {
 			t.Errorf("users = %#v, want nil on failure (a truncated result must not look complete)", users)
 		}
 	})
-}
-
-// --- C. 纯函数 ---------------------------------------------------------------
-
-// clawIMLikePattern：`%kw%` 包裹 + LIKE 元字符转义。
-// 转义顺序不能换（先反斜杠，再 % 和 _），"mixed wildcards" 那条专门钉顺序。
-func TestUserSearchLikePatternEscapesWildcards(t *testing.T) {
-	cases := []struct {
-		name    string
-		keyword string
-		want    string
-	}{
-		{"a plain keyword is only wrapped", "alice", "%alice%"},
-		{"percent is escaped", "a%b", `%a\%b%`},
-		{"underscore is escaped", "a_b", `%a\_b%`},
-		{"backslash is escaped first", `a\b`, `%a\\b%`},
-		{"a lone percent cannot match the whole table", "%", `%\%%`},
-		{"mixed wildcards keep the escape order", `%_\`, `%\%\_\\%`},
-		{"an empty keyword yields the match-everything pattern (the handler must block it)", "", "%%"},
-		{"chinese passes through", "张三", "%张三%"},
-		{"a single quote is bound, not escaped", "o'brien", "%o'brien%"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := clawIMLikePattern(tc.keyword); got != tc.want {
-				t.Errorf("clawIMLikePattern(%q) = %q, want %q", tc.keyword, got, tc.want)
-			}
-		})
-	}
 }
 
 // --- D. 边界（按实现事实写预期） ---------------------------------------------

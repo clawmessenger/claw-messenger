@@ -16,23 +16,42 @@ package rongcloud
 // .agent-runs/2026-10-27/task-001/implementer-report.md 的 D1/D2/D3/D4 与 §8）：
 //
 //  1. 加 `LIMIT 20`：旧实现无上限，一次搜索可能把整张表通过一条 IM 私聊下发；
-//  2. 命中字段多一列 `user_id`：web 界面上「账号」显示的是 userId
-//     （AddFriendDialog.tsx:646），而注册允许自定义 username（claw_compat.go:330-359），
-//     只搜旧实现那四列会出现「用户看着自己的数字 id 却搜不到自己」；
+//  2. 命中字段多一列 `user_id`：老账号可能没有 username（注册允许自定义
+//     username，见 claw_compat.go:330-359），只搜旧实现那四列会出现「用户看着
+//     自己的数字 id 却搜不到自己」；
 //  3. 不做头像回填融云：旧实现逐行调 /user/info.json 并写库
 //     （command_handler.py:1968-1980），是 N+1 次外部调用，会把命令通道拖到客户端
 //     15s 超时附近。代价是老账号搜索结果可能没有头像（前端有默认头像兜底）；
 //  4. 回包不含 `email` / `phone`：旧实现把这两列一起回传
-//     （command_handler.py:1981-1990）。**命中列比回包宽** —— 这两列只用于 WHERE
-//     匹配、不返回给调用方。理由：本 action 不校验身份、也没有频率限制，若把命中的
-//     手机号/邮箱回传，「递增关键字 + 观察结果」就能把手机号/邮箱从模糊匹配里逐位
-//     枚举出来；而两端 UI 都不消费它们（web `AddFriendDialog` 只用
-//     userId/username/nickname/portraitUri；uniapp `search-user/index.vue:366-375`
-//     的映射也只取这 4 个）；
+//     （command_handler.py:1981-1990）。本 action 不校验身份、也没有频率限制，把
+//     手机号/邮箱回给任意搜索者本身就是泄漏面；而两端 UI 都不消费它们（web
+//     `AddFriendDialog` 只用 userId/username/nickname/portraitUri；uniapp
+//     `search-user/index.vue:366-375` 的映射也只取这 4 个）；
 //  5. `nickname` 为空时不回退成 `username`：旧实现明确兜底
 //     （command_handler.py:1984 `row["nickname"] or row["username"]`），这里返回原始值
 //     （可能是空串）。与 claw_compat.go:360-363「昵称不用账号名兜底」的最新口径一致，
 //     前端自己兜底（AddFriendDialog.tsx:643 `user.nickname || user.username`）。
+//
+// # 2026-10-28 收口：从「五列模糊」改成「虾说号精确」
+//
+// 产品口径变了：加好友**只允许按虾说号找人**，不接受昵称/手机号/邮箱。此前 WHERE
+// 命中 username / nickname / email / phone / user_id 五列且是 `%kw%` 模糊匹配，
+// 于是「递增关键字 + 观察结果」就能把手机号、邮箱、真实姓名逐位枚举出来 ——
+// 客户端那层 `pickExactShuoshuoId` 只能挡住界面，直接打 IM 命令通道照样能捞人。
+//
+// 现在的判定（`username ILIKE $1 OR user_id = $1`）：
+//   - `$1` 是**原样关键字**，不再包 `%...%`。ILIKE 不带通配符就是「忽略大小写的
+//     等值」，所以 `%`/`_` 这类 LIKE 元字符天然失效，不需要转义（也不能再包通配符，
+//     否则 `alice%` 又能把前缀匹配捡回来）；
+//   - nickname / email / phone 彻底退出 WHERE（连「命中但不回传」都不再成立）；
+//   - 保留 `user_id` 精确等值，只为那批没有 username 的老账号还能被找到；userId 是
+//     不可猜的串，不构成枚举入口；
+//   - `claw_im_users.username` 有 UNIQUE 约束（migrations/583），所以这个判定最多
+//     命中一条真人账号，`LIMIT 20` 保留只为兜住「username 与 user_id 同时命中」。
+//
+// 客户端（web `AddFriendDialog.pickExactShuoshuoId`、小程序 `search-user`）仍保留
+// 一层精确过滤：发布顺序上总是前端先上、后端后上，旧后端还在跑的那段时间里，
+// 那层过滤就是唯一的口径执行者。
 //
 // 一处**刻意照旧**：不校验发送者身份（serviceActor 失败会回 401，而 web 的
 // searchUsers 没有错误码映射，会把英文原文直接 toast 给用户）。
@@ -51,9 +70,9 @@ import (
 
 // UserSummary 是 user/search 的一条结果，json tag 用 camelCase。
 //
-// 只有四个字段：**命中列比回包宽** —— `email` / `phone` 参与 WHERE 匹配但不回传
-// （理由见文件头「有意偏离」第 4 条：避免把手机号/邮箱回给任意搜索者）。旧实现回传
-// 这两个字段（command_handler.py:1981-1990），本次有意收窄。web 的 `UserInfo`
+// 只有四个字段：`email` / `phone` 既不参与 WHERE 也不参与回包（理由见文件头
+// 「有意偏离」第 4 条与 2026-10-28 的收口说明）。旧实现回传这两个字段
+// （command_handler.py:1981-1990），本次有意收窄。web 的 `UserInfo`
 // （types/api.ts:8-19）里 phone/email 是可选字段，缺省不影响类型。
 //
 // 不加 `id`/`avatar`：旧实现的 search 也没给，两端的 `||` 兜底已兼容
@@ -110,38 +129,37 @@ func (h *systemHandler) handleUserSearch(ctx context.Context, msg NormalizedMess
 //     src/lib/ai-node-id.ts:48-49）。前端也过滤一层，但那是兜底，不能只靠前端；
 //   - `ORDER BY created_at DESC`：与旧实现一致。
 //
-// 注意「命中列 ≠ 回包列」：WHERE 里 ILIKE 的是 5 列（含 email / phone），SELECT
-// 只取 4 列。按下手机号/邮箱能搜到人（旧实现的产品能力），但命中的手机号/邮箱
-// 不回给调用方 —— 详见文件头「有意偏离」第 4 条。改 SELECT 时必须同步改 rows.Scan。
+// 命中判定是**精确**的（2026-10-28 收口，详见文件头）：`username ILIKE $1` 是
+// 忽略大小写的等值（$1 不带任何通配符），外加 `user_id = $1` 兜住没有 username
+// 的老账号。nickname / email / phone 已完全退出 WHERE —— 也就是说「按手机号搜得到
+// 人」这个旧能力被有意取消了，不要在没有产品决定的情况下加回来。
+//
+// 改 SELECT 时必须同步改 rows.Scan。
 func searchClawIMUsers(ctx context.Context, dbtx db.DBTX, keyword string, limit int) ([]UserSummary, error) {
 	if limit <= 0 {
 		limit = userSearchLimit
 	}
-	// 空关键字在 SQL 这一层再兜一道：clawIMLikePattern("") 得到的是 `%%`，在后端
-	// 语义上就是「匹配全表」，等于把前 limit 条账号无条件吐出去。
-	//
-	// 当前唯一的拦截是 handleUserSearch 里的 TrimSpace 空判（那里回 400，是对外
-	// 契约，不要动），但这道防线长在调用方身上 —— 将来若有人从 HTTP 入口或其它
-	// service 直接复用 SearchUsers，就会绕过去。所以这里不构造 pattern、也不发起
-	// Query，直接回空结果。
+	// 空关键字在 SQL 这一层再兜一道：精确匹配下空串虽然只可能命中「user_id 为空」
+	// 的脏数据，但这类守卫不能寄希望于上游 —— 当前唯一的拦截是 handleUserSearch
+	// 里的 TrimSpace 空判（那里回 400，是对外契约，不要动），而它长在调用方身上。
+	// 将来若有人从 HTTP 入口或其它 service 直接复用 SearchUsers，就会绕过去。
 	//
 	// 这条分支不改变 user/search 的对外行为：handler 先回 400，走不到这里。
 	if strings.TrimSpace(keyword) == "" {
 		return make([]UserSummary, 0, limit), nil
 	}
+	// $1 直接绑原样关键字：**不要**在这里包 `%...%`。包了就把模糊匹配又放回来了
+	// （`alice%` 能前缀命中），而 ILIKE 不带通配符本身就是等值匹配，`%`/`_` 因此
+	// 不会退化成元字符，也就不需要转义。
 	rows, err := dbtx.Query(ctx, `
 		SELECT user_id, username, COALESCE(nickname, ''), COALESCE(portrait_uri, '')
 		FROM claw_im_users
 		WHERE status = 'active'
 		  AND LEFT(username, 3) <> 'om_'
 		  AND LEFT(user_id, 3) <> 'om_'
-		  AND (username ILIKE $1
-		       OR COALESCE(nickname, '') ILIKE $1
-		       OR COALESCE(email, '') ILIKE $1
-		       OR COALESCE(phone, '') ILIKE $1
-		       OR user_id ILIKE $1)
+		  AND (username ILIKE $1 OR user_id = $1)
 		ORDER BY created_at DESC
-		LIMIT $2`, clawIMLikePattern(keyword), limit)
+		LIMIT $2`, keyword, limit)
 	if err != nil {
 		return nil, fmt.Errorf("rongcloud: search claw users: %w", err)
 	}
@@ -165,19 +183,4 @@ func searchClawIMUsers(ctx context.Context, dbtx db.DBTX, keyword string, limit 
 		return nil, fmt.Errorf("rongcloud: iterate claw users: %w", err)
 	}
 	return users, nil
-}
-
-// clawIMLikePattern 把关键字包成 ILIKE 的 `%kw%`，并转义 LIKE 元字符。
-//
-// 与 internal/handler/claw_admin_compat.go:178-183 的 clawAdminLikePattern 同逻辑：
-// 那个函数未导出、且集成层不该反向依赖 handler 包，所以这里保留一份副本。
-// 顺序不能换：先转义反斜杠，再转义 % 和 _ —— 反过来会把刚加上的转义符再转一次。
-// PostgreSQL 的 LIKE/ILIKE 默认转义字符就是反斜杠，不需要额外写 ESCAPE 子句。
-//
-// 绝不要退化成 `"%" + keyword + "%"` 裸拼接：那样用户输一个 `%` 就能把全表捞出来。
-func clawIMLikePattern(keyword string) string {
-	escaped := strings.ReplaceAll(keyword, "\\", "\\\\")
-	escaped = strings.ReplaceAll(escaped, "%", "\\%")
-	escaped = strings.ReplaceAll(escaped, "_", "\\_")
-	return "%" + escaped + "%"
 }
