@@ -1668,6 +1668,11 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// upgrade_download.go。
 	r.Get("/api/agent/upgrade/download", h.ClawUpgradeDownload)
 	r.Get("/api/claw/nodes/{nodeId}/status", h.ClawNodeStatus)
+	// 绑定智能体的使用权限（私聊/群聊/讨论组/聊天室/读写文件 + 行为规范）。
+	// 读对任何登录用户开放，写只允许 claimed_by_user_id 本人 —— 见
+	// internal/handler/claw_agent_permission.go 顶部。
+	r.Get("/api/claw/nodes/{nodeId}/permissions", h.ClawGetNodePermission)
+	r.Put("/api/claw/nodes/{nodeId}/permissions", h.ClawUpdateNodePermission)
 	r.Post("/api/claw/nodes/{nodeId}", h.ClawUpdateNode)
 	r.Delete("/api/claw/nodes/{nodeId}", h.ClawDeleteNode)
 	r.Get("/api/claw/nodes", h.ClawListNodes)

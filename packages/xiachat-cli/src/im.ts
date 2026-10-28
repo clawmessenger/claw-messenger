@@ -34,6 +34,12 @@ import {
 } from "./role-recommend.js";
 import { formatUseModelAck, parseUseModelCommand, type UseModelCommand } from "./use-model.js";
 import type { UserModelStore } from "./user-models.js";
+import {
+  behaviorPromptFor,
+  decidePrivateChat,
+  type PermissionSnapshot,
+  type PrivateGateReason,
+} from "./agent-permissions.js";
 
 // Inbound message shape normalized from the IM SDK listener.
 export interface InboundIMMessage {
@@ -175,6 +181,12 @@ export interface DispatcherDeps {
   // 台账就只补帧、不再跑一遍 agent —— 融云重连重放的是**新消息**（新
   // messageUId），run.ts 的 UID 去重拦不住它。省略 -> 退化成旧行为（重跑）。
   answeredTurns?: AnsweredTurnStore;
+  // 权限快照读取（supervisor 轮询落盘的那份，见 agent-permissions.ts）。
+  // 省略 -> 不做私聊闸门，行为与升级前完全一致（旧版 CLI / 测试）。
+  permissionSnapshot?: () => PermissionSnapshot | null;
+  // 本节点在**服务端**的 node_id —— 权限快照按它索引。注意不要和上面的
+  // `nodeId`（= 本节点的融云 user id，用于流帧）混用，两者不是同一个 id。
+  permissionNodeId?: string;
 }
 
 /** 一个已经落到服务端的产出文件。 */
@@ -187,8 +199,17 @@ export interface UploadedArtifact {
   type: string;
 }
 
+/** 一轮 turn 的附加指令（目前只有行为规范）。 */
+export interface TurnOptions {
+  /**
+   * 本轮要注入到**指令层**的行为规范。只有私聊会带：群聊/讨论组/聊天室的行为
+   * 准则由服务端拼进 role_prompt，设备端重复注入会白烧上下文还可能被复述。
+   */
+  behaviorPrompt?: string;
+}
+
 export interface TurnRunner {
-  runTurn: (prompt: string, model?: string, sessionKey?: string) => Promise<string>;
+  runTurn: (prompt: string, model?: string, sessionKey?: string, opts?: TurnOptions) => Promise<string>;
   // Streaming variant: same contract as runTurn plus per-chunk deltas of the
   // answer as the agent produces them. Optional: dispatchers fall back to
   // runTurn when absent (tests / agents without stdout streaming).
@@ -201,6 +222,7 @@ export interface TurnRunner {
     onDelta: (delta: string, reasoningDelta?: string, activity?: ActivityStep[]) => void,
     signal?: AbortSignal,
     sessionKey?: string,
+    opts?: TurnOptions,
   ) => Promise<string>;
 }
 
@@ -342,6 +364,84 @@ export class MessageDispatcher {
 
   constructor(private readonly deps: DispatcherDeps) {}
 
+  /** 一次性提示的记账：同一原因只记一行，避免每条消息刷屏。 */
+  private readonly loggedPrivateGateReasons = new Set<string>();
+
+  /**
+   * 私聊闸门 + 该 agent 的行为规范。
+   *
+   * 快照由 supervisor 的 10s 轮询落盘（agent-permissions.ts 里有 5s 内存缓存 +
+   * mtime 失效），这里不做任何网络请求，也不会每条消息都读盘。
+   */
+  private privateGate(fromUserId: string): {
+    allow: boolean;
+    reason: PrivateGateReason;
+    behaviorPrompt: string;
+  } {
+    const snapshot = this.deps.permissionSnapshot?.() ?? null;
+    const query = {
+      fromUserId,
+      ...(this.deps.permissionNodeId ? { nodeId: this.deps.permissionNodeId } : {}),
+      ...(this.deps.agentName ? { agent: this.deps.agentName } : {}),
+    };
+    const decision = decidePrivateChat(snapshot, query);
+    return {
+      allow: decision.allow,
+      reason: decision.reason,
+      behaviorPrompt: behaviorPromptFor(snapshot, query),
+    };
+  }
+
+  /**
+   * 私聊闸门的日志：四条分支必须一眼可分（任务书 success_criteria #2）。
+   *
+   * 规则（队长 2026-10-27 裁决 + 审查 S3）：
+   *  · `unrestricted`（有快照且 allowPrivate 不是 false）不记 —— 正常路径不刷屏；
+   *  · `no-snapshot`（整份快照都没有）**每条 warn** —— fail-open，必须与
+   *    「有快照且允许」一眼可分；
+   *  · `no-agent-entry`（有快照但没这个节点）**每条 warn** —— 现在是**拒绝**，
+   *    不放行，但仍要留痕，否则现场只看到「不回私聊」查不到原因；
+   *  · `denied-stranger` **每条 warn** —— 安全事件，宁多勿少；
+   *  · `owner` / `unclaimed-fail-open` 每进程只记一次（不会变成刷屏）。
+   */
+  private logPrivateGate(reason: PrivateGateReason, fromUserId: string): void {
+    const node = this.deps.permissionNodeId || this.deps.agentName || "?";
+    if (reason === "unrestricted") return;
+    if (reason === "no-snapshot") {
+      console.warn(
+        "im in: 私聊闸门无权限快照，降级放行（fail-open，不是 allowPrivate=true）"
+        + ` from=${fromUserId} node=${node} — supervisor 尚未落盘快照，或本机是独立 run 模式`,
+      );
+      return;
+    }
+    if (reason === "denied-stranger") {
+      console.warn(
+        `im in: private chat dropped (allowPrivate=false, denied-stranger) from=${fromUserId} node=${node}`,
+      );
+      return;
+    }
+    if (reason === "no-agent-entry") {
+      console.warn(
+        "im in: private chat dropped (no-agent-entry) — 权限快照里没有本节点；"
+        + "有快照就说明服务端已在管权限，查不到不能放行"
+        + ` from=${fromUserId} node=${node}`,
+      );
+      return;
+    }
+    if (this.loggedPrivateGateReasons.has(reason)) return;
+    this.loggedPrivateGateReasons.add(reason);
+    if (reason === "unclaimed-fail-open") {
+      console.warn(
+        "未认领设备，私聊闸门降级放行：allowPrivate=false 但 ownerUserId 为空，"
+        + `无法判定谁是主人（from=${fromUserId}）—— 这是唯一允许的 fail-open 点`,
+      );
+      return;
+    }
+    if (reason === "owner") {
+      console.log(`im in: private chat allowed for device owner (from=${fromUserId})`);
+    }
+  }
+
   async handle(msg: InboundIMMessage, turns: TurnRunner): Promise<void> {
     // Never answer our own messages: see DispatcherDeps.selfUserId.
     if (this.isOwnMessage(msg)) {
@@ -375,6 +475,18 @@ export class MessageDispatcher {
         return;
       }
       if (!text) return;
+      // 私聊闸门（allowPrivate）。
+      //
+      // 为什么必须在设备端：服务端**没有私聊派发点**，私聊这条 RC:TxtMsg 是 CLI
+      // 收到就直接跑 agent 的（本函数下面就是 runStreamedTurn）。服务端 webhook
+      // 也收到同一条消息，但那是另一条链路，拦它不影响这一条。
+      const gate = this.privateGate(msg.fromUserId);
+      this.logPrivateGate(gate.reason, msg.fromUserId);
+      if (!gate.allow) {
+        // **不回复**「无权限」：那会把闸门变成探测信道（陌生人能靠回包确认这里有
+        // 活的 agent），也违背「安静地不理」这个产品语义。只留一行本机日志。
+        return;
+      }
       // `/use-model` 是 web 切模型发的**文本命令**（设备管理里选模型、圆桌里
       // 给某个角色换模型，都是给目标节点的 AI 账号私发这一条）。必须在进
       // agent 之前截住：以前没有这个分支，命令会变成用户提问，agent 要么回
@@ -397,6 +509,9 @@ export class MessageDispatcher {
         // 私聊按对端分桶：不给键的话 openclaw 会把私聊也塞进主会话，和群聊、
         // 讨论组共享一串上下文。
         sessionKey: turnSessionKey("private", msg.fromUserId),
+        // 行为规范只走指令层（codex 的 AGENTS.md 标记块 / opencode 的
+        // instructions 文件），**绝不拼进 text** —— 那会污染用户原话。
+        turnOptions: gate.behaviorPrompt ? { behaviorPrompt: gate.behaviorPrompt } : {},
         turns,
         fallback: (out) => this.deliverAgentReply(msg.fromUserId, out),
       });
@@ -615,6 +730,11 @@ export class MessageDispatcher {
     turns: TurnRunner;
     /** 见 turnSessionKey：把这一轮绑到本会话独立的 agent 会话上。 */
     sessionKey?: string;
+    /**
+     * 传给 agent 的附加指令（目前只有行为规范）。**只有私聊会带** —— 群聊/讨论组
+     * 的行为准则由服务端拼进 role_prompt，设备端不重复注入。
+     */
+    turnOptions?: TurnOptions;
     /** your_turn 轮的派发者（服务端系统节点）：流式心跳的收件人。 */
     yourTurnFrom?: string;
     /**
@@ -777,7 +897,7 @@ export class MessageDispatcher {
         // old single-shot reply is the whole turn — including the old error
         // semantics (single chat: log only; your_turn: error command_result).
         try {
-          const out = await opts.turns.runTurn(opts.prompt, opts.model, opts.sessionKey);
+          const out = await opts.turns.runTurn(opts.prompt, opts.model, opts.sessionKey, opts.turnOptions);
           const uploaded = await this.collectArtifacts(artifactSnapshot);
           await opts.fallback(this.ensureVisibleReply(out, uploaded));
           await this.sendArtifactMessages(ctx, uploaded);
@@ -894,6 +1014,7 @@ export class MessageDispatcher {
             sendDelta,
             controller.signal,
             opts.sessionKey,
+            opts.turnOptions,
           );
           break;
         } catch (err) {

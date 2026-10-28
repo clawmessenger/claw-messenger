@@ -153,6 +153,13 @@ type interactiveRole struct {
 	Model            string
 	SpeakingOrder    int
 	IsHost           bool
+	// BehaviorPrompt 是该 agent 的行为准则（迁移 607），由 interactiveDispatch
+	// 在拼 prompt 前从权限快照里填好（已是生效值）。
+	//
+	// 放成字段而不是 interactiveBuildPrompt 的参数：那个函数是纯渲染器，加
+	// 参数会改动全部调用点；加字段则「没有装载就不注入」自然成立 —— 测试直接
+	// 构造的角色没有准则，断言基线不变。
+	BehaviorPrompt string
 }
 
 // interactiveTask 是落进 rongcloud_discussion_command.payload 的任务描述
@@ -501,15 +508,32 @@ func (rt *discussionRuntime) interactiveNext(ctx context.Context, d DiscussionRe
 	if err != nil {
 		return err
 	}
+	// 权限快照：**本轮只查一次**（普通成员 + 主持人一起批量取），循环里按
+	// rc id 判。逐人查会变成「8 人 × 10 轮 = 80 次」，而这里每轮只多一次。
+	//
+	// 主持人也要一起取：它不参与权限闸门（主持工作由创建者选定），但拼 prompt
+	// 时要注入它自己的行为准则 —— 少取它就只能拿默认模板，自定义配置失效。
+	perms := rt.agentPermissions(ctx, interactiveDispatchCandidates(ordinary, host))
 	for _, role := range ordinary {
 		if done[role.MemberID] {
 			continue
 		}
+		// 跳过原因只有两种，事件类型与信封都不变（复用 member_skipped）：
+		//   * 成员被移出/禁用 —— 沿用既有文案，不改口径；
+		//   * 主人关掉了该 agent 的「讨论组」权限 —— 追加 permission_denied。
+		// 前端对 member_skipped 的 reason 只做长度校验（discussion-v3.ts:140），
+		// 所以新增枚举不需要前端同步发版。
+		skipReason := ""
 		if !rt.interactiveMemberEnabled(ctx, d, role.MemberID) {
+			skipReason = "Member is disabled or no longer available"
+		} else if !perms.allows(role.MemberID, sceneDiscussion) {
+			skipReason = "permission_denied"
+		}
+		if skipReason != "" {
 			skipped, _, emitErr := rt.interactiveEmit(ctx, d, interactiveEvent{
 				EventType: "member_skipped", ActorID: "system", TargetID: role.MemberID,
 				Payload: map[string]interface{}{"round": d.CurrentRound, "memberId": role.MemberID,
-					"reason": "Member is disabled or no longer available"},
+					"reason": skipReason},
 				Key:       fmt.Sprintf("skip:%d:%s", d.Version, role.MemberID),
 				RequestID: uuid.NewString(),
 				StateVer:  d.Version,
@@ -562,6 +586,21 @@ func (rt *discussionRuntime) interactiveNext(ctx context.Context, d DiscussionRe
 		return err
 	}
 	return rt.interactiveDispatch(ctx, summarizing, host, 1)
+}
+
+// interactiveDispatchCandidates 列出本轮可能被派发的全部融云 id（普通成员 +
+// 主持人），给权限批量查询用。两者一起取：普通成员要判权限，主持人要取行为准则。
+func interactiveDispatchCandidates(ordinary []interactiveRole, host interactiveRole) []string {
+	ids := make([]string, 0, len(ordinary)+1)
+	for _, role := range ordinary {
+		if role.MemberID != "" {
+			ids = append(ids, role.MemberID)
+		}
+	}
+	if host.MemberID != "" {
+		ids = append(ids, host.MemberID)
+	}
+	return ids
 }
 
 // interactiveRoundContributions 统计本轮真正落地的成员发言（按成员去重）。
@@ -929,7 +968,25 @@ func roleEntryLabel(entry map[string]interface{}) string {
 // 原样塞进 agent 提示词，所以插话与前序发言都是从这里进入 agent 的上下文
 // —— 轮次指针不受影响。
 func (rt *discussionRuntime) interactiveBuildPrompt(d DiscussionRecord, role interactiveRole, extra string, opinions []interactiveOpinion, history interactiveHistory) string {
-	parts := make([]string, 0, 4)
+	parts := make([]string, 0, 5)
+	// 行为准则放在**最前面**、且在 4000 字上下文预算之外。
+	//
+	// 为什么在预算外：它是主人的全局约束，每轮都要原样出现，不该因为本轮前序
+	// 发言长就被裁掉。预算只扣 coreText + extra（见下方 budget），所以这里等于
+	// 免费 —— 代价是整条 prompt 变长，靠写入侧的 4000 字上限（见
+	// handler/claw_agent_permission.go 的 agentBehaviorPromptMaxRunes）兜住 argv
+	// 上限（8000 字符）。
+	//
+	// 为什么单独成段带标题：角色人设（parts[0]）也是「你应该……」，两段直接
+	// 相邻时模型容易只执行其中一条；【行为准则】这个标题把优先级说清楚。
+	//
+	// 长度沿用 relay 那一档封顶（600 字，relayBehaviorPromptLimit）：这一段不吃
+	// 4000 上下文预算，但它仍然占用 CLI 的 argv 8000 字符硬上限 —— 人设（快照里
+	// 最长可到 8000）+ 上下文 4000 + 准则 4000 会一起越界，越界即退化到 CLI 不支持
+	// 的 stdin 模式，整轮静默空转。600 字足够写下任何真实的行为准则。
+	if role.BehaviorPrompt != "" {
+		parts = append(parts, "【行为准则】\n"+relayClipToRoom(role.BehaviorPrompt, relayBehaviorPromptLimit))
+	}
 	if role.RoleInstructions != "" {
 		parts = append(parts, role.RoleInstructions)
 	}
@@ -1521,10 +1578,17 @@ func interactiveInterjectionRoundFor(status string, currentRound int, roundAllDo
 }
 
 // interactiveDispatch 落 outbox + 事件，并把 your_turn 私发给目标节点。
+//
+// 行为准则从这里取：一次派发只查**这一个** agent 的权限（带 TTL 缓存的批量查询，
+// 见 agentPermissions）。不把快照当参数传进来是为了不改变既有签名 —— 引擎里有
+// 五处派发入口（含失败重试），多一个参数只是把「查一次」的负担转嫁给每个调用方。
 func (rt *discussionRuntime) interactiveDispatch(ctx context.Context, d DiscussionRecord, role interactiveRole, attempt int) error {
 	if !IsLiveDiscussionStatus(d.Status) {
 		return nil
 	}
+	// 只在需要准则时查：permissions 有 TTL 缓存，同一轮里第二个成员起基本命中缓存，
+	// 所以「每轮每人」不会真的变成 N 次往返。
+	role.BehaviorPrompt = rt.agentPermissions(ctx, []string{role.MemberID}).behaviorPromptFor(role.MemberID)
 	requestID := uuid.NewString()
 	// 本轮被消费的用户插话 + 前序发言：同一份快照同时用于提示词拼接与回执落库，
 	// 避免重复全量拉事件，也避免两处看到不同快照。
@@ -2299,16 +2363,41 @@ func (rt *discussionRuntime) interactiveInterject(ctx context.Context, cmd Comma
 		if existing, _ := payload["content"].(string); existing != content {
 			return errResult(400, "conflicting message uid")
 		}
-		return okResult(discussionSnapshotView(d, rt.latestArtifactPtr(ctx, d.DiscussionID)))
+		view := discussionSnapshotView(d, rt.latestArtifactPtr(ctx, d.DiscussionID))
+		if round, ok := payload["consumedFromRound"].(float64); ok {
+			view["appliedRound"] = int(round)
+		}
+		return okResult(view)
 	}
 	if !IsLiveDiscussionStatus(d.Status) {
 		return errResult(409, "discussion is no longer active")
 	}
+	// 版本冲突不再直接拒（R6「随时插话」的门槛就在这里）。
+	//
+	// 插话是**追加**：它不改轮次指针、不改状态机、不打断正在跑的发言，只是在
+	// 库里多一条会被后续轮次消费的事件。客户端带旧 stateVersion 提交时，唯一
+	// 正确的处理是按**库中最新版本**接受 —— 流式回答期间版本一直在变，硬冲突
+	// 会让「随时插话」在最需要它的时刻（agent 正说着话）永远失败。
+	//
+	// 仍然拒绝终态：completed/cancelled/failed 之后没有后续轮次能承载这条意见，
+	// 接受它等于让用户看到「已接受」却永远没人读。刷新后要再判一次 —— 库里最新
+	// 的那条可能已经是终态。
 	if version, ok := paramInt(cmd, "stateVersion", "state_version", "version"); !ok || version != d.Version {
-		return rt.versionConflictResult(ctx, d.DiscussionID)
+		fresh, err := rt.repo.Get(ctx, d.DiscussionID)
+		if err != nil {
+			return errResult(409, "discussion version mismatch")
+		}
+		if !IsLiveDiscussionStatus(fresh.Status) {
+			return errResult(409, "discussion is no longer active")
+		}
+		d = fresh
 	}
 	// 插话归属轮次：轮末与未开局时当前轮不会再派发，必须顺延到真正会被消费的轮次，
 	// 否则气泡显示「已接受」但永远无人读到。
+	//
+	// 顺延到下一轮是**刻意的**语义（用户要的「下一个 agent 读取」），不是缺陷；
+	// 回包用 appliedRound 把真实轮次告诉前端，UI 才能提示「将在第 N 轮读到」，
+	// 而不是让用户以为当前发言者漏看了。
 	consumedRound := rt.interactiveInterjectionRound(ctx, d)
 	if consumedRound == 0 {
 		return errResult(409, "当前讨论已无后续轮次可承载这条意见")
@@ -2327,7 +2416,9 @@ func (rt *discussionRuntime) interactiveInterject(ctx context.Context, cmd Comma
 		return errResult(500, "写入插话事件失败")
 	}
 	rt.interactiveBroadcast(ctx, d, event)
-	return okResult(discussionSnapshotView(d, rt.latestArtifactPtr(ctx, d.DiscussionID)))
+	view := discussionSnapshotView(d, rt.latestArtifactPtr(ctx, d.DiscussionID))
+	view["appliedRound"] = consumedRound
+	return okResult(view)
 }
 
 // interactiveCancel 取消一个 v3 讨论：置 cancelled + 落事件，并终结在跑的派发。

@@ -38,6 +38,13 @@ func (h *chatroomRelayHub) StartGroupRelay(ctx context.Context, groupID, request
 		return errRelayResult(403, "仅群成员可以发起对话")
 	}
 	speakers := relayMembersFromGroup(aiMembers)
+	// 权限闸门（迁移 607）：allow_group=false 的 agent 不参与群聊接力。
+	// 一次批量查询就够（按 rc id），不按成员逐个查 —— 群成员数 × 每条消息都查
+	// 一次会把「有人说话」变成一串 N+1。
+	//
+	// 全被过滤时走下面现成的 409：群还在、成员也在，只是没人有权限说话。
+	perms := h.rt.agentPermissions(ctx, relayMemberIDs(speakers))
+	speakers = applyBehaviorPrompts(filterMembersByPermission(speakers, perms, sceneGroup), perms)
 	if len(speakers) == 0 {
 		return errRelayResult(409, "该群没有可发言的 AI 成员")
 	}

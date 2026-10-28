@@ -621,8 +621,58 @@ export function discoverOpencodeConfigPath(opts: DiscoverOpts = {}): string | nu
   return null;
 }
 
+export interface DeviceOpencodeConfigOpts {
+  /**
+   * 「文件读写禁止」限制态（见 agent-permissions.ts fsRestriction）。
+   *
+   * 为什么把键写进配置而不是加命令行参数：opencode 没有「禁用工具」的 CLI 参数，
+   * 工具授权只在配置里。写入两套键是为了同时覆盖 1.x 与 2.x：
+   *   · `permission`（1.x 起就有，2.x 仍接受，schema 里标 deprecated 但保留）
+   *     —— `edit` / `bash` 等工具级的 allow|ask|deny；
+   *   · `tools`（更老的版本只认这个）—— 工具名 → 布尔开关。
+   * 两套都写、语义一致，任一版本生效即可，不必猜版本。
+   */
+  fsRestricted?: boolean;
+  /**
+   * 追加到 `instructions` 的行为规范文件路径（不存在就不传）。
+   *
+   * opencode 的 `instructions` 是「补充环境指令」的路径数组（schema:
+   * `instructions: string[]`），正好是「指令层」而不是用户消息层。
+   */
+  instructions?: string[];
+}
+
+// 文件读写限制态要关掉的工具。`read`/`glob`/`grep`/`list` 是读，`edit`/`write`/
+// `patch` 是写；`bash` 既能读也能写，一并关掉 —— 否则「禁了文件工具但留一个
+// shell」等于没禁。`task`（子 agent）也关：子 agent 会重新拿到全套工具。
+const FS_DENY_PERMISSION: Readonly<Record<string, string>> = {
+  read: "deny",
+  edit: "deny",
+  glob: "deny",
+  grep: "deny",
+  list: "deny",
+  bash: "deny",
+  task: "deny",
+  external_directory: "deny",
+  webfetch: "deny",
+  websearch: "deny",
+};
+
+const FS_DENY_TOOLS: Readonly<Record<string, boolean>> = {
+  read: false,
+  write: false,
+  edit: false,
+  patch: false,
+  bash: false,
+  glob: false,
+  grep: false,
+  list: false,
+  webfetch: false,
+};
+
 /**
- * 从用户的 opencode 配置派生出「设备端专用」精简版：只去掉 `plugin` 与 `mcp`。
+ * 从用户的 opencode 配置派生出「设备端专用」精简版：去掉 `plugin` 与 `mcp`，
+ * 再按权限快照写入限制/指令。
  *
  * 为什么要这么做（2026-10-26 实测）：那两段里的 `superpowers@git+https://…`
  * 插件与 `uvx --from git+https://…` 的 MCP，会让 `opencode run` 在
@@ -633,7 +683,10 @@ export function discoverOpencodeConfigPath(opts: DiscoverOpts = {}): string | nu
  * 返回 null 表示这份配置读不懂（带 BOM、非对象、JSON 破损）——调用方这时
  * 应该什么都不做，让 opencode 用原配置，别把它弄成「配置没了」。
  */
-export function buildDeviceOpencodeConfig(rawText: string): { text: string; dropped: string[] } | null {
+export function buildDeviceOpencodeConfig(
+  rawText: string,
+  opts: DeviceOpencodeConfigOpts = {},
+): { text: string; dropped: string[] } | null {
   let parsed: unknown;
   try {
     parsed = JSON.parse(stripJsonComments(rawText.replace(/^\uFEFF/, "")));
@@ -649,6 +702,23 @@ export function buildDeviceOpencodeConfig(rawText: string): { text: string; drop
       delete out[key];
       dropped.push(key);
     }
+  }
+  if (opts.instructions && opts.instructions.length > 0) {
+    // 追加而不是覆盖：用户自己的 instructions 必须原样保留。
+    const existing = Array.isArray(out.instructions)
+      ? out.instructions.filter((item): item is string => typeof item === "string")
+      : [];
+    out.instructions = [...new Set([...existing, ...opts.instructions])];
+  }
+  if (opts.fsRestricted) {
+    const permission = (out.permission && typeof out.permission === "object" && !Array.isArray(out.permission))
+      ? { ...(out.permission as Record<string, unknown>) }
+      : {};
+    out.permission = { ...permission, ...FS_DENY_PERMISSION };
+    const tools = (out.tools && typeof out.tools === "object" && !Array.isArray(out.tools))
+      ? { ...(out.tools as Record<string, unknown>) }
+      : {};
+    out.tools = { ...tools, ...FS_DENY_TOOLS };
   }
   return { text: JSON.stringify(out, null, 2), dropped };
 }

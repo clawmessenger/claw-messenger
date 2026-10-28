@@ -53,6 +53,18 @@ export interface AgentControlState {
   nodeId: string;
   desiredState: "running" | "stopped" | string;
   version: number;
+  // 绑定权限（FROZEN CONTRACT，字段名与服务端一致，不要改）。
+  //
+  // 全部 optional：旧服务端不返回这些字段，设备端必须按「不限制」处理，
+  // 否则一次 CLI 升级就会把所有老服务端下的 agent 全锁死（见
+  // agent-permissions.ts 顶部的兼容性说明）。`allowFs` 的语义是「允许文件
+  // 读写」，false = 禁止；行为规范由服务端拼好生效值下发。
+  allowPrivate?: boolean;
+  allowGroup?: boolean;
+  allowDiscussion?: boolean;
+  allowChatroom?: boolean;
+  allowFs?: boolean;
+  behaviorPrompt?: string;
 }
 
 // 服务端下发的 exe 升级指令（POST /api/claw/device/control 响应里的 upgrade）。
@@ -69,9 +81,14 @@ export interface DeviceUpgradeIntent {
   mirrors: string[];
 }
 
-/** 一次设备轮询的结果：启停意图 + 可选的升级指令。 */
+/** 一次设备轮询的结果：启停意图 + 权限快照 + 可选的升级指令。 */
 export interface DeviceControlSnapshot {
   agents: AgentControlState[];
+  /**
+   * 认领这台设备的用户（claw IM user_id）。空串 = 未认领。
+   * 旧服务端不返回 → undefined（闸门按「未认领」处理，即 fail-open）。
+   */
+  ownerUserId?: string;
   upgrade?: DeviceUpgradeIntent;
 }
 
@@ -286,7 +303,9 @@ export class XiachatApi {
     secret: string,
     report?: { version?: string; platform?: string; hostname?: string },
   ): Promise<DeviceControlSnapshot> {
-    const raw = await this.request<{ data?: { agents?: AgentControlState[]; upgrade?: DeviceUpgradeIntent } }>(
+    const raw = await this.request<{
+      data?: { ownerUserId?: string; agents?: AgentControlState[]; upgrade?: DeviceUpgradeIntent };
+    }>(
       "POST",
       "/api/claw/device/control",
       {
@@ -303,9 +322,12 @@ export class XiachatApi {
       throw new Error("POST /api/claw/device/control: unexpected response shape");
     }
     const upgrade = raw.data?.upgrade;
-    return upgrade && typeof upgrade.generation === "number"
-      ? { agents, upgrade }
-      : { agents };
+    const ownerUserId = typeof raw.data?.ownerUserId === "string" ? raw.data.ownerUserId : undefined;
+    return {
+      agents,
+      ...(ownerUserId !== undefined ? { ownerUserId } : {}),
+      ...(upgrade && typeof upgrade.generation === "number" ? { upgrade } : {}),
+    };
   }
 
   // 回传升级进度（阶段跃迁时调用，不是按百分比刷）。服务端按代次防抖：代次对不上

@@ -15,6 +15,7 @@ import {
 } from "./runtime-recovery.js";
 import type { StoredCredentials } from "./keystore.js";
 import type { XiachatApi } from "./api.js";
+import { loadPermissionSnapshot } from "./agent-permissions.js";
 import { defaultUserModelsPath, FileUserModelStore } from "./user-models.js";
 
 // Per-conversation FIFO. Same conversation serializes (agent busy -> queue,
@@ -411,6 +412,11 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
     agentName: opts.agentName,
     selfUserId: opts.transport.getSelfUserId?.(),
     nodeId: opts.transport.getSelfUserId?.(),
+    // 私聊闸门的权限来源：supervisor 轮询落盘的那份快照（带 5s 缓存）。
+    // permissionNodeId 是**服务端**的 node_id（快照按它索引），与上面的
+    // nodeId（本节点的融云 user id，用于流帧）不是同一个 id。
+    permissionSnapshot: () => loadPermissionSnapshot(),
+    ...(opts.creds.nodeId ? { permissionNodeId: opts.creds.nodeId } : {}),
     // html_revise 的上一版 HTML 落盘目录：放 agent 的工作目录里，读它不需要
     // 越出工作区（见 im.ts writeReviseSource）。
     reviseSourceDir: opts.cwd,
@@ -460,7 +466,7 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
   // 压死**上面两者：设备上只要带过 `--model`，服务端给角色配的模型就永远不生效，
   // 用户在界面里换模型也看不出任何变化。默认值不该打赢显式指定，所以反过来。
   const turns: TurnRunner = {
-    runTurn: (prompt, model, sessionKey) =>
+    runTurn: (prompt, model, sessionKey, turnOpts) =>
       runAgentTurn({
         execPath: opts.agentExecPath,
         agentName: opts.agentName,
@@ -469,12 +475,13 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
         timeoutMs: opts.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS,
         cwd: opts.cwd,
         sessionKey,
+        ...(turnOpts?.behaviorPrompt ? { behaviorPrompt: turnOpts.behaviorPrompt } : {}),
       }),
     // Streaming variant: the agent's stdout is decoded chunk by chunk
     // (agents.ts onChunk, UTF-8 boundary safe); the dispatcher turns those
     // deltas into chat_stream snapshot frames. signal lets chat_stop kill
     // the agent process instead of just muting the frames.
-    runTurnStreamed: (prompt, model, onDelta, signal, sessionKey) =>
+    runTurnStreamed: (prompt, model, onDelta, signal, sessionKey, turnOpts) =>
       runAgentTurn({
         execPath: opts.agentExecPath,
         agentName: opts.agentName,
@@ -491,6 +498,9 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
         onActivity: (steps) => onDelta("", undefined, steps),
         signal,
         sessionKey,
+        // 行为规范走指令层（codex AGENTS.md / opencode instructions 文件），
+        // 只有私聊轮次非空 —— 绝不拼进 prompt。
+        ...(turnOpts?.behaviorPrompt ? { behaviorPrompt: turnOpts.behaviorPrompt } : {}),
       }),
   };
   const queue = new SessionQueue({

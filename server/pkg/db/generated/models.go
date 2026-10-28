@@ -852,6 +852,28 @@ type GithubPullRequestCheckSuite struct {
 	UpdatedAt  pgtype.Timestamptz `json:"updated_at"`
 }
 
+// 通讯录分组（运维 / 我的 Agent / 用户自建）。slot 非空的是默认分组，不可删除。
+type ImContactGroup struct {
+	ID     pgtype.UUID `json:"id"`
+	UserID string      `json:"user_id"`
+	Name   string      `json:"name"`
+	// 默认分组标识：maintenance=运维（按机器聚合的视图，不存成员）、my_agent=我的 Agent。NULL=用户自建。
+	Slot pgtype.Text `json:"slot"`
+	// 显式排序。不靠 created_at 兜底：默认分组要先于自建分组出现，而它们可能是后创建的。
+	SortOrder int32              `json:"sort_order"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+}
+
+// 设备（agent 节点）→ 分组的归属。行不存在表示落在默认「我的 Agent」分组。
+type ImContactGroupMember struct {
+	UserID string `json:"user_id"`
+	// rongcloud_node.node_id（与 /api/claw/nodes 返回的 node_id 同源，不是融云 id）。
+	NodeID    string             `json:"node_id"`
+	GroupID   pgtype.UUID        `json:"group_id"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
 // 融云会话号映射：target_id（对方融云 id / 群号）+ conversation_type → conversation_id。
 type ImConversation struct {
 	ID               int64  `json:"id"`
@@ -1662,6 +1684,18 @@ type RongcloudNode struct {
 	MachineID       string             `json:"machine_id"`
 	// C 端认领者（claw_im_users.user_id / 融云 id）。设备归属的本地投影，权威真相仍是融云好友边。
 	ClaimedByUserID pgtype.Text `json:"claimed_by_user_id"`
+	// 主人是否允许该智能体处理私聊消息（设备端据此判定，见 /api/claw/device/control 的 ownerUserId）。
+	AllowPrivate bool `json:"allow_private"`
+	// 主人是否允许该智能体在普通群聊（融云 group）中按序发言。
+	AllowGroup bool `json:"allow_group"`
+	// 主人是否允许该智能体加入讨论组并参与正式轮次（v3 圆桌）。
+	AllowDiscussion bool `json:"allow_discussion"`
+	// 主人是否允许该智能体在聊天室（非讨论态）里参与闲聊接龙。
+	AllowChatroom bool `json:"allow_chatroom"`
+	// 主人是否允许该智能体读写本机文件（设备端执行权限，服务端只负责下发）。
+	AllowFs bool `json:"allow_fs"`
+	// 该智能体的行为规范，每轮注入提示词；空串表示使用服务端默认模板。
+	BehaviorPrompt string `json:"behavior_prompt"`
 }
 
 type RongcloudNodeControl struct {
