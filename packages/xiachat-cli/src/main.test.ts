@@ -5,7 +5,7 @@ import { EventEmitter } from "node:events";
 import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { allowDuplicateSupervisor, buildProgram, commanderExit, OPS_SCOPE_ENV, scopeDaemonReport, SUPERVISED_ENV, supervisedSelfKillRejection, waitForAliveFor, wholeMachineActionRejection } from "./main.js";
 import { Keystore } from "./keystore.js";
 import type { XiachatApi } from "./api.js";
@@ -103,6 +103,26 @@ describe("clawmessenger register", () => {
 });
 
 describe("clawmessenger pair", () => {
+  /**
+   * 2026-10-27 flaky 定位（Tess）：这三例在负载下发过 `Test timed out in
+   * 20000ms/60000ms`，断言本身一次都没失败过。
+   *
+   * 真因不是断言窗口：`pair` 的动作里会先 `discoverAgents({})` 扫**整条真实
+   * PATH**（25 个 CLI 名 × 本机 49 个目录 × 3 个扩展名 ≈ 3,700 次 `fs.access`）。
+   * 本机实测单次 490–914ms；某个磁盘/杀软繁忙的窗口里 3 次调用合计 **52s**。
+   * 这几例各跑 1–3 次 `pair`，于是基线 1.5s 的用例在负载下被这串 stat 拖到超时。
+   *
+   * 修法是**隔离环境**而不是放宽断言：PATH 指空 ⇒ 扫描 0ms，等价于「这台机器
+   * 没装任何 agent CLI」。这几例只断言幂等键/keystore 落盘，agent 列表不参与
+   * 任何断言，所以语义不变。
+   */
+  beforeEach(() => {
+    vi.stubEnv("PATH", "");
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
   it("does not overwrite the keystore when the ticket was already claimed", async () => {
     const keystore = tempKeystore();
     const fakeApi = {
