@@ -306,3 +306,105 @@ func TestSyncUserPortraitsRevertsBrandPortraitToUnified(t *testing.T) {
 		t.Fatal("回滚也要推融云，否则客户端还是旧图")
 	}
 }
+
+// 融云侧没有这个账号（1002）时：报告 missing、不算失败、不写库、也不擅自补建。
+// 这是线上真实形态——`kimi_8594527409` 这类残行在库里存在，融云侧从没注册过。
+func TestSyncUserPortraitsAgentBrandMissingUserIsNotAFailure(t *testing.T) {
+	portraitTestClearEnv(t)
+	pool, q, svc, rec, wsID := newPortraitSyncFixture(t)
+	id := "kimi_" + uniqueID("am")
+	cleanupPortraitUsers(t, pool, id)
+	seedPortraitUser(t, q, wsID, id, DefaultUserPortraitURI)
+	rec.markUserNotFound(id)
+
+	outcomes, err := svc.SyncUserPortraits(context.Background(), wsID, BackfillFriendsOptions{AgentPortraits: true})
+	if err != nil {
+		t.Fatalf("SyncUserPortraits 不该因为 1002 整体失败: %v", err)
+	}
+
+	var found bool
+	for _, o := range outcomes {
+		if o.RCUser != id {
+			continue
+		}
+		found = true
+		if o.Status != "missing" {
+			t.Fatalf("1002 行的状态 = %q, want missing（不能是 failed）", o.Status)
+		}
+		if o.Error == "" {
+			t.Fatal("missing 行要带原因，否则日志里看不出为什么没换成")
+		}
+	}
+	if !found {
+		t.Fatal("目标行没出现在 outcomes 里")
+	}
+
+	// 未开 -register-missing：绝不能去建账号。
+	if calls := len(rec.requests("/user/getToken.json")); calls != 0 {
+		t.Fatalf("默认不该注册缺失账号，实际调了 %d 次 getToken", calls)
+	}
+	// 库内保持原值（先推融云再落库，推失败就不写）。
+	var stored string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT COALESCE(portrait_uri, '') FROM rongcloud_user WHERE rongcloud_user_id = $1`, id).Scan(&stored); err != nil {
+		t.Fatalf("read portrait: %v", err)
+	}
+	if stored != DefaultUserPortraitURI {
+		t.Fatalf("库内 portrait 被改了: %q", stored)
+	}
+}
+
+// 显式开 -register-missing 时：用 getToken 一次的 name+portraitUri 把账号和头像
+// 一起建出来，落库，状态记 registered。
+func TestSyncUserPortraitsAgentBrandRegistersMissingUserWhenAsked(t *testing.T) {
+	portraitTestClearEnv(t)
+	pool, q, svc, rec, wsID := newPortraitSyncFixture(t)
+	id := "kimi_" + uniqueID("ar")
+	cleanupPortraitUsers(t, pool, id)
+	seedPortraitUser(t, q, wsID, id, DefaultUserPortraitURI)
+	rec.markUserNotFound(id)
+
+	brand, _ := AgentPortraitURI("kimi")
+	outcomes, err := svc.SyncUserPortraits(context.Background(), wsID, BackfillFriendsOptions{
+		AgentPortraits:  true,
+		RegisterMissing: true,
+	})
+	if err != nil {
+		t.Fatalf("SyncUserPortraits: %v", err)
+	}
+
+	var found bool
+	for _, o := range outcomes {
+		if o.RCUser != id {
+			continue
+		}
+		found = true
+		if o.Status != "registered" {
+			t.Fatalf("补建后的状态 = %q, want registered", o.Status)
+		}
+	}
+	if !found {
+		t.Fatal("目标行没出现在 outcomes 里")
+	}
+
+	// 只允许一次 getToken，且必须带上品牌头像（否则建出来的账号没图）。
+	regs := rec.requests("/user/getToken.json")
+	if len(regs) != 1 {
+		t.Fatalf("getToken 调用 %d 次，want 1", len(regs))
+	}
+	if got := regs[0].Get("portraitUri"); got != brand {
+		t.Fatalf("getToken 的 portraitUri = %q, want %q", got, brand)
+	}
+	if got := regs[0].Get("userId"); got != id {
+		t.Fatalf("getToken 的 userId = %q, want %q", got, id)
+	}
+
+	var stored string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT COALESCE(portrait_uri, '') FROM rongcloud_user WHERE rongcloud_user_id = $1`, id).Scan(&stored); err != nil {
+		t.Fatalf("read portrait: %v", err)
+	}
+	if stored != brand {
+		t.Fatalf("库内 portrait = %q, want %q", stored, brand)
+	}
+}

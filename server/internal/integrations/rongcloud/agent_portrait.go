@@ -154,6 +154,23 @@ func AgentPortraitURI(kind string) (string, bool) {
 	return AgentPortraitBase() + "/" + k + "-256.png", true
 }
 
+// rcUserNotFoundCode 是融云「该 userId 不存在」的业务错误码。
+//
+// 存量库里确实有这种行：`rongcloud_user` 有记录，但融云侧从来没注册过这个
+// 账号（设备绑定没走到 getToken、或机器重装后旧节点残留）。这种行调
+// `/user/refresh.json` 只会回 1002，头像无从谈起。
+//
+// 它必须和「推送失败」分开计数：否则一轮批量会被几行历史脏数据判成 failed，
+// 让人以为改坏了 —— 而这批行本来就没有可显示头像的地方（融云没账号，就不
+// 可能在好友列表里出现）。
+const rcUserNotFoundCode = 1002
+
+// IsRCUserNotFound 判断错误是否为「融云侧没有这个用户」。
+func IsRCUserNotFound(err error) bool {
+	code, _, ok := RongCloudAPIError(err)
+	return ok && code == rcUserNotFoundCode
+}
+
 // IsAgentPortraitURI 判断一个 portrait 是不是本方案写进去的品牌头像。
 //
 // 用途有两个，都是「重跑要幂等」的前提：
