@@ -524,13 +524,22 @@ func syncGroupPortraits(ctx context.Context, pool *pgxpool.Pool, svc *rongcloud.
 //
 // 只写本地库：融云聊天室 API 没有头像字段，这一列是各端读头像的唯一来源
 // （web 会话列表、小程序聊天室列表都读它）。
-func syncChatroomPortraits(ctx context.Context, pool *pgxpool.Pool, dryRun bool) (portraitSummary, error) {
+//
+// onlyRoomIDs 非空时只处理这些房间（测试必须只碰自己种下的行，不能把共享库里的
+// 存量房间顺手刷一遍；线上调用不传，语义仍是全量）。
+func syncChatroomPortraits(ctx context.Context, pool *pgxpool.Pool, dryRun bool, onlyRoomIDs ...string) (portraitSummary, error) {
 	var summary portraitSummary
-	rows, err := pool.Query(ctx, `
+	query := `
 		SELECT id::text, rongcloud_chatroom_id, COALESCE(conversation_kind, ''), COALESCE(portrait_uri, '')
 		FROM rongcloud_chatroom
-		WHERE `+groupPortraitNeedsFixWhere+`
-		ORDER BY rongcloud_chatroom_id`, groupPortraitFixCandidates()...)
+		WHERE ` + groupPortraitNeedsFixWhere
+	args := groupPortraitFixCandidates()
+	if len(onlyRoomIDs) > 0 {
+		query += ` AND rongcloud_chatroom_id = ANY($5::text[])`
+		args = append(args, onlyRoomIDs)
+	}
+	query += ` ORDER BY rongcloud_chatroom_id`
+	rows, err := pool.Query(ctx, query, args...)
 	if err != nil {
 		return summary, fmt.Errorf("list chatrooms: %w", err)
 	}

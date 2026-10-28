@@ -371,7 +371,7 @@ func TestChatroomPortraitsFollowConversationKind(t *testing.T) {
 	}
 
 	// dry-run：计划 3 条，库内一个字节都不动。
-	summary, err := syncChatroomPortraits(ctx, pool, true)
+	summary, err := syncChatroomPortraits(ctx, pool, true, mine...)
 	if err != nil {
 		t.Fatalf("syncChatroomPortraits(dry run): %v", err)
 	}
@@ -383,7 +383,7 @@ func TestChatroomPortraitsFollowConversationKind(t *testing.T) {
 	}
 
 	// commit：按类型落图。
-	summary, err = syncChatroomPortraits(ctx, pool, false)
+	summary, err = syncChatroomPortraits(ctx, pool, false, mine...)
 	if err != nil {
 		t.Fatalf("syncChatroomPortraits(commit): %v", err)
 	}
@@ -409,7 +409,7 @@ func TestChatroomPortraitsFollowConversationKind(t *testing.T) {
 
 	// 幂等：再跑一次什么都不该改（回填会被运维反复执行）。
 	before := summary.updated
-	summary, err = syncChatroomPortraits(ctx, pool, false)
+	summary, err = syncChatroomPortraits(ctx, pool, false, mine...)
 	if err != nil {
 		t.Fatalf("syncChatroomPortraits(second commit): %v", err)
 	}
