@@ -1718,6 +1718,12 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	r.Get("/api/user/info", h.ClawUserInfo)
 	r.Post("/api/user/info", h.ClawUserInfo)
 	r.Post("/api/user/update", h.ClawUserUpdate)
+	// 账号安全（改密码 / 绑手机邮箱 / 绑微信）。三条都要求 Bearer 登录态：
+	// 操作对象只从 token 解出，请求体里不接受 userId —— 老 /api/user/update 那种
+	// 「按 body 里的 username 改库」的写法不能再复制一遍。
+	r.Post("/api/user/password", h.ClawUserPassword)
+	r.Post("/api/user/binding", h.ClawUserBinding)
+	r.Post("/api/user/wechat-bind", h.ClawUserWeChatBind)
 	r.Get("/api/config/user-guide", h.ClawUserGuide)
 	r.Post("/api/im/refresh-token", h.ClawImRefreshToken)
 	// 配额与半成品列表（讨论组引导式创建与配额）：C 端预检 / 会话列表合并。

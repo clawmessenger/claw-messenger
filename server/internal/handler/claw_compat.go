@@ -245,6 +245,19 @@ type clawUserRow struct {
 	Status       string
 	PasswordHash string
 	RCStored     sql.NullString
+	// WeChatOpenID 非空即「已绑定微信」。原样留在结构体里、但**不出现在接口回包**
+	// 中：openid 是微信侧的身份，客户端拿到也没有用，多给一个字段就多一处泄漏面。
+	WeChatOpenID string
+}
+
+// clawHasPassword 判断这个账号是不是「真的设过密码」。
+//
+// 微信登录建出来的账号写的是不可解析的哨兵哈希（`wechat_only$no_password_set`，
+// 见 integrations/rongcloud/user_command.go），`clawVerifyPassword` 对它一律返回
+// false。所以「有密码」不能按 password_hash 非空判断 —— 那样微信-only 账号会被
+// 要求输入一个它从来没有的旧密码，改密入口直接死锁。
+func clawHasPassword(hash string) bool {
+	return strings.HasPrefix(strings.TrimSpace(hash), "pbkdf2_sha256$")
 }
 
 func (h *Handler) clawQueryUser(ctx context.Context, field string, arg string) (*clawUserRow, error) {
@@ -255,11 +268,38 @@ func (h *Handler) clawQueryUser(ctx context.Context, field string, arg string) (
 	row := h.DB.QueryRow(ctx,
 		"SELECT user_id, username, COALESCE(nickname,''), COALESCE(portrait_uri,''), "+
 			"COALESCE(email,''), COALESCE(phone,''), COALESCE(signature,''), COALESCE(gender,''), "+
-			"COALESCE(birthday,''), status, password_hash, rongcloud_token "+
+			"COALESCE(birthday,''), status, password_hash, rongcloud_token, COALESCE(wechat_openid,'') "+
 			"FROM claw_im_users WHERE "+field+" = $1", arg)
 	var u clawUserRow
 	err := row.Scan(&u.UserID, &u.Username, &u.Nickname, &u.PortraitURI, &u.Email, &u.Phone,
-		&u.Signature, &u.Gender, &u.Birthday, &u.Status, &u.PasswordHash, &u.RCStored)
+		&u.Signature, &u.Gender, &u.Birthday, &u.Status, &u.PasswordHash, &u.RCStored, &u.WeChatOpenID)
+	if err != nil {
+		return nil, err
+	}
+	return &u, nil
+}
+
+// clawQueryUserByIdentifier 按「登录账号 / 虾说号 / 手机号 / 邮箱」找账号。
+//
+// 为什么要一次查四种：用户记不住自己当初是用哪个注册的，而 `claw_im_users` 里
+// 这四列都可能唯一（虾说号是主键、username 有 UNIQUE、手机号/邮箱由绑定接口保证
+// 唯一）。登录框只给一个输入框，服务端就得负责认出它是哪种。
+//
+// 优先级写进 ORDER BY 而不是分四次查：一次往返就把「username 优先于手机号」
+// 这类歧义定死 —— 两个账号一个把手机号设成 username、另一个真用这个手机号时，
+// 命中的必须是前者（他一直在用用户名登录）。email 用 lower() 比较，大小写不敏感。
+func (h *Handler) clawQueryUserByIdentifier(ctx context.Context, identifier string) (*clawUserRow, error) {
+	row := h.DB.QueryRow(ctx,
+		"SELECT user_id, username, COALESCE(nickname,''), COALESCE(portrait_uri,''), "+
+			"COALESCE(email,''), COALESCE(phone,''), COALESCE(signature,''), COALESCE(gender,''), "+
+			"COALESCE(birthday,''), status, password_hash, rongcloud_token, COALESCE(wechat_openid,'') "+
+			"FROM claw_im_users "+
+			"WHERE username=$1 OR user_id=$1 OR phone=$1 OR lower(email)=lower($1) "+
+			"ORDER BY (username=$1) DESC, (user_id=$1) DESC, (phone=$1) DESC, created_at ASC "+
+			"LIMIT 1", identifier)
+	var u clawUserRow
+	err := row.Scan(&u.UserID, &u.Username, &u.Nickname, &u.PortraitURI, &u.Email, &u.Phone,
+		&u.Signature, &u.Gender, &u.Birthday, &u.Status, &u.PasswordHash, &u.RCStored, &u.WeChatOpenID)
 	if err != nil {
 		return nil, err
 	}
@@ -278,6 +318,10 @@ func clawUserJSON(u *clawUserRow) map[string]interface{} {
 		"gender":      u.Gender,
 		"birthday":    u.Birthday,
 		"status":      u.Status,
+		// 账号安全面板要据此决定「改密码」是「设置」还是「修改」，以及微信那一行
+		// 显示「已绑定」还是「去绑定」。只回布，不回 openid 本身。
+		"hasPassword": clawHasPassword(u.PasswordHash),
+		"wechatBound": u.WeChatOpenID != "",
 	}
 }
 
@@ -446,8 +490,10 @@ func (h *Handler) ClawLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	u, err := h.clawQueryUser(ctx, "username", username)
+	u, err := h.clawQueryUserByIdentifier(ctx, username)
 	if err != nil || !clawVerifyPassword(req.Password, u.PasswordHash) {
+		// 微信-only 账号（哨兵哈希）也落在这里：`clawVerifyPassword` 对它恒 false，
+		// 所以「用密码登录微信账号」会被当成密码错误，而不是登进去一个没有密码的号。
 		clawJSON(w, 401, 401, "用户名或密码错误", nil)
 		return
 	}
@@ -580,7 +626,15 @@ func (h *Handler) ClawUserInfo(w http.ResponseWriter, r *http.Request) {
 		clawJSON(w, 404, 404, "用户不存在", nil)
 		return
 	}
-	clawJSON(w, 200, 200, "", clawUserJSON(u))
+	payload := clawUserJSON(u)
+	// hasPassword / wechatBound 是**账号状态**，不是公开资料：这个接口任何登录态
+	// （甚至无登录态）都能查别人，把「这人设没设密码、绑没绑微信」回出去等于给
+	// 撞库和社工送情报。只有查自己时才带上（账号安全面板靠它渲染）。
+	if viewer, _ := h.clawViewerUserID(ctx, r); viewer != u.UserID {
+		delete(payload, "hasPassword")
+		delete(payload, "wechatBound")
+	}
+	clawJSON(w, 200, 200, "", payload)
 }
 
 // clawQueryRongCloudUser 按 rongcloud_user_id 查节点/系统账号的公开资料。
@@ -798,6 +852,33 @@ type clawPairingView struct {
 	ReportedAgents []string `json:"reportedAgents,omitempty"`
 	// BoundAgents 是用户在弹窗勾选绑定后生成的 [{agent,nodeId}] 结果。
 	BoundAgents []rongcloud.BoundAgentResult `json:"boundAgents,omitempty"`
+}
+
+// clawViewerUserID 是 clawRequireClawUser 的**静默版**：只探测可选身份，不写响应、
+// 不因缺 token 失败。用于「公开接口，但对本人多回几个字段」的场景（/api/user/info
+// 的账号安全状态）。无 token / token 失效一律按匿名（空串）处理。
+func (h *Handler) clawViewerUserID(ctx context.Context, r *http.Request) (string, error) {
+	auth := r.Header.Get("Authorization")
+	if !strings.HasPrefix(auth, "Bearer ") {
+		return "", nil
+	}
+	token := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+	if token == "" {
+		return "", nil
+	}
+	var userID string
+	err := h.DB.QueryRow(ctx,
+		"SELECT user_id FROM claw_im_users WHERE rongcloud_token=$1 AND status='active' LIMIT 1",
+		token).Scan(&userID)
+	if err != nil {
+		// ErrNoRows = token 过期/被换掉，属于匿名浏览的正常分支；真错才上报，
+		// 调用方对错误的处理也是「当匿名」，等于 fail-closed（少回字段）。
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", nil
+		}
+		return "", err
+	}
+	return userID, nil
 }
 
 // clawRequireClawUser 按旧站契约认证：Bearer 即 claw_im_users.rongcloud_token。

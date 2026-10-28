@@ -221,3 +221,37 @@ func wechatCode2Session(ctx context.Context, apiBase string, client *http.Client
 	}
 	return openID, nil
 }
+
+// WeChatOpenIDForCode 把小程序 `wx.login` 的 code 换成 openid（已导出，供
+// 「已登录账号绑定微信」复用）。
+//
+// 与 WeChatLogin 的区别只在职责：这里不查库、不建号、不发 token —— 调用方
+// （/api/user/wechat-bind）已经在 HTTP 层校验过登录态，它要的只是「这个 code
+// 属于哪个微信」。错误映射与 WeChatLogin 保持一致（*WeChatLoginError：503 未配置、
+// 400 code 无效、500 微信侧不可达），调用方按 Status 原样回给客户端。
+//
+// apiBase / client 传空值即走生产默认（仅测试注入）。
+func WeChatOpenIDForCode(ctx context.Context, apiBase string, client *http.Client, code string) (string, error) {
+	appID := strings.TrimSpace(os.Getenv(wechatOpenIDEnvAppID))
+	appSecret := strings.TrimSpace(os.Getenv(wechatOpenIDEnvSecret))
+	if appID == "" || appSecret == "" {
+		return "", newWeChatLoginError(503, "微信登录未配置：缺少 WECHAT_MP_APPID / WECHAT_MP_SECRET")
+	}
+	code = strings.TrimSpace(code)
+	if code == "" {
+		return "", newWeChatLoginError(400, "code is required")
+	}
+	openID, err := wechatCode2Session(ctx, apiBase, client, appID, appSecret, code)
+	if err != nil {
+		var apiErr *wechatAPIError
+		if errors.As(err, &apiErr) {
+			// code 一次性、5 分钟有效：过期/复用会回 40163 / 40029。
+			return "", newWeChatLoginError(400, "微信登录失败："+apiErr.message)
+		}
+		return "", newWeChatLoginError(500, "failed to reach the WeChat login service")
+	}
+	if strings.TrimSpace(openID) == "" {
+		return "", newWeChatLoginError(500, "微信没有返回 openid")
+	}
+	return openID, nil
+}

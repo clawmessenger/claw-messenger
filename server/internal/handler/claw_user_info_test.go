@@ -109,13 +109,13 @@ func TestClawUserInfoHumanStillWins(t *testing.T) {
 		if strings.Contains(sql, "FROM rongcloud_user") {
 			t.Fatal("human hit must never reach the rongcloud_user fallback")
 		}
-		// 12 个值对应 clawQueryUser 的 12 个扫描目标（claw_compat.go:226-233）：
+		// 13 个值对应 clawQueryUser 的 13 个扫描目标（claw_compat.go 的 SELECT）：
 		// user_id, username, nickname, portrait_uri, email, phone, signature,
-		// gender, birthday, status, password_hash, rongcloud_token。少一个就会
-		// 撞上 assignGroupScan 的 arity 检查 → 被当成「查不到」→ 落到
-		// rongcloud_user 回落，测试红在一个跟断言无关的地方。
+		// gender, birthday, status, password_hash, rongcloud_token,
+		// wechat_openid。少一个就会撞上 assignGroupScan 的 arity 检查 → 被当成
+		// 「查不到」→ 落到 rongcloud_user 回落，测试红在一个跟断言无关的地方。
 		return &groupStubRow{values: []any{
-			"897610", "probe040318", "绑定探针", "", "", "", "", "", "", "active", "hash", "token",
+			"897610", "probe040318", "绑定探针", "", "", "", "", "", "", "active", "hash", "token", "",
 		}}
 	}
 	h := &Handler{DB: fake}
