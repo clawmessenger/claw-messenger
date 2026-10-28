@@ -69,6 +69,8 @@ func run() error {
 	bidirectional := flag.Bool("both", false, "also write the reverse edge (agent -> owner)")
 	syncNames := flag.Bool("sync-names", false, "push every node's database nickname to RongCloud (/user/refresh.json) instead of, or in addition to, friending")
 	syncPortraits := flag.Bool("sync-portraits", false, "unify default portraits for claw_im_users and rongcloud_user, and switch group / chatroom default images to the per-kind group art (群聊 / 讨论组 / 聊天室); custom portraits are never overwritten")
+	syncAgentPortraits := flag.Bool("sync-agent-portraits", false, "give every AI agent its own brand portrait (<base>/<kind>-256.png; base = $CLAW_AGENT_PORTRAIT_BASE or the claw-web static dir). Only rows whose RongCloud id resolves to an agent kind are touched; custom portraits are never overwritten. Mutually exclusive with -sync-portraits")
+	registerMissing := flag.Bool("register-missing", false, "with -sync-agent-portraits: when RongCloud answers 1002 (userId not exist), create the account via /user/getToken.json (name + portraitUri in one call) instead of only reporting it as missing. Off by default: this writes identity, not just a field")
 	dsnFlag := flag.String("dsn", "", "postgres DSN (default: $DATABASE_URL, then $MULTICA_DATABASE_URL)")
 	envFile := flag.String("env-file", "", "load KEY=VALUE environment variables from this file before reading configuration")
 	flag.Parse()
@@ -79,8 +81,13 @@ func run() error {
 		}
 	}
 
-	if *userFlag == "" && !*allUsers && !*syncNames && !*syncPortraits {
+	if *userFlag == "" && !*allUsers && !*syncNames && !*syncPortraits && !*syncAgentPortraits {
 		return fmt.Errorf("specify -user <id[,id...]>, -all-users, -sync-names, or -sync-portraits to choose what to repair")
+	}
+
+	if *registerMissing && !*syncAgentPortraits {
+		// 单独给 -register-missing 没有意义：补建只发生在品牌头像那一路。
+		return fmt.Errorf("-register-missing 必须和 -sync-agent-portraits 一起用")
 	}
 
 	dsn := firstNonEmpty(*dsnFlag, os.Getenv("DATABASE_URL"), os.Getenv("MULTICA_DATABASE_URL"))
@@ -121,7 +128,7 @@ func run() error {
 	if len(workspaces) == 0 {
 		return fmt.Errorf("no rongcloud workspace found to backfill")
 	}
-	if len(users) == 0 && !*syncNames && !*syncPortraits {
+	if len(users) == 0 && !*syncNames && !*syncPortraits && !*syncAgentPortraits {
 		return fmt.Errorf("no claw user matched; nothing to do")
 	}
 
@@ -130,13 +137,15 @@ func run() error {
 		Bidirectional: *bidirectional,
 		DryRun:        !*commit,
 		// -user 同时约束 -sync-portraits 的 rongcloud_user 那一路（白名单）。
-		OnlyRCUserIDs: users,
+		OnlyRCUserIDs:   users,
+		AgentPortraits:  *syncAgentPortraits,
+		RegisterMissing: *syncAgentPortraits && *registerMissing,
 	}
 	if opts.DryRun {
 		fmt.Println("DRY RUN — nothing will be written. Re-run with -commit to apply.")
 	}
-	fmt.Printf("workspaces=%d users=%d include_ops=%v bidirectional=%v sync_names=%v sync_portraits=%v\n\n",
-		len(workspaces), len(users), opts.IncludeOps, opts.Bidirectional, *syncNames, *syncPortraits)
+	fmt.Printf("workspaces=%d users=%d include_ops=%v bidirectional=%v sync_names=%v sync_portraits=%v sync_agent_portraits=%v register_missing=%v\n\n",
+		len(workspaces), len(users), opts.IncludeOps, opts.Bidirectional, *syncNames, *syncPortraits, *syncAgentPortraits, *registerMissing)
 
 	failed := 0
 
@@ -166,6 +175,28 @@ func run() error {
 			}
 		}
 		fmt.Printf("nickname summary: renamed=%d refreshed=%d skipped=%d failed=%d\n", renamed, refreshed, skipped, failed)
+		fmt.Println()
+	}
+
+	// agent 品牌头像：独立开关，且与「统一默认图」互斥 —— 两者折向同一批行，
+	// 同时开等于自己覆盖自己。只碰 rongcloud_user（真人表 claw_im_users 不参与）。
+	if *syncAgentPortraits {
+		if *syncPortraits {
+			return fmt.Errorf("-sync-portraits 与 -sync-agent-portraits 互斥：前者把默认图统一成一张，后者按 agent 类型发各自的品牌图")
+		}
+		var summary portraitSummary
+		for _, ws := range workspaces {
+			outcomes, err := svc.SyncUserPortraits(ctx, ws, opts)
+			if err != nil {
+				return fmt.Errorf("sync agent portraits workspace %s: %w", uuidString(ws), err)
+			}
+			for _, o := range outcomes {
+				summary.add(o.Status)
+				printPortrait(o.Scope, o.Status, o.RCUser, o.From, o.To, o.Error)
+			}
+		}
+		failed += summary.failed
+		fmt.Printf("agent portrait summary: planned=%d updated=%d registered=%d missing=%d skipped=%d failed=%d\n", summary.planned, summary.updated, summary.registered, summary.missing, summary.skipped, summary.failed)
 		fmt.Println()
 	}
 
@@ -217,7 +248,7 @@ func run() error {
 			summary.merge(localSummary)
 		}
 		failed += summary.failed
-		fmt.Printf("portrait summary: planned=%d updated=%d skipped=%d failed=%d\n", summary.planned, summary.updated, summary.skipped, summary.failed)
+		fmt.Printf("portrait summary: planned=%d updated=%d registered=%d missing=%d skipped=%d failed=%d\n", summary.planned, summary.updated, summary.registered, summary.missing, summary.skipped, summary.failed)
 		fmt.Println()
 	}
 
@@ -320,10 +351,12 @@ func resolveUsers(ctx context.Context, pool *pgxpool.Pool, userFlag string, all 
 
 // portraitSummary counts -sync-portraits outcomes.
 type portraitSummary struct {
-	planned int
-	updated int
-	skipped int
-	failed  int
+	planned    int
+	updated    int
+	registered int
+	missing    int
+	skipped    int
+	failed     int
 }
 
 func (s *portraitSummary) add(status string) {
@@ -332,6 +365,12 @@ func (s *portraitSummary) add(status string) {
 		s.planned++
 	case "updated":
 		s.updated++
+	case "registered":
+		s.registered++
+	case "missing":
+		// 融云侧没有这个账号：既不是成功也不是我们的失败，单独计数。
+		// 不能并入 failed —— 库里历史残行会让整轮退出码变 1，掩盖真正的失败。
+		s.missing++
 	case "skipped":
 		s.skipped++
 	case "failed":

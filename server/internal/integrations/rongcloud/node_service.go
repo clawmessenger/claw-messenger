@@ -767,6 +767,19 @@ type BackfillFriendsOptions struct {
 	// 命中这些值的行。CLI 的 -user 走它，否则一次「只补某个用户」会顺手刷全部
 	// workspace 的 rongcloud_user —— 那既是越权写也是不可控的融云调用量。
 	OnlyRCUserIDs []string
+	// AgentPortraits 把「融云 id 能解析出 agent 类型」的行刷成该类型的品牌头像
+	// （`<base>/<kind>-256.png`，见 agent_portrait.go），用于存量 agent 一次性
+	// 换图。与统一默认图那套语义互斥：开着它时机器主节点 / ops / 真人镜像行
+	// 一律 skipped，不会被顺手重刷。用户自选的头像两种模式都不会覆盖。
+	AgentPortraits bool
+	// RegisterMissing 让品牌头像这一路顺手补建融云侧缺失的账号：命中 1002
+	// （userId 不存在）时改走 /user/getToken.json —— 它带 name/portraitUri 创建
+	// 用户，一次调用就把账号和头像一起落下，不需要再补一次 refresh。
+	//
+	// 默认关闭。这是往融云写「身份」而不是改一个字段：库里可能存在早就不在
+	// 线的机器留下的残行，未经确认就把它们注册成真实 IM 账号，等于凭空造出
+	// 一批能收发消息的账号。要补的时候显式开。
+	RegisterMissing bool
 }
 
 // BackfillFriendOutcome records one owner->agent friend attempt.
@@ -937,8 +950,9 @@ type PortraitSyncOutcome struct {
 	Name   string `json:"name"`
 	From   string `json:"from"`
 	To     string `json:"to"`
-	// Status is one of: planned (dry run), updated, skipped (already default or
-	// a自定义头像), failed.
+	// Status is one of: planned (dry run), updated, registered (融云侧原本没有
+	// 这个账号，-register-missing 补建成功), missing (融云侧没有这个账号、未补建),
+	// skipped (already default or a自定义头像), failed.
 	Status string `json:"status"`
 	Error  string `json:"error,omitempty"`
 }
@@ -976,14 +990,63 @@ func (s *NodeService) SyncUserPortraits(ctx context.Context, workspaceID pgtype.
 			}
 		}
 		current := strings.TrimSpace(u.PortraitUri.String)
+		target := DefaultUserPortrait()
+		// 品牌头像（`<kind>-256.png`）也是我们自己写进去的，不是用户自选 ——
+		// 统一默认图这一路把它一并纳入可覆盖集合，`-sync-portraits` 就成了
+		// 「批量换回灰人形」的现成回滚命令。用户自选的头像仍然永不覆盖。
+		overridable := NeedsDefaultPortrait(current) || IsAgentPortraitURI(current)
+		if opts.AgentPortraits {
+			// 品牌头像这一路只认「融云 id 能解析出 agent 类型」的行：机器主节点、
+			// ops 节点、真人镜像行保持统一默认图 —— 目标是给 agent 换图，不是重刷全表。
+			kind, isAgent := AgentKindFromRCUserID(u.RongcloudUserID)
+			brand, hasBrand := "", false
+			if isAgent {
+				brand, hasBrand = AgentPortraitURI(kind)
+			}
+			if !hasBrand {
+				outcomes = append(outcomes, PortraitSyncOutcome{
+					Scope:  "rongcloud_user",
+					RCUser: u.RongcloudUserID,
+					Name:   u.Name.String,
+					From:   current,
+					To:     "",
+					Status: "skipped",
+				})
+				continue
+			}
+			target = brand
+			// 幂等：已经是目标值就跳过，一轮重跑零融云调用。
+			if current == target {
+				outcomes = append(outcomes, PortraitSyncOutcome{
+					Scope:  "rongcloud_user",
+					RCUser: u.RongcloudUserID,
+					Name:   u.Name.String,
+					From:   current,
+					To:     target,
+					Status: "skipped",
+				})
+				continue
+			}
+			// 可覆盖 = 空 / 历史默认图 / **当前统一默认图** / 上一轮我们自己写进去的
+			// 品牌图（换过图、或 id 解析出的类型变了都要能重刷）。
+			//
+			// 注意 `NeedsDefaultPortrait` 对「已经是统一默认图」返回 false（那是给
+			// 幂等复跑用的），但在换品牌图这一路，统一默认图正是**最该被覆盖**的那种，
+			// 所以必须单独判一次 `current == DefaultUserPortrait()`——漏掉它整批都会 skip。
+			//
+			// 用户自选的头像不属于以上任何一类，永不覆盖。
+			overridable = NeedsDefaultPortrait(current) ||
+				current == DefaultUserPortrait() ||
+				IsAgentPortraitURI(current)
+		}
 		outcome := PortraitSyncOutcome{
 			Scope:  "rongcloud_user",
 			RCUser: u.RongcloudUserID,
 			Name:   u.Name.String,
 			From:   current,
-			To:     DefaultUserPortrait(),
+			To:     target,
 		}
-		if !NeedsDefaultPortrait(current) {
+		if !overridable {
 			outcome.Status = "skipped"
 			outcomes = append(outcomes, outcome)
 			continue
@@ -996,6 +1059,37 @@ func (s *NodeService) SyncUserPortraits(ctx context.Context, workspaceID pgtype.
 		// 先推融云再落库：若 refreshUser 失败，库内仍是旧值，下一次 backfill 还能
 		// 命中重试；反过来先写库会让失败记录永远 skipped。
 		if _, err := s.client.refreshUser(ctx, u.RongcloudUserID, u.Name.String, outcome.To); err != nil {
+			// 1002 = 融云侧没有这个账号（库里是残行）。这不是「推送失败」：
+			// 重试一万次也还是 1002，不该拖累整轮批量的结论。
+			if IsRCUserNotFound(err) {
+				if !opts.RegisterMissing {
+					outcome.Status = "missing"
+					outcome.Error = err.Error()
+					outcomes = append(outcomes, outcome)
+					continue
+				}
+				// 显式要求补建：getToken 带 name/portraitUri 创建用户，
+				// 账号和头像一次落地，省掉再补一次 refresh。
+				if _, regErr := s.client.getUserToken(ctx, u.RongcloudUserID, u.Name.String, outcome.To); regErr != nil {
+					outcome.Status = "failed"
+					outcome.Error = fmt.Sprintf("register missing user: %v", regErr)
+					outcomes = append(outcomes, outcome)
+					continue
+				}
+				if _, err := s.queries.UpdateRongCloudUserProfile(ctx, db.UpdateRongCloudUserProfileParams{
+					ID:          u.ID,
+					Name:        u.Name,
+					PortraitUri: pgText(outcome.To),
+				}); err != nil {
+					outcome.Status = "failed"
+					outcome.Error = err.Error()
+					outcomes = append(outcomes, outcome)
+					continue
+				}
+				outcome.Status = "registered"
+				outcomes = append(outcomes, outcome)
+				continue
+			}
 			outcome.Status = "failed"
 			outcome.Error = err.Error()
 			outcomes = append(outcomes, outcome)

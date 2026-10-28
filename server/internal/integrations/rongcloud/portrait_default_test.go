@@ -66,13 +66,24 @@ type rongCloudFormRecorder struct {
 	forms map[string][]url.Values
 	// failPaths 命中的路径统一回 {code:1000}，用来验证「推送失败」分支。
 	failPaths map[string]bool
+	// notFoundUsers 命中的 userId 在 /user/refresh.json 上回 {code:1002}
+	// （融云「该用户不存在」），用来复现存量的「库里有行、融云没账号」。
+	notFoundUsers map[string]bool
 }
 
 func newRongCloudFormRecorder() *rongCloudFormRecorder {
 	return &rongCloudFormRecorder{
-		forms:     map[string][]url.Values{},
-		failPaths: map[string]bool{},
+		forms:         map[string][]url.Values{},
+		failPaths:     map[string]bool{},
+		notFoundUsers: map[string]bool{},
 	}
+}
+
+// markUserNotFound 让某个 userId 的 refresh 请求回 1002。
+func (r *rongCloudFormRecorder) markUserNotFound(userID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.notFoundUsers[userID] = true
 }
 
 func (r *rongCloudFormRecorder) start(t *testing.T) *httptest.Server {
@@ -84,11 +95,16 @@ func (r *rongCloudFormRecorder) start(t *testing.T) *httptest.Server {
 		r.mu.Lock()
 		r.forms[req.URL.Path] = append(r.forms[req.URL.Path], req.PostForm)
 		fail := r.failPaths[req.URL.Path]
+		notFound := req.URL.Path == "/user/refresh.json" && r.notFoundUsers[req.PostForm.Get("userId")]
 		r.mu.Unlock()
 
 		w.Header().Set("Content-Type", "application/json")
 		if fail {
 			fmt.Fprint(w, `{"code":1000,"errorMessage":"boom"}`)
+			return
+		}
+		if notFound {
+			fmt.Fprintf(w, `{"code":1002,"errorMessage":"userId %s is not exist."}`, req.PostForm.Get("userId"))
 			return
 		}
 		if req.URL.Path == "/user/getToken.json" {

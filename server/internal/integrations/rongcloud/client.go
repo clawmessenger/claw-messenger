@@ -6,6 +6,7 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -147,9 +148,34 @@ func (c *rongcloudAPIClient) postForm(ctx context.Context, path string, form url
 		return nil, fmt.Errorf("rongcloud: parse response: %w", err)
 	}
 	if code, ok := result["code"].(float64); ok && code != 200 {
-		return result, fmt.Errorf("rongcloud: API error code %v: %v", code, result["errorMessage"])
+		message, _ := result["errorMessage"].(string)
+		return result, &APIError{Code: int(code), Message: message}
 	}
 	return result, nil
+}
+
+// APIError 是融云的业务错误（响应体 `code != 200`）。
+//
+// 之前这里只返回 `fmt.Errorf`，调用方想区分「用户不存在」「不是好友」这类
+// 具体错误码就只能比对错误字符串 —— 那既脆又易错。现在有了类型，用
+// `errors.As` 取码即可；`Error()` 的输出和旧格式逐字一致，靠字符串匹配的
+// 老调用方（如 friend_request.go 的 25460 判定）不受影响。
+type APIError struct {
+	Code    int
+	Message string
+}
+
+func (e *APIError) Error() string {
+	return fmt.Sprintf("rongcloud: API error code %d: %s", e.Code, e.Message)
+}
+
+// RongCloudAPIError 把 err 还原成 *APIError；不是融云业务错误时 ok=false。
+func RongCloudAPIError(err error) (code int, message string, ok bool) {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		return 0, "", false
+	}
+	return apiErr.Code, apiErr.Message, true
 }
 
 // sendPrivateMessage sends a message to a specific user via RongCloud.
