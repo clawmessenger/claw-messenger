@@ -84,7 +84,7 @@ func (s *ChatroomService) CreateChatroom(ctx context.Context, params ChatroomCre
 		ConversationKind:    pgtype.Text{String: params.ConversationKind, Valid: params.ConversationKind != ""},
 		Config:              params.Config,
 		Status:              "active",
-		PortraitUri:         DefaultPortraitIfEmpty(params.PortraitUri),
+		PortraitUri:         GroupPortraitIfEmpty(ChatroomPortraitKind(params.ConversationKind), params.PortraitUri),
 	})
 }
 

@@ -445,7 +445,8 @@ func (h *systemHandler) actionChatroomUpdate(ctx context.Context, cmd CommandCon
 		}
 	}
 	// 只有非空 patch 才覆盖，与群设置（COALESCE(NULLIF(...))）语义一致：客户端
-	// 显式传 portraitUri:"" 不能把已有头像清空。两边都为空时落统一默认图。
+	// 显式传 portraitUri:"" 不能把已有头像清空。两边都为空时按房间类型落默认图
+	// （讨论组=圆桌三席 / 聊天室=两个气泡），不再落真人那张灰人形。
 	// 注意：聊天室头像**只写本地库** —— 融云聊天室 API 没有头像字段，这里不推融云，
 	// 也不存在「已同步到融云」这回事。
 	portrait := room.PortraitUri
@@ -454,7 +455,7 @@ func (h *systemHandler) actionChatroomUpdate(ctx context.Context, cmd CommandCon
 			portrait = trimmed
 		}
 	}
-	portrait = DefaultPortraitIfEmpty(portrait)
+	portrait = GroupPortraitIfEmpty(ChatroomPortraitKind(room.ConversationKind.String), portrait)
 	maxRounds := room.MaxRounds
 	if v, ok := cmd.Params["openclawMaxRounds"]; ok {
 		switch t := v.(type) {
@@ -715,7 +716,7 @@ func parseAIMembers(v interface{}) []aiMemberInput {
 func (h *systemHandler) actionChatroomCreate(ctx context.Context, cmd CommandContent, actor db.RongcloudUser) commandResult {
 	rcID := strings.TrimSpace(getStringAny(cmd.Params, "chatroom_id", "chatroomId"))
 	name := strings.TrimSpace(getStringAny(cmd.Params, "chatroom_name", "chatroomName"))
-	portrait := DefaultPortraitIfEmpty(getStringAny(cmd.Params, "portrait_uri", "portraitUri"))
+	portrait := GroupPortraitIfEmpty(GroupPortraitKindChatroom, getStringAny(cmd.Params, "portrait_uri", "portraitUri"))
 	hostNodeID := strings.TrimSpace(getStringAny(cmd.Params, "host_node_id", "hostNodeId"))
 	aiMembers := parseAIMembers(cmd.Params["aiMembers"])
 	maxRounds := int32(20)

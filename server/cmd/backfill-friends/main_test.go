@@ -275,3 +275,216 @@ func TestPortraitPrefilterOnlySelectsKnownDefaults(t *testing.T) {
 		t.Fatalf("dry run touched the custom row: %q", got)
 	}
 }
+
+// ---- 群类会话：按类型回刷（群聊 / 讨论组 / 聊天室） --------------------------
+
+// seedChatroomRowKind 落一行带 conversation_kind 的聊天室。kind 传空串时写 NULL
+// （历史行就是这种形态，判定上按聊天室处理）。
+func seedChatroomRowKind(t *testing.T, pool *pgxpool.Pool, rcID, kind, portrait string) {
+	t.Helper()
+	var kindValue any
+	if kind != "" {
+		kindValue = kind
+	}
+	_, err := pool.Exec(context.Background(), `
+		INSERT INTO rongcloud_chatroom (workspace_id, rongcloud_chatroom_id, owner_user_id, conversation_kind, portrait_uri)
+		VALUES ('00000000-0000-0000-0000-0000000000aa'::uuid, $1, '00000000-0000-0000-0000-0000000000bb'::uuid, $2, $3)`,
+		rcID, kindValue, portrait)
+	if err != nil {
+		t.Fatalf("seed rongcloud_chatroom %s: %v", rcID, err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM rongcloud_chatroom WHERE rongcloud_chatroom_id = $1`, rcID)
+	})
+}
+
+// seedGroupRow 落一行 rongcloud_group（群头像的本地镜像）。
+func seedGroupRow(t *testing.T, pool *pgxpool.Pool, groupID, portrait string) {
+	t.Helper()
+	_, err := pool.Exec(context.Background(), `
+		INSERT INTO rongcloud_group (group_id, group_name, owner_id, portrait_uri)
+		VALUES ($1, $2, 'owner-1', $3)`, groupID, "G "+groupID, portrait)
+	if err != nil {
+		t.Fatalf("seed rongcloud_group %s: %v", groupID, err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM rongcloud_group WHERE group_id = $1`, groupID)
+	})
+}
+
+// TestChatroomPortraitsFollowConversationKind 钉住聊天室回刷的两个要点：
+//
+//  1. 目标图按 conversation_kind 分流（讨论组=圆桌三席、聊天室=两个气泡，空 kind
+//     算聊天室），不再是所有人共用一张灰人形；
+//  2. 「统一默认图 default_user.png」必须能被预筛选中 —— 换图之前的房间全落在
+//     它上面，预筛漏掉这档就等于这条命令永远刷不动存量。
+//
+// 这一路不推融云（聊天室 API 没有头像字段），所以整个用例不需要假融云服务。
+func TestChatroomPortraitsFollowConversationKind(t *testing.T) {
+	forcedDryRunEnv(t)
+	pool := backfillTestPool(t)
+	ctx := context.Background()
+
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	discussionRC := "bf-disc-" + suffix
+	chatroomRC := "bf-room-" + suffix
+	noKindRC := "bf-nokind-" + suffix
+	customRC := "bf-custom-" + suffix
+	const custom = "https://cdn.example.com/uploads/self-chosen.png"
+
+	unified := rongcloud.DefaultUserPortraitURI
+	seedChatroomRowKind(t, pool, discussionRC, "discussion", unified)
+	seedChatroomRowKind(t, pool, chatroomRC, "chatroom", unified)
+	seedChatroomRowKind(t, pool, noKindRC, "", "")
+	seedChatroomRowKind(t, pool, customRC, "discussion", custom)
+	mine := []string{discussionRC, chatroomRC, noKindRC, customRC}
+
+	// 预筛：三条默认图入选，自定义头像不入选。
+	args := append(groupPortraitFixCandidates(), mine)
+	rows, err := pool.Query(ctx, fmt.Sprintf(`
+		SELECT rongcloud_chatroom_id FROM rongcloud_chatroom
+		WHERE rongcloud_chatroom_id = ANY($5::text[]) AND %s
+		ORDER BY 1`, groupPortraitNeedsFixWhere), args...)
+	if err != nil {
+		t.Fatalf("prefilter query: %v", err)
+	}
+	var selected []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			t.Fatalf("scan: %v", err)
+		}
+		selected = append(selected, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	if len(selected) != 3 {
+		t.Fatalf("prefilter selected %v, want the 3 default rows (自定义头像绝不能入选)", selected)
+	}
+	for _, id := range selected {
+		if id == customRC {
+			t.Fatalf("prefilter selected the custom row %s", id)
+		}
+	}
+
+	// dry-run：计划 3 条，库内一个字节都不动。
+	summary, err := syncChatroomPortraits(ctx, pool, true)
+	if err != nil {
+		t.Fatalf("syncChatroomPortraits(dry run): %v", err)
+	}
+	if summary.planned < 3 || summary.updated != 0 {
+		t.Fatalf("dry run summary = %+v, want at least 3 planned and 0 updated", summary)
+	}
+	if got := readChatroomPortrait(t, pool, discussionRC); got != unified {
+		t.Fatalf("dry run wrote %s: %q", discussionRC, got)
+	}
+
+	// commit：按类型落图。
+	summary, err = syncChatroomPortraits(ctx, pool, false)
+	if err != nil {
+		t.Fatalf("syncChatroomPortraits(commit): %v", err)
+	}
+	if summary.updated < 3 {
+		t.Fatalf("commit updated=%d, want at least 3", summary.updated)
+	}
+	discussionWant := rongcloud.GroupPortraitURI(rongcloud.GroupPortraitKindDiscussion)
+	chatroomWant := rongcloud.GroupPortraitURI(rongcloud.GroupPortraitKindChatroom)
+	if got := readChatroomPortrait(t, pool, discussionRC); got != discussionWant {
+		t.Fatalf("discussion portrait = %q, want %q", got, discussionWant)
+	}
+	if got := readChatroomPortrait(t, pool, chatroomRC); got != chatroomWant {
+		t.Fatalf("chatroom portrait = %q, want %q", got, chatroomWant)
+	}
+	// 没有 conversation_kind 的历史行按聊天室处理。
+	if got := readChatroomPortrait(t, pool, noKindRC); got != chatroomWant {
+		t.Fatalf("kind-less room portrait = %q, want %q", got, chatroomWant)
+	}
+	// 自定义头像原样保留。
+	if got := readChatroomPortrait(t, pool, customRC); got != custom {
+		t.Fatalf("custom portrait was overwritten: %q", got)
+	}
+
+	// 幂等：再跑一次什么都不该改（回填会被运维反复执行）。
+	before := summary.updated
+	summary, err = syncChatroomPortraits(ctx, pool, false)
+	if err != nil {
+		t.Fatalf("syncChatroomPortraits(second commit): %v", err)
+	}
+	if summary.updated != 0 {
+		t.Fatalf("second run still updated %d rows (was %d)", summary.updated, before)
+	}
+}
+
+// TestGroupPortraitsTargetTheGroupArt 覆盖群这一路的预筛 + 目标图判定：
+// 群头像要推融云（真实 HTTP），所以这里只验「哪些行会进候选、目标是什么」，
+// 推送本身由 portrait_default_test.go 的 refreshGroupInfo 断言覆盖。
+func TestGroupPortraitsTargetTheGroupArt(t *testing.T) {
+	forcedDryRunEnv(t)
+	pool := backfillTestPool(t)
+	ctx := context.Background()
+
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	unifiedID := "bf-grp-unified-" + suffix
+	groupArtID := "bf-grp-art-" + suffix
+	discussionArtID := "bf-grp-disc-" + suffix
+	customID := "bf-grp-custom-" + suffix
+	const custom = "https://cdn.example.com/uploads/our-group.png"
+
+	seedGroupRow(t, pool, unifiedID, rongcloud.DefaultUserPortraitURI)
+	seedGroupRow(t, pool, groupArtID, rongcloud.GroupPortraitURI(rongcloud.GroupPortraitKindGroup))
+	seedGroupRow(t, pool, discussionArtID, rongcloud.GroupPortraitURI(rongcloud.GroupPortraitKindDiscussion))
+	seedGroupRow(t, pool, customID, custom)
+	mine := []string{unifiedID, groupArtID, discussionArtID, customID}
+
+	args := append(groupPortraitFixCandidates(), mine)
+	rows, err := pool.Query(ctx, fmt.Sprintf(`
+		SELECT group_id FROM rongcloud_group
+		WHERE group_id = ANY($5::text[]) AND %s
+		ORDER BY 1`, groupPortraitNeedsFixWhere), args...)
+	if err != nil {
+		t.Fatalf("prefilter query: %v", err)
+	}
+	var selected []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			t.Fatalf("scan: %v", err)
+		}
+		selected = append(selected, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	// 三张我方图都进候选（含已经是目标图的那条：第二层 NeedsGroupPortraitFix 才
+	// 决定它 skipped），只有用户自定义头像不进。
+	if len(selected) != 3 {
+		t.Fatalf("prefilter selected %v, want the 3 default rows", selected)
+	}
+	for _, id := range selected {
+		if id == customID {
+			t.Fatalf("prefilter selected the custom group %s", id)
+		}
+	}
+
+	groupWant := rongcloud.GroupPortraitURI(rongcloud.GroupPortraitKindGroup)
+	cases := map[string]bool{
+		unifiedID:       true, // 统一默认图 → 要改成群图
+		groupArtID:      false, // 已经是群图 → 幂等跳过
+		discussionArtID: true, // 类型判错留下的讨论组图 → 要纠正
+		customID:        false,
+	}
+	for id, want := range cases {
+		var current string
+		if err := pool.QueryRow(ctx, `SELECT COALESCE(portrait_uri,'') FROM rongcloud_group WHERE group_id = $1`, id).Scan(&current); err != nil {
+			t.Fatalf("read group %s: %v", id, err)
+		}
+		if got := rongcloud.NeedsGroupPortraitFix(current, groupWant); got != want {
+			t.Fatalf("NeedsGroupPortraitFix(%s = %q) = %v, want %v", id, current, got, want)
+		}
+	}
+}

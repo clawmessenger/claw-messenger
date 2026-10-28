@@ -19,7 +19,8 @@ import (
 // portrait_default_test.go 覆盖「默认头像统一成 default_user.png 并同步融云」这
 // 条需求的写入侧契约：
 //
-//  1. 图源唯一 —— 真人 / AI 节点 / 群 / 讨论组 / 聊天室成员取的是同一串；
+//  1. 图源唯一 —— 真人 / AI 节点 / 聊天室成员取的是同一串（群类会话见
+//     portrait_group_test.go：群聊 / 讨论组 / 聊天室各有专属图）；
 //  2. NeedsDefaultPortrait 的判定表 —— 只命中空值与已知旧默认值，用户自定义
 //     头像绝不能命中（存量补齐最容易出错的地方）；
 //  3. 每条写路径（注册 / 刷新 token / 资料更新 / 建群 / 聊天室 / 讨论组）都不再
@@ -303,7 +304,6 @@ func TestNeedsDefaultPortraitNeverMatchesCustomPortraits(t *testing.T) {
 }
 
 // ---- 3a. 建群：空头像落库 + 补一次 refreshGroupInfo --------------------------
-
 func TestGroupCreateFillsDefaultPortraitAndRefreshesIt(t *testing.T) {
 	portraitTestClearEnv(t)
 	rec, srv := newGroupTestServer(t)
@@ -326,13 +326,15 @@ func TestGroupCreateFillsDefaultPortraitAndRefreshesIt(t *testing.T) {
 		t.Fatalf("group/create must not carry a portrait, got %q", got)
 	}
 
-	// 建群成功后必须补一次 /group/refresh.json 写群资料头像。
+	// 建群成功后必须补一次 /group/refresh.json 写群资料头像。目标是**群聊**专属
+	// 默认图（两人剪影），不是真人那张统一默认图 —— 移动端会话列表读的就是它。
 	refreshes := rec.calls("/group/refresh.json")
 	if len(refreshes) != 1 {
 		t.Fatalf("refresh calls = %d, want exactly 1", len(refreshes))
 	}
-	if got := refreshes[0]["portraitUri"]; got != DefaultUserPortraitURI {
-		t.Fatalf("refresh portraitUri = %q, want %q", got, DefaultUserPortraitURI)
+	groupPortrait := GroupPortraitURI(GroupPortraitKindGroup)
+	if got := refreshes[0]["portraitUri"]; got != groupPortrait {
+		t.Fatalf("refresh portraitUri = %q, want %q", got, groupPortrait)
 	}
 	if got := refreshes[0]["groupId"]; got != "100001" {
 		t.Fatalf("refresh groupId = %q", got)
@@ -342,12 +344,12 @@ func TestGroupCreateFillsDefaultPortraitAndRefreshesIt(t *testing.T) {
 		t.Fatalf("refresh must not touch the group name, got %q", got)
 	}
 
-	// 本地镜像也必须是默认图，不是空串。
+	// 本地镜像也必须是群聊默认图，不是空串。
 	if len(stub.saved) != 1 {
 		t.Fatalf("mirror saved %d groups, want 1", len(stub.saved))
 	}
-	if got := stub.saved[0].PortraitURI; got != DefaultUserPortraitURI {
-		t.Fatalf("mirror portrait = %q, want %q", got, DefaultUserPortraitURI)
+	if got := stub.saved[0].PortraitURI; got != groupPortrait {
+		t.Fatalf("mirror portrait = %q, want %q", got, groupPortrait)
 	}
 
 	// 回包里的 portraitUri 与落库值一致（web 直接渲染它）。
@@ -356,8 +358,8 @@ func TestGroupCreateFillsDefaultPortraitAndRefreshesIt(t *testing.T) {
 	if !ok {
 		t.Fatalf("result data is not an object: %#v", result["data"])
 	}
-	if got := data["portraitUri"]; got != DefaultUserPortraitURI {
-		t.Fatalf("command result portraitUri = %v, want %q", got, DefaultUserPortraitURI)
+	if got := data["portraitUri"]; got != groupPortrait {
+		t.Fatalf("command result portraitUri = %v, want %q", got, groupPortrait)
 	}
 }
 
@@ -402,8 +404,8 @@ func TestGroupCreateSurvivesPortraitRefreshFailure(t *testing.T) {
 	if result := rec.lastCommandResult(t); result["status"] != "success" {
 		t.Fatalf("a portrait refresh failure must not fail the command: %#v", result)
 	}
-	if len(stub.saved) != 1 || stub.saved[0].PortraitURI != DefaultUserPortraitURI {
-		t.Fatalf("mirror must still record the default portrait, got %#v", stub.saved)
+	if len(stub.saved) != 1 || stub.saved[0].PortraitURI != GroupPortraitURI(GroupPortraitKindGroup) {
+		t.Fatalf("mirror must still record the group default portrait, got %#v", stub.saved)
 	}
 }
 
@@ -537,9 +539,10 @@ func TestChatroomCreateAndJoinNeverStoreEmptyPortrait(t *testing.T) {
 	f := setupChatroomFixtureFull(t)
 	ctx := context.Background()
 
-	// 房间头像（纯本地列，融云聊天室 API 没有该字段）。
-	if got := chatroomPortrait(t, f.pool, f.roomRCID); got != DefaultUserPortraitURI {
-		t.Fatalf("chatroom portrait = %q, want %q", got, DefaultUserPortraitURI)
+	// 房间头像（纯本地列，融云聊天室 API 没有该字段）：聊天室落「两个气泡」。
+	// 成员行仍是人和 AI 节点，继续落统一默认图（下面逐行断言非空）。
+	if got := chatroomPortrait(t, f.pool, f.roomRCID); got != GroupPortraitURI(GroupPortraitKindChatroom) {
+		t.Fatalf("chatroom portrait = %q, want %q", got, GroupPortraitURI(GroupPortraitKindChatroom))
 	}
 
 	// 建聊天室时落下的成员行（owner / host / 普通 AI）都不能是空串。
@@ -688,8 +691,8 @@ func TestRoundtableRoomAndMembersCarryDefaultPortrait(t *testing.T) {
 	f := setupSetupFixture(t)
 	chatroomID, _ := f.createShell(t, "req-portrait-"+uniqueID("t"))
 
-	if got := chatroomPortrait(t, f.pool, chatroomID); got != DefaultUserPortraitURI {
-		t.Fatalf("roundtable room portrait = %q, want %q", got, DefaultUserPortraitURI)
+	if got := chatroomPortrait(t, f.pool, chatroomID); got != GroupPortraitURI(GroupPortraitKindDiscussion) {
+		t.Fatalf("roundtable room portrait = %q, want %q", got, GroupPortraitURI(GroupPortraitKindDiscussion))
 	}
 	members := chatroomMemberPortraits(t, f.pool, chatroomID)
 	if len(members) == 0 {
