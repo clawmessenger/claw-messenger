@@ -3,7 +3,7 @@ import { buildProgram, commanderExit } from "./main.js";
 import { Keystore } from "./keystore.js";
 import { XiachatApi } from "./api.js";
 import { defaultKeystorePath } from "./config.js";
-import { ensureInstalled, isSeaExecutable, installPaths, type InstallResult } from "./install.js";
+import { ensureInstalled, isSeaExecutable, upgradeTargetPath, type InstallResult } from "./install.js";
 import { applyStagedUpdate, cleanupStaleBackups, healInstall } from "./self-update.js";
 
 // A staged update — downloaded and checksum-verified by `clawmessenger update`
@@ -15,7 +15,18 @@ import { applyStagedUpdate, cleanupStaleBackups, healInstall } from "./self-upda
 let stagedVersion: string | null = null;
 try {
   if (isSeaExecutable(process.argv[1])) {
-    const target = installPaths(process.platform, os.homedir()).target;
+    // 落点必须是**正在运行的自己**（`process.execPath`），不能按平台猜 ——
+    // 与手动 `update`、服务端下发升级共用 upgradeTargetPath 这一个判定。
+    // 按 installPaths 猜会在 Linux 上直接猜错：systemd 的 unit 可能指向
+    // /usr/local/bin，而 installPaths 给的是 ~/.local/bin，于是暂存文件落在
+    // 没人运行的那份旁边，每次启动都「什么也没有」，升级静默失效。判定细节
+    // 与理由见 install.ts 的 upgradeTargetPath。
+    const target = upgradeTargetPath(
+      process.platform,
+      process.argv[1],
+      process.execPath,
+      os.homedir(),
+    );
     // 自愈先于交换：升级的交换是两步 rename（旧 → .old-<ts>、新 → target），
     // 中间 target 会短暂不存在。断电停在那一步之后，登录自启的 VBS 会找不到
     // exe 而静默失败 —— 设备就此离线。这里（以及 __relaunch）把 target 补回来。

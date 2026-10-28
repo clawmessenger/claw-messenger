@@ -1134,7 +1134,17 @@ export function buildProgram(opts: BuildProgramOpts): Command {
     .option("--force", "stage the latest release even when it is not newer than this build")
     .action(async (cmdOpts: { check?: boolean; force?: boolean }) => {
       const current = program.version() ?? "0.0.0";
-      const target = installPaths(process.platform, os.homedir()).target;
+      // 暂存到**正在运行的自己**旁边，而不是 installPaths 猜出来的安装位 ——
+      // 两者在 Linux 上经常不同（systemd 的 unit 指向 /usr/local/bin，installPaths
+      // 指向 ~/.local/bin）。猜错的话，`update` 会兴高采烈地报「staged 1.3.x」，
+      // 而每次启动去另一个目录找暂存、永远找不到，升级静默失效；下一次 update
+      // 又会去改同一个错文件，问题自己不会暴露。
+      const target = upgradeTargetPath(
+        process.platform,
+        process.argv[1],
+        process.execPath,
+        os.homedir(),
+      );
       let plan;
       try {
         plan = await checkForUpdate(current, process.platform, process.arch);
