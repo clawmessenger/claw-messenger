@@ -302,6 +302,13 @@ func (h *Handler) ClawAdminRequestNodeUpgrade(w http.ResponseWriter, r *http.Req
 			singleSHA = digest
 		}
 	}
+	// nil 切片必须换成空切片再出响应：`skips` 是命名返回值，一次「全部下发成功」
+	// 的批量里它从没 append 过，`encoding/json` 会把它写成 `"skipped": null`，
+	// 而管理端 UpgradeModal 读的是 `result.skipped.length` —— 线上就是这么白屏的
+	// （TypeError: Cannot read properties of null (reading 'length')，整页被 React
+	// 卸载）。契约上「没有跳过」是 []，不是 null。
+	issued = clawAdminUpgradeNonNil(issued)
+	skips = clawAdminUpgradeNonNil(skips)
 	clawAdminOK(w, map[string]interface{}{
 		"batch_id":        batchID,
 		"target_version":  release.Version,
@@ -318,6 +325,23 @@ func (h *Handler) ClawAdminRequestNodeUpgrade(w http.ResponseWriter, r *http.Req
 		"issued":          issued,
 		"skipped":         skips,
 	})
+}
+
+// clawAdminUpgradeNonNil 把 nil 切片换成空切片，只用于出响应。
+//
+// 这不是洁癖，是线上事故：Go 的 nil slice 序列化成 JSON `null`，而管理端页面
+// 直接读 `result.skipped.length` / `result.issued.map`。`skips` 在
+// clawAdminResolveUpgradeTargets 里是命名返回值，一次「全部下发成功」的批量里
+// 它从没 append 过、于是是 nil —— 响应里就是 `"skipped": null`，页面渲染当场
+// TypeError（Cannot read properties of null (reading 'length')），React 卸载整棵树，
+// 管理端白屏。契约上「没有跳过」是 []，「字段不存在」才是 null，两者不能混。
+//
+// 归一只做在边界（写响应之前），内部逻辑仍然可以自由用 nil 表示空集合。
+func clawAdminUpgradeNonNil[T any](items []T) []T {
+	if items == nil {
+		return []T{}
+	}
+	return items
 }
 
 // clawUpgradeSkipSummary 把跳过原因压成一句人话（按原因计数，最多列 3 类）。

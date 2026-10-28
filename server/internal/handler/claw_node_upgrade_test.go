@@ -387,6 +387,41 @@ func TestDecodeClawUpgradeRequestRejectsAnythingButMachineListAndForce(t *testin
 	}
 }
 
+// 线上事故回归（2026-10-28）：Go 的 nil slice 会序列化成 JSON `null`，而管理端
+// UpgradeModal 读的是 `result.skipped.length`。`skips` 在
+// clawAdminResolveUpgradeTargets 里是命名返回值，一次「全部下发成功」的批量里它
+// 从没 append 过、于是是 nil —— 响应里就是 `"skipped": null`，页面渲染期
+// TypeError（Cannot read properties of null (reading 'length')），React 卸载整棵树，
+// 管理端白屏。
+//
+// 契约上「没有跳过」是 []，「字段不存在/不可用」才是 null，两者不能混。这条用例钉
+// 住的是序列化结果本身，而不是 normalize 函数长得对不对。
+func TestClawAdminUpgradeResponseNeverSerializesNullSlices(t *testing.T) {
+	var nilIssued []clawAdminUpgradeProgress
+	var nilSkips []clawUpgradeSkip
+
+	payload, err := json.Marshal(map[string]interface{}{
+		"issued":  clawAdminUpgradeNonNil(nilIssued),
+		"skipped": clawAdminUpgradeNonNil(nilSkips),
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if got := string(payload); got != `{"issued":[],"skipped":[]}` {
+		t.Fatalf("empty collections must serialize as [], got %s", got)
+	}
+
+	// 非 nil 必须原样透传：归一化不能顺手把内容吃掉或改顺序。
+	issued := []clawAdminUpgradeProgress{{MachineID: "m1", Status: clawUpgradeStatusPending}}
+	skips := []clawUpgradeSkip{{MachineID: "m2", Reason: "already_current"}}
+	if got := clawAdminUpgradeNonNil(issued); len(got) != 1 || got[0].MachineID != "m1" {
+		t.Fatalf("non-nil slice must pass through unchanged, got %+v", got)
+	}
+	if got := clawAdminUpgradeNonNil(skips); len(got) != 1 || got[0].Reason != "already_current" {
+		t.Fatalf("non-nil slice must pass through unchanged, got %+v", got)
+	}
+}
+
 // fakeGitHub 是一个最小可用的 releases/latest 后端，用于验证缓存与降级语义。
 func fakeGitHub(t *testing.T, version string, fail *atomic.Bool) (*httptest.Server, *atomic.Int32) {
 	t.Helper()
