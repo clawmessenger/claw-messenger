@@ -487,6 +487,16 @@ describe("CUSTOM_MESSAGE_TYPES（融云注册表）", () => {
     const names = new Set(CUSTOM_MESSAGE_TYPES.map(([name]) => name));
     for (const type of webSide) expect(names.has(type)).toBe(true);
   });
+
+  it("command 与 web / spec 一致：不存历史、不计未读", () => {
+    // spec 2026-10-12-claw-runtime-recovery-design §4 的前提是
+    // isPersisted=false、isCounted=false，web 端 im.ts 也一直是 [false, false]。
+    // 这里曾是 [true, true]：每条探活应答都进融云历史并计未读，用户会话里
+    // 反复冒出「runtime binary present」气泡，红点也一直被机器帧顶起来。
+    const command = CUSTOM_MESSAGE_TYPES.find(([name]) => name === "command")!;
+    expect(command[1]).toBe(false);
+    expect(command[2]).toBe(false);
+  });
 });
 
 describe("SendThrottle（全连接串行发送队列）", () => {

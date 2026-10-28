@@ -695,12 +695,20 @@ export class SendThrottle {
 /**
  * 设备端注册的融云自定义消息（objectName → [持久化, 计未读]）。与 web 端
  * src/services/im.ts 的同名表同源 —— 缺一条，那类消息就被融云当未知类型拒发
- * （unsupported objectName）。0.2.29 漏了 chat_stream_chunk：超过 9KB 的流帧
+ * （unsupported objectName）；同一 objectName 的 [持久化, 计未读] 标志也必须
+ * 与 web 端一致，否则会单方面把内部协议帧写进用户历史并顶起未读红点。
+ * 0.2.29 漏了 chat_stream_chunk：超过 9KB 的流帧
  * 全部被拒，长思考/长正文轮次在 web 上永远停在流式中，直到兜底整包文本落地
  * 才补上 —— 0.2.30 修。
  */
 export const CUSTOM_MESSAGE_TYPES: ReadonlyArray<readonly [string, boolean, boolean]> = [
-  ["command", true, true],
+  // command: 本项目的内部协议通道（运行时探活、模型目录、命令回执）。
+  // spec 2026-10-12-claw-runtime-recovery-design §4 的前提是 isPersisted=false、
+  // isCounted=false，web 端 im.ts 也一直是 [false, false]。这里曾误注册成
+  // [true, true]，于是每条探活应答都进融云历史并计未读 —— 用户会话里反复
+  // 冒出「runtime binary present」气泡，红点也一直被这些机器帧顶起来。
+  // 改成与 web / spec 一致：不存历史、不计未读。
+  ["command", false, false],
   ["card_message", true, true],
   ["card_update", true, true],
   ["card_action", false, false],
