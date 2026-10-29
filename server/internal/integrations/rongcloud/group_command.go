@@ -296,6 +296,16 @@ func (h *systemHandler) sendWebError(ctx context.Context, msg NormalizedMessage,
 		cmd.Service, cmd.Action, "error", code, nil, message)
 }
 
+// sendWebErrorWithData 与 sendWebError 相同，但**带上 data**。
+//
+// 只有「失败里必须点名到具体是哪几个」的场景才需要它：一句 message 说不清
+// 「5 个好友里第 3 个的智能体被主人关掉了群聊权限」，而前端要靠 data 才能把
+// 这句话拼成人话（错误回执的 data 在 web 侧是 error.data，见 services/im.ts）。
+func (h *systemHandler) sendWebErrorWithData(ctx context.Context, msg NormalizedMessage, cmd CommandContent, code int, message string, data interface{}) error {
+	return h.client.sendWebCommandResult(ctx, h.nodeID, msg.FromUserID, cmd.RequestID,
+		cmd.Service, cmd.Action, "error", code, data, message)
+}
+
 // getStringSlice reads a JSON array of strings, tolerating a single string or a
 // comma-separated list (the web has sent both shapes historically).
 func getStringSlice(params map[string]interface{}, key string) []string {
