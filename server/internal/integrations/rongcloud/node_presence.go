@@ -25,9 +25,17 @@ import (
 //
 // presence 查询失败按离线处理（fail closed）：命令发不出去，讨论/房间都驱动不了，
 // 谎报在线只会让流程走到更靠后的地方再失败。这一点与原版 _rongcloud_online 一致。
+//
+// 判定语义**没有变**：权威信号仍然是融云 /user/checkOnline.json。变的只是同一次
+// 观测在 nodePresenceCacheTTL（4s）内会被复用 —— 一轮推荐要对 N 台候选设备做
+// 同一件事，串行逐台问一遍是 1-4s × N 的主要来源。失败结果不缓存（见
+// node_presence_cache.go 的文件头注释）。
 func nodeIsOnline(ctx context.Context, client *rongcloudAPIClient, node db.RongcloudNode) bool {
 	if client == nil || node.RongcloudUserID == "" {
 		return node.DeployStatus == "online"
+	}
+	if online, hit := client.presence.lookup(node.RongcloudUserID); hit {
+		return online
 	}
 	online, err := client.checkOnline(ctx, node.RongcloudUserID)
 	if err != nil {
@@ -39,6 +47,7 @@ func nodeIsOnline(ctx context.Context, client *rongcloudAPIClient, node db.Rongc
 			"error", err)
 		return false
 	}
+	client.presence.store(node.RongcloudUserID, online)
 	return online
 }
 

@@ -46,6 +46,13 @@ const (
 // 下限天然受「一个 agent 只能演一个角色」约束（候选节点数）。
 const recommendRoleCountCap = 5
 
+// recommendRolesFallbackTimeoutSeconds 是「主持配置里没给超时」时等设备端推荐
+// 结果的兜底秒数，与管理端默认值同口径（handler 侧
+// clawAdminDiscussionHostTimeoutInit = 120）：一次完整的设备端 LLM 回合十几秒到
+// 100s+，兜底值比产品要求的一次推荐耗时还短，等于必然报超时。只影响
+// timeout_seconds 为 0/缺失的配置（正常路径用配置值）。
+const recommendRolesFallbackTimeoutSeconds = 120
+
 // setupPromptPayload 是 setup_prompt 事件的 data 形状（v3 契约，见 web
 // lib/discussion-v3.ts 的 eventData.setup_prompt）。
 func setupPromptPayload(step, prompt string) map[string]interface{} {
@@ -416,6 +423,10 @@ func (rt *discussionRuntime) recommendForSetupAsync(ctx context.Context, discuss
 // 重试入口），不再回写命令回调（它早已 200）。
 func (rt *discussionRuntime) recommendForSetupBatch(ctx context.Context, discussionID string, attempt int, req setupRecommendRequest) {
 	logger := rt.logger
+	// 整条管线的墙钟起点：成功与失败日志都要带总耗时 —— 过去只有失败打日志、
+	// 且没有耗时，用户报「点了很久没反应」时无法判断慢在 presence、broker 往返
+	// 还是设备端模型回合。
+	startedAt := time.Now()
 	// code 是唯一权威，文案由它派生：主持设备「在线但跑不出推荐」有三种完全
 	// 不同的内因（设备端轮次超时 / 应答无法解析 / 通道未装配），过去全部落在
 	// 同一句「角色推荐失败，请重试」上，用户只能反复点重试。见
@@ -437,7 +448,8 @@ func (rt *discussionRuntime) recommendForSetupBatch(ctx context.Context, discuss
 			rt.interactiveBroadcast(ctx, d, rec)
 		}
 		logger.Warn("discussion: setup 角色推荐失败",
-			"discussionId", discussionID, "attempt", attempt, "code", code, "message", message)
+			"discussionId", discussionID, "attempt", attempt, "code", code, "message", message,
+			"elapsedMs", time.Since(startedAt).Milliseconds())
 	}
 
 	d, err := rt.repo.Get(ctx, discussionID)
@@ -453,7 +465,7 @@ func (rt *discussionRuntime) recommendForSetupBatch(ctx context.Context, discuss
 		fail(hostErr)
 		return
 	}
-	candidates, candCode := rt.roundtable.roleCandidateNodesFor(ctx, d.CreatedBy, host, req.nodeIDs, req.nodeIDsGiven)
+	candidates, candCode, presenceStats := rt.roundtable.roleCandidateNodesForWithStats(ctx, d.CreatedBy, host, req.nodeIDs, req.nodeIDsGiven)
 	if candCode != "" {
 		fail(candCode)
 		return
@@ -486,7 +498,9 @@ func (rt *discussionRuntime) recommendForSetupBatch(ctx context.Context, discuss
 	}
 	timeout := host.timeoutSeconds
 	if timeout <= 0 {
-		timeout = 60
+		// 配置缺失/为 0 时的兜底，与 handler 侧 clawAdminDiscussionHostTimeoutInit
+		// （120s）同口径：一份「没配超时」的主持配置不该比默认值更急。
+		timeout = recommendRolesFallbackTimeoutSeconds
 	}
 	bctx, cancel := context.WithTimeout(ctx, time.Duration(timeout+5)*time.Second)
 	defer cancel()
@@ -562,6 +576,20 @@ func (rt *discussionRuntime) recommendForSetupBatch(ctx context.Context, discuss
 	}, setupPromptIdemPrefix+setupStepRoles+":"+discussionID+":"+intStr(attempt)); err != nil {
 		logger.Warn("discussion: setup_prompt(roles) emit failed", "discussionId", discussionID, "error", err)
 	}
+	// 成功路径的唯一一行日志。过去成功完全静默（只有失败打日志），于是「推荐慢」
+	// 这件用户最直观的抱怨在服务端没有任何锚点。presenceMs 是候选在线探测那一段
+	// 的墙钟耗时（并发后已从 N × 1-4s 压到 ≈1-4s），totalMs 是整条管线的墙钟
+	// 耗时 —— 两者之差基本就是持久化 + broker 往返 + 设备端模型回合。
+	logger.Info("discussion: setup 角色推荐成功",
+		"discussionId", discussionID,
+		"attempt", attempt,
+		"append", req.appendMode,
+		"roles", len(roles),
+		"candidates", len(candidates),
+		"presenceNodes", presenceStats.nodes,
+		"presenceOnline", presenceStats.online,
+		"presenceMs", presenceStats.duration.Milliseconds(),
+		"totalMs", time.Since(startedAt).Milliseconds())
 	rt.touchSetup(ctx, discussionID)
 }
 

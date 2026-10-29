@@ -97,7 +97,8 @@ func (rt *discussionRuntime) actionRecommendRoles(ctx context.Context, cmd Comma
 	}
 	timeout := host.timeoutSeconds
 	if timeout <= 0 {
-		timeout = 60
+		// 与 setup 链路同一口径（见 recommendRolesFallbackTimeoutSeconds）。
+		timeout = recommendRolesFallbackTimeoutSeconds
 	}
 	bctx, cancel := context.WithTimeout(ctx, time.Duration(timeout+5)*time.Second)
 	defer cancel()

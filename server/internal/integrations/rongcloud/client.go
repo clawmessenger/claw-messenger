@@ -37,6 +37,12 @@ type rongcloudAPIClient struct {
 	// construction or successfully loaded), so failed loads can retry
 	// without re-running after a success.
 	credsResolved bool
+	// presence 是「节点融云 id → 是否在线」的短 TTL 缓存，只被 nodeIsOnline
+	// 使用（见 node_presence_cache.go）。放在 client 上而不是包级变量，是为了让
+	// 它天然跟着「一个融云凭据上下文」走：用例里每个假服务各建一个 client，
+	// 互不串味；生产里一个进程一个 client，正好只合并同一进程内的重复探测。
+	// nil 表示不缓存（只有用例才会这样构造）。
+	presence *nodePresenceCache
 }
 
 func newRongCloudAPIClient(appKey, appSecret, base string, client *http.Client, logger *slog.Logger) *rongcloudAPIClient {
@@ -55,6 +61,7 @@ func newRongCloudAPIClient(appKey, appSecret, base string, client *http.Client, 
 		base:      base,
 		client:    client,
 		logger:    logger,
+		presence:  newNodePresenceCache(nodePresenceCacheTTL),
 	}
 }
 
