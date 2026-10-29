@@ -46,6 +46,14 @@ const setupRecommendInflightTTL = 11 * time.Minute
 // 不是切失败卡，混用会把用户从等待直接推到重试。
 const setupRecommendInProgressCode = "ROLE_RECOMMEND_IN_PROGRESS"
 
+// setupTopicChangedWhileRecommendingCode 是「在途推荐期间议题被改了」的 code。
+//
+// 单独一个码，不与上面那个混用：语义完全不同 —— 前者是「你点的这次没生效，等就行」，
+// 这个还额外意味着**在跑的这批结果是按旧议题产出的**，前端必须告诉用户「新议题要等
+// 下一批才生效」，否则用户会拿到一批和新议题毫不相干的角色，而回包看上去一切正常
+// （正是这个静默错配促使它单独成码）。
+const setupTopicChangedWhileRecommendingCode = "SETUP_TOPIC_CHANGED_WHILE_RECOMMENDING"
+
 // setupRecommendGate 记录「哪些 discussion 正在跑推荐」。
 //
 // 零值可用（map 在首次 tryAcquire 里惰性创建）；并发安全靠一把互斥锁保护 map

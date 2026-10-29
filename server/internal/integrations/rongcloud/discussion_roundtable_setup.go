@@ -213,8 +213,12 @@ func (rt *discussionRuntime) actionSubmitSetupTopic(ctx context.Context, cmd Com
 		Goal:         goal,
 	})
 	if err != nil {
-		// CAS 未命中：同 topic 重复提交按幂等成功接受（步骤已在 roles），
-		// 不同 topic 说明已在更后面的步骤，回 409 让前端重同步。
+		// CAS 未命中：不是「步骤已经走过 roles」—— WHERE 里**包含** 'roles'，允许从
+		// roles 步重提议题（用户在 S2 回上一步改议题，是合法且常用的流程）。真正能
+		// 让它未命中的只有「这个半成品已经不是 configuring 了」（被确认开始、被 GC
+		// 回收）以及断点既非 topic 也非 roles（当前链路不会出现，纯防御）。
+		//
+		// 同 topic 的重复提交按幂等成功接受；其它回 409 让前端重同步。
 		if row.SetupStep == setupStepRoles && row.Topic == topic {
 			// 幂等重放也补一次名字：上一次可能在改名那步之前就断了。
 			rt.nameDiscussionGroupFromTopic(ctx, chatroomID, topic)
@@ -233,11 +237,38 @@ func (rt *discussionRuntime) actionSubmitSetupTopic(ctx context.Context, cmd Com
 	attempt := rt.setupRecommendAttempt(ctx, row.DiscussionID) + 1
 	// 首推也占同一把在途闸门：S1 的批次还在跑时，用户在 S2 点「换一批 / 重试」会被
 	// actionRequestRoleRecommend 挡住，不会叠第二批设备端回合。
-	// 这里的「占不到」实际打不到（同 topic 重提走幂等早退、改 topic 走 CAS 409），
-	// 所以回包形状保持 {accepted:true} 不变。
-	if !rt.dispatchSetupRecommend(row.DiscussionID, attempt, setupRecommendRequest{}) && rt.logger != nil {
-		rt.logger.Info("discussion: setup 首推已在途，议题已受理但不再派发",
-			"discussionId", row.DiscussionID, "attempt", attempt)
+	//
+	// 「占不到门」是**真能走到的**，不是死分支：CAS 的 WHERE 允许从 'roles' 步重提，
+	// 所以在途期间再提交一次议题照样 UPDATE 成功、照样落在这里。既然走到了，就得
+	// 区分「议题没变」和「议题变了」：
+	//   - 没变：同一次提交又发了一遍（刷新页面丢掉 pending、多端同时提交），按幂等
+	//     成功回 {accepted:true}，前端继续等那批正在跑的结果，语义完全正确；
+	//   - 变了：用户以为新议题已经生效，但**在跑的这批是按旧议题产出的**。什么都不
+	//     说的话，前端会照常进等待态、最后上屏一批和新议题不相干的角色，而回包看
+	//     上去一切正常 —— 这就是必须显式回包的原因。
+	//
+	// 判据用「提交前」那一行的 topic（row.Topic），它正是在跑这批所用的议题；
+	// row.Topic 为空说明此前根本没定过议题，在跑的只可能是同议题的并发提交，
+	// 这种情况宁可当幂等也不算「变了」，避免误报。
+	if !rt.dispatchSetupRecommend(row.DiscussionID, attempt, setupRecommendRequest{}) {
+		if row.Topic != "" && row.Topic != topic {
+			if rt.logger != nil {
+				rt.logger.Info("discussion: 议题在推荐在途期间被改，本批仍按旧议题产出，新议题等下一批",
+					"discussionId", row.DiscussionID,
+					"runningTopic", row.Topic, "submittedTopic", topic, "attempt", attempt)
+			}
+			// 单独一个 code，不复用 ROLE_RECOMMEND_IN_PROGRESS：那个是「这次没生效，
+			// 等就行」，这个还额外意味着「等到的结果也不是新议题的」。
+			return okResult(map[string]interface{}{
+				"accepted":        true,
+				"already_running": true,
+				"code":            setupTopicChangedWhileRecommendingCode,
+			})
+		}
+		if rt.logger != nil {
+			rt.logger.Info("discussion: setup 首推已在途，同议题重提，按幂等接受不再派发",
+				"discussionId", row.DiscussionID, "attempt", attempt)
+		}
 	}
 	return okResult(map[string]interface{}{"accepted": true})
 }
