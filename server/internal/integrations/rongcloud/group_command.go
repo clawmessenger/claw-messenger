@@ -193,6 +193,43 @@ func (h *systemHandler) handleGroupCreate(ctx context.Context, msg NormalizedMes
 		}
 	}
 
+	// 加入侧闸门（迁移 607 的 allow_group）也必须覆盖**建群**这条路径。
+	//
+	// 这是最容易漏的一处：addMember 有闸门，create 却把 memberIds 直接塞给
+	// /group/create.json —— 于是「新建群聊」成了绕过口，勾上别人关了群聊权限的
+	// agent，照样被拉进群（只是进去以后永远不吭声）。只在候选名单上做过滤等于把
+	// 唯一防线放在前端：刷新一下缓存、或者换小程序就破了。闸门必须落在真正写
+	// 数据的地方。
+	//
+	// 判据与 addMember 完全同源（decideAgentJoin），不要在这里再写一份 if：两道
+	// 闸门的主人口径一旦分叉，就会出现「建群加得进去、加人加不进去」这种没法解释
+	// 的组合。
+	//
+	// 与 addMember 唯一的差别：**不因为全员被拦就拒绝建群**。用户要的是一个群，
+	// 不是一次权限报错；群照建，被拦的成员不写入，明细随成功回包带回去点名。
+	perms, err := h.agentJoinPermissions(ctx, userIDs)
+	if err != nil {
+		// 写操作 fail-closed：group_join_gate.go 的注释点过名，「把查询故障翻译成
+		// 全员无限制」是最危险的退化 —— 在这条路径上就是「一次权限库抖动，把所有
+		// 人的开关都当成开的，顺手把一批不该进群的 agent 拉进来」。宁可 503 让用户
+		// 重试也不建。注意这与好友列表的 fail-open 不矛盾：那边只是少显示一个人，
+		// 这边是写数据。
+		h.logger.Error("rongcloud: group create permission lookup", "error", err)
+		return h.sendWebError(ctx, msg, cmd, 503, "group service is unavailable")
+	}
+	joinable, rejected := decideAgentJoin(userIDs, perms, ownerID)
+	// 群主必须留在名单里：融云建群要求群主本身是成员，把 owner 判掉只会建出一个
+	// 没有群主的群，或者直接被融云拒掉。ownerID 能落到 rejected 的唯一情形是
+	// 「群主自己就是别人名下的 agent，且那个人关了开关」—— 现实中不成立，但不能
+	// 靠「现实中不成立」兜底：真出现时要保证群还建得出来，并且留一条 warn。
+	if !containsUserID(joinable, ownerID) {
+		h.logger.Warn("rongcloud: group create owner would be filtered by the join gate",
+			"owner_id", ownerID)
+		joinable = append([]string{ownerID}, joinable...)
+		rejected = withoutRejection(rejected, ownerID)
+	}
+	userIDs = joinable
+
 	groupID, err := h.groupMirror.AllocateID(ctx)
 	if err != nil {
 		h.logger.Error("rongcloud: group create allocate id", "error", err)
@@ -228,14 +265,23 @@ func (h *systemHandler) handleGroupCreate(ctx context.Context, msg NormalizedMes
 
 	h.logger.Info("rongcloud: group created",
 		"group_id", groupID, "owner_id", ownerID, "members", len(userIDs))
-	return h.sendWebOK(ctx, msg, cmd, map[string]interface{}{
+	data := map[string]interface{}{
 		"groupId":           groupID,
 		"groupName":         groupName,
 		"ownerId":           ownerID,
 		"portraitUri":       portraitURI,
 		"description":       description,
 		"openclawMaxRounds": maxRounds,
-	})
+	}
+	// 被拦下的成员必须逐人点名，字段形状与 addMember 的 skipped 一致
+	// （[]{userId, reason}）—— 前端已经按那个形状做文案映射，换个形状会静默退化成
+	// 「建群成功但少了几个人」的哑巴结果。
+	if len(rejected) > 0 {
+		data["skipped"] = rejected
+		h.logger.Info("rongcloud: group created without some members (owner permission denied)",
+			"group_id", groupID, "owner_id", ownerID, "skipped", len(rejected))
+	}
+	return h.sendWebOK(ctx, msg, cmd, data)
 }
 
 func (h *systemHandler) handleGroupUpdate(ctx context.Context, msg NormalizedMessage, cmd CommandContent) error {
@@ -369,6 +415,34 @@ func containsAgentNode(userIDs []string) bool {
 		}
 	}
 	return false
+}
+
+// containsUserID reports whether id is in the list. Used to guarantee the group
+// owner survives the join gate (see handleGroupCreate).
+func containsUserID(ids []string, id string) bool {
+	for _, candidate := range ids {
+		if candidate == id {
+			return true
+		}
+	}
+	return false
+}
+
+// withoutRejection drops the entry for id from a rejection list. Only used for
+// the owner escape hatch in handleGroupCreate: if the owner is being force-kept
+// in the member list, it must not also be reported as skipped.
+func withoutRejection(rejected []agentJoinRejection, id string) []agentJoinRejection {
+	if len(rejected) == 0 {
+		return rejected
+	}
+	out := make([]agentJoinRejection, 0, len(rejected))
+	for _, entry := range rejected {
+		if entry.UserID == id {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return out
 }
 
 // groupMaxRounds clamps the round limit into the range the runtime accepts.
