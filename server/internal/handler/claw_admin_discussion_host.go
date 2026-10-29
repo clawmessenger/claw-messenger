@@ -46,7 +46,20 @@ const (
 	clawAdminDiscussionHostMaxPrompt   = 32000
 	clawAdminDiscussionHostMinTimeout  = 10
 	clawAdminDiscussionHostMaxTimeout  = 600
-	clawAdminDiscussionHostTimeoutInit = 60
+	// clawAdminDiscussionHostTimeoutInit 是「没配过超时」时的默认等待秒数。
+	//
+	// 为什么是 120 而不是 60：一次角色推荐要在主持设备上跑一整回合 LLM（十几秒
+	// 到 100s+），60s 会把正常但偏慢的回合判成超时，用户看到的是「转圈很久然后
+	// 失败」。120s 给正常回合留出余量，同时仍是上限 600s 的五分之一。
+	//
+	// 两个约束：
+	//   - 下限/上限仍是 10/600（clawAdminDiscussionHostMinTimeout/MaxTimeout），
+	//     **不要**因为改默认值而收窄夹逼范围；
+	//   - 管理端表单（clawmessenger-admin-web 的 System/DiscussionHost.tsx 与
+	//     api/discussion-host.ts）的默认值和 min/max 必须与这里同源，见
+	//     discussion-host.test.ts 的夹逼用例；设备端/融云包里的兜底值见
+	//     rongcloud.recommendRolesFallbackTimeoutSeconds。
+	clawAdminDiscussionHostTimeoutInit = 120
 
 	// clawAdminDiscussionHostMaxModelSegment 是 provider / model 单段的字符上限，
 	// 与设备端（xiachat-cli/src/model-catalog.ts 的 ROUTE_RE）以及 web 的

@@ -697,3 +697,95 @@ func TestClawAdminDiscussionHostGetDropsIllegalStoredModel(t *testing.T) {
 		t.Fatalf("运行时 Model = %q, want empty", cfg.Model)
 	}
 }
+
+// TestClawAdminDiscussionHostTimeoutDefaultIs120 钉住「没配过超时」时的默认值。
+//
+// 为什么不是 60：一次角色推荐要在主持设备上跑一整回合 LLM（十几秒到 100s+），
+// 60s 会把正常但偏慢的回合判成超时，用户看到「转圈很久然后失败」。这个用例守的是
+// **默认值**，不是夹逼范围（见下一个用例）。
+func TestClawAdminDiscussionHostTimeoutDefaultIs120(t *testing.T) {
+	if clawAdminDiscussionHostTimeoutInit != 120 {
+		t.Fatalf("clawAdminDiscussionHostTimeoutInit = %d, want 120", clawAdminDiscussionHostTimeoutInit)
+	}
+	f := setupDiscussionHostFixture(t, "")
+	ws, err := f.h.clawAdminDiscussionHostWorkspaceID(context.Background())
+	if err != nil {
+		t.Fatalf("resolve workspace: %v", err)
+	}
+	// 存量配置（可能由旁路 PUT 写入）没有 timeout_seconds 键：读路径必须回落默认值。
+	if _, err := f.tx.Exec(context.Background(), `
+		INSERT INTO rongcloud_system_config (workspace_id, config_key, node_id, config, config_version)
+		VALUES ($1, $2, $3, $4::jsonb, 1)`,
+		ws, clawAdminDiscussionHostKey, f.nodeUUID,
+		`{"enabled":true,"display_name":"主持人","discussion_host_prompt":"保持中立"}`); err != nil {
+		t.Fatalf("seed config without timeout: %v", err)
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/admin/system/discussion-host", nil)
+	req.Header.Set("Authorization", "Bearer "+f.token)
+	f.h.ClawAdminDiscussionHostGet(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("GET = %d (%s)", rr.Code, rr.Body.String())
+	}
+	data := dataOf(t, rr)
+	got, ok := data["timeout_seconds"].(float64)
+	if !ok {
+		t.Fatalf("GET 没回 timeout_seconds: %#v", data)
+	}
+	if int(got) != clawAdminDiscussionHostTimeoutInit {
+		t.Fatalf("timeout_seconds = %v, want %d", got, clawAdminDiscussionHostTimeoutInit)
+	}
+}
+
+// TestClawAdminDiscussionHostTimeoutClampStaysTenTo600 守住夹逼范围没被这次
+// 「改默认值」顺手收窄：
+//   - 管理端表单（System/DiscussionHost.tsx 的 InputNumber min/max）与
+//     api/discussion-host.ts 的请求超时都按 10–600 夹逼；
+//   - 后端若把上限压到更小，配置成 600 的合法值会被 400 拒掉；前端若压小，
+//     合法配置会在前端先被掐断 —— 两种都是「假超时」。
+func TestClawAdminDiscussionHostTimeoutClampStaysTenTo600(t *testing.T) {
+	if clawAdminDiscussionHostMinTimeout != 10 || clawAdminDiscussionHostMaxTimeout != 600 {
+		t.Fatalf("夹逼范围 = %d–%d, want 10–600（改默认值时不许动它）",
+			clawAdminDiscussionHostMinTimeout, clawAdminDiscussionHostMaxTimeout)
+	}
+	f := setupDiscussionHostFixture(t, "")
+
+	// PUT payload 由 helper 造，只替换 timeout_seconds。
+	withTimeout := func(version, seconds int) string {
+		var payload map[string]interface{}
+		if err := json.Unmarshal([]byte(f.putBody(version, nil, nil)), &payload); err != nil {
+			t.Fatalf("decode put body: %v", err)
+		}
+		payload["timeout_seconds"] = seconds
+		raw, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatalf("encode put body: %v", err)
+		}
+		return string(raw)
+	}
+
+	for _, seconds := range []int{9, 601} {
+		rr := f.put(t, withTimeout(0, seconds))
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("PUT timeout_seconds=%d = %d (%s), want 400", seconds, rr.Code, rr.Body.String())
+		}
+	}
+
+	rr := f.put(t, withTimeout(0, 10))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("PUT timeout_seconds=10 = %d (%s), want 200", rr.Code, rr.Body.String())
+	}
+	version, ok := dataOf(t, rr)["config_version"].(float64)
+	if !ok {
+		t.Fatalf("PUT 响应缺 config_version: %s", rr.Body.String())
+	}
+
+	rr = f.put(t, withTimeout(int(version), 600))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("PUT timeout_seconds=600 = %d (%s), want 200（上限不能被收窄）", rr.Code, rr.Body.String())
+	}
+	if got, _ := dataOf(t, rr)["timeout_seconds"].(float64); int(got) != 600 {
+		t.Fatalf("保存后的 timeout_seconds = %v, want 600", dataOf(t, rr)["timeout_seconds"])
+	}
+}
