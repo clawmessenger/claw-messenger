@@ -255,7 +255,7 @@ func (h *systemHandler) handleGroupMine(ctx context.Context, msg NormalizedMessa
 		h.logger.Error("rongcloud: group list by user", "error", err)
 		return h.sendWebError(ctx, msg, cmd, 503, "group service is unavailable")
 	}
-	return h.sendWebOK(ctx, msg, cmd, groupProfileViews(groups))
+	return h.sendWebOK(ctx, msg, cmd, groupProfileViews(groups, senderID))
 }
 
 // ---- getProfiles / getInfo ---------------------------------------------------
@@ -278,7 +278,7 @@ func (h *systemHandler) handleGroupProfiles(ctx context.Context, msg NormalizedM
 		h.logger.Error("rongcloud: group profiles", "error", err)
 		return h.sendWebError(ctx, msg, cmd, 503, "group service is unavailable")
 	}
-	return h.sendWebOK(ctx, msg, cmd, groupProfileViews(profiles))
+	return h.sendWebOK(ctx, msg, cmd, groupProfileViews(profiles, strings.TrimSpace(msg.FromUserID)))
 }
 
 func (h *systemHandler) handleGroupInfo(ctx context.Context, msg NormalizedMessage, cmd CommandContent) error {
@@ -298,14 +298,18 @@ func (h *systemHandler) handleGroupInfo(ctx context.Context, msg NormalizedMessa
 	if len(profiles) == 0 {
 		return h.sendWebError(ctx, msg, cmd, 404, "group not found")
 	}
-	return h.sendWebOK(ctx, msg, cmd, groupProfileView(profiles[0]))
+	return h.sendWebOK(ctx, msg, cmd, groupProfileView(profiles[0], strings.TrimSpace(msg.FromUserID)))
 }
 
 // groupProfileViews 组装 getProfiles/getMyGroups 的数组。
-func groupProfileViews(profiles []GroupProfile) []map[string]interface{} {
+//
+// viewerID 是**观察者**（本条命令的发送者）：isOwner 是「相对视角」的字段，同一条
+// 群资料对不同调用者答案不同，所以必须逐条按同一个 viewer 判定，不能缓存也不能
+// 用群自己的 owner 字段顶替。
+func groupProfileViews(profiles []GroupProfile, viewerID string) []map[string]interface{} {
 	views := make([]map[string]interface{}, 0, len(profiles))
 	for _, profile := range profiles {
-		views = append(views, groupProfileView(profile))
+		views = append(views, groupProfileView(profile, viewerID))
 	}
 	return views
 }
@@ -315,17 +319,38 @@ func groupProfileViews(profiles []GroupProfile) []map[string]interface{} {
 // 同时给 groupName 与 name、portraitUri 与 avatar 两组别名：前端各处历史写法不
 // 一致（web 读 groupName/portraitUri，移动端 getProfiles 读 groupId|id 与
 // portraitUri|avatar），别名一份省得某一端显示空白。
-func groupProfileView(profile GroupProfile) map[string]interface{} {
+//
+// 为什么要下发 isOwner（而不是让客户端拿 ownerId 自己比）：
+//   - 群镜像的 owner_id 对老群可能是空串 —— 历史群、从旧后端迁移来的群、早期
+//     版本建出来的群都没有回填过这个字段。客户端一旦改成「ownerId === 我」的
+//     字符串比对，这些群上真正的群主会被判成非群主，于是「移除成员」入口整块
+//     消失，而「添加成员」（不判权限）还在，用户看到的就是「功能没了」。
+//   - 客户端本地还有两套 id 空间（平台 userId 与融云 imUserId），比对时得同时
+//     试两个，这本身就是服务端有确定答案的事情，不该让每个端各猜一遍。
+//
+// 重要边界：isOwner 只用于**显示侧**的开关（决定要不要把入口画出来）。真正的写
+// 操作仍由 handleGroupRemoveMember 在服务端校验（ownerID != msg.FromUserID 即
+// 403），前端不得把 isOwner 当成授权凭据 —— 它是投影，不是令牌。
+//
+// viewerID 为空（未登录、取不到发送者）时一律 isOwner=false：fail-closed。绝不
+// 能因为 owner 为空而把「没有观察者」当成「观察者就是群主」。
+func groupProfileView(profile GroupProfile, viewerID string) map[string]interface{} {
 	rounds := profile.MaxRounds
 	if rounds <= 0 {
 		rounds = defaultGroupRounds
 	}
+	ownerID := strings.TrimSpace(profile.OwnerID)
+	viewer := strings.TrimSpace(viewerID)
+	isOwner := ownerID != "" && viewer != "" && ownerID == viewer
 	return map[string]interface{}{
 		"id":                profile.GroupID,
 		"groupId":           profile.GroupID,
 		"groupName":         profile.GroupName,
 		"name":              profile.GroupName,
+		// ownerId 保留镜像原值（可能是空串），不因为 isOwner 的判定而改写：
+		// 别的端/老客户端还靠它显示「群主：xxx」，抹成空会让它们更困惑。
 		"ownerId":           profile.OwnerID,
+		"isOwner":           isOwner,
 		"memberCount":       profile.MemberCount,
 		"portraitUri":       profile.PortraitURI,
 		"avatar":            profile.PortraitURI,
