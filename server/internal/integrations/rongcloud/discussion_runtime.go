@@ -310,6 +310,31 @@ func paramInt(cmd CommandContent, keys ...string) (int, bool) {
 	return 0, false
 }
 
+// paramBool 读一个布尔参数（append / append_mode），兼容 JSON 原始 bool、
+// 字符串 "true"/"1" 与数字 1。缺失或形态不认识一律按 false —— 可选参数，
+// 老客户端不传时必须与「没有这个开关」的行为完全一致。
+func paramBool(cmd CommandContent, keys ...string) bool {
+	for _, k := range keys {
+		v, ok := cmd.Params[k]
+		if !ok {
+			continue
+		}
+		switch b := v.(type) {
+		case bool:
+			return b
+		case float64:
+			return b != 0
+		case string:
+			switch strings.ToLower(strings.TrimSpace(b)) {
+			case "true", "1", "yes":
+				return true
+			}
+			return false
+		}
+	}
+	return false
+}
+
 // paramStringList 读一个字符串数组参数（node_ids / nodeIds）。
 //
 // 返回值是 (值, 是否给出, 是否合法)：参数缺失（或显式 null）→ (nil,false,true)；

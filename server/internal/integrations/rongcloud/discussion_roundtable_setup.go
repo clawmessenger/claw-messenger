@@ -307,8 +307,13 @@ func (rt *discussionRuntime) nameDiscussionGroupFromTopic(ctx context.Context, c
 
 // ---- requestRoleRecommend --------------------------------------------------
 
-// actionRequestRoleRecommend S2 换一批/失败重试：异步重跑推荐，attempt 递增
-// （幂等键带 attempt，多次换一批各自落一条 setup_prompt 事件，前端取最新一条）。
+// actionRequestRoleRecommend S2 换一批/失败重试/继续推荐：异步重跑推荐，attempt 递增
+// （幂等键带 attempt，多次推荐各自落一条 setup_prompt 事件，前端取最新一条）。
+//
+// 两个可选参数，老前端不传时行为与「换一批」完全一致：
+//   - node_ids（nodeIds）本批允许作为候选的设备 —— 前端传「剩余未参与」的那批；
+//   - append（append_mode / appendMode）续推：新角色追加进**当前**推荐行，
+//     recommendationId 保持不变，用户已添加的角色继续有效。
 func (rt *discussionRuntime) actionRequestRoleRecommend(ctx context.Context, cmd CommandContent, actor discussionActor) commandResult {
 	if rt.roundtable == nil || !rt.interactiveReady() {
 		return errResult(503, "discussion runtime not available")
@@ -316,6 +321,17 @@ func (rt *discussionRuntime) actionRequestRoleRecommend(ctx context.Context, cmd
 	chatroomID := paramTrim(cmd, "chatroom_id", "chatroomId")
 	if chatroomID == "" {
 		return errResult(400, "INVALID_ROUNDTABLE_REQUEST")
+	}
+	// 候选列表沿用既有解析：给了空数组 / 超过上限的形态直接判非法，不做宽松兜底
+	// （见 paramStringList 的注释）。
+	requested, requestedGiven, listOK := paramStringList(cmd, "node_ids", "nodeIds")
+	if !listOK {
+		return errResult(400, "INVALID_ROUNDTABLE_REQUEST")
+	}
+	req := setupRecommendRequest{
+		nodeIDs:      requested,
+		nodeIDsGiven: requestedGiven,
+		appendMode:   paramBool(cmd, "append", "append_mode", "appendMode"),
 	}
 	row, _, rErr := rt.findConfiguringSetup(ctx, chatroomID, actor.RcID)
 	if rErr != nil {
@@ -327,7 +343,7 @@ func (rt *discussionRuntime) actionRequestRoleRecommend(ctx context.Context, cmd
 	}
 	rt.touchSetup(ctx, row.DiscussionID)
 	attempt := rt.setupRecommendAttempt(ctx, row.DiscussionID) + 1
-	go rt.recommendForSetupAsync(context.Background(), row.DiscussionID, attempt)
+	go rt.recommendForSetupBatch(context.Background(), row.DiscussionID, attempt, req)
 	return okResult(map[string]interface{}{"accepted": true})
 }
 
@@ -372,11 +388,29 @@ func setupRecommendFailureMessage(code string) string {
 	return "角色推荐失败，请重试"
 }
 
-// recommendForSetupAsync 是 S1/S2 共用的后台推荐管线：host 校验 → 候选设备 →
+// setupRecommendRequest 是一次后台推荐的入参（S1 首推 / S2 换一批 / S2 续推共用）。
+//
+// 零值等价于历史行为：候选由服务端自动挑、新建一条推荐行。
+type setupRecommendRequest struct {
+	// nodeIDs / nodeIDsGiven 是本批允许作为候选的设备（前端传「剩余未参与」的那批）。
+	// 未给出时沿用「自动选候选」的老路径。
+	nodeIDs      []string
+	nodeIDsGiven bool
+	// appendMode 为 true 表示续推：本批角色追加进当前推荐行，recommendationId 不变。
+	appendMode bool
+}
+
+// recommendForSetupAsync 是首推（S1）用的入口：没有候选收敛/续推参数，等价于零值
+// setupRecommendRequest。保留这个形状，调用方（含既有用例）无需跟着改。
+func (rt *discussionRuntime) recommendForSetupAsync(ctx context.Context, discussionID string, attempt int) {
+	rt.recommendForSetupBatch(ctx, discussionID, attempt, setupRecommendRequest{})
+}
+
+// recommendForSetupBatch 是 S1/S2 共用的后台推荐管线：host 校验 → 候选设备 →
 // broker 往返 → 角色绑定设备 → 落 recommendation（TTL 7 天）→ emit
 // setup_prompt(roles)。任何一步失败都落 setup_recommend_failed（前端据以展示
 // 重试入口），不再回写命令回调（它早已 200）。
-func (rt *discussionRuntime) recommendForSetupAsync(ctx context.Context, discussionID string, attempt int) {
+func (rt *discussionRuntime) recommendForSetupBatch(ctx context.Context, discussionID string, attempt int, req setupRecommendRequest) {
 	logger := rt.logger
 	// code 是唯一权威，文案由它派生：主持设备「在线但跑不出推荐」有三种完全
 	// 不同的内因（设备端轮次超时 / 应答无法解析 / 通道未装配），过去全部落在
@@ -415,10 +449,31 @@ func (rt *discussionRuntime) recommendForSetupAsync(ctx context.Context, discuss
 		fail(hostErr)
 		return
 	}
-	candidates, candCode := rt.roundtable.roleCandidateNodesFor(ctx, d.CreatedBy, host, nil, false)
+	candidates, candCode := rt.roundtable.roleCandidateNodesFor(ctx, d.CreatedBy, host, req.nodeIDs, req.nodeIDsGiven)
 	if candCode != "" {
 		fail(candCode)
 		return
+	}
+	// 续推：把上一批已绑定的设备从候选里剔掉。assignRoleNodes 只在 candidates 里
+	// 挑设备，一旦挑中已占用的那台，confirm 就会以 ROLE_DEVICE_DUPLICATED 整单拒绝，
+	// 而用户看到的只是一句看不懂的报错。前端本就只传「剩余未参与」，这里是兜底。
+	var appendRec db.RongcloudRoleRecommendation
+	appendOK := false
+	if req.appendMode {
+		if rec, ok := rt.currentSetupRecommendation(ctx, discussionID); ok {
+			appendRec, appendOK = rec, true
+			candidates = excludeNodeIDs(candidates, recommendationRoleNodeIDs(rec.Roles))
+			if len(candidates) == 0 {
+				// 剩余设备都已被上一批占满：没有可推荐的对象，按「没有可用设备」处理。
+				fail("NO_ELIGIBLE_USER_DEVICES")
+				return
+			}
+		} else {
+			// 没有当前推荐行（比如首推就失败了）：没有可延续的 recommendationId，
+			// 退化成普通推荐，前端从最新一张卡里取新的 recommendationId。
+			logger.Warn("discussion: setup 续推找不到当前推荐行，退化为普通推荐",
+				"discussionId", discussionID)
+		}
 	}
 	if rt.nodeRequests == nil {
 		logger.Warn("discussion: setup 推荐无法下发 —— node request broker 未装配")
@@ -450,29 +505,39 @@ func (rt *discussionRuntime) recommendForSetupAsync(ctx context.Context, discuss
 	}
 	assignRoleNodes(payloadRoles(payload), candidates)
 
-	recID, _ := payload["recommendation_id"].(string)
 	rolesJSON, _ := json.Marshal(payload["roles"])
 	expiresAt := time.Now().Add(recommendRolesTTL)
-	if _, err := rt.queries.InsertRongCloudRoleRecommendation(ctx, db.InsertRongCloudRoleRecommendationParams{
-		RecommendationID: recID,
-		RequestID:        "c2c_" + recID,
-		UserID:           d.CreatedBy,
-		HostNodeID:       host.nodeID,
-		HostAiUserID:     host.aiUserID,
-		ConfigVersion:    host.configVersion,
-		Topic:            d.Topic,
-		Goal:             d.Goal,
-		Roles:            rolesJSON,
-		ExpiresAt:        pgtype.Timestamptz{Time: expiresAt, Valid: true},
-	}); err != nil {
-		// 幂等：同 request_id 已落过（重放）→ 读回既存推荐 id。
-		if existing, gErr := rt.queries.GetRongCloudRoleRecommendationByRequest(ctx, "c2c_"+recID); gErr == nil {
-			recID = existing.RecommendationID
+	// 落库：一次推荐的收尾只有两种落法 —— 新建一行（首推/换一批），或追加进
+	// 当前行（续推）。追加的意义就是 recommendation_id 保持不变：上一批已经下发给
+	// 前端的 role_id 全部继续有效，confirm 的校验因此零改动。
+	recID := ""
+	if appendOK {
+		recID = appendRec.RecommendationID
+		updated, aErr := rt.queries.AppendRongCloudRoleRecommendationRoles(ctx, db.AppendRongCloudRoleRecommendationRolesParams{
+			RecommendationID: recID,
+			Column2:          rolesJSON,
+			ExpiresAt:        pgtype.Timestamptz{Time: expiresAt, Valid: true},
+		})
+		if aErr != nil {
+			// 推荐行已被清理（或并发删除）：退化成新建一行，并把上一批角色一并带上 ——
+			// 否则用户已经添加的角色在新行里查不到，confirm 会被整单拒绝。
+			logger.Warn("discussion: setup 续推追加失败，退化为新建推荐行",
+				"discussionId", discussionID, "recommendationId", recID, "error", aErr)
+			recID, _ = payload["recommendation_id"].(string)
+			rolesJSON = mergeRecommendationRolesJSON(appendRec.Roles, rolesJSON)
+			recID = rt.insertSetupRecommendation(ctx, d, host, recID, rolesJSON, expiresAt)
+		} else {
+			recID = updated.RecommendationID
 		}
+	} else {
+		recID, _ = payload["recommendation_id"].(string)
+		recID = rt.insertSetupRecommendation(ctx, d, host, recID, rolesJSON, expiresAt)
 	}
 
 	// 事件契约里的角色形状（RecommendedRole）：roleName/roleInstructions/nodeId/
 	// selected（默认全选，客户端勾选是暂态不落库）+ role_id（确认时回传校验用）。
+	// 只发**本批**角色：续推时库里那一行已经是好几批的合集，把全集再发一次
+	// 会让前端把上一批角色重复插进清单。
 	roles := make([]map[string]interface{}, 0)
 	for _, role := range payloadRoles(payload) {
 		roles = append(roles, map[string]interface{}{
@@ -494,6 +559,100 @@ func (rt *discussionRuntime) recommendForSetupAsync(ctx context.Context, discuss
 		logger.Warn("discussion: setup_prompt(roles) emit failed", "discussionId", discussionID, "error", err)
 	}
 	rt.touchSetup(ctx, discussionID)
+}
+
+// insertSetupRecommendation 落一行新的推荐（首推/换一批）。幂等：同 request_id
+// 已落过（重放）时读回既存推荐 id，返回最终生效的 recommendation_id。
+func (rt *discussionRuntime) insertSetupRecommendation(ctx context.Context, d DiscussionRecord, host roundtableHostConfig, recID string, rolesJSON []byte, expiresAt time.Time) string {
+	if _, err := rt.queries.InsertRongCloudRoleRecommendation(ctx, db.InsertRongCloudRoleRecommendationParams{
+		RecommendationID: recID,
+		RequestID:        "c2c_" + recID,
+		UserID:           d.CreatedBy,
+		HostNodeID:       host.nodeID,
+		HostAiUserID:     host.aiUserID,
+		ConfigVersion:    host.configVersion,
+		Topic:            d.Topic,
+		Goal:             d.Goal,
+		Roles:            rolesJSON,
+		ExpiresAt:        pgtype.Timestamptz{Time: expiresAt, Valid: true},
+	}); err != nil {
+		if existing, gErr := rt.queries.GetRongCloudRoleRecommendationByRequest(ctx, "c2c_"+recID); gErr == nil {
+			return existing.RecommendationID
+		}
+	}
+	return recID
+}
+
+// currentSetupRecommendation 取当前正在展示的那行推荐（最近一条 roles 引导卡里的
+// recommendationId）。续推要复用同一个 recommendation_id，而 configuring 阶段的
+// 讨论行还没写 recommendation_id（confirm 时才落），事件里的这张卡才是唯一的锚点。
+func (rt *discussionRuntime) currentSetupRecommendation(ctx context.Context, discussionID string) (db.RongcloudRoleRecommendation, bool) {
+	events, err := rt.repo.ListEventsAfter(ctx, discussionID, 0)
+	if err != nil {
+		return db.RongcloudRoleRecommendation{}, false
+	}
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i].EventType != setupEventPrompt {
+			continue
+		}
+		var payload map[string]interface{}
+		if err := json.Unmarshal(events[i].Payload, &payload); err != nil {
+			continue
+		}
+		if step, _ := payload["step"].(string); step != setupStepRoles {
+			continue
+		}
+		recID, _ := payload["recommendationId"].(string)
+		if recID == "" {
+			return db.RongcloudRoleRecommendation{}, false
+		}
+		rec, err := rt.queries.GetRongCloudRoleRecommendation(ctx, recID)
+		if err != nil {
+			return db.RongcloudRoleRecommendation{}, false
+		}
+		return rec, true
+	}
+	return db.RongcloudRoleRecommendation{}, false
+}
+
+// recommendationRoleNodeIDs 取出推荐行里各角色已绑定的设备（续推时要避开）。
+func recommendationRoleNodeIDs(raw []byte) map[string]bool {
+	var roles []map[string]interface{}
+	_ = json.Unmarshal(raw, &roles)
+	used := make(map[string]bool, len(roles))
+	for _, role := range roles {
+		if nodeID, _ := role["node_id"].(string); nodeID != "" {
+			used[nodeID] = true
+		}
+	}
+	return used
+}
+
+// excludeNodeIDs 从候选里剔掉已占用的设备，保持原有顺序。
+func excludeNodeIDs(candidates []string, exclude map[string]bool) []string {
+	if len(candidates) == 0 || len(exclude) == 0 {
+		return candidates
+	}
+	out := make([]string, 0, len(candidates))
+	for _, nodeID := range candidates {
+		if exclude[nodeID] {
+			continue
+		}
+		out = append(out, nodeID)
+	}
+	return out
+}
+
+// mergeRecommendationRolesJSON 把本批角色拼到既有角色数组后面（续推退化路径用）。
+func mergeRecommendationRolesJSON(existing, batch []byte) []byte {
+	var merged []interface{}
+	_ = json.Unmarshal(existing, &merged)
+	var incoming []interface{}
+	if err := json.Unmarshal(batch, &incoming); err == nil {
+		merged = append(merged, incoming...)
+	}
+	out, _ := json.Marshal(merged)
+	return out
 }
 
 func stringValue(v interface{}) string {

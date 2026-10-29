@@ -67,6 +67,42 @@ func (q *Queries) AppendRongCloudDiscussionEvent(ctx context.Context, arg Append
 	return i, err
 }
 
+const appendRongCloudRoleRecommendationRoles = `-- name: AppendRongCloudRoleRecommendationRoles :one
+UPDATE rongcloud_role_recommendation
+   SET roles = roles || $2::jsonb,
+       expires_at = $3
+ WHERE recommendation_id = $1
+RETURNING recommendation_id, request_id, user_id, host_node_id, host_ai_user_id, config_version, topic, goal, roles, expires_at, created_at
+`
+
+type AppendRongCloudRoleRecommendationRolesParams struct {
+	RecommendationID string             `json:"recommendation_id"`
+	Column2          []byte             `json:"column_2"`
+	ExpiresAt        pgtype.Timestamptz `json:"expires_at"`
+}
+
+// 续推：把本批新角色追加进同一推荐行的 roles，并刷新有效期。
+// recommendation_id 不变是这条 query 的全部意义 —— 用户之前已添加的角色
+// （role_id 已下发到前端）必须继续有效，confirm 校验才能零改动。
+func (q *Queries) AppendRongCloudRoleRecommendationRoles(ctx context.Context, arg AppendRongCloudRoleRecommendationRolesParams) (RongcloudRoleRecommendation, error) {
+	row := q.db.QueryRow(ctx, appendRongCloudRoleRecommendationRoles, arg.RecommendationID, arg.Column2, arg.ExpiresAt)
+	var i RongcloudRoleRecommendation
+	err := row.Scan(
+		&i.RecommendationID,
+		&i.RequestID,
+		&i.UserID,
+		&i.HostNodeID,
+		&i.HostAiUserID,
+		&i.ConfigVersion,
+		&i.Topic,
+		&i.Goal,
+		&i.Roles,
+		&i.ExpiresAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const createRongCloudDiscussion = `-- name: CreateRongCloudDiscussion :one
 
 INSERT INTO rongcloud_discussion (

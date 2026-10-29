@@ -185,6 +185,16 @@ SELECT * FROM rongcloud_role_recommendation WHERE recommendation_id = $1;
 -- name: GetRongCloudRoleRecommendationByRequest :one
 SELECT * FROM rongcloud_role_recommendation WHERE request_id = $1;
 
+-- name: AppendRongCloudRoleRecommendationRoles :one
+-- 续推：把本批新角色追加进同一推荐行的 roles，并刷新有效期。
+-- recommendation_id 不变是这条 query 的全部意义 —— 用户之前已添加的角色
+-- （role_id 已下发到前端）必须继续有效，confirm 校验才能零改动。
+UPDATE rongcloud_role_recommendation
+   SET roles = roles || $2::jsonb,
+       expires_at = $3
+ WHERE recommendation_id = $1
+RETURNING *;
+
 -- name: ListRongCloudRoundDocumentsForDiscussion :many
 SELECT * FROM rongcloud_discussion_round_document
 WHERE discussion_id = $1 ORDER BY round ASC, revision DESC;
