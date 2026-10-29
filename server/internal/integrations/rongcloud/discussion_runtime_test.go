@@ -285,6 +285,50 @@ func TestDiscussionWorkflowCapabilities(t *testing.T) {
 	}
 }
 
+// TestDiscussionSystemHostStatusExposesTimeout 钉住 getSystemHostStatus 回包里的
+// timeout_seconds：C 端要靠它算「推荐等多久算可疑」的本地窗口，口径必须与
+// discussion_roundtable_setup.go 的 `WithTimeout(timeout+5s)` 一致。
+//
+// 不下发这个字段时前端只能拍死值：管理端把超时配到 120s 以上，前端就会先于
+// 服务端判死并诱导用户「重试」—— 一次多余的完整设备端 LLM 回合。
+func TestDiscussionSystemHostStatusExposesTimeout(t *testing.T) {
+	// 未配置：仍回 200，timeout_seconds 回 0 由前端按默认值兜底。
+	bare := &discussionRuntime{}
+	bareRes := bare.actionGetSystemHostStatus(context.Background())
+	if bareRes.code != 200 {
+		t.Fatalf("unconfigured status: %d", bareRes.code)
+	}
+	bareData := bareRes.data.(map[string]interface{})
+	if got, ok := bareData["timeout_seconds"]; !ok || got != 0 {
+		t.Fatalf("unconfigured timeout_seconds = %v (want 0 present)", bareData["timeout_seconds"])
+	}
+	if bareData["reason"] != "SYSTEM_HOST_NOT_CONFIGURED" {
+		t.Fatalf("unconfigured reason = %v", bareData["reason"])
+	}
+
+	// 已配置：原样下发管理端配的秒数（含 120 以上的值）。
+	for _, seconds := range []int{60, 120, 600} {
+		rt := &discussionRuntime{}
+		rt.systemHostLoader = func(context.Context) (DiscussionSystemHostConfig, bool, error) {
+			return DiscussionSystemHostConfig{
+				NodeID: "node-host", DisplayName: "系统主持人", Avatar: "a.png",
+				TimeoutSeconds: seconds,
+			}, true, nil
+		}
+		res := rt.actionGetSystemHostStatus(context.Background())
+		if res.code != 200 {
+			t.Fatalf("status: %d", res.code)
+		}
+		data := res.data.(map[string]interface{})
+		if got := data["timeout_seconds"]; got != seconds {
+			t.Fatalf("timeout_seconds = %v (want %d)", got, seconds)
+		}
+		if data["display_name"] != "系统主持人" || data["reason"] != nil {
+			t.Fatalf("status payload changed: %v", data)
+		}
+	}
+}
+
 // TestResolveActorUnknownSender 验证未知发送者报错。
 func TestResolveActorUnknownSender(t *testing.T) {
 	f := setupDiscussionFixture(t)
