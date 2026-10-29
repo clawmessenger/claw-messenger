@@ -102,7 +102,7 @@ func roleCandidateNodes(eligible map[string]db.RongcloudNode, requested []string
 			}
 		}
 		if len(out) == 0 {
-			return nil, "NO_ELIGIBLE_USER_DEVICES"
+			return nil, codeNoEligibleUserDevices
 		}
 		return out, ""
 	}
@@ -111,7 +111,7 @@ func roleCandidateNodes(eligible map[string]db.RongcloudNode, requested []string
 		ids = append(ids, nodeID)
 	}
 	if len(ids) == 0 {
-		return nil, "NO_ELIGIBLE_USER_DEVICES"
+		return nil, codeNoEligibleUserDevices
 	}
 	// 没给 node_ids 时集合来自 map，必须排序：同一份配置两次调用要给出同一份推荐。
 	sort.Strings(ids)
@@ -126,10 +126,56 @@ func roleCandidateNodes(eligible map[string]db.RongcloudNode, requested []string
 // 权限闸门放在**候选池**这一层，而不是只在 confirm 拦：写进推荐卡的角色必须是
 // 用户真能确认的。只拦 confirm 的后果是「推荐成功 → 点开始 → 整单 400」，用户
 // 只会一路重试，且界面上没有任何东西显示哪台设备有问题。
+//
+// 闸门剔空之后还必须说清「为什么空」：候选池有两种空法 —— 设备都不在线，或者
+// 有设备但主人关了讨论组权限。两者的下一步动作完全相反（去启动设备 vs 去让
+// 主人开开关），过去都折进 NO_ELIGIBLE_USER_DEVICES 的「没有可用的在线设备」，
+// 于是一个明明在线、只是没权限的 agent 会把用户引去反复重启设备。
 func (s *roundtableCreationService) roleCandidateNodesFor(ctx context.Context, userID string, host roundtableHostConfig, requested []string, requestedGiven bool) ([]string, string) {
 	_, eligible := s.ownedAndEligibleNodes(ctx, userID, host)
-	allowed, _ := filterDiscussionJoinNodes(eligible, userID)
-	return roleCandidateNodes(allowed, requested, requestedGiven)
+	allowed, blocked := filterDiscussionJoinNodes(eligible, userID)
+	ids, code := roleCandidateNodes(allowed, requested, requestedGiven)
+	if code == codeNoEligibleUserDevices && permissionExplainsEmpty(eligible, blocked, requested, requestedGiven) {
+		return nil, codeNoPermittedUserDevices
+	}
+	return ids, code
+}
+
+// 候选池为空的两种原因码。字面量集中在这里，避免同一串在三处拼错。
+const (
+	codeNoEligibleUserDevices  = "NO_ELIGIBLE_USER_DEVICES"
+	codeNoPermittedUserDevices = "NO_PERMITTED_USER_DEVICES"
+)
+
+// permissionExplainsEmpty 判断「候选池空」是不是权限造成的。
+//
+// 只在 roleCandidateNodes 已经返回「没有可用设备」之后调用，所以这里只需回答
+// 一个问题：被闸门拦下的那批，是否**就是**本该被考虑的每一个候选。
+//
+//   - 前端给了 node_ids（选 agent / 续推）：只看交集的判定，交集里只要有一台
+//     没被拦，空集就另有原因（那台是离线/能力不足），仍按「没有在线设备」报；
+//     交集为空说明这些设备连 eligible 都没进，也与权限无关。
+//   - 前端没给 node_ids（首推，服务端自选）：eligible 全被拦才算权限问题。
+//
+// 两处都要求 blocked 非空：没有拦过任何一台就不可能怪到权限头上。
+func permissionExplainsEmpty(eligible, blocked map[string]db.RongcloudNode, requested []string, requestedGiven bool) bool {
+	if len(blocked) == 0 {
+		return false
+	}
+	if requestedGiven {
+		sawEligible := false
+		for _, nodeID := range requested {
+			if _, ok := eligible[nodeID]; !ok {
+				continue
+			}
+			sawEligible = true
+			if _, denied := blocked[nodeID]; !denied {
+				return false
+			}
+		}
+		return sawEligible
+	}
+	return len(eligible) > 0 && len(blocked) == len(eligible)
 }
 
 // ensureChatroom 对齐 _ensure_chatroom：融云侧建房 + DB 行 + owner/host 成员行。

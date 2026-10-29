@@ -60,3 +60,20 @@ func nodeDiscussionJoinAllowed(node db.RongcloudNode, viewerRCID string) bool {
 	}
 	return node.AllowDiscussion
 }
+
+// discussionJoinBlockedFlag 是**显示侧**的唯一判据：这台节点要不要在
+// `/api/claw/nodes` 上打 `discussionJoinBlocked`，让 C 端把它排除出候选。
+//
+// 与写路径（候选池 / confirm）共用 nodeDiscussionJoinAllowed，只是把「viewer 为空」
+// 这一种内部调用的情形挡掉：workspace 全量视图没有「我是谁」，没有主人豁免可谈，
+// 打标只会让内部调用方看到一堆莫名其妙的标记。
+//
+// 标记的代价是**不对称**的：漏标只让用户多点一次，随后被闸门挡下并说明原因；
+// 误标会把主人自己还能用的 agent 藏起来 —— 「东西不见了又没有任何解释」比多点
+// 一次糟得多。所以判不清的一律不打标（未认领、viewer 为空都归这一类）。
+func discussionJoinBlockedFlag(node db.RongcloudNode, viewerRCID string) bool {
+	if strings.TrimSpace(viewerRCID) == "" {
+		return false
+	}
+	return !nodeDiscussionJoinAllowed(node, viewerRCID)
+}

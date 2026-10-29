@@ -652,6 +652,20 @@ func (s *NodeService) LegacyNodeRecords(ctx context.Context, userID string) ([]m
 			"created_at":      n.CreatedAt.Time,
 			"updated_at":      n.UpdatedAt.Time,
 		}
+		// 讨论组的「显示侧」：这台 agent 能不能被我拉进讨论组。
+		//
+		// 归属按融云好友边算，好友边里既有我自己的 agent，也有别人分享过来的 ——
+		// 后者能不能进讨论组，取决于**它主人的** allow_discussion，而我通过
+		// `/api/claw/nodes/{id}/permissions` 查不到（非主人一律 403）。不下发这个
+		// 标记，前端就只能把它列进候选，用户选完再被服务端闸门剔掉，最终看到的是
+		// 「角色推荐失败：没有可用于讨论的在线设备」（候选池被权限过滤成空集），
+		// 既没指向权限也没指向设备，是纯粹的死胡同。
+		//
+		// 判据见 discussionJoinBlockedFlag（discussion_join_gate.go）：显示侧、
+		// 候选池、confirm 三处共用 nodeDiscussionJoinAllowed，不另写等价 if。
+		if discussionJoinBlockedFlag(n, userID) {
+			record["discussionJoinBlocked"] = true
+		}
 		// Expose the machine's ops node to the client so the device detail
 		// can still offer the 运维 entry point without listing the ops node.
 		if opsRC, ok := opsByMachine[n.MachineID]; ok && opsRC != "" {

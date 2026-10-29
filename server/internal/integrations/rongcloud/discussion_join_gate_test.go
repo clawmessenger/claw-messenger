@@ -164,7 +164,7 @@ func TestRoleCandidateNodesForFiltersByDiscussionPermission(t *testing.T) {
 	}
 }
 
-func TestRoleCandidateNodesForAllDeniedReportsNoDevice(t *testing.T) {
+func TestRoleCandidateNodesForAllDeniedReportsPermissionNotOffline(t *testing.T) {
 	const owner = "rc-owner"
 	svc := newCandidateService([]db.RongcloudNode{
 		gateNode("shared-a", "rc-peer", false),
@@ -172,12 +172,65 @@ func TestRoleCandidateNodesForAllDeniedReportsNoDevice(t *testing.T) {
 	})
 	host := roundtableHostConfig{nodeID: "host-node"}
 
-	// 显式点名这两台：以前它们会进候选、推荐成功、confirm 才炸；现在在候选池
-	// 这一层就为空，前端拿到的是「没有可参与讨论的设备」而不是「请检查…」。
+	// 显式点名这两台：以前它们会进候选、推荐成功、confirm 才炸；上一批挪到候选池
+	// 这一层剔空，但报的是 NO_ELIGIBLE_USER_DEVICES（「没有在线设备」）—— 设备明明
+	// 在线，缺的是主人的开关，用户被引去反复重启设备。现在空集由权限造成时换一个码。
 	got, code := svc.roleCandidateNodesFor(context.Background(), owner, host,
 		[]string{"shared-a", "shared-b"}, true)
+	if code != "NO_PERMITTED_USER_DEVICES" {
+		t.Fatalf("code = %q (candidates=%v), want NO_PERMITTED_USER_DEVICES", code, got)
+	}
+}
+
+// 「被拦的确实在线、没被拦的只是离线」时，空集的原因是设备而不是权限 ——
+// 这时候仍必须报 NO_ELIGIBLE_USER_DEVICES，否则用户会去找一个不存在的开关。
+func TestRoleCandidateNodesForDeniedMixWithOfflineKeepsOfflineCode(t *testing.T) {
+	const owner = "rc-owner"
+	svc := newCandidateService([]db.RongcloudNode{
+		gateNode("shared-closed", "rc-peer", false), // 在线但被拦
+	})
+	host := roundtableHostConfig{nodeID: "host-node"}
+
+	// 点名一台**根本没进 eligible** 的设备（不在 nodeOwner 列表 = 不在线/能力不足）：
+	// 交集为空说明与权限无关。
+	got, code := svc.roleCandidateNodesFor(context.Background(), owner, host,
+		[]string{"offline-node"}, true)
 	if code != "NO_ELIGIBLE_USER_DEVICES" {
 		t.Fatalf("code = %q (candidates=%v), want NO_ELIGIBLE_USER_DEVICES", code, got)
+	}
+}
+
+// 首推（不点名设备、由服务端自选）同样要能说出「是权限不是离线」：
+// 这条路径正是 S1 提交议题后的第一次推荐，用户遇到空集时最容易被误导。
+func TestRoleCandidateNodesForAutoPickAllDeniedReportsPermission(t *testing.T) {
+	const owner = "rc-owner"
+	svc := newCandidateService([]db.RongcloudNode{
+		gateNode("shared-a", "rc-peer", false),
+		gateNode("shared-b", "rc-peer", false),
+	})
+	host := roundtableHostConfig{nodeID: "host-node"}
+
+	got, code := svc.roleCandidateNodesFor(context.Background(), owner, host, nil, false)
+	if code != "NO_PERMITTED_USER_DEVICES" {
+		t.Fatalf("code = %q (candidates=%v), want NO_PERMITTED_USER_DEVICES", code, got)
+	}
+}
+
+// 部分被拦、部分可选：候选非空，什么都不该报 —— 权限只影响名单，不该污染成功路径。
+func TestRoleCandidateNodesForPartialDeniedStaysSilent(t *testing.T) {
+	const owner = "rc-owner"
+	svc := newCandidateService([]db.RongcloudNode{
+		gateNode("own", owner, true),
+		gateNode("shared-closed", "rc-peer", false),
+	})
+	host := roundtableHostConfig{nodeID: "host-node"}
+
+	got, code := svc.roleCandidateNodesFor(context.Background(), owner, host, nil, false)
+	if code != "" {
+		t.Fatalf("unexpected code %q", code)
+	}
+	if len(got) != 1 || got[0] != "own" {
+		t.Fatalf("got %v, want [own]", got)
 	}
 }
 
@@ -196,5 +249,58 @@ func TestRoleCandidateNodesForKeepsOwnAgentWhenOthersDenied(t *testing.T) {
 	}
 	if len(got) != 1 || got[0] != "own" {
 		t.Fatalf("got %v, want only the caller's own node", got)
+	}
+}
+
+// ---- 显示侧标记（/api/claw/nodes 的 discussionJoinBlocked） --------------------
+
+// 显示侧必须是写路径的同一把尺子：只把「别人的 + 关了」标出来。
+// 主人豁免要特别钉住 —— 把自己名下的 agent 标黑，等于把用户还能用的东西藏起来。
+func TestDiscussionJoinBlockedFlag(t *testing.T) {
+	cases := []struct {
+		name   string
+		node   db.RongcloudNode
+		viewer string
+		want   bool
+	}{
+		{"别人的 + 关着 → 标记", gateNode("n1", "rc-peer", false), "rc-owner", true},
+		{"别人的 + 开着 → 不标", gateNode("n1", "rc-peer", true), "rc-owner", false},
+		{"自己的 + 关着 → 不标（主人豁免）", gateNode("n1", "rc-owner", false), "rc-owner", false},
+		{"未认领 → 不标（没有能点开关的人）", gateNode("n1", "", false), "rc-owner", false},
+		// 内部调用（workspace 全量视图）没有「我是谁」，一律不打标。
+		{"viewer 为空 → 不标", gateNode("n1", "rc-peer", false), "", false},
+		{"viewer 只有空白 → 不标", gateNode("n1", "rc-peer", false), "   ", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := discussionJoinBlockedFlag(tc.node, tc.viewer); got != tc.want {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// 标记必须与闸门**逐格一致**：任何一个节点上两者不一致，就会出现
+// 「列表里看不出来，选的时候被拦下」或者「列表里消失了，其实能进」。
+func TestDiscussionJoinBlockedFlagMatchesGate(t *testing.T) {
+	const viewer = "rc-owner"
+	nodes := []db.RongcloudNode{
+		gateNode("own-open", "rc-owner", true),
+		gateNode("own-closed", "rc-owner", false),
+		gateNode("peer-open", "rc-peer", true),
+		gateNode("peer-closed", "rc-peer", false),
+		gateNode("unclaimed", "", false),
+	}
+	for _, node := range nodes {
+		allowed, blocked := filterDiscussionJoinNodes(
+			map[string]db.RongcloudNode{node.NodeID: node}, viewer)
+		_, gatePass := allowed[node.NodeID]
+		_, gateDeny := blocked[node.NodeID]
+		flag := discussionJoinBlockedFlag(node, viewer)
+		// 标记 = 被闸门拦下；被放行的绝不能带标记。
+		if flag != gateDeny || flag == gatePass {
+			t.Fatalf("%s: flag=%v allowed=%v blocked=%v —— 显示侧与闸门判定不一致",
+				node.NodeID, flag, gatePass, gateDeny)
+		}
 	}
 }

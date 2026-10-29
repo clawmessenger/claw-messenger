@@ -384,6 +384,10 @@ func setupRecommendFailureMessage(code string) string {
 		return "系统主持 AI 当前不可用，请确认主持设备上的 clawmessenger 正在运行"
 	case "NO_ELIGIBLE_USER_DEVICES":
 		return "没有可用于讨论的在线设备"
+	case "NO_PERMITTED_USER_DEVICES":
+		// 与上一句必须分开：设备是在线的，缺的是**主人**的开关。混成一句会把用户
+		// 引去反复重启设备，而真正要做的动作在另一个人的账号里。
+		return "所选智能体的主人没有开启讨论组权限，请换一个智能体，或让对方在权限设置里开启后重试"
 	}
 	return "角色推荐失败，请重试"
 }
