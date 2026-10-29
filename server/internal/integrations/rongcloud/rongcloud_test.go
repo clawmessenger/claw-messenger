@@ -807,23 +807,80 @@ func TestCheckOnline(t *testing.T) {
 	}
 }
 
+// TestGetUserInfo 钉住 /user/info.json 的三种响应形状。
+//
+// 为什么必须三种都测：线上实际返回是 data 包裹（旧 Python 后端 command_handler.py:1973
+// 的注释），官方英文文档给的是顶层扁平且字段名叫 userName / userPortrait，而代码里
+// 最早只认扁平 name / portraitUri。只认一种时 postForm 依然回 200，getUserInfo 会
+// 静默返回空名字空头像 —— 没有错误、没有日志，调用方只能看到「补不到东西」。
 func TestGetUserInfo(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeJSONResponse(w, map[string]interface{}{
-			"code":        200,
-			"userId":      "user1",
-			"name":        "Alice",
-			"portraitUri": "http://avatar.png",
-		})
-	}))
-	defer srv.Close()
-	c := newRongCloudAPIClient("key", "secret", srv.URL, srv.Client(), testLogger())
-	info, err := c.getUserInfo(context.Background(), "user1")
-	if err != nil {
-		t.Fatalf("getUserInfo: %v", err)
+	cases := []struct {
+		name string
+		body map[string]interface{}
+		want userInfoResult
+	}{
+		{
+			name: "线上形状：data 包裹 + 老字段名",
+			body: map[string]interface{}{
+				"code": 200,
+				"data": map[string]interface{}{
+					"userId":      "user1",
+					"name":        "Alice",
+					"portraitUri": "http://avatar.png",
+				},
+			},
+			want: userInfoResult{UserID: "user1", Name: "Alice", PortraitURI: "http://avatar.png"},
+		},
+		{
+			name: "官方文档形状：顶层扁平 + userName/userPortrait",
+			body: map[string]interface{}{
+				"code":         200,
+				"userName":     "Bob",
+				"userPortrait": "http://bob.png",
+				"createTime":   "2016-05-24 10:38:19",
+			},
+			// 没有 userId 时退回入参 —— 调用方关心的是「这次问的是谁」。
+			want: userInfoResult{UserID: "user1", Name: "Bob", PortraitURI: "http://bob.png"},
+		},
+		{
+			name: "老扁平形状：顶层 name/portraitUri",
+			body: map[string]interface{}{
+				"code":        200,
+				"userId":      "user1",
+				"name":        "Carol",
+				"portraitUri": "http://carol.png",
+			},
+			want: userInfoResult{UserID: "user1", Name: "Carol", PortraitURI: "http://carol.png"},
+		},
+		{
+			name: "data 是空对象时不能把顶层字段吃掉",
+			body: map[string]interface{}{
+				"code":       200,
+				"data":       map[string]interface{}{},
+				"name":       "Dave",
+				"portraitUri": "http://dave.png",
+			},
+			want: userInfoResult{UserID: "user1", Name: "Dave", PortraitURI: "http://dave.png"},
+		},
 	}
-	if info.UserID != "user1" || info.Name != "Alice" || info.PortraitURI != "http://avatar.png" {
-		t.Errorf("unexpected info: %+v", info)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/user/info.json" {
+					t.Errorf("unexpected path: %s", r.URL.Path)
+				}
+				writeJSONResponse(w, tc.body)
+			}))
+			defer srv.Close()
+			c := newRongCloudAPIClient("key", "secret", srv.URL, srv.Client(), testLogger())
+			info, err := c.getUserInfo(context.Background(), "user1")
+			if err != nil {
+				t.Fatalf("getUserInfo: %v", err)
+			}
+			if info != tc.want {
+				t.Errorf("unexpected info: got %+v want %+v", info, tc.want)
+			}
+		})
 	}
 }
 

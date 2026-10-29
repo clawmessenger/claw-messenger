@@ -40,6 +40,10 @@ type imServiceServerOptions struct {
 	// weChatErrCode 非 0 时 jscode2session 回业务错误。
 	weChatErrCode int
 	weChatErrMsg  string
+	// userInfo 是 /user/info.json 回的资料，按 userId 索引（值即 data 子字典）。
+	// 缺席的用户回空 data —— 搜索的资料回填只在本地缺字段时才发这次请求，其余
+	// 用例不该因为多了一次调用就变红。
+	userInfo map[string]map[string]interface{}
 }
 
 type imServiceServer struct {
@@ -92,6 +96,17 @@ func newIMServiceServer(t *testing.T, opts imServiceServerOptions) (*imServiceSe
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{
 				"code":  200,
 				"token": "rc-token-minted",
+			})
+		case "/user/info.json":
+			// 缺省回空 data（= 融云不认识这个号）。搜索回填只在本地缺名字/头像
+			// 时才发这次请求，所以其余用例不受影响。
+			profile := opts.userInfo[r.PostForm.Get("userId")]
+			if profile == nil {
+				profile = map[string]interface{}{}
+			}
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"code": 200,
+				"data": profile,
 			})
 		case "/message/private/publish.json":
 			var content map[string]interface{}

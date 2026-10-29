@@ -19,9 +19,13 @@ package rongcloud
 //  2. 命中字段多一列 `user_id`：老账号可能没有 username（注册允许自定义
 //     username，见 claw_compat.go:330-359），只搜旧实现那四列会出现「用户看着
 //     自己的数字 id 却搜不到自己」；
-//  3. 不做头像回填融云：旧实现逐行调 /user/info.json 并写库
-//     （command_handler.py:1968-1980），是 N+1 次外部调用，会把命令通道拖到客户端
-//     15s 超时附近。代价是老账号搜索结果可能没有头像（前端有默认头像兜底）；
+//  3. 不做 N+1 式的头像回填融云：旧实现**逐行**调 /user/info.json 并写库
+//     （command_handler.py:1968-1980），20 条结果就是 20 次外部调用，会把命令
+//     通道拖到客户端 15s 超时附近。移植时整段砍掉了。
+//     2026-10-29 修订：搜索改成按虾说号精确匹配后，一次最多命中 1 个真人 + 1 个
+//     节点，调用次数降到 ≤2，原来那条「N+1」的理由已经不成立，于是**只针对缺名字
+//     或缺头像的行**补一次（enrichUserSummariesFromRongCloud，带 2s 预算）。
+//     仍然不写库 —— 理由见该函数注释；
 //  4. 回包不含 `email` / `phone`：旧实现把这两列一起回传
 //     （command_handler.py:1981-1990）。本 action 不校验身份、也没有频率限制，把
 //     手机号/邮箱回给任意搜索者本身就是泄漏面；而两端 UI 都不消费它们（web
@@ -79,7 +83,9 @@ package rongcloud
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
+	"time"
 
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
@@ -130,9 +136,85 @@ func (h *systemHandler) handleUserSearch(ctx context.Context, msg NormalizedMess
 	if users == nil {
 		users = []UserSummary{}
 	}
+	// 命中之后回融云补一次资料（见 enrichUserSummariesFromRongCloud）。
+	// 为什么现在才敢加：旧实现在这里逐行调 /user/info.json 是 N+1（20 条结果
+	// = 20 次外部调用），会把命令通道拖到客户端 15s 超时附近，所以移植时被砍掉
+	// （见文件头「有意偏离」第 3 条）。改成按虾说号精确匹配之后，一次搜索最多
+	// 命中 1 个真人 + 1 个节点，同一条链路只剩 ≤2 次调用，N+1 这个理由已经不成立。
+	if h.client != nil {
+		enrichUserSummariesFromRongCloud(ctx, h.client, h.logger, users)
+	}
 	// 必须是 map，不能传裸切片：设备信封分支对 map 逐键摊平、对其它类型塞进
 	// payload.data（system_handler.go:634-642），CLI 侧要看到 payload.list。
 	return h.replyOK(ctx, msg, cmd, map[string]interface{}{"list": users})
+}
+
+// userSearchEnrichTimeout 是回填阶段的总预算，不占用整条命令链路的超时。
+//
+// 融云 /user/info.json 限 100 QPS、正常几十毫秒返回，2s 足够覆盖两次调用；
+// 真挂住时宁可少补一个名字，也不能让「搜一个号」卡到客户端放弃等待。
+const userSearchEnrichTimeout = 2 * time.Second
+
+// rongcloudUserInfoFetcher 是回填阶段唯一需要的外部能力，抽成接口只为让测试
+// 不用起 httptest。生产实现是 *rongcloudAPIClient.getUserInfo。
+type rongcloudUserInfoFetcher interface {
+	getUserInfo(ctx context.Context, userID string) (userInfoResult, error)
+}
+
+// enrichUserSummariesFromRongCloud 用融云注册资料补齐搜索结果里缺的名字/头像。
+//
+// 为什么需要（2026-10-29 加）：搜索的数据源是本地两张表 —— 真人读
+// claw_im_users，节点读 rongcloud_node LEFT JOIN rongcloud_user。镜像是**投影**，
+// 节点换过名字、或者 rongcloud_user 里干脆没有这一行时，回包就只有一串
+// `rc_node_...`，前端只好显示 id（web AddFriendDialog 有默认头像兜底，但名字
+// 兜不住）。而虾说号本身就是融云 userId，拿它去问一次 /user/info.json 就能拿到
+// 注册时的真名和头像 —— 这是本地表补不了的。
+//
+// 只补**空字段**，不覆盖已有值：真人的 nickname/portrait_uri 以本地为准（我们是
+// 往融云推数据的一方，反过来拿融云旧值覆盖，会让用户刚改的昵称被回滚）。
+// 也正因为只补空，绝大多数搜索根本不会发这次请求。
+//
+// 失败一律不阻塞：查不到（账号已注销 / 网络 / 融云 5xx）就保持原样返回。把
+// 「补资料」的失败升级成搜索失败没有道理 —— 用户至少还能看到那串 id 并申请加好友。
+//
+// 不做「查到就写回本地表」：UserSummary 不带来源标记，分不清这一行来自
+// claw_im_users 还是 rongcloud_node，写回要按来源分两条 UPDATE；而这条链路是
+// 读路径，写库会引入新的锁竞争面。收益（省下一次查询）远小于代价。
+func enrichUserSummariesFromRongCloud(ctx context.Context, fetcher rongcloudUserInfoFetcher, logger *slog.Logger, users []UserSummary) {
+	if fetcher == nil || len(users) == 0 {
+		return
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	ctx, cancel := context.WithTimeout(ctx, userSearchEnrichTimeout)
+	defer cancel()
+	for i := range users {
+		user := &users[i]
+		needName := strings.TrimSpace(user.Nickname) == ""
+		needPortrait := strings.TrimSpace(user.PortraitURI) == ""
+		if !needName && !needPortrait {
+			continue
+		}
+		userID := strings.TrimSpace(user.UserID)
+		if userID == "" {
+			continue
+		}
+		info, err := fetcher.getUserInfo(ctx, userID)
+		if err != nil {
+			// Debug 而不是 Warn：融云对已注销/不存在的号本来就会报错，一次
+			// 搜索里出现它属于预期，Warn 会把日志刷满。
+			logger.Debug("rongcloud: user search enrich skipped",
+				"error", err, "user_id", userID)
+			continue
+		}
+		if needName {
+			user.Nickname = info.Name
+		}
+		if needPortrait {
+			user.PortraitURI = info.PortraitURI
+		}
+	}
 }
 
 // searchClawIMUsers 是 UserStore.SearchUsers 的生产实现（表：claw_im_users +

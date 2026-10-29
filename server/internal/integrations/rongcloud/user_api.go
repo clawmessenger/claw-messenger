@@ -167,16 +167,42 @@ func (c *rongcloudAPIClient) getFriends(ctx context.Context, userID string) ([]f
 }
 
 // getUserInfo retrieves a user's info from RongCloud.
+//
+// 响应有两种形状，**必须都收**：
+//
+//	{"code":200,"data":{"userId":"u1","name":"Alice","portraitUri":"http://..."}}
+//	{"code":200,"userName":"Alice","userPortrait":"http://...","createTime":"..."}
+//
+// 前者是线上实际返回（字段包在 data 子字典里）—— 旧 Python 后端的命令通道就是
+// 按 `result["data"]["portraitUri"]` 读的，注释见
+// clawmessenger-server/rongcloud/command_handler.py:1973；后者是官方英文文档
+// （platform-chat-api/user/get）给出的扁平结构，且字段名是 userName / userPortrait。
+//
+// 之前这里只认扁平 `name` / `portraitUri`，两种形状都对不上：postForm 只看
+// `code`，200 就返回成功，于是 getUserInfo 会**静默**回一个空名字 + 空头像，
+// 调用方拿不到任何错误信号。它在 2026-10-29 之前没有任何生产调用点（只有
+// rongcloud_test.go 里一个扁平 mock），所以这个错位一直没暴露；搜索回填接上
+// 来之后就是「永远补不到东西」的哑故障，因此在这里一次性收口。
+//
+// userId 只在老结构里回传，没回就退回入参 —— 调用方关心的是「这次问的是谁」。
 func (c *rongcloudAPIClient) getUserInfo(ctx context.Context, userID string) (userInfoResult, error) {
 	form := url.Values{"userId": {userID}}
 	result, err := c.postForm(ctx, "/user/info.json", form)
 	if err != nil {
 		return userInfoResult{}, err
 	}
+	// 优先 data 子字典；它是空对象或不是对象时退回顶层，两种形状共用下面的取值。
+	fields := result
+	if data, ok := result["data"].(map[string]interface{}); ok && len(data) > 0 {
+		fields = data
+	}
 	info := userInfoResult{
-		UserID:      getString(result, "userId"),
-		Name:        getString(result, "name"),
-		PortraitURI: getString(result, "portraitUri"),
+		UserID:      getStringAny(fields, "userId"),
+		Name:        getStringAny(fields, "name", "userName"),
+		PortraitURI: getStringAny(fields, "portraitUri", "userPortrait"),
+	}
+	if info.UserID == "" {
+		info.UserID = userID
 	}
 	return info, nil
 }

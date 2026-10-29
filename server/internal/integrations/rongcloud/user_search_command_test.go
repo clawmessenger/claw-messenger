@@ -1289,3 +1289,136 @@ func TestUserSearchReturnsNodeAccountsInTheShapeClientsExpect(t *testing.T) {
 		t.Errorf("args[1] = %#v, want %d", d.args[1], userSearchLimit)
 	}
 }
+
+// --- E. 融云资料回填（2026-10-29）-------------------------------------------
+//
+// 背景：搜索结果的数据源是本地两张表（claw_im_users / rongcloud_node LEFT JOIN
+// rongcloud_user）。镜像是投影，节点换过名字、或者 rongcloud_user 里根本没有那一行
+// 时，回包只剩一串 rc_node_...，前端只能显示 id。虾说号本身就是融云 userId，所以
+// 命中后拿它问一次 /user/info.json 就能拿到注册时的真名和头像。
+//
+// 这批用例钉住三件事：
+//   1. 只在缺字段时才发请求（否则每次搜索都多一次外部调用，白白吃 15s 预算）；
+//   2. 已有值绝不被融云旧值覆盖（真人的 nickname 以本地为准）；
+//   3. 回填失败不能让搜索失败 —— 用户至少还能看到那串 id 去申请加好友。
+
+// fakeUserInfoFetcher 顶替融云 /user/info.json，省掉 httptest。
+type fakeUserInfoFetcher struct {
+	mu    sync.Mutex
+	infos map[string]userInfoResult
+	err   error
+	calls []string
+}
+
+func (f *fakeUserInfoFetcher) getUserInfo(_ context.Context, userID string) (userInfoResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, userID)
+	if f.err != nil {
+		return userInfoResult{}, f.err
+	}
+	return f.infos[userID], nil
+}
+
+// 只补空字段，且只对缺字段的行发请求。
+func TestUserSearchEnrichmentOnlyFillsMissingFields(t *testing.T) {
+	fetcher := &fakeUserInfoFetcher{infos: map[string]userInfoResult{
+		"100001":          {UserID: "100001", Name: "融云里的旧名字", PortraitURI: "https://example.test/old.png"},
+		"rc_node_1_agent": {UserID: "rc_node_1_agent", Name: "前端小助手", PortraitURI: "https://example.test/node.png"},
+	}}
+	users := []UserSummary{
+		// 本地齐全：一个字段都不该被改，也不该为它发请求。
+		{UserID: "100001", Username: "alice", Nickname: "爱丽丝", PortraitURI: "https://example.test/a.png"},
+		// 镜像缺行：名字和头像都空。
+		{UserID: "rc_node_1_agent", Username: "rc_node_1_agent"},
+	}
+
+	enrichUserSummariesFromRongCloud(context.Background(), fetcher, testLogger(), users)
+
+	if len(fetcher.calls) != 1 || fetcher.calls[0] != "rc_node_1_agent" {
+		t.Fatalf("fetcher calls = %#v, want only [rc_node_1_agent] — "+
+			"完整的结果不该触发外部调用", fetcher.calls)
+	}
+	if users[0].Nickname != "爱丽丝" || users[0].PortraitURI != "https://example.test/a.png" {
+		t.Errorf("user[0] = %#v, want it untouched — 融云旧值不能覆盖本地值", users[0])
+	}
+	if users[1].Nickname != "前端小助手" || users[1].PortraitURI != "https://example.test/node.png" {
+		t.Errorf("user[1] = %#v, want the rongcloud profile filled in", users[1])
+	}
+	// 只缺一个字段时，另一个字段不能被抹掉。
+	if users[1].UserID != "rc_node_1_agent" || users[1].Username != "rc_node_1_agent" {
+		t.Errorf("user[1] identity fields overwritten: %#v", users[1])
+	}
+}
+
+// 回填报错（账号已注销 / 网络 / 融云 5xx）时保持原样，不 panic、不清空。
+func TestUserSearchEnrichmentFailureLeavesTheRowAsIs(t *testing.T) {
+	fetcher := &fakeUserInfoFetcher{err: errors.New("rongcloud: API error code 1000")}
+	users := []UserSummary{{UserID: "rc_node_2_agent", Username: "rc_node_2_agent", Nickname: ""}}
+
+	enrichUserSummariesFromRongCloud(context.Background(), fetcher, testLogger(), users)
+
+	if len(fetcher.calls) != 1 {
+		t.Fatalf("fetcher calls = %#v, want 1", fetcher.calls)
+	}
+	if users[0].Nickname != "" || users[0].PortraitURI != "" {
+		t.Errorf("user[0] = %#v, want it unchanged after a failed lookup", users[0])
+	}
+}
+
+// 没装配 fetcher（未接融云的部署 / 单测）与零结果都必须是无操作。
+func TestUserSearchEnrichmentNoOps(t *testing.T) {
+	users := []UserSummary{{UserID: "u1"}}
+	enrichUserSummariesFromRongCloud(context.Background(), nil, testLogger(), users)
+	if users[0].Nickname != "" {
+		t.Errorf("nil fetcher must be a no-op, got %#v", users[0])
+	}
+	// 零结果不该发请求，也不该 panic。
+	fetcher := &fakeUserInfoFetcher{}
+	enrichUserSummariesFromRongCloud(context.Background(), fetcher, testLogger(), nil)
+	if len(fetcher.calls) != 0 {
+		t.Errorf("empty result set issued %d lookups, want 0", len(fetcher.calls))
+	}
+}
+
+// 命令通道端到端：本地只有 id 的节点，回包里要带上融云的头像和名字。
+// 同时验证 handleUserSearch 真的接上了回填（不是只写了函数没人调）。
+func TestUserSearchFillsTheProfileFromRongCloudWhenTheMirrorIsEmpty(t *testing.T) {
+	rec, srv := newIMServiceServer(t, imServiceServerOptions{
+		userInfo: map[string]map[string]interface{}{
+			"rc_node_9_agent": {
+				"userId":      "rc_node_9_agent",
+				"name":        "代码审查助手",
+				"portraitUri": "https://example.test/node.png",
+			},
+		},
+	})
+	t.Cleanup(srv.Close)
+	handler := newIMServiceHandler(t, srv)
+	stub := &userSearchStub{result: []UserSummary{
+		{UserID: "rc_node_9_agent", Username: "rc_node_9_agent"},
+	}}
+	handler.userStore = &UserStore{SearchUsers: stub.search}
+
+	sendWebCommand(t, handler, "user-7", "user", "search",
+		map[string]interface{}{"keyword": "rc_node_9_agent"})
+
+	reply := rec.last(t)
+	if reply["status"] != "success" {
+		t.Fatalf("status = %#v, want success (reply %#v)", reply["status"], reply)
+	}
+	list := userSearchList(t, reply)
+	if len(list) != 1 {
+		t.Fatalf("data.list length = %d, want 1", len(list))
+	}
+	first, _ := list[0].(map[string]interface{})
+	if got := first["nickname"]; got != "代码审查助手" {
+		t.Errorf("nickname = %#v, want 代码审查助手 — 镜像缺名字时要用融云注册资料补上", got)
+	}
+	if got := first["portraitUri"]; got != "https://example.test/node.png" {
+		t.Errorf("portraitUri = %#v, want the rongcloud portrait", got)
+	}
+	if !rec.called("/user/info.json") {
+		t.Error("/user/info.json was never called — handleUserSearch 没接上回填")
+	}
+}
