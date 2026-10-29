@@ -36,7 +36,10 @@ import { formatUseModelAck, parseUseModelCommand, type UseModelCommand } from ".
 import type { UserModelStore } from "./user-models.js";
 import {
   behaviorPromptFor,
+  decideCommandSender,
   decidePrivateChat,
+  type CommandGateDecision,
+  type CommandGateKind,
   type PermissionSnapshot,
   type PrivateGateReason,
 } from "./agent-permissions.js";
@@ -404,6 +407,57 @@ export class MessageDispatcher {
    *  · `denied-stranger` **每条 warn** —— 安全事件，宁多勿少；
    *  · `owner` / `unclaimed-fail-open` 每进程只记一次（不会变成刷屏）。
    */
+  /** command / chat_stop / card_action 三条分支的发送方闸门的去重记账。 */
+  private readonly loggedCommandGateReasons = new Set<string>();
+
+  /**
+   * 三条「非文本」分支的发送方闸门。
+   *
+   * 为什么这三条需要单独的闸门：私聊闸门（`privateGate`）只挂在 `RC:TxtMsg` 上，
+   * 而 `command` / `chat_stop` / `card_action` 三条此前完全不看发送方。结果是
+   * 任何持有融云账号的人都能伪造一条 `your_turn`，把 `params.role_prompt` 当人设
+   * 喂进 prompt、用 `params.model` 烧主人的额度、用 `params.chatroom_id` 把输出
+   * 推进任意本节点所在的房间 —— 五个准入开关一个都不经过。
+   *
+   * 判定见 `decideCommandSender`：服务端帧认系统账号，用户帧认这一行自己的主人。
+   */
+  private commandGate(fromUserId: string, kind: CommandGateKind): CommandGateDecision {
+    const snapshot = this.deps.permissionSnapshot?.() ?? null;
+    const decision = decideCommandSender(snapshot, {
+      fromUserId,
+      ...(this.deps.permissionNodeId ? { nodeId: this.deps.permissionNodeId } : {}),
+      ...(this.deps.agentName ? { agent: this.deps.agentName } : {}),
+      kind,
+    });
+    this.logCommandGate(decision, fromUserId, kind);
+    return decision;
+  }
+
+  /**
+   * 闸门日志：丢弃的每一条都记（安全事件宁多勿少），放行的兼容路径每种只记一次
+   * （否则 10s 轮询 + 每轮派发会把日志刷满）。
+   */
+  private logCommandGate(decision: CommandGateDecision, fromUserId: string, kind: CommandGateKind): void {
+    const node = this.deps.permissionNodeId || this.deps.agentName || "?";
+    if (!decision.allow) {
+      console.warn(
+        `im in: ${kind} dropped (${decision.reason}) from=${fromUserId} node=${node}`
+        + " — 发送方既不是服务端系统账号，也不是这个 agent 的主人",
+      );
+      return;
+    }
+    if (decision.reason === "no-system-node" || decision.reason === "no-owner-known"
+      || decision.reason === "no-snapshot") {
+      const key = `${kind}:${decision.reason}`;
+      if (this.loggedCommandGateReasons.has(key)) return;
+      this.loggedCommandGateReasons.add(key);
+      console.warn(
+        `im in: ${kind} sender gate degraded to allow (${decision.reason}) node=${node}`
+        + " — 服务端还没下发判定依据（老服务端 / 尚未轮询成功），升级后自动收紧",
+      );
+    }
+  }
+
   private logPrivateGate(reason: PrivateGateReason, fromUserId: string): void {
     const node = this.deps.permissionNodeId || this.deps.agentName || "?";
     if (reason === "unrestricted") return;
@@ -522,11 +576,19 @@ export class MessageDispatcher {
     // AbortController），并按协议回 chat_stop_result。
     if (msg.objectName === "chat_stop") {
       const stop = parseChatStopRequest(msg.content);
-      if (stop) await this.handleChatStop(msg, stop.requestId, stop.streamId, stop.requestMessageId);
+      if (!stop) return;
+      // 只有这个 agent 的主人能叫停。`locateActiveStream` 的前两级匹配
+      // （streamId / requestMessageId）不看发送方，而 streamId 随 chat_stream
+      // 帧广播进房间 —— 不设这道闸，房间内任何成员都能打断别人正在跑的轮次。
+      if (!this.commandGate(msg.fromUserId, "user-command").allow) return;
+      await this.handleChatStop(msg, stop.requestId, stop.streamId, stop.requestMessageId);
       return;
     }
 
     if (msg.objectName === "card_action") {
+      // 卡片的合法操作者是卡主本人（`findHtmlCard` 的兜底分支也按 fromUserId
+      // 过滤，但第一分支按 cardId 直接命中、不校验归属）。
+      if (!this.commandGate(msg.fromUserId, "user-command").allow) return;
       await this.handleCardAction(msg, turns);
       return;
     }
@@ -536,6 +598,10 @@ export class MessageDispatcher {
       // v2), so it can never decode as a discussion command — match it first.
       const catalogRequest = parseModelCatalogRequest(msg.content);
       if (catalogRequest) {
+        // 模型目录会回「本机装了哪些 provider / 模型」，是**未认证的探测信道**。
+        // 只允许这个 agent 的主人问：闸门以前完全没挂在这一支上，任何融云账号
+        // 私发一条就能拿到设备指纹。
+        if (!this.commandGate(msg.fromUserId, "user-command").allow) return;
         await this.handleModelCatalogRequest(msg, catalogRequest);
         return;
       }
@@ -543,11 +609,21 @@ export class MessageDispatcher {
       // v1 recovery packet carries requestId/action, not request_id/params.
       const recoveryRequest = parseRuntimeRecoveryRequest(msg.content);
       if (recoveryRequest) {
+        if (!this.commandGate(msg.fromUserId, "server-command").allow) return;
         await this.handleRuntimeRecovery(msg, recoveryRequest);
         return;
       }
       const cmd = decodeCommandContent(msg.content);
       if (!cmd || cmd.service !== "discussion") {
+        return;
+      }
+      // service=discussion 的帧全部由服务端系统账号发出（your_turn 由
+      // chatroom_relay / discussion_coordinator 派发，recommend_roles 由
+      // node_request_broker 派发，两者都走 sendPrivateMessage(systemNodeID…)）。
+      // 这里必须拦在**解析 params 之前**：伪造帧的危害正是通过 params 进来的
+      // （role_prompt / model / requester_id / chatroom_id），先判身份再读参数，
+      // 免得「读了一半才发现不该读」。
+      if (!this.commandGate(msg.fromUserId, "server-command").allow) {
         return;
       }
       if (cmd.action === ROLE_RECOMMEND_ACTION) {

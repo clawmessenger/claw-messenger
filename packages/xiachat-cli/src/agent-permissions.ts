@@ -36,6 +36,15 @@ export interface AgentPermissionEntry {
   allowDiscussion?: boolean;
   allowChatroom?: boolean;
   allowFs?: boolean;
+  /**
+   * **这一个 agent** 的认领者（融云 id），未认领或老服务端没下发时为空。
+   *
+   * 为什么不能只用快照顶层的 `ownerUserId`：那是**设备级**的（一台机器一个
+   * 主人）。一台机器上绑了分属两个账号的 agent 时，设备级单值必然错一半 ——
+   * A 会被当成 B 那台 agent 的主人（越权豁免），B 私聊自己的 agent 反而被判
+   * 陌生人（主人用不了）。逐行下发之后，闸门按「这条消息是发给谁的」判。
+   */
+  claimedBy?: string;
   /** 服务端已拼好的生效值（用户没改时是平台默认模板）。空串 = 不下发。 */
   behaviorPrompt: string;
   /** control 行的版本号；仅用于排障，不参与任何判定。 */
@@ -52,6 +61,18 @@ export interface PermissionSnapshot {
    * 后者必须保留上一份（否则服务端一滚回旧版本，认领关系就被抹成未认领）。
    */
   ownerUserIdPresent?: boolean;
+  /**
+   * 服务端**系统账号**的融云 id。
+   *
+   * 服务端下发的 `command` 帧（`your_turn` / `recommend_roles`）全部由这个账号
+   * 发出（Go 侧 `sendPrivateMessage(systemNodeID, ...)`），而 `chat_stop` /
+   * `card_action` 是用户用自己的账号发的。设备端靠它区分「服务端让我干活」和
+   * 「某个融云账号伪造了一条 command」。
+   *
+   * 空串 / undefined = 老服务端没下发（或集成未装配），此时 command 闸门保持
+   * 放行 —— 否则一次服务端未升级就把所有设备的讨论组掐死。
+   */
+  systemNodeId?: string;
   agents: AgentPermissionEntry[];
   /** 设备本地写入时间（ms），仅用于排障。 */
   updatedAt: number;
@@ -122,14 +143,17 @@ export function parseControlPermissions(raw: unknown, now: number = Date.now()):
       allowDiscussion: asBool(row.allowDiscussion) ?? asBool(row.allow_discussion),
       allowChatroom: asBool(row.allowChatroom) ?? asBool(row.allow_chatroom),
       allowFs: asBool(row.allowFs) ?? asBool(row.allow_fs),
+      claimedBy: asString(row.claimedBy) || asString(row.claimed_by) || undefined,
       behaviorPrompt: asString(row.behaviorPrompt) || asString(row.behavior_prompt),
       version: asNumber(row.version),
     });
   }
   const ownerRaw = data.ownerUserId ?? data.owner_user_id;
+  const systemNodeRaw = data.systemNodeId ?? data.system_node_id;
   return {
     ownerUserId: asString(ownerRaw),
     ownerUserIdPresent: typeof ownerRaw === "string",
+    systemNodeId: asString(systemNodeRaw),
     agents,
     updatedAt: now,
   };
@@ -146,7 +170,11 @@ export function parsePermissionFile(text: string, now: number = Date.now()): Per
   if (!parsed || typeof parsed !== "object") return null;
   const body = parsed as Record<string, unknown>;
   if (!Array.isArray(body.agents)) return null;
-  const snapshot = parseControlPermissions({ agents: body.agents, ownerUserId: body.ownerUserId }, now);
+  const snapshot = parseControlPermissions({
+    agents: body.agents,
+    ownerUserId: body.ownerUserId,
+    systemNodeId: body.systemNodeId,
+  }, now);
   return snapshot;
 }
 
@@ -236,11 +264,14 @@ export function permissionSignature(snapshot: PermissionSnapshot | null): string
       a.allowDiscussion ?? null,
       a.allowChatroom ?? null,
       a.allowFs ?? null,
+      // claimedBy / systemNodeId 决定「这条消息是不是主人/服务端发的」，
+      // 变了必须重写快照，否则磁盘上留的还是上一版判定依据。
+      a.claimedBy ?? null,
       a.behaviorPrompt,
       a.version,
     ])
     .sort((left, right) => String(left[1] ?? left[0]).localeCompare(String(right[1] ?? right[0])));
-  return JSON.stringify({ owner: snapshot.ownerUserId, agents });
+  return JSON.stringify({ owner: snapshot.ownerUserId, system: snapshot.systemNodeId ?? "", agents });
 }
 
 /**
@@ -288,9 +319,18 @@ export function mergePermissionSnapshot(
     else if (prior.allowChatroom !== undefined) merged.allowChatroom = prior.allowChatroom;
     if (entry.allowFs !== undefined) merged.allowFs = entry.allowFs;
     else if (prior.allowFs !== undefined) merged.allowFs = prior.allowFs;
+    // claimedBy 与权限位同规则：服务端明确下发才更新，缺失沿用上一份。
+    // 否则一次服务端回滚就会把逐行认领者抹成空，私聊闸门退回设备级误判。
+    if (entry.claimedBy !== undefined) merged.claimedBy = entry.claimedBy;
+    else if (prior.claimedBy !== undefined) merged.claimedBy = prior.claimedBy;
     return merged;
   });
-  return { ownerUserId, ownerUserIdPresent: true, agents, updatedAt: next.updatedAt };
+  // systemNodeId 同理：字段缺失（老服务端）时沿用上一份，抹成空等于把 command
+  // 闸门从「严格」悄悄退回「放行」。
+  const systemNodeId = typeof next.systemNodeId === "string" && next.systemNodeId !== ""
+    ? next.systemNodeId
+    : previous?.systemNodeId ?? "";
+  return { ownerUserId, ownerUserIdPresent: true, systemNodeId, agents, updatedAt: next.updatedAt };
 }
 
 /** 查这个节点（或这个 agent 名）的配置。nodeId 优先，agent 名兜底。 */
@@ -364,10 +404,101 @@ export function decidePrivateChat(
   const entry = findPermissionEntry(snapshot, query);
   if (!entry) return { allow: false, reason: "no-agent-entry" };
   if (entry.allowPrivate !== false) return { allow: true, reason: "unrestricted", entry };
-  const owner = snapshot.ownerUserId.trim();
+  // 主人是谁：**优先用这一行自己的认领者**，没有才退回设备级 ownerUserId。
+  //
+  // 设备级 ownerUserId 优先取机器主节点的认领者，一台机器绑了分属两个账号的
+  // agent 时它必然错一半：A 私聊 B 的 agent 会被判成主人（越权豁免），而 B
+  // 私聊自己的 agent 反被判陌生人（主人用不了自己的东西）。单主人设备上两者
+  // 恒等，所以这个错一直没暴露。逐行认领者是服务端 2026-10 起下发的，老服务端
+  // 没有这个字段时退回设备级，行为与升级前一致。
+  const agentOwner = entry.claimedBy?.trim() ?? "";
+  const owner = agentOwner || snapshot.ownerUserId.trim();
   if (!owner) return { allow: true, reason: "unclaimed-fail-open", entry };
   if (query.fromUserId && query.fromUserId === owner) return { allow: true, reason: "owner", entry };
   return { allow: false, reason: "denied-stranger", entry };
+}
+
+/**
+ * `command` / `chat_stop` / `card_action` 三类帧的发送方闸门。
+ *
+ * 背景：`im.ts` 的消息分发只有四个分支，而私聊闸门只挂在 `RC:TxtMsg` 上。
+ * 另外三条此前**完全不校验发送方** —— 任何持有融云账号的人，只要知道某个
+ * agent 的融云 id，就能给它私发一条 `command`：
+ *
+ *   · `your_turn` 的 `params.role_prompt` 会被原样拼进 prompt，
+ *   · `params.model` 决定用哪个模型（烧主人的额度），
+ *   · `params.chatroom_id` + `conversation_type` 决定流帧投递到哪个房间，
+ *   · `params.requester_id` 决定套用谁选过的模型。
+ *
+ * 换句话说是「完全接管」，而且绕开全部五个准入开关。
+ *
+ * 两类帧的合法发送方不同，不能一刀切：
+ *
+ *   · **server-command**（`your_turn` / `recommend_roles`）：服务端经融云私发，
+ *     发送方恒为**系统账号**（Go 侧 `sendPrivateMessage(systemNodeID, ...)`）。
+ *     这类帧必须来自 `snapshot.systemNodeId`，别的账号发来的一律丢。
+ *   · **user-command**（`chat_stop` / `card_action`）：web 用户用自己的账号发，
+ *     合法发送方是这个 agent 的**主人**（逐行 `claimedBy`，退回设备级
+ *     `ownerUserId`）。
+ *
+ * 兼容：`systemNodeId` 缺失（老服务端 / 集成未装配）、主人信息缺失（未认领 /
+ * 老服务端）时**放行并记 warn** —— 一次服务端没升级就把所有设备的讨论组掐死
+ * 是不可接受的。这两条兼容路径正是本闸门仅剩的 fail-open，且都只在「服务端
+ * 还没下发新字段」的窗口里成立。
+ */
+export type CommandGateKind =
+  /** 服务端派发的帧（your_turn / recommend_roles） */
+  | "server-command"
+  /** 用户端发出的帧（chat_stop / card_action） */
+  | "user-command";
+
+export type CommandGateReason =
+  | "server-command-from-system"
+  | "user-command-from-owner"
+  /** 发送方不在信任集合 → 丢弃 */
+  | "denied-foreign-sender"
+  /** 没有快照（旧服务端 / 独立 run）→ 放行 */
+  | "no-snapshot"
+  /** 快照没有 systemNodeId（老服务端）→ 放行 */
+  | "no-system-node"
+  /** 拿不到主人（未认领 / 老服务端）→ 放行 */
+  | "no-owner-known"
+  /** 帧里没有发送方 → 放行（融云协议上必然有，缺了说明解析异常，不是可伪造的形态） */
+  | "no-sender";
+
+export interface CommandGateDecision {
+  allow: boolean;
+  reason: CommandGateReason;
+}
+
+/**
+ * 判断一条 command / chat_stop / card_action 帧是否该被执行。
+ *
+ * 与 `decidePrivateChat` 同一套快照、同一套主人口径（逐行 `claimedBy` 优先，
+ * 设备级 `ownerUserId` 兜底），但**判的是发送方身份**，不是准入开关。
+ */
+export function decideCommandSender(
+  snapshot: PermissionSnapshot | null,
+  query: { fromUserId: string; nodeId?: string; agent?: string; kind: CommandGateKind },
+): CommandGateDecision {
+  if (!snapshot) return { allow: true, reason: "no-snapshot" };
+  const from = (query.fromUserId ?? "").trim();
+  if (!from) return { allow: true, reason: "no-sender" };
+
+  if (query.kind === "server-command") {
+    const systemNode = (snapshot.systemNodeId ?? "").trim();
+    if (!systemNode) return { allow: true, reason: "no-system-node" };
+    return from === systemNode
+      ? { allow: true, reason: "server-command-from-system" }
+      : { allow: false, reason: "denied-foreign-sender" };
+  }
+
+  const entry = findPermissionEntry(snapshot, query);
+  const owner = (entry?.claimedBy?.trim() ?? "") || snapshot.ownerUserId.trim();
+  if (!owner) return { allow: true, reason: "no-owner-known" };
+  return from === owner
+    ? { allow: true, reason: "user-command-from-owner" }
+    : { allow: false, reason: "denied-foreign-sender" };
 }
 
 export interface FsRestriction {
