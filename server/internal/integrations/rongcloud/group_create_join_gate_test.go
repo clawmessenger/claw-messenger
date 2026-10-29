@@ -165,6 +165,49 @@ func TestGroupCreateFailsClosedWhenPermissionLookupBreaks(t *testing.T) {
 	}
 }
 
+// TestGroupCreateLetsHumansAndUnclaimedNodesThrough：闸门只管「别人名下的
+// agent」。真人没有节点行、未认领节点没有主人（也就没有可点的开关），两类都必须
+// 照常进群。
+//
+// 未认领单独列一条是因为它最容易被写成「allow_group=false 就拦」：NOT NULL
+// DEFAULT false 意味着一个从没被认领过的整机主节点，这一列读出来就是 false，
+// 按值拦会把整机智能体永久踢出所有新群，而用户手上没有任何自救入口。
+func TestGroupCreateLetsHumansAndUnclaimedNodesThrough(t *testing.T) {
+	rec, srv := newGroupTestServer(t)
+	defer srv.Close()
+	stub := newGroupMirrorStub()
+	rows := []db.ListRongCloudNodePermissionsByRcUserIDsRow{
+		// 未认领：claimed_by_user_id 为 NULL，allow_group 取列默认值 false。
+		joinPermRow("rc_node_machine1", "", false),
+		joinPermRow("agent-blocked", "owner-a", false),
+	}
+	handler := newJoinGateHandler(t, rec, srv, stub.mirror(), rows)
+
+	msg := groupCommand("create", "user-7",
+		`{"groupName":"混合名单","memberIds":["user-8","rc_node_machine1","agent-blocked"]}`)
+	if err := handler.handleCommand(context.Background(), msg); err != nil {
+		t.Fatalf("handleCommand: %v", err)
+	}
+
+	got := createdUserIDs(t, rec)
+	want := []string{"user-7", "user-8", "rc_node_machine1"}
+	if len(got) != len(want) {
+		t.Fatalf("create userIds = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("create userIds = %v, want %v", got, want)
+		}
+	}
+	skipped := skippedEntries(t, rec)
+	if len(skipped) != 1 {
+		t.Fatalf("skipped = %#v, want only the claimed-and-disabled agent", skipped)
+	}
+	if entry, ok := skipped[0].(map[string]interface{}); !ok || entry["userId"] != "agent-blocked" {
+		t.Fatalf("skipped[0] = %#v, want agent-blocked only", skipped[0])
+	}
+}
+
 // TestGroupCreateKeepsTheOwnerEvenIfTheGateWouldFilterIt：群主被判定拦下时仍要
 // 留在成员里（融云建群要求群主是成员），并且不能再出现在 skipped 里 —— 一边
 // 把人塞进去、一边告诉前端「这个人没进去」是自相矛盾的。
