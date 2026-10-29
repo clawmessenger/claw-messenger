@@ -35,8 +35,22 @@
 // makes every agent render flat next to its human. -claims rebuilds the column
 // from the authoritative source — the RongCloud friend edges — and writes a node
 // only when the owner is uniquely determinable (exactly one account has the node
-// as a friend, or the intersection over one machine_id is exactly one account).
-// Ambiguous nodes are deliberately left empty rather than guessed.
+// as a friend, or the intersection over one machine_id's friend-backed nodes is
+// exactly one account). Ambiguous nodes are deliberately left empty rather than
+// guessed, and a machine whose friend evidence contradicts itself (empty
+// intersection over two or more non-empty claimant sets — two accounts each
+// claiming a different node of the same device) is reported as `conflict` and
+// writes nothing at all, including nodes that looked unique on their own: one
+// device has one owner, so two disjoint candidate sets cannot both be right.
+//
+// -claims is fail-closed: when any candidate account's friend-edge lookup fails,
+// the missing account is a missing voter and may be the one friend that would
+// have turned a unique answer into an ambiguous one, so -commit writes not a
+// single byte and exits non-zero. -allow-partial is the escape hatch for the
+// case where an account is permanently gone on the RongCloud side; it judges
+// only nodes that already have a non-empty claimant set (nodes with no edge stay
+// no-edge: with a voter missing, "no edge" no longer means "nobody"), prints a
+// loud warning, and marks the summary line so the report says it is partial.
 //
 // Typical use (from the server/ directory):
 //
@@ -46,6 +60,7 @@
 //	go run ./cmd/backfill-friends -env-file ../.env -sync-portraits
 //	go run ./cmd/backfill-friends -env-file ../.env -claims            # dry run
 //	go run ./cmd/backfill-friends -env-file ../.env -claims -commit
+//	go run ./cmd/backfill-friends -env-file ../.env -claims -commit -allow-partial
 package main
 
 import (
@@ -87,7 +102,8 @@ func run() error {
 	syncPortraits := flag.Bool("sync-portraits", false, "unify default portraits for claw_im_users and rongcloud_user, and switch group / chatroom default images to the per-kind group art (群聊 / 讨论组 / 聊天室); custom portraits are never overwritten")
 	syncAgentPortraits := flag.Bool("sync-agent-portraits", false, "give every AI agent its own brand portrait (<base>/<kind>-256.png; base = $CLAW_AGENT_PORTRAIT_BASE or the claw-web static dir). Only rows whose RongCloud id resolves to an agent kind are touched; custom portraits are never overwritten. Mutually exclusive with -sync-portraits")
 	registerMissing := flag.Bool("register-missing", false, "with -sync-agent-portraits: when RongCloud answers 1002 (userId not exist), create the account via /user/getToken.json (name + portraitUri in one call) instead of only reporting it as missing. Off by default: this writes identity, not just a field")
-	claims := flag.Bool("claims", false, "backfill rongcloud_node.claimed_by_user_id from the RongCloud friend edges: writes a node only when its owner is uniquely determinable (one claimant, or the intersection over one machine_id is one account); ambiguous nodes stay empty (default is a dry run)")
+	claims := flag.Bool("claims", false, "backfill rongcloud_node.claimed_by_user_id from the RongCloud friend edges: writes a node only when its owner is uniquely determinable (one claimant, or the intersection over one machine_id's friend-backed nodes is one account); ambiguous nodes stay empty and a machine whose evidence contradicts itself is reported as conflict (default is a dry run)")
+	allowPartial := flag.Bool("allow-partial", false, "with -claims: keep going when some accounts' friend-edge lookup fails. Default is fail-closed — any lookup failure makes -commit write not a single byte and exit non-zero, because a missing voter can turn an ambiguous node into a wrong unique answer. With this flag only nodes that already have a non-empty claimant set are judged (nodes without edges stay no-edge), a WARNING is printed, and the summary is marked as partial. Use it only when those broken accounts cannot own any node")
 	dsnFlag := flag.String("dsn", "", "postgres DSN (default: $DATABASE_URL, then $MULTICA_DATABASE_URL)")
 	envFile := flag.String("env-file", "", "load KEY=VALUE environment variables from this file before reading configuration")
 	flag.Parse()
@@ -138,7 +154,7 @@ func run() error {
 	// 所以放在解析 workspace 之前：纯 -claims 调用不该因为「没有 workspace」
 	// 或「没有 -user」而报错退出。
 	if *claims {
-		if err := runClaims(ctx, pool, client, *commit); err != nil {
+		if err := runClaims(ctx, pool, client, *commit, *allowPartial); err != nil {
 			return fmt.Errorf("backfill node claims: %w", err)
 		}
 		if *userFlag == "" && !*allUsers && !*syncNames && !*syncPortraits && !*syncAgentPortraits {
@@ -345,10 +361,20 @@ const (
 	claimVerdictSingle    claimVerdict = "single"    // 单节点唯一 claimant
 	claimVerdictMachine   claimVerdict = "machine"   // 机器级交集唯一
 	claimVerdictAmbiguous claimVerdict = "ambiguous" // 多个候选，不写
+	claimVerdictConflict  claimVerdict = "conflict"  // 同一台机器的证据互相矛盾，整机不写
 	claimVerdictNoEdge    claimVerdict = "no-edge"   // 没有任何好友边，不写
 	claimVerdictHidden    claimVerdict = "hidden"    // 机器主节点 / 运维节点，不在好友列表里
 	claimVerdictAlready   claimVerdict = "already"   // 已有归属，不参与判定
 )
+
+// claimResolveOptions 是判定口径的开关。零值 = 全量证据下的严格口径，也是
+// resolveClaims（测试与常规调用）使用的口径。
+type claimResolveOptions struct {
+	// AllowPartial 表示「本轮有账号好友边反查失败」。此时 claimants 为空的节点
+	// 可能只是「投票人缺席」，而不是「真的没人加它」，所以禁止用机器级证据去补
+	// 这些节点（它们一律落回 no-edge）：宁可少写，不猜。
+	AllowPartial bool
+}
 
 // claimDecision 是一行节点的判定结果。Owner 非空当且仅当这一行可以安全写入。
 type claimDecision struct {
@@ -359,23 +385,41 @@ type claimDecision struct {
 }
 
 // resolveClaims 是 -claims 的判定核心（纯函数，不碰库也不碰融云，便于单测）。
+// 等价于 claimResolveOptions{}（全量证据、严格口径）。
+func resolveClaims(nodes []nodeRow, claimants map[string]map[string]bool) []claimDecision {
+	return resolveClaimsWith(nodes, claimants, claimResolveOptions{})
+}
+
+// resolveClaimsWith 是 -claims 的判定核心（纯函数，不碰库也不碰融云，便于单测）。
 //
 // claimants[nodeRCID] = 「把这个节点加为好友的账号集合」，即好友边反查的原始结果。
 // 规则只有一条：**唯一解才写**，有歧义宁可不说 —— 归属写错会让一个智能体出现在
 // 别人的「我的智能体」块里，比平铺更糟。
 //
-//	第一轮：claimants 恰好一个人 → 归他。
-//	第二轮：按 machine_id 把同一台机器的节点分组求交集（同一台设备只可能有一个
-//	        主人，第一轮已判定的节点也是证据）；交集恰好一个人 → 这台机器上所有
-//	        待判节点都归他。
-//	其余：no-edge（没有任何好友边）/ ambiguous（多解），都不写。
-func resolveClaims(nodes []nodeRow, claimants map[string]map[string]bool) []claimDecision {
+//	第一轮：claimants 恰好一个人 → 记成**候选**单解（先不落地：机器级证据可能
+//	        证明同一台设备的证据互相矛盾，那时连这个单解也要撤销）。
+//	第二轮：按 machine_id 分组求交集，**只有 claimants 非空的节点参与投票**
+//	        （完全没有好友边的节点既不能投票，也不能否决）：
+//	          |交集| == 1           → 这台机器上所有尚无归属的节点（含 claimants
+//	                                  为空的节点，它们靠机器级证据拿到归属）都取它；
+//	          |交集| > 1            → 这台机器上所有节点 ambiguous，一行都不写；
+//	          |交集| == 0 且该机器有 ≥2 个非空 claimants 集合
+//	                                → 冲突（conflict）：同一台设备上两套互不相交的
+//	                                  证据不可能都对，这台机器上**所有**节点（包括
+//	                                  第一轮已得单解的）一律降级，一行都不写；
+//	          只有一个非空集合且 |集合| > 1
+//	                                → 这台机器全部 ambiguous。
+//	第三轮：剩下仍无归属 → claimants 为空 no-edge，否则 ambiguous。
+//
+// 一台机器只有一个节点时交集就是它自己的 claimants，不可能被判成冲突 —— 冲突
+// 的定义要求至少两套非空证据。
+func resolveClaimsWith(nodes []nodeRow, claimants map[string]map[string]bool, opts claimResolveOptions) []claimDecision {
 	decisions := make([]claimDecision, len(nodes))
 	for i, n := range nodes {
 		decisions[i] = claimDecision{Node: n, Claimants: sortedClaimKeys(claimants[n.RCUserID])}
 	}
 
-	// 第一轮：单节点唯一解。len(claimants)==1 时没有第二种解释。
+	// 第一轮：分拣 + 候选单解。
 	eligible := make([]int, 0, len(decisions))
 	for i := range decisions {
 		d := &decisions[i]
@@ -389,6 +433,7 @@ func resolveClaims(nodes []nodeRow, claimants map[string]map[string]bool) []clai
 		default:
 			eligible = append(eligible, i)
 			if len(d.Claimants) == 1 {
+				// 候选单解：真冲突（同一台机器上还有一套不相交的证据）时会被撤销。
 				d.Owner = d.Claimants[0]
 				d.Verdict = claimVerdictSingle
 			}
@@ -397,8 +442,8 @@ func resolveClaims(nodes []nodeRow, claimants map[string]map[string]bool) []clai
 
 	// 第二轮：机器级交集。同一台设备只可能有一个主人，所以把同 machine_id 的
 	// 节点求交。分组里包含第一轮已判定的节点 —— 它本身就是机器归属的证据：
-	// A={u1,u2}、B={u1} 时 A 也只能归 u1。写只落在第一轮没判定的行上。
-	// 没有 machine_id 的行无法归组，留给第三档。
+	// A={u1,u2}、B={u1} 时 A 也只能归 u1。
+	// 没有 machine_id 的行无法归组，留给第三轮。
 	order := make([]string, 0, len(eligible))
 	groups := make(map[string][]int, len(eligible))
 	for _, i := range eligible {
@@ -413,23 +458,54 @@ func resolveClaims(nodes []nodeRow, claimants map[string]map[string]bool) []clai
 	}
 	for _, mid := range order {
 		idxs := groups[mid]
-		common := intersectClaimants(idxs, claimants, decisions)
-		if len(common) != 1 {
+		// 只用有好友边的节点投票：完全没有好友边的节点不能投票，也不能否决。
+		voters := make([]int, 0, len(idxs))
+		for _, i := range idxs {
+			if len(decisions[i].Claimants) > 0 {
+				voters = append(voters, i)
+			}
+		}
+		if len(voters) == 0 {
+			// 这台机器一个投票人都没有：没有任何证据，留给第三轮判 no-edge。
 			continue
 		}
-		for _, i := range idxs {
-			if decisions[i].Owner != "" {
-				continue
+		common := intersectClaimants(voters, claimants, decisions)
+		switch {
+		case len(common) == 0 && len(voters) >= 2:
+			// 冲突：同一台设备上出现两套（以上）互不相交的证据。一台设备只有一个
+			// 主人，两套证据不可能都对，所以谁都不写 —— 连第一轮的单解也撤销：
+			// 如果 B 已因「单节点唯一」定成 u3，而同一台机器上 A={u1,u2} 与
+			// B={u3} 毫无交集，那么至少有一套证据是错的，写下去就是在赌哪套。
+			for _, i := range idxs {
+				decisions[i].Owner = ""
+				decisions[i].Verdict = claimVerdictConflict
 			}
-			decisions[i].Owner = common[0]
-			decisions[i].Verdict = claimVerdictMachine
+		case len(common) == 1:
+			for _, i := range idxs {
+				if decisions[i].Owner != "" {
+					continue
+				}
+				if opts.AllowPartial && len(decisions[i].Claimants) == 0 {
+					// 部分反查时「没有好友边」可能只是投票人缺席，不能用机器级证据
+					// 替它猜归属；它会落回第三轮的 no-edge。
+					continue
+				}
+				decisions[i].Owner = common[0]
+				decisions[i].Verdict = claimVerdictMachine
+			}
+		case len(common) > 1:
+			// 交集不止一个人：机器级证据也定不下来，整台机器都不写。
+			for _, i := range idxs {
+				decisions[i].Owner = ""
+				decisions[i].Verdict = claimVerdictAmbiguous
+			}
 		}
 	}
 
-	// 剩下的仍无唯一解：自己一条好友边都没有 → no-edge，否则 → ambiguous。
+	// 第三轮：剩下的仍无归属：自己一条好友边都没有 → no-edge，否则 → ambiguous。
 	for _, i := range eligible {
 		d := &decisions[i]
-		if d.Owner != "" {
+		if d.Owner != "" || d.Verdict != "" {
 			continue
 		}
 		if len(d.Claimants) == 0 {
@@ -500,7 +576,12 @@ const claimFillSQL = `UPDATE rongcloud_node
 // runClaims 是 -claims 的入口：反查好友边 → 判定 → （仅 -commit）写库。
 //
 // 幂等：已填的行不在待填集合里，重跑不会重复写，也不会覆盖别人的归属。
-func runClaims(ctx context.Context, pool *pgxpool.Pool, lister claimsFriendLister, commit bool) error {
+//
+// 安全顺序：**任何账号好友边反查失败都在写库之前拦下**。反查失败的账号等于
+// 「缺席的投票人」—— 它可能才是某个节点的唯一好友，缺了它就会把歧义判成唯一解，
+// 归属写错比平铺更糟。所以 -commit 在这种情况下一个字节都不写并报错退出（守卫在
+// 写库循环之前，不是之后）。-allow-partial 是唯一的逃生阀，语义见 isPartial。
+func runClaims(ctx context.Context, pool *pgxpool.Pool, lister claimsFriendLister, commit, allowPartial bool) error {
 	if !commit {
 		fmt.Println("DRY RUN — nothing will be written. Re-run with -commit to apply.")
 	}
@@ -510,17 +591,42 @@ func runClaims(ctx context.Context, pool *pgxpool.Pool, lister claimsFriendListe
 	}
 	fmt.Printf("claim candidates (claw_im_users active): %d\n", len(candidates))
 
-	claimants, lookupFailed := collectClaimants(ctx, lister, candidates)
+	claimants, failedUsers := collectClaimants(ctx, lister, candidates)
+	lookupFailed := len(failedUsers)
+
+	// ---- 守卫（必须先于写库循环）----------------------------------------
+	// 位置很重要：这段判定原来在写库循环之后，于是「-commit 且部分账号反查失败」
+	// 会先污染数据再报错，操作者还以为没写成。现在把它整体上移 —— 只要有任何
+	// 账号反查失败，-commit 就是纯 no-op。
+	if lookupFailed > 0 {
+		failedList := strings.Join(failedUsers, ",")
+		if commit && !allowPartial {
+			return fmt.Errorf("有 %d 个账号的好友边反查失败（%s），-commit 一个字节都不写并退出："+
+				"缺席的投票人可能把歧义判成唯一解，从而写错归属；修复这些账号后重跑，"+
+				"确认它们不可能拥有任何节点时才加 -allow-partial", lookupFailed, failedList)
+		}
+		if allowPartial {
+			// 醒目的一行，走 stderr：这次不是全量证据，报表里的「唯一解」可能被
+			// 缺席的投票人抬成了唯一。
+			fmt.Fprintf(os.Stderr,
+				"WARNING: 有 %d 个账号好友边未知（%s），其归属可能被判成错误的唯一解；-allow-partial 已开启，只对已有好友边的节点做判定\n",
+				lookupFailed, failedList)
+		} else {
+			fmt.Printf("WARNING: %d 个账号的好友边反查失败（%s）；干跑结果仅供参考，-commit 会零写入并报错退出（确需绕过加 -allow-partial）\n",
+				lookupFailed, failedList)
+		}
+	}
+
 	nodes, err := listClaimNodes(ctx, pool)
 	if err != nil {
 		return err
 	}
-	decisions := resolveClaims(nodes, claimants)
+	decisions := resolveClaimsWith(nodes, claimants, claimResolveOptions{AllowPartial: allowPartial})
 
 	var (
-		pending, single, machine, ambiguous, noEdge, hidden, already int
-		written, writeFailed, lostRace                               int
-		stuck                                                        []string
+		pending, single, machine, ambiguous, conflict, noEdge, hidden, already int
+		written, writeFailed, lostRace                                          int
+		stuck                                                                   []string
 	)
 	for _, d := range decisions {
 		verdict := string(d.Verdict)
@@ -534,6 +640,11 @@ func runClaims(ctx context.Context, pool *pgxpool.Pool, lister claimsFriendListe
 		case claimVerdictAmbiguous:
 			ambiguous++
 			verdict = "ambiguous"
+			stuck = append(stuck, d.Node.RCUserID)
+		case claimVerdictConflict:
+			conflict++
+			// 比 ambiguous 更具体：同机器证据打架，连单节点唯一解都撤销了。
+			verdict = "conflict"
 			stuck = append(stuck, d.Node.RCUserID)
 		case claimVerdictNoEdge:
 			noEdge++
@@ -552,6 +663,7 @@ func runClaims(ctx context.Context, pool *pgxpool.Pool, lister claimsFriendListe
 		fmt.Printf("%-26s | %-34s | %9d | %s\n", d.Node.MachineID, d.Node.RCUserID, len(d.Claimants), verdict)
 	}
 
+	// ---- 写库（守卫已在上面过完：走到这里的 -commit 一定是全量证据）--------
 	if commit {
 		for _, d := range decisions {
 			if d.Owner == "" {
@@ -572,20 +684,15 @@ func runClaims(ctx context.Context, pool *pgxpool.Pool, lister claimsFriendListe
 		}
 	}
 
-	if lookupFailed > 0 {
-		// 反查失败的账号等于「缺席的投票人」：它可能才是某个节点的唯一好友，
-		// 缺了它就会把歧义判成唯一解 —— 归属写错比平铺更糟，所以拒绝写库。
-		if commit {
-			return fmt.Errorf("%d 个账号的好友边反查失败，拒绝写库（缺席的投票人可能把歧义判成唯一解）；修复后重跑，或先缩小范围", lookupFailed)
-		}
-		fmt.Printf("WARNING: %d 个账号的好友边反查失败；干跑结果仅供参考，-commit 会拒绝写库\n", lookupFailed)
-	}
-
 	fmt.Println()
-	fmt.Printf("claims summary: 待填=%d 单节点判定=%d 机器交集判定=%d 歧义跳过=%d 无边跳过=%d 实际写入=%d\n",
-		pending, single, machine, ambiguous, noEdge, written)
+	fmt.Printf("claims summary: 待填=%d 单节点判定=%d 机器交集判定=%d 歧义跳过=%d 冲突跳过=%d 无边跳过=%d 实际写入=%d\n",
+		pending, single, machine, ambiguous, conflict, noEdge, written)
 	fmt.Printf("claims detail: 隐藏跳过=%d 已有归属=%d 好友边反查失败=%d 写入失败=%d 已被抢先填写=%d\n",
 		hidden, already, lookupFailed, writeFailed, lostRace)
+	if allowPartial && lookupFailed > 0 {
+		// 报表自己说明这次不是全量证据：只看汇总行也能判断结论的可信度。
+		fmt.Printf("部分反查=1 未知账号=%d（-allow-partial：仅对已有好友边的节点做判定，无人友边的节点按 no-edge 处理）\n", lookupFailed)
+	}
 	if !commit && pending > 0 {
 		fmt.Printf("干跑：-commit 时将写 %d 行（单节点 %d + 机器交集 %d）\n", single+machine, single, machine)
 	}
@@ -600,12 +707,14 @@ func runClaims(ctx context.Context, pool *pgxpool.Pool, lister claimsFriendListe
 }
 
 // collectClaimants 反查每个候选账号的融云好友列表，构造「谁把这个节点加为好友」。
-// 单个账号失败只跳过并计数（一个坏 token 不该让整张表失去归属），失败数由调用方
-// 决定能不能写库。
-func collectClaimants(ctx context.Context, lister claimsFriendLister, candidates []string) (map[string]map[string]bool, int) {
+// 单个账号失败只跳过并计数（一个坏 token 不该让整张表失去归属），但**失败账号的
+// 清单必须带回去**：调用方要在报错文案里点名，也要据此决定能不能写库。
+//
+// 返回值第二个是反查失败的账号（按候选顺序，便于复现），它的长度就是失败数。
+func collectClaimants(ctx context.Context, lister claimsFriendLister, candidates []string) (map[string]map[string]bool, []string) {
 	claimants := make(map[string]map[string]bool, len(candidates))
 	if len(candidates) == 0 || lister == nil {
-		return claimants, 0
+		return claimants, nil
 	}
 	ctx, cancel := context.WithTimeout(ctx, claimsLookupTimeout)
 	defer cancel()
@@ -635,10 +744,10 @@ func collectClaimants(ctx context.Context, lister claimsFriendLister, candidates
 	// 单个账号的错误已经落在 answers 里，这里不需要从 errgroup 取错误。
 	_ = g.Wait()
 
-	failed := 0
+	var failedUsers []string
 	for i, userID := range candidates {
 		if answers[i].err != nil {
-			failed++
+			failedUsers = append(failedUsers, userID)
 			fmt.Printf("lookup FAILED user=%s error=%v\n", userID, answers[i].err)
 			continue
 		}
@@ -653,7 +762,7 @@ func collectClaimants(ctx context.Context, lister claimsFriendLister, candidates
 			claimants[friend][userID] = true
 		}
 	}
-	return claimants, failed
+	return claimants, failedUsers
 }
 
 // listClaimNodes 返回待填归属的节点，跳过隐藏节点由判定层负责（保证报表能说明
