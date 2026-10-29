@@ -295,7 +295,8 @@ func (f *discussionHostFixture) storedConfig(t *testing.T) map[string]interface{
 	return stored
 }
 
-func dataOf(t *testing.T, rr *httptest.ResponseRecorder) map[string]interface{} {	t.Helper()
+func dataOf(t *testing.T, rr *httptest.ResponseRecorder) map[string]interface{} {
+	t.Helper()
 	var body map[string]interface{}
 	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
 		t.Fatalf("response is not JSON: %v (%s)", err, rr.Body.String())

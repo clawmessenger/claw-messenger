@@ -37,6 +37,16 @@ import (
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
+// 超时三个值的分工（改任何一个都要连带看另外两个）：
+//   - clawAdminDiscussionHostMinTimeout / MaxTimeout（10 / 600）是**夹逼范围**：
+//     管理端表单（clawmessenger-admin-web 的 System/DiscussionHost.tsx）与
+//     api/discussion-host.ts 的请求超时都按它夹逼，收窄会报「假超时」；
+//   - clawAdminDiscussionHostTimeoutInit（120）是「没配过超时」时的**默认值**。
+//     为什么从 60 提到 120：一次角色推荐要在主持设备上跑一整回合 LLM（十几秒到
+//     100s+），60s 会把正常但偏慢的回合判成超时，用户看到的是「转圈很久然后
+//     失败」。120s 给正常回合留出余量，仍是上限 600s 的五分之一；
+//   - 推荐链路里 timeout<=0 的兜底值见 rongcloud.recommendRolesFallbackTimeoutSeconds
+//     （同为 120，避免「没配超时」的配置比默认值更急）。
 const (
 	clawAdminDiscussionHostKey = "system_host"
 
@@ -46,19 +56,6 @@ const (
 	clawAdminDiscussionHostMaxPrompt   = 32000
 	clawAdminDiscussionHostMinTimeout  = 10
 	clawAdminDiscussionHostMaxTimeout  = 600
-	// clawAdminDiscussionHostTimeoutInit 是「没配过超时」时的默认等待秒数。
-	//
-	// 为什么是 120 而不是 60：一次角色推荐要在主持设备上跑一整回合 LLM（十几秒
-	// 到 100s+），60s 会把正常但偏慢的回合判成超时，用户看到的是「转圈很久然后
-	// 失败」。120s 给正常回合留出余量，同时仍是上限 600s 的五分之一。
-	//
-	// 两个约束：
-	//   - 下限/上限仍是 10/600（clawAdminDiscussionHostMinTimeout/MaxTimeout），
-	//     **不要**因为改默认值而收窄夹逼范围；
-	//   - 管理端表单（clawmessenger-admin-web 的 System/DiscussionHost.tsx 与
-	//     api/discussion-host.ts）的默认值和 min/max 必须与这里同源，见
-	//     discussion-host.test.ts 的夹逼用例；设备端/融云包里的兜底值见
-	//     rongcloud.recommendRolesFallbackTimeoutSeconds。
 	clawAdminDiscussionHostTimeoutInit = 120
 
 	// clawAdminDiscussionHostMaxModelSegment 是 provider / model 单段的字符上限，
@@ -68,8 +65,8 @@ const (
 	// 向主持节点要一次模型目录的等待上限。目录是设备本机的快跑查询（CLI 侧还有
 	// 5 分钟缓存），8s 与 C 端浏览器的超时同值；查询接口放宽到 12s，因为那是一
 	// 次显式的人工操作，而保存路径要短——离线节点不能让「改个提示词」卡 12 秒。
-	clawAdminDiscussionHostCatalogTimeout  = 12 * time.Second
-	clawAdminDiscussionHostVerifyTimeout   = 8 * time.Second
+	clawAdminDiscussionHostCatalogTimeout = 12 * time.Second
+	clawAdminDiscussionHostVerifyTimeout  = 8 * time.Second
 )
 
 // clawAdminModelSegmentCharset 是 provider / model 单段允许的字符集。`@` 保留在
@@ -94,7 +91,6 @@ const (
 	clawAdminModelCheckUnverified = "unverified"
 	clawAdminModelCheckRejected   = "rejected"
 )
-
 
 // clawAdminRequiredHostCapabilities mirrors REQUIRED_HOST_CAPABILITIES in the
 // legacy discussion/system_host.py: a node advertising anything less than all
@@ -149,7 +145,6 @@ type clawAdminDiscussionHostBody struct {
 	ModelProvider            *string `json:"model_provider"`
 	Model                    *string `json:"model"`
 }
-
 
 // clawAdminDiscussionHostWorkspaceID resolves which workspace the config row
 // belongs to: the one already holding a row for this key, else whatever
