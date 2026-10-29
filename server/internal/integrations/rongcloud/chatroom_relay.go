@@ -370,7 +370,9 @@ func (h *chatroomRelayHub) StartRelay(ctx context.Context, chatroomRCID, request
 		scene = sceneDiscussion
 	}
 	perms := h.rt.agentPermissions(ctx, relayMemberIDs(members))
-	members = applyBehaviorPrompts(filterMembersByPermission(members, perms, scene), perms)
+	// requesterRCID 就是「这次派发为谁的意图服务」：主人自己在聊天室说话时，
+	// 他自己关掉的开关不该挡住他自己的 agent（与设备端私聊的 reason:"owner" 同口径）。
+	members = applyBehaviorPrompts(filterMembersByPermission(members, perms, scene, requesterRCID), perms)
 	if len(members) == 0 {
 		return errRelayResult(409, "该聊天室没有可发言的 AI 成员")
 	}
@@ -1328,6 +1330,12 @@ type agentPermission struct {
 	// 否则它们会被永久排除在所有派发之外，而用户手上没有任何可操作的入口。
 	// 已认领的节点严格按开关走，那是被分享出去、主人以为还在自己手里的那些。
 	claimed bool
+	// claimedBy 是主人（认领者）的融云 id，用于主人豁免；未认领时为空。
+	//
+	// claimed_by_user_id 存的是 claw_im_users.user_id，而它在融云侧就是 user id
+	// （见迁移 600 的列注释），所以可以直接和 requesterRCID / CreatedBy 这类融云
+	// id 做字符串比较。**不要**换成 owner_user_id：那是工作区管理员，语义完全不同。
+	claimedBy string
 }
 
 // agentPermissionSet 是一轮派发用的一份权限快照，键是融云 id。
@@ -1339,19 +1347,40 @@ type agentPermissionSet map[string]agentPermission
 
 // allows 报告 rcID 在该场景下能否被派发。
 //
-// 三种情况，语义必须分清：
+// 四种情况，语义必须分清（**判定顺序不能换**，后一条永远只在前一条不成立时才生效）：
 //   - 快照里没有这个 rc id（查不到节点行）：**不可派发**。未知就是未知，
 //     「查不到」不能等同于「没限制」。
 //   - 有节点行但没有认领者：**可派发**。没有主人就没有可点的开关，权限位对
 //     这类节点永远停在 DEFAULT false 上，按「关」处理会把它们永久踢出所有
 //     场景，而用户没有任何自救入口。
-//   - 已认领：严格按对应场景的开关判，这是「主人关掉了就不许拉它干活」的落点。
-func (s agentPermissionSet) allows(rcID string, scene agentPermissionScene) bool {
+//   - 有认领者且这次派发正是为**主人自己**服务的（actorRCID 命中）：**可派发**。
+//     与设备端私聊闸门 `reason: "owner"` 同口径 —— 开关管的是「别的账号能不能用
+//     我的 agent」，主人自己发起时不该被自己的开关挡住（否则他关掉群聊发言后，
+//     在自己建的讨论组里也开不了口，与用户预期相反）。
+//   - 已认领且发起人不是主人：严格按对应场景的开关判，这是「主人关掉了就不许
+//     拉它干活」的落点。
+//
+// actorRCID 的语义是「**这次派发是为谁的意图服务的**」，不是「谁在说话」。三个
+// 调用点分别传：
+//   - 群聊（group_relay.go）：requesterRCID，发这条群消息的人；
+//   - 聊天室（chatroom_relay.go）：requesterRCID，发起闲聊的人；
+//   - 讨论组 v3 正式轮次（discussion_interactive.go）：d.CreatedBy，讨论组的创建者。
+//     用创建者而不是「本轮谁触发」：v3 没有「发消息的发起人」这个角色，轮次由系统
+//     按 speaking_order 推进（甚至由上一轮发言的 AI 触发），而「这是主人自己的局」
+//     最稳定的信号就是他建的组。用「谁触发」的话，第二轮的触发者是 AI，主人豁免
+//     会在中途莫名失效，表现为「第 1 轮能说、第 2 轮不说了」。
+//
+// actorRCID 为空表示「拿不到发起人」：**不豁免**，照常按开关判。缺参数不是放行
+// 理由，fail-closed 在这里优先于「尽量派发」。
+func (s agentPermissionSet) allows(rcID string, scene agentPermissionScene, actorRCID string) bool {
 	perm, ok := s[rcID]
 	if !ok {
 		return false
 	}
 	if !perm.claimed {
+		return true
+	}
+	if actorRCID != "" && perm.claimedBy != "" && perm.claimedBy == actorRCID {
 		return true
 	}
 	switch scene {
@@ -1481,12 +1510,20 @@ func (rt *discussionRuntime) agentPermissions(ctx context.Context, rcIDs []strin
 	}
 	fetched := make(agentPermissionSet, len(rows))
 	for _, row := range rows {
+		// 只在 Valid 时取字符串：pgtype.Text 的零值是 {String:"",Valid:false}，
+		// 但历史的 TEXT 列可能是空串而不是 NULL，两者都要当「没有主人」处理，
+		// 所以统一 TrimSpace 后再判空。
+		claimedBy := ""
+		if row.ClaimedByUserID.Valid {
+			claimedBy = strings.TrimSpace(row.ClaimedByUserID.String)
+		}
 		fetched[row.RongcloudUserID] = agentPermission{
 			allowGroup:      row.AllowGroup,
 			allowChatroom:   row.AllowChatroom,
 			allowDiscussion: row.AllowDiscussion,
 			behaviorPrompt:  row.BehaviorPrompt,
 			claimed:         row.ClaimedByUserID.Valid && row.ClaimedByUserID.String != "",
+			claimedBy:       claimedBy,
 		}
 	}
 	storeAgentPermissions(now, misses, fetched)
@@ -1500,10 +1537,13 @@ func (rt *discussionRuntime) agentPermissions(ctx context.Context, rcIDs []strin
 
 // filterMembersByPermission 丢掉该场景下无权限的成员，保持原顺序（接龙顺序即
 // 发言顺序，重排会改变「接住谁的话」）。
-func filterMembersByPermission(members []relayMember, perms agentPermissionSet, scene agentPermissionScene) []relayMember {
+//
+// actorRCID 是「这次派发为谁的意图服务」，原样透传给 allows 做主人豁免判定；
+// 传空串表示拿不到发起人，此时不豁免（见 allows 的说明）。
+func filterMembersByPermission(members []relayMember, perms agentPermissionSet, scene agentPermissionScene, actorRCID string) []relayMember {
 	out := make([]relayMember, 0, len(members))
 	for _, member := range members {
-		if !perms.allows(member.rcID, scene) {
+		if !perms.allows(member.rcID, scene, actorRCID) {
 			continue
 		}
 		out = append(out, member)

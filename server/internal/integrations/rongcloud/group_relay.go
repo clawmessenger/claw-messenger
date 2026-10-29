@@ -43,8 +43,11 @@ func (h *chatroomRelayHub) StartGroupRelay(ctx context.Context, groupID, request
 	// 一次会把「有人说话」变成一串 N+1。
 	//
 	// 全被过滤时走下面现成的 409：群还在、成员也在，只是没人有权限说话。
+	//
+	// actor = requesterRCID（发这条群消息的人）：群聊闸门同样有主人豁免 —— 主人
+	// 在自己发的消息里不该被自己关掉的开关挡住，与设备端私聊的 owner 口径一致。
 	perms := h.rt.agentPermissions(ctx, relayMemberIDs(speakers))
-	speakers = applyBehaviorPrompts(filterMembersByPermission(speakers, perms, sceneGroup), perms)
+	speakers = applyBehaviorPrompts(filterMembersByPermission(speakers, perms, sceneGroup, requesterRCID), perms)
 	if len(speakers) == 0 {
 		return errRelayResult(409, "该群没有可发言的 AI 成员")
 	}

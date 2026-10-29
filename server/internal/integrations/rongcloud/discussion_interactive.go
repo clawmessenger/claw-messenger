@@ -523,10 +523,14 @@ func (rt *discussionRuntime) interactiveNext(ctx context.Context, d DiscussionRe
 		//   * 主人关掉了该 agent 的「讨论组」权限 —— 追加 permission_denied。
 		// 前端对 member_skipped 的 reason 只做长度校验（discussion-v3.ts:140），
 		// 所以新增枚举不需要前端同步发版。
+		// 主人豁免：actor 用 d.CreatedBy（讨论组创建者的融云 id）。v3 没有「发消息
+		// 的发起人」，轮次由系统按 speaking_order 推进（甚至由上一轮发言的 AI 触发），
+		// 而「这是主人自己的局」最稳定的信号就是他建的组 —— 用「谁触发」的话，
+		// 第 2 轮的触发者是 AI，豁免会在中途失效。
 		skipReason := ""
 		if !rt.interactiveMemberEnabled(ctx, d, role.MemberID) {
 			skipReason = "Member is disabled or no longer available"
-		} else if !perms.allows(role.MemberID, sceneDiscussion) {
+		} else if !perms.allows(role.MemberID, sceneDiscussion, d.CreatedBy) {
 			skipReason = "permission_denied"
 		}
 		if skipReason != "" {
