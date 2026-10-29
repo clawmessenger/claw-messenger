@@ -564,6 +564,24 @@ func userSearchSQLChecks() []userSearchSQLCheck {
 		{"the ordering `ORDER BY created_at DESC`",
 			regexp.MustCompile(`(?i)ORDER\s+BY\s+created_at\s+DESC`)},
 		{"the row cap `LIMIT $2`", regexp.MustCompile(`(?i)LIMIT\s+\$2`)},
+		// 节点账号（智能体）也是可搜对象（2026-10-29）：C 端资料卡把节点自己的融云
+		// 账号当「虾说号」展示，搜不到就是死路。这两张表必须在同一条语句里 UNION，
+		// 不能改回「只查 claw_im_users」——那只证明真人还能搜到，证明不了节点。
+		{"the `UNION ALL` over node accounts", regexp.MustCompile(`(?i)\bUNION\s+ALL\b`)},
+		{"the node table `FROM rongcloud_node`",
+			regexp.MustCompile(`(?i)\bFROM\s+rongcloud_node\b`)},
+		{"a `rongcloud_user_id ILIKE $1` exact hit column (节点虾说号)",
+			userSearchILikeColumn("rongcloud_user_id")},
+		// 隐藏节点不得可搜：机器主节点（ai_type 空）与运维节点（'ops'）是内部管道，
+		// 判据与好友列表的 isHiddenNode（node_service.go:254）同源。
+		{"the internal node exclusion `COALESCE(ai_type, '') NOT IN ('', 'ops')`",
+			regexp.MustCompile(`(?i)COALESCE\(\s*n\.ai_type\s*,\s*''\s*\)\s+NOT\s+IN\s*\(\s*''\s*,\s*'ops'\s*\)`)},
+		// 机器主节点必须单独排除：真实库里它的 ai_type 是 'opencode'（不是空串），
+		// 只靠上面那条 ai_type 判据会把 `rc_node_<machine>` 搜出来 —— 加完就被好友
+		// 列表隐藏，用户看到「添加成功」却永远找不到它（红线 #6）。
+		{"the machine-node exclusion (no agent suffix after `rc_node_`)",
+			regexp.MustCompile(`(?i)LEFT\(\s*n\.rongcloud_user_id\s*,\s*8\s*\)\s*(?:<>|!=)\s*'rc_node_'\s+OR\s+` +
+				`strpos\(\s*substr\(\s*n\.rongcloud_user_id\s*,\s*9\s*\)\s*,\s*'_'\s*\)\s*>\s*0`)},
 		// 精确匹配的「形状指纹」：这条 SQL 里一个 `%` 都不该有。把 `%kw%` 包回来
 		// （写成 `'%' || $1 || '%'` 或字面量 `%alice%`）都会立刻踩中这条。
 		{"no `%` wildcard anywhere (exact match, not LIKE-prefix)",
@@ -807,6 +825,47 @@ func TestUserSearchQueryChecksRejectBrokenSQL(t *testing.T) {
 			what: "the row cap `LIMIT $2`",
 			mutate: func(s string) string {
 				return strings.Replace(s, "LIMIT $2", "LIMIT 20", 1)
+			},
+		},
+		{
+			// 回退到「只搜真人」：节点账号又变成搜不到。
+			name: "the node branch is dropped",
+			what: "the `UNION ALL` over node accounts",
+			mutate: func(s string) string {
+				return strings.Replace(s, "UNION ALL", "UNION", 1)
+			},
+		},
+		{
+			name: "the node table is renamed",
+			what: "the node table `FROM rongcloud_node`",
+			mutate: func(s string) string {
+				return strings.Replace(s, "FROM rongcloud_node", "FROM rongcloud_nodes", 1)
+			},
+		},
+		{
+			// 节点也退化成大小写敏感：`codex_...` 与 `Codex_...` 认不出同一个节点。
+			name: "the node hit column stops being case-insensitive",
+			what: "a `rongcloud_user_id ILIKE $1` exact hit column (节点虾说号)",
+			mutate: func(s string) string {
+				return strings.Replace(s, "n.rongcloud_user_id ILIKE $1", "n.rongcloud_user_id = $1", 1)
+			},
+		},
+		{
+			// 内部节点泄漏：机器主节点 / 运维节点会出现在「添加好友」结果里。
+			name: "the internal node exclusion is dropped",
+			what: "the internal node exclusion `COALESCE(ai_type, '') NOT IN ('', 'ops')`",
+			mutate: func(s string) string {
+				return strings.Replace(s, "COALESCE(n.ai_type, '') NOT IN ('', 'ops')",
+					"COALESCE(n.ai_type, '') <> 'never'", 1)
+			},
+		},
+		{
+			// 主节点泄漏：它的 ai_type 是 'opencode'，只删上面那条判据是拦不住的 ——
+			// 这一条专门证明「形状判据」确实被执行，而不是被 ai_type 顺带兜住。
+			name: "the machine-node exclusion is dropped",
+			what: "the machine-node exclusion (no agent suffix after `rc_node_`)",
+			mutate: func(s string) string {
+				return strings.Replace(s, "strpos(substr(n.rongcloud_user_id, 9), '_') > 0", "1 = 1", 1)
 			},
 		},
 	}
@@ -1174,5 +1233,59 @@ func TestUserSearchKeepsAnEmptyNicknameAndDoesNotFilterTheSender(t *testing.T) {
 	} else if nickname != "" {
 		t.Errorf("list[0].nickname = %#v, want the empty string — the server must not backfill "+
 			"it with the username (the web does `nickname || username`)", nickname)
+	}
+}
+
+// --- E. 节点账号（智能体）也可被搜到（2026-10-29） --------------------------
+
+// 为什么这条必须存在：C 端资料卡把节点自己的融云账号当「虾说号」展示并给了复制
+// 按钮，用户复制去搜索却落空。修法是把 rongcloud_node 并进同一条 UNION，但两端
+// 客户端对「结果长什么样」有硬依赖，这三条不能只靠 SQL 文本证明：
+//
+//   - `userId` 必须是节点融云账号：web `getTargetId()` 取的就是它，随后
+//     `isAiNodeId(userId)` 决定走「向拥有者申请」而不是 `friend/add`（后者对节点
+//     恒回 403）；
+//   - `username` 必须与 `userId` 同值：web `pickExactShuoshuoId` 只保留
+//     `username`（无 username 时才看 userId）精确命中的行，不同值 = 用户搜到却
+//     被前端丢掉，界面仍是「没有找到这个虾说号」；
+//   - `nickname` 来自 rongcloud_user 的资料镜像（LEFT JOIN），查不到就留空串，
+//     由前端 `nickname || username` 兜底（与真人那条同口径）。
+func TestUserSearchReturnsNodeAccountsInTheShapeClientsExpect(t *testing.T) {
+	const rcID = "codex_3300776275"
+
+	d := &userSearchDB{rows: &userSearchRows{values: [][]string{
+		{rcID, rcID, "codex", "https://cdn.example/agent-avatars/codex-256.png"},
+	}}}
+	users, err := searchClawIMUsers(context.Background(), d, rcID, userSearchLimit)
+	if err != nil {
+		t.Fatalf("searchClawIMUsers: %v", err)
+	}
+	if d.queries != 1 {
+		t.Fatalf("Query calls = %d, want 1 — 节点与真人必须走同一条语句（两次往返会把客户端 15s 超时吃满）", d.queries)
+	}
+	if len(users) != 1 {
+		t.Fatalf("users = %#v, want one node hit", users)
+	}
+	got := users[0]
+	if got.UserID != rcID {
+		t.Errorf("userId = %q, want the node's rongcloud account %q (web 用它判断 isAiNodeId)", got.UserID, rcID)
+	}
+	if got.Username != rcID {
+		t.Errorf("username = %q, want %q — pickExactShuoshuoId 只按 username 精确命中，"+
+			"两者不同值时用户会看到「没有找到这个虾说号」", got.Username, rcID)
+	}
+	if got.Nickname != "codex" {
+		t.Errorf("nickname = %q, want the rongcloud_user profile name", got.Nickname)
+	}
+
+	// 绑定参数：$1 是原样关键字（节点分支同样不许包通配符），$2 是条数上限。
+	if len(d.args) != 2 {
+		t.Fatalf("args = %#v, want exactly (keyword, limit)", d.args)
+	}
+	if keyword, _ := d.args[0].(string); keyword != rcID {
+		t.Errorf("args[0] = %#v, want the raw keyword %q", d.args[0], rcID)
+	}
+	if limit, _ := d.args[1].(int); limit != userSearchLimit {
+		t.Errorf("args[1] = %#v, want %d", d.args[1], userSearchLimit)
 	}
 }

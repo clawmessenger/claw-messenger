@@ -56,9 +56,25 @@ package rongcloud
 // 一处**刻意照旧**：不校验发送者身份（serviceActor 失败会回 401，而 web 的
 // searchUsers 没有错误码映射，会把英文原文直接 toast 给用户）。
 //
-// 数据源只有 claw_im_users 一张表：rongcloud_user 只是节点/安装账号的资料镜像，
-// 真人账号不写它（system_handler.go:124-129、chatroom_commands.go:53-63）。
-// 因此 AI 节点（rc_node_*）搜不到 —— 与旧实现一致，属既有边界而非本次缺陷。
+// 数据源是两张表，各管一类账号（2026-10-29 起）：
+//   - claw_im_users：真人账号（C 端注册写入）；
+//   - rongcloud_node（LEFT JOIN rongcloud_user 取名字/头像）：AI 节点账号。
+//
+// 为什么要加第二张表：C 端「智能体资料卡」把节点自己的融云账号（形如
+// `codex_3300776275`、`rc_node_<machine>_<agent>`）当「虾说号」展示并给了复制按钮，
+// 用户复制去搜索却必然落空 —— 之前只有 claw_im_users 一个数据源。产品口径是
+// **所有设备账号都可被搜到并申请添加**（是否通过由节点拥有者审批，见
+// friend/sendRequest），所以搜索必须覆盖节点账号。
+//
+// 节点的「虾说号」就是它的融云账号（= `rongcloud_node.rongcloud_user_id`），
+// 与资料卡展示的是同一个值；两端客户端（web AddFriendDialog、uniapp
+// search-user）都已经能用 `isAiNodeId()` 认出它，并自动改走「向拥有者申请」的
+// 通道，因此这里只需要把行搜出来，不需要给回包加新字段。
+//
+// 隐藏节点仍然搜不到：机器主节点与运维节点是内部管道（红线 #6），判据与好友列表的
+// `isHiddenNode`（node_service.go:254）一致 —— 运维节点看 `ai_type = 'ops'`；机器
+// 主节点不能靠 `ai_type` 判（真实库里它是 `opencode` 这类值），只能看 rc id 形状：
+// `rc_node_<machineKey>` 没有 agent 后缀。具体写法见 SQL 里的注释。
 
 import (
 	"context"
@@ -119,20 +135,27 @@ func (h *systemHandler) handleUserSearch(ctx context.Context, msg NormalizedMess
 	return h.replyOK(ctx, msg, cmd, map[string]interface{}{"list": users})
 }
 
-// searchClawIMUsers 是 UserStore.SearchUsers 的生产实现（表：claw_im_users，
-// migrations/583 + 599）。参数化 SQL 走 DBTX 是集成层的既有约定：这个 service
-// 的本地表读写没有 sqlc 查询（registration.go:42-46），因此不需要 `make sqlc`。
+// searchClawIMUsers 是 UserStore.SearchUsers 的生产实现（表：claw_im_users +
+// rongcloud_node，migrations/583 + 599 + 564）。参数化 SQL 走 DBTX 是集成层的既有
+// 约定：这个 service 的本地表读写没有 sqlc 查询（registration.go:42-46），因此
+// 不需要 `make sqlc`。
 //
 // 过滤条件全部来自旧实现（command_handler.py:1948-1958）：
 //   - `status = 'active'`：被 admin 停用的账号不该出现在搜索结果里；
 //   - 双 `om_` 前缀排除：`om_` 是同一台机器上的运维账号（web
 //     src/lib/ai-node-id.ts:48-49）。前端也过滤一层，但那是兜底，不能只靠前端；
-//   - `ORDER BY created_at DESC`：与旧实现一致。
+//   - `ORDER BY created_at DESC`：与旧实现一致（节点与真人混排，最近接入的在前）。
 //
 // 命中判定是**精确**的（2026-10-28 收口，详见文件头）：`username ILIKE $1` 是
 // 忽略大小写的等值（$1 不带任何通配符），外加 `user_id = $1` 兜住没有 username
 // 的老账号。nickname / email / phone 已完全退出 WHERE —— 也就是说「按手机号搜得到
-// 人」这个旧能力被有意取消了，不要在没有产品决定的情况下加回来。
+// 人」这个旧能力被有意取消了，不要在没有产品决定的情况下加回来。节点分支同理：
+// 只按 `rongcloud_user_id ILIKE $1` 命中，节点名/机器名都**不**参与。
+//
+// 一条查询取两张表（UNION ALL）而不是发两次 Query：回包是一条 IM 私聊消息，
+// 搜索又落在客户端 15s 超时的链路上，往返次数不能因为加了节点而翻倍。
+// 外层再套一层是为了让 `ORDER BY` / `LIMIT` 对两类账号统一生效，同时保住
+// 「SELECT 四列、列序 = Scan 顺序」这条契约（内层多带一个 created_at 只用于排序）。
 //
 // 改 SELECT 时必须同步改 rows.Scan。
 func searchClawIMUsers(ctx context.Context, dbtx db.DBTX, keyword string, limit int) ([]UserSummary, error) {
@@ -153,11 +176,31 @@ func searchClawIMUsers(ctx context.Context, dbtx db.DBTX, keyword string, limit 
 	// 不会退化成元字符，也就不需要转义。
 	rows, err := dbtx.Query(ctx, `
 		SELECT user_id, username, COALESCE(nickname, ''), COALESCE(portrait_uri, '')
-		FROM claw_im_users
-		WHERE status = 'active'
-		  AND LEFT(username, 3) <> 'om_'
-		  AND LEFT(user_id, 3) <> 'om_'
-		  AND (username ILIKE $1 OR user_id = $1)
+		FROM (
+			SELECT user_id, username, nickname, portrait_uri, created_at
+			  FROM claw_im_users
+			 WHERE status = 'active'
+			   AND LEFT(username, 3) <> 'om_'
+			   AND LEFT(user_id, 3) <> 'om_'
+			   AND (username ILIKE $1 OR user_id = $1)
+			UNION ALL
+			-- 节点账号：虾说号 = 融云账号。两类内部节点必须排除，判据与好友列表的
+			-- isHiddenNode（node_service.go:254）同源：
+			--   1) 运维节点 —— ai_type = 'ops'；
+			--   2) 机器主节点 —— rc id 形如 rc_node_<machineKey>，没有 agent 后缀。
+			--      注意不能只看 ai_type 判它：真实库里机器主节点的 ai_type 是
+			--      'opencode' 这类值（不是空串），只看 ai_type 会把主节点搜出来。
+			--      机器 key 不含下划线（web ai-node-id.ts:152 同前提），所以「去掉
+			--      rc_node_ 前缀后是否还有下划线」就是「有没有 agent 后缀」。
+			SELECT n.rongcloud_user_id, n.rongcloud_user_id, ru.name, ru.portrait_uri, n.created_at
+			  FROM rongcloud_node n
+			  LEFT JOIN rongcloud_user ru ON ru.rongcloud_user_id = n.rongcloud_user_id
+			 WHERE n.rongcloud_user_id ILIKE $1
+			   AND LEFT(n.rongcloud_user_id, 3) <> 'om_'
+			   AND COALESCE(n.ai_type, '') NOT IN ('', 'ops')
+			   AND (LEFT(n.rongcloud_user_id, 8) <> 'rc_node_'
+			        OR strpos(substr(n.rongcloud_user_id, 9), '_') > 0)
+		) hit
 		ORDER BY created_at DESC
 		LIMIT $2`, keyword, limit)
 	if err != nil {
