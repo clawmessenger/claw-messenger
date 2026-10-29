@@ -60,23 +60,52 @@ func (h *systemHandler) handleGroupAddMember(ctx context.Context, msg Normalized
 		return h.sendWebError(ctx, msg, cmd, 403, "only a group member can invite new members")
 	}
 
-	if err := h.client.joinGroup(ctx, groupID, memberIDs); err != nil {
+	// 加入侧闸门（迁移 607 的 allow_group）：主人关掉这个开关表达的是「别把我
+	// 的智能体拉进别人的群」，而此前它只在派发侧生效 —— agent 照样被拉进去，
+	// 只是永远不吭声，用户看到的是「这群里有个哑巴」。
+	//
+	// 逐人判、部分放行：一次勾 5 个人，只为其中 1 个 agent 被拦就整单失败，
+	// 用户只会反复重试；而被拦的必须回给前端点名，否则他会以为加成功了。
+	perms, err := h.agentJoinPermissions(ctx, memberIDs)
+	if err != nil {
+		// 读不到权限位就不知道能不能加。宁可 503 让用户重试，也不静默放行
+		// （与派发侧 "dispatch denied (no-permission-info)" 同一取舍方向）。
+		h.logger.Error("rongcloud: group add member permission lookup", "error", err, "group_id", groupID)
+		return h.sendWebError(ctx, msg, cmd, 503, "group service is unavailable")
+	}
+	joinable, rejected := decideAgentJoin(memberIDs, perms, senderID)
+	if len(joinable) == 0 {
+		h.logger.Info("rongcloud: group add member denied by owner permission",
+			"group_id", groupID, "inviter", senderID, "denied", len(rejected))
+		return h.sendWebErrorWithData(ctx, msg, cmd, 403,
+			"the owners of these agents disabled group chat for them",
+			map[string]interface{}{"groupId": groupID, "skipped": rejected})
+	}
+
+	if err := h.client.joinGroup(ctx, groupID, joinable); err != nil {
 		h.logger.Error("rongcloud: group join", "error", err, "group_id", groupID)
 		return h.sendWebError(ctx, msg, cmd, 500, "failed to add the members to the RongCloud group")
 	}
 
 	// 融云已经加进去了；镜像写失败不回滚（镜像只是读模型，丢一次可由下次
 	// getMembers 的融云结果遮住），但必须留日志。
-	if err := h.groupMirror.AddMembers(ctx, groupID, memberIDs); err != nil {
+	if err := h.groupMirror.AddMembers(ctx, groupID, joinable); err != nil {
 		h.logger.Error("rongcloud: group mirror add members", "error", err, "group_id", groupID)
 	}
 
-	h.logger.Info("rongcloud: group members added", "group_id", groupID, "count", len(memberIDs))
-	return h.sendWebOK(ctx, msg, cmd, map[string]interface{}{
+	data := map[string]interface{}{
 		"groupId":    groupID,
-		"userIds":    memberIDs,
-		"addedCount": len(memberIDs),
-	})
+		"userIds":    joinable,
+		"addedCount": len(joinable),
+	}
+	if len(rejected) > 0 {
+		data["skipped"] = rejected
+		h.logger.Info("rongcloud: group add member partially denied",
+			"group_id", groupID, "added", len(joinable), "denied", len(rejected))
+	}
+
+	h.logger.Info("rongcloud: group members added", "group_id", groupID, "count", len(joinable))
+	return h.sendWebOK(ctx, msg, cmd, data)
 }
 
 // ---- removeMember ------------------------------------------------------------
