@@ -232,6 +232,24 @@ export interface BuildProgramOpts {
   relaunchReadyMs?: number;
   /** 见 RELAUNCH_ALIVE_MS；测试注入很小的值以免每条用例真等 1 秒。 */
   relaunchAliveMs?: number;
+  /** 见 RELAUNCH_TERM_GRACE_MS / RELAUNCH_KILL_SETTLE_MS；测试注入 0 以免真等。 */
+  relaunchTermGraceMs?: number;
+  relaunchKillSettleMs?: number;
+  /** 注入 pid 存活探测（默认 {@link processAlive}）。用例靠它模拟「杀掉之后才消失」。 */
+  pidProbe?: (pid: number) => boolean;
+  /** 注入信号发送器（默认 `process.kill`）。用例靠它记录 SIGTERM→SIGKILL，不真的发信号。 */
+  killProcess?: (pid: number, signal: NodeJS.Signals) => void;
+  /**
+   * 关掉「退出硬上限」（默认开）。测试进程不能被真的 `process.exit` 结束，所以用例
+   * 要么显式关掉，要么注入 {@link exitProcess}。
+   */
+  shutdownHardExit?: boolean;
+  /** 见 SHUTDOWN_AGENT_GRACE_MS；测试注入小值。 */
+  shutdownAgentGraceMs?: number;
+  /** 见 SHUTDOWN_HARD_EXIT_MS；测试注入小值。 */
+  shutdownHardExitMs?: number;
+  /** 注入 `process.exit`，避免用例结束整条测试进程。 */
+  exitProcess?: (code: number) => void;
   /**
    * 注入登录自启脚本的模板刷新（`Daemon.refreshStartupScript`）。
    *
@@ -297,6 +315,38 @@ export const RELAUNCH_READY_MS = 10_000;
  * 1s —— 足够覆盖慢机器的启动抖动，又不至于让父进程一直捏着端口锁。
  */
 export const RELAUNCH_ALIVE_MS = 1_000;
+
+/**
+ * 旧 supervisor 收到 SIGTERM 之后、动刀（SIGKILL）之前的宽限。
+ *
+ * 这道兜底是为 2026-10-29 那台 Linux 设备加的：`shutdown()` 只给 agent 子进程发
+ * SIGTERM，遇到不理会信号（或卡在系统调用里）的子进程，父进程连状态文件都清干净了，
+ * 却退不出事件循环。于是 `__relaunch` 的 60s 闸门把它判成 pid_timeout 并**拒绝拉起**，
+ * 结果是「磁盘已是新版 + 一个 supervisor 都没有」——设备永久离线，页面永远停在
+ * 「重启中」。此刻旧进程早已完成换盘、也走完了 shutdown，杀掉它不会丢任何东西；
+ * 让它活着才是灾难。所以先礼后兵。
+ */
+export const RELAUNCH_TERM_GRACE_MS = 5_000;
+
+/** SIGKILL 之后再等 pid 消失的上限；还不消失只可能是 D 状态（不可中断睡眠）。 */
+export const RELAUNCH_KILL_SETTLE_MS = 10_000;
+
+/**
+ * supervisor 退出时给 agent 子进程的 SIGTERM 宽限（毫秒）。
+ *
+ * 与 {@link RELAUNCH_TERM_GRACE_MS} 是同一件事的两个视角：接力进程负责「等不到就动刀」，
+ * 这里负责「到点主动清理」。两边都不做，退出就完全取决于子进程是否配合。
+ */
+export const SHUTDOWN_AGENT_GRACE_MS = 5_000;
+
+/**
+ * supervisor 退出的绝对上限（毫秒）：到点无论还有多少句柄没放手，都直接 exit。
+ *
+ * 必须明显小于 `__relaunch --timeout`（默认 60s）：接力进程还在等 pid，我们先自己
+ * 结束，它就能顺利拉起新版。给到 15s 是为了容下 agent 的 SIGTERM 宽限加一次 SIGKILL
+ * 的落地时间。
+ */
+export const SHUTDOWN_HARD_EXIT_MS = 15_000;
 
 /**
  * 新 supervisor 拿到端口锁之后写这个文件，`__relaunch` 用它当**交接成功的正向证据**。
@@ -1222,14 +1272,53 @@ export function buildProgram(opts: BuildProgramOpts): Command {
         opts.stdout.write(`relaunch: wrote ${relaunchFailureMarkerPath()} (reason=${reason})\n`);
         process.exitCode = 1;
       };
-      while (Number.isFinite(waitPid) && waitPid > 0 && processAlive(waitPid)) {
-        if (Date.now() > deadline) {
-          // 旧进程没退干净就不要拉起第二份 supervisor（两份会登录同一批融云
-          // 账号、互相踢线）。宁可失败，让人工 `clawmessenger start` 收拾。
-          fail("pid_timeout", `pid ${waitPid} did not exit within ${timeoutMs}ms; not starting`);
+      // 存活探测与信号发送都可注入：用例要模拟「杀掉之后才消失」，真机上这两件事
+      // 必须真的作用在系统上。
+      const alive = opts.pidProbe ?? processAlive;
+      const kill = opts.killProcess ?? ((pid: number, signal: NodeJS.Signals) => { process.kill(pid, signal) });
+      /** 等到 pid 消失；返回它到底有没有消失（而不是「等够了就算消失」）。 */
+      const awaitPidExit = async (pid: number, ms: number): Promise<boolean> => {
+        if (!Number.isFinite(pid) || pid <= 0) return true;
+        const until = Date.now() + ms;
+        while (alive(pid)) {
+          if (Date.now() > until) return false;
+          await sleep(200);
+        }
+        return true;
+      };
+
+      if (!(await awaitPidExit(waitPid, timeoutMs))) {
+        // 到点旧进程还活着。原来这里只写一个 marker 就放弃，于是磁盘已是新版、却
+        // 一个 supervisor 都没有 —— 设备永久离线（2026-10-29 现场：pid_timeout，
+        // 页面永远停在「重启中」）。此刻旧进程早已完成换盘、也走完了 shutdown，
+        // 它不再承载任何值得保护的状态；真正要守的只有「不能同时有两份 supervisor」，
+        // 而杀掉它恰好满足这一条。所以先礼后兵，而不是退让。
+        const termGraceMs = opts.relaunchTermGraceMs ?? RELAUNCH_TERM_GRACE_MS;
+        const settleMs = opts.relaunchKillSettleMs ?? RELAUNCH_KILL_SETTLE_MS;
+        try {
+          kill(waitPid, "SIGTERM");
+        } catch {
+          // ESRCH（已经没了）/ EPERM（没权限）：交给下面的存活探测判，不在这里赌。
+        }
+        let gone = await awaitPidExit(waitPid, termGraceMs);
+        if (!gone) {
+          try {
+            kill(waitPid, "SIGKILL");
+          } catch {
+            // 同上。
+          }
+          gone = await awaitPidExit(waitPid, settleMs);
+        }
+        if (!gone) {
+          fail(
+            "pid_timeout",
+            `pid ${waitPid} survived SIGTERM (${termGraceMs}ms) and SIGKILL (${settleMs}ms); not starting`,
+          );
           return;
         }
-        await sleep(200);
+        opts.stdout.write(
+          `relaunch: pid ${waitPid} did not exit within ${timeoutMs}ms; killed it and continuing\n`,
+        );
       }
       // 端口锁也等一等：旧 supervisor 可能已经退出但 socket 还没被 OS 回收。
       const acquire = opts.acquireLock ?? acquireSupervisorLock;
@@ -2293,6 +2382,45 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
   // is what holds the supervisor open.
   if (typeof controlTimer.unref === "function") controlTimer.unref();
 
+  /**
+   * 退出不能只靠「事件循环自然变空」。
+   *
+   * 2026-10-29 现场：agent 子进程不理会 SIGTERM，`shutdown()` 已经把状态文件清掉、
+   * 也不再轮询（所以 `status` 说没在跑、服务端把设备判成离线），可进程本身永远活着。
+   * `__relaunch` 等到 60s 判 pid_timeout 并拒绝拉起 —— 磁盘是新版却没有 supervisor，
+   * 页面永远停在「重启中」。所以退出要自己兜底：先给子进程宽限再 SIGKILL，到硬上限
+   * 无论剩下什么句柄都 exit。
+   *
+   * 两个定时器都 unref：它们只负责兜底，不能成为「必须等满才允许退出」的理由 ——
+   * 正常情况下子进程一退，事件循环自然变空，进程当场结束。
+   */
+  const armShutdownDeadlines = (): void => {
+    if (opts.shutdownHardExit === false) return;
+    const graceMs = opts.shutdownAgentGraceMs ?? SHUTDOWN_AGENT_GRACE_MS;
+    const hardMs = opts.shutdownHardExitMs ?? SHUTDOWN_HARD_EXIT_MS;
+    const exit = opts.exitProcess ?? ((code: number): void => { process.exit(code) });
+    const term = setTimeout(() => {
+      for (const entry of managed.values()) {
+        const child = entry.child;
+        if (!child) continue;
+        // 真实 ChildProcess 的约定：running 时 exitCode 是 null，退出后才是数字。
+        // 未知（测试替身 / 老 Node）按「还活着」处理 —— 宁可多补一刀，也不能因为
+        // 判不出来就放任它把事件循环钉住。
+        if (typeof child.exitCode === "number") continue;
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // 已经没了 / 平台不支持，忽略。
+        }
+      }
+    }, graceMs);
+    const hard = setTimeout(() => {
+      exit(0);
+    }, hardMs);
+    if (typeof term.unref === "function") term.unref();
+    if (typeof hard.unref === "function") hard.unref();
+  };
+
   const shutdown = (): void => {
     const first = !stopping;
     stopping = true;
@@ -2312,6 +2440,8 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
       } catch {
         // 清不掉状态文件不影响退出。
       }
+      // 状态文件已经清了 → 此刻「活着但不干活」是最坏的状态，必须保证进程真的走。
+      armShutdownDeadlines();
     }
     // Returning instead of looping forever lets the process exit once the
     // children are gone; `process.on` below replaces Node's default SIGTERM

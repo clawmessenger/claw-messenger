@@ -149,6 +149,9 @@ function makeHarness(
     })) as never,
     // 默认不真的 spawn `__relaunch`：那会多出一个子进程并影响子进程计数断言。
     relaunch: () => {},
+    // 退出硬上限默认会调 process.exit（生产行为），测试进程不能被它结束 ——
+    // 这里默认关掉，专门的用例注入 exitProcess 之后再打开。
+    shutdownHardExit: false,
     ...overrides,
   });
 
@@ -340,6 +343,31 @@ describe("runSupervisor restart backoff", () => {
 
     await h.run;
     expect(resolved).toBe(true);
+  });
+
+  // 2026-10-29 现场：agent 子进程不理会 SIGTERM，`shutdown()` 清完状态文件就不再干活
+  // （所以 status 说没在跑、服务端判离线），进程本身却一直活着 —— __relaunch 等满
+  // 60 秒判 pid_timeout 并放弃拉起，设备永久离线。所以退出必须自己兜底：
+  // 宽限到点 SIGKILL 子进程，硬上限到点直接 exit。
+  it("escalates to SIGKILL and hard-exits when an agent child ignores SIGTERM", async () => {
+    const exits: number[] = [];
+    const h = makeHarness([], BOUND_OPS, {
+      shutdownHardExit: true,
+      shutdownAgentGraceMs: 5,
+      shutdownHardExitMs: 40,
+      exitProcess: (code: number) => { exits.push(code) },
+    });
+    await vi.waitFor(() => expect(h.spawned.length).toBe(1), { timeout: 5_000 });
+
+    h.getShutdown()();
+    expect(h.spawned[0].child.kills).toEqual(["SIGTERM"]);
+
+    await vi.waitFor(
+      () => expect(h.spawned[0].child.kills).toEqual(["SIGTERM", "SIGKILL"]),
+      { timeout: 2_000 },
+    );
+    // 子进程仍然「活着」（fakeChild 从不发 exit），硬上限必须真的把我们带走。
+    await vi.waitFor(() => expect(exits).toEqual([0]), { timeout: 2_000 });
   });
 
   it("cancels a pending restart timer at shutdown", async () => {
@@ -776,6 +804,103 @@ describe("__relaunch helper", () => {
     // 不抛异常即可（写入失败也不能让 helper 崩掉）。
     expect(process.exitCode ?? 0).toBe(1);
     process.exitCode = undefined;
+  });
+
+  // 2026-10-29 那台 Linux 设备的原样复现：换盘成功、shutdown 也走完了，但旧进程
+  // 退不出事件循环（agent 子进程不理会 SIGTERM）。原来这里 60 秒后只写个 marker
+  // 就放弃 —— 磁盘是新版、一个 supervisor 都没有，设备永久离线。现在必须先礼后兵。
+  it("kills a supervisor that never exits instead of leaving the device without one", async () => {
+    const dir = mkdtempSync(join(process.env.TEMP ?? ".", "relaunch-stuck-"));
+    dirs.push(dir);
+    const target = join(dir, "install", "clawmessenger.exe");
+    mkdirSync(join(dir, "install"));
+    writeFileSync(target, "NEW-BINARY");
+
+    const signals: string[] = [];
+    const spawned: string[] = [];
+    const output: string[] = [];
+    let alive = true; // 只有 SIGKILL 才让它「消失」，SIGTERM 被无视
+    const program = buildProgram({
+      keystore: new Keystore(join(dir, "creds.json")),
+      apiFactory: () => ({}) as unknown as XiachatApi,
+      stdout: { write: (chunk: unknown) => { output.push(String(chunk)); return true } } as unknown as NodeJS.WriteStream,
+      acquireLock: () => Promise.resolve({ release: () => {} }),
+      sleep: () => Promise.resolve(),
+      relaunchAliveMs: 20,
+      relaunchTermGraceMs: 0,
+      relaunchKillSettleMs: 0,
+      pidProbe: () => alive,
+      killProcess: (_pid, signal) => {
+        signals.push(signal);
+        if (signal === "SIGKILL") alive = false;
+      },
+      spawnChild: ((command: string) => {
+        spawned.push(command);
+        writeRelaunchReadyFile(target, process.pid);
+        return { unref: () => {}, pid: process.pid };
+      }) as unknown as typeof spawn,
+    });
+
+    await program.parseAsync([
+      "node", "clawmessenger", "__relaunch", "--wait-pid", String(process.pid), "--target", target, "--timeout", "1",
+    ]);
+
+    expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(spawned).toEqual([target]);
+    expect(output.join("")).toContain("killed it and continuing");
+    expect(process.exitCode ?? 0).toBe(0);
+  });
+
+  // 连 SIGKILL 都杀不掉只可能是 D 状态（不可中断睡眠）。这时仍然不能起第二份
+  // supervisor —— 两份会登录同一批融云账号、互相踢线，比离线更难收拾。
+  it("still refuses to start a second supervisor when the pid survives SIGKILL", async () => {
+    const dir = mkdtempSync(join(process.env.TEMP ?? ".", "relaunch-unkillable-"));
+    dirs.push(dir);
+    const target = join(dir, "install", "clawmessenger.exe");
+    mkdirSync(join(dir, "install"));
+    writeFileSync(target, "NEW-BINARY");
+
+    const home = process.env.CLAWMESSENGER_HOME;
+    // 失败标记按 CLAWMESSENGER_HOME 落盘，别写进真实家目录。
+    process.env.CLAWMESSENGER_HOME = dir;
+    try {
+      const signals: string[] = [];
+      const spawned: string[] = [];
+      const program = buildProgram({
+        keystore: new Keystore(join(dir, "creds.json")),
+        apiFactory: () => ({}) as unknown as XiachatApi,
+        stdout: { write: () => true } as unknown as NodeJS.WriteStream,
+        acquireLock: () => Promise.resolve({ release: () => {} }),
+        sleep: () => Promise.resolve(),
+        relaunchAliveMs: 20,
+        relaunchTermGraceMs: 0,
+        relaunchKillSettleMs: 0,
+        pidProbe: () => true,
+        killProcess: (_pid, signal) => { signals.push(signal) },
+        spawnChild: ((command: string) => {
+          spawned.push(command);
+          return { unref: () => {}, pid: process.pid };
+        }) as unknown as typeof spawn,
+      });
+
+      await program.parseAsync([
+        "node", "clawmessenger", "__relaunch", "--wait-pid", String(process.pid), "--target", target, "--timeout", "1",
+      ]);
+
+      expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+      expect(spawned).toEqual([]);
+      expect(process.exitCode).toBe(1);
+      // 留痕要能分辨「它就是不退」，而不是原来那句笼统的 did not exit。
+      const marker = JSON.parse(readFileSync(join(dir, "relaunch-failed.json"), "utf8")) as {
+        reason: string; detail?: string;
+      };
+      expect(marker.reason).toBe("pid_timeout");
+      expect(marker.detail).toContain("survived SIGTERM");
+    } finally {
+      process.exitCode = undefined;
+      if (home === undefined) delete process.env.CLAWMESSENGER_HOME;
+      else process.env.CLAWMESSENGER_HOME = home;
+    }
   });
 });
 
