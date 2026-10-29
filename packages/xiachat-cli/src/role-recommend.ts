@@ -43,7 +43,11 @@ export const ROLE_RECOMMEND_ROLE_PROMPT_CHARS = 120;
 /**
  * 本轮实际要几个角色：产品口径 3 个，服务端下发的 max_roles 更小时按 max_roles
  * （一个 agent 只能演一个角色，候选设备不够时多要的角色没人演）。
- * max_roles 缺失/非法时调用方已在 parseRoleRecommendRequest 里回落到 3。
+ *
+ * max_roles **缺失**时调用方已在 parseRoleRecommendRequest 里回落到 3；而 max_roles
+ * **非法**（非整数、越界）不是回落 —— 那条命令在 parseRoleRecommendRequest 里整条
+ * 拒收，根本走不到这里。函数里的 !Number.isFinite 分支只是给导出的公共函数兜底
+ * （直接传 NaN/Infinity 时不至于算出 NaN 个角色）。
  */
 export function roleRecommendTargetRoleCount(maxRoles: number): number {
   if (!Number.isFinite(maxRoles)) return ROLE_RECOMMEND_TARGET_ROLES;
