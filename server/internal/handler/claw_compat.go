@@ -750,6 +750,11 @@ func (h *Handler) ClawUserFriends(w http.ResponseWriter, r *http.Request) {
 		clawJSON(w, 200, 200, "", map[string]interface{}{"list": []interface{}{}})
 		return
 	}
+	// 归属投影读的是 rongcloud_node.claimed_by_user_id，要 DBTX；NodeService 在
+	// router 里只拿到 *db.Queries，按需在这里挂连接池（与绑定、节点管理同做法，
+	// 见 clawAttachNodeClaimDB）。漏了这一步，friendOwnerProjection 会静默返回
+	// 空 map —— 好友列表永远不带 ownerId，前端只能把人和智能体平铺。
+	h.clawAttachNodeClaimDB()
 	friends, err := h.RongCloudNode.ListUserFriends(r.Context(), userID)
 	if err != nil {
 		// A failed lookup must not break the client: it falls back to the IM

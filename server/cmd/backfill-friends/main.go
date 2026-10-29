@@ -27,12 +27,25 @@
 // Nothing is written unless -commit is passed — the default is a dry run that
 // only prints the plan.
 //
+// It can also repair the device->owner projection column (-claims):
+// rongcloud_node.claimed_by_user_id is only written by the pairing-bind path and
+// the admin transfer path, so devices bound before those existed (and devices
+// bound through BindAgentsByDeviceCredential, which passes an empty owner) carry
+// NULL. The friend list groups "人和他的智能体" by that column, so a NULL owner
+// makes every agent render flat next to its human. -claims rebuilds the column
+// from the authoritative source — the RongCloud friend edges — and writes a node
+// only when the owner is uniquely determinable (exactly one account has the node
+// as a friend, or the intersection over one machine_id is exactly one account).
+// Ambiguous nodes are deliberately left empty rather than guessed.
+//
 // Typical use (from the server/ directory):
 //
 //	go run ./cmd/backfill-friends -env-file ../.env -commit -all-users
 //	go run ./cmd/backfill-friends -env-file ../.env -commit -user 100123,100456
 //	go run ./cmd/backfill-friends -env-file ../.env -commit -sync-names
 //	go run ./cmd/backfill-friends -env-file ../.env -sync-portraits
+//	go run ./cmd/backfill-friends -env-file ../.env -claims            # dry run
+//	go run ./cmd/backfill-friends -env-file ../.env -claims -commit
 package main
 
 import (
@@ -42,7 +55,9 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -50,6 +65,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/logger"
 	"github.com/multica-ai/multica/server/internal/util/secretbox"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
+	"golang.org/x/sync/errgroup"
 )
 
 func main() {
@@ -71,6 +87,7 @@ func run() error {
 	syncPortraits := flag.Bool("sync-portraits", false, "unify default portraits for claw_im_users and rongcloud_user, and switch group / chatroom default images to the per-kind group art (群聊 / 讨论组 / 聊天室); custom portraits are never overwritten")
 	syncAgentPortraits := flag.Bool("sync-agent-portraits", false, "give every AI agent its own brand portrait (<base>/<kind>-256.png; base = $CLAW_AGENT_PORTRAIT_BASE or the claw-web static dir). Only rows whose RongCloud id resolves to an agent kind are touched; custom portraits are never overwritten. Mutually exclusive with -sync-portraits")
 	registerMissing := flag.Bool("register-missing", false, "with -sync-agent-portraits: when RongCloud answers 1002 (userId not exist), create the account via /user/getToken.json (name + portraitUri in one call) instead of only reporting it as missing. Off by default: this writes identity, not just a field")
+	claims := flag.Bool("claims", false, "backfill rongcloud_node.claimed_by_user_id from the RongCloud friend edges: writes a node only when its owner is uniquely determinable (one claimant, or the intersection over one machine_id is one account); ambiguous nodes stay empty (default is a dry run)")
 	dsnFlag := flag.String("dsn", "", "postgres DSN (default: $DATABASE_URL, then $MULTICA_DATABASE_URL)")
 	envFile := flag.String("env-file", "", "load KEY=VALUE environment variables from this file before reading configuration")
 	flag.Parse()
@@ -81,8 +98,8 @@ func run() error {
 		}
 	}
 
-	if *userFlag == "" && !*allUsers && !*syncNames && !*syncPortraits && !*syncAgentPortraits {
-		return fmt.Errorf("specify -user <id[,id...]>, -all-users, -sync-names, or -sync-portraits to choose what to repair")
+	if *userFlag == "" && !*allUsers && !*syncNames && !*syncPortraits && !*syncAgentPortraits && !*claims {
+		return fmt.Errorf("specify -user <id[,id...]>, -all-users, -sync-names, -sync-portraits, or -claims to choose what to repair")
 	}
 
 	if *registerMissing && !*syncAgentPortraits {
@@ -116,6 +133,19 @@ func run() error {
 	}
 	client := rongcloud.NewRongCloudAPIClientForServices(box, queries, slog.Default())
 	svc := rongcloud.NewNodeService(queries, client, box, slog.Default())
+
+	// -claims 只碰 rongcloud_node 一张表，与 workspace / claw 用户白名单无关，
+	// 所以放在解析 workspace 之前：纯 -claims 调用不该因为「没有 workspace」
+	// 或「没有 -user」而报错退出。
+	if *claims {
+		if err := runClaims(ctx, pool, client, *commit); err != nil {
+			return fmt.Errorf("backfill node claims: %w", err)
+		}
+		if *userFlag == "" && !*allUsers && !*syncNames && !*syncPortraits && !*syncAgentPortraits {
+			return nil
+		}
+		fmt.Println()
+	}
 
 	workspaces, err := resolveWorkspaces(ctx, pool, *workspaceFlag)
 	if err != nil {
@@ -284,6 +314,373 @@ func run() error {
 		return fmt.Errorf("%d operation(s) failed", failed)
 	}
 	return nil
+}
+
+// claimsFriendLister 只依赖 FriendIDs，调用方与测试都不必构造完整的融云客户端。
+type claimsFriendLister interface {
+	FriendIDs(ctx context.Context, userID string) ([]string, error)
+}
+
+// claimsLookupTimeout 是整轮好友边反查的总预算。这里是批量工具，不在「打开通讯录」
+// 的热路径上，所以可以比热路径的 3s 宽松；但必须封顶 —— 候选账号上百个时，没有
+// 总预算的批量外网调用会把运维钉在终端前。
+const claimsLookupTimeout = 60 * time.Second
+
+// claimsLookupConcurrency 与 friendNodeOwners.build 的反查并发（8）保持一致，
+// 免得批量工具把融云的 per-app 频率配额打满，affected 到线上登录。
+const claimsLookupConcurrency = 8
+
+// nodeRow 是一行待判定节点（只取判定需要的列）。
+type nodeRow struct {
+	RCUserID  string // rongcloud_node.rongcloud_user_id
+	MachineID string // rongcloud_node.machine_id
+	AiType    string // rongcloud_node.ai_type
+	Claimed   string // rongcloud_node.claimed_by_user_id；空 = 待填
+}
+
+// claimVerdict 是判定档位，只用于计划表与汇总。
+type claimVerdict string
+
+const (
+	claimVerdictSingle    claimVerdict = "single"    // 单节点唯一 claimant
+	claimVerdictMachine   claimVerdict = "machine"   // 机器级交集唯一
+	claimVerdictAmbiguous claimVerdict = "ambiguous" // 多个候选，不写
+	claimVerdictNoEdge    claimVerdict = "no-edge"   // 没有任何好友边，不写
+	claimVerdictHidden    claimVerdict = "hidden"    // 机器主节点 / 运维节点，不在好友列表里
+	claimVerdictAlready   claimVerdict = "already"   // 已有归属，不参与判定
+)
+
+// claimDecision 是一行节点的判定结果。Owner 非空当且仅当这一行可以安全写入。
+type claimDecision struct {
+	Node      nodeRow
+	Owner     string
+	Verdict   claimVerdict
+	Claimants []string // 排序后的候选归属人，供计划表打印
+}
+
+// resolveClaims 是 -claims 的判定核心（纯函数，不碰库也不碰融云，便于单测）。
+//
+// claimants[nodeRCID] = 「把这个节点加为好友的账号集合」，即好友边反查的原始结果。
+// 规则只有一条：**唯一解才写**，有歧义宁可不说 —— 归属写错会让一个智能体出现在
+// 别人的「我的智能体」块里，比平铺更糟。
+//
+//	第一轮：claimants 恰好一个人 → 归他。
+//	第二轮：按 machine_id 把同一台机器的节点分组求交集（同一台设备只可能有一个
+//	        主人，第一轮已判定的节点也是证据）；交集恰好一个人 → 这台机器上所有
+//	        待判节点都归他。
+//	其余：no-edge（没有任何好友边）/ ambiguous（多解），都不写。
+func resolveClaims(nodes []nodeRow, claimants map[string]map[string]bool) []claimDecision {
+	decisions := make([]claimDecision, len(nodes))
+	for i, n := range nodes {
+		decisions[i] = claimDecision{Node: n, Claimants: sortedClaimKeys(claimants[n.RCUserID])}
+	}
+
+	// 第一轮：单节点唯一解。len(claimants)==1 时没有第二种解释。
+	eligible := make([]int, 0, len(decisions))
+	for i := range decisions {
+		d := &decisions[i]
+		switch {
+		case strings.TrimSpace(d.Node.Claimed) != "":
+			// 已有归属的行不参与判定，也不允许被覆盖（写库 SQL 同样带空值条件，
+			// 两道保险）。
+			d.Verdict = claimVerdictAlready
+		case isHiddenClaimNode(d.Node):
+			d.Verdict = claimVerdictHidden
+		default:
+			eligible = append(eligible, i)
+			if len(d.Claimants) == 1 {
+				d.Owner = d.Claimants[0]
+				d.Verdict = claimVerdictSingle
+			}
+		}
+	}
+
+	// 第二轮：机器级交集。同一台设备只可能有一个主人，所以把同 machine_id 的
+	// 节点求交。分组里包含第一轮已判定的节点 —— 它本身就是机器归属的证据：
+	// A={u1,u2}、B={u1} 时 A 也只能归 u1。写只落在第一轮没判定的行上。
+	// 没有 machine_id 的行无法归组，留给第三档。
+	order := make([]string, 0, len(eligible))
+	groups := make(map[string][]int, len(eligible))
+	for _, i := range eligible {
+		mid := strings.TrimSpace(decisions[i].Node.MachineID)
+		if mid == "" {
+			continue
+		}
+		if _, seen := groups[mid]; !seen {
+			order = append(order, mid)
+		}
+		groups[mid] = append(groups[mid], i)
+	}
+	for _, mid := range order {
+		idxs := groups[mid]
+		common := intersectClaimants(idxs, claimants, decisions)
+		if len(common) != 1 {
+			continue
+		}
+		for _, i := range idxs {
+			if decisions[i].Owner != "" {
+				continue
+			}
+			decisions[i].Owner = common[0]
+			decisions[i].Verdict = claimVerdictMachine
+		}
+	}
+
+	// 剩下的仍无唯一解：自己一条好友边都没有 → no-edge，否则 → ambiguous。
+	for _, i := range eligible {
+		d := &decisions[i]
+		if d.Owner != "" {
+			continue
+		}
+		if len(d.Claimants) == 0 {
+			d.Verdict = claimVerdictNoEdge
+			continue
+		}
+		d.Verdict = claimVerdictAmbiguous
+	}
+	return decisions
+}
+
+// intersectClaimants 求一组节点 claimant 集合的交集，结果按字典序（报表稳定）。
+func intersectClaimants(idxs []int, claimants map[string]map[string]bool, decisions []claimDecision) []string {
+	if len(idxs) == 0 {
+		return nil
+	}
+	first := claimants[decisions[idxs[0]].Node.RCUserID]
+	common := make([]string, 0, len(first))
+	for candidate := range first {
+		inAll := true
+		for _, i := range idxs[1:] {
+			if !claimants[decisions[i].Node.RCUserID][candidate] {
+				inAll = false
+				break
+			}
+		}
+		if inAll {
+			common = append(common, candidate)
+		}
+	}
+	sort.Strings(common)
+	return common
+}
+
+// isHiddenClaimNode 与 rongcloud.isHiddenNode 同口径（运维 agent + 机器主节点）：
+// 这两类节点不出现在好友列表里，填归属没有意义。机器主节点复用导出的
+// rongcloud.IsMachineNode，避免在 Go 里重写 `rc_node_ || machine_id` 的归一化
+// （MAC 大小写、.local 后缀）而与设备侧漂移。
+func isHiddenClaimNode(r nodeRow) bool {
+	if strings.TrimSpace(r.AiType) == rongcloud.OpsAgentType {
+		return true
+	}
+	return rongcloud.IsMachineNode(db.RongcloudNode{
+		RongcloudUserID: r.RCUserID,
+		MachineID:       r.MachineID,
+		AiType:          pgtype.Text{String: r.AiType, Valid: r.AiType != ""},
+	})
+}
+
+// sortedClaimKeys 把集合摊平并按字典序排序。
+func sortedClaimKeys(set map[string]bool) []string {
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// claimFillSQL 只填空值：WHERE 里带 NULL / 空串条件，绝不覆盖已有归属。
+// 判定与写入之间可能插入真实的绑定写路径（SetNodeClaim），那时 RowsAffected
+// 会是 0 —— 调用方据此报告「已被抢先填写」，而不是报成功。
+const claimFillSQL = `UPDATE rongcloud_node
+	SET claimed_by_user_id = $1, updated_at = now()
+	WHERE rongcloud_user_id = $2
+	  AND (claimed_by_user_id IS NULL OR btrim(claimed_by_user_id) = '')`
+
+// runClaims 是 -claims 的入口：反查好友边 → 判定 → （仅 -commit）写库。
+//
+// 幂等：已填的行不在待填集合里，重跑不会重复写，也不会覆盖别人的归属。
+func runClaims(ctx context.Context, pool *pgxpool.Pool, lister claimsFriendLister, commit bool) error {
+	if !commit {
+		fmt.Println("DRY RUN — nothing will be written. Re-run with -commit to apply.")
+	}
+	candidates, err := resolveUsers(ctx, pool, "", true)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("claim candidates (claw_im_users active): %d\n", len(candidates))
+
+	claimants, lookupFailed := collectClaimants(ctx, lister, candidates)
+	nodes, err := listClaimNodes(ctx, pool)
+	if err != nil {
+		return err
+	}
+	decisions := resolveClaims(nodes, claimants)
+
+	var (
+		pending, single, machine, ambiguous, noEdge, hidden, already int
+		written, writeFailed, lostRace                               int
+		stuck                                                        []string
+	)
+	for _, d := range decisions {
+		verdict := string(d.Verdict)
+		switch d.Verdict {
+		case claimVerdictSingle:
+			single++
+			verdict = d.Owner + " (single)"
+		case claimVerdictMachine:
+			machine++
+			verdict = d.Owner + " (machine)"
+		case claimVerdictAmbiguous:
+			ambiguous++
+			verdict = "ambiguous"
+			stuck = append(stuck, d.Node.RCUserID)
+		case claimVerdictNoEdge:
+			noEdge++
+			verdict = "no-edge"
+			stuck = append(stuck, d.Node.RCUserID)
+		case claimVerdictHidden:
+			hidden++
+			verdict = "hidden"
+		case claimVerdictAlready:
+			already++
+			verdict = "skip (already " + d.Node.Claimed + ")"
+		}
+		if d.Verdict != claimVerdictHidden && d.Verdict != claimVerdictAlready {
+			pending++
+		}
+		fmt.Printf("%-26s | %-34s | %9d | %s\n", d.Node.MachineID, d.Node.RCUserID, len(d.Claimants), verdict)
+	}
+
+	if commit {
+		for _, d := range decisions {
+			if d.Owner == "" {
+				continue
+			}
+			tag, err := pool.Exec(ctx, claimFillSQL, d.Owner, d.Node.RCUserID)
+			if err != nil {
+				writeFailed++
+				fmt.Printf("%-26s | %-34s | write FAILED: %v\n", d.Node.MachineID, d.Node.RCUserID, err)
+				continue
+			}
+			if tag.RowsAffected() == 0 {
+				// 判定之后被真实绑定写路径抢先填了：不覆盖，如实报告。
+				lostRace++
+				continue
+			}
+			written++
+		}
+	}
+
+	if lookupFailed > 0 {
+		// 反查失败的账号等于「缺席的投票人」：它可能才是某个节点的唯一好友，
+		// 缺了它就会把歧义判成唯一解 —— 归属写错比平铺更糟，所以拒绝写库。
+		if commit {
+			return fmt.Errorf("%d 个账号的好友边反查失败，拒绝写库（缺席的投票人可能把歧义判成唯一解）；修复后重跑，或先缩小范围", lookupFailed)
+		}
+		fmt.Printf("WARNING: %d 个账号的好友边反查失败；干跑结果仅供参考，-commit 会拒绝写库\n", lookupFailed)
+	}
+
+	fmt.Println()
+	fmt.Printf("claims summary: 待填=%d 单节点判定=%d 机器交集判定=%d 歧义跳过=%d 无边跳过=%d 实际写入=%d\n",
+		pending, single, machine, ambiguous, noEdge, written)
+	fmt.Printf("claims detail: 隐藏跳过=%d 已有归属=%d 好友边反查失败=%d 写入失败=%d 已被抢先填写=%d\n",
+		hidden, already, lookupFailed, writeFailed, lostRace)
+	if !commit && pending > 0 {
+		fmt.Printf("干跑：-commit 时将写 %d 行（单节点 %d + 机器交集 %d）\n", single+machine, single, machine)
+	}
+	if len(stuck) > 0 {
+		// 故意保留：这几个智能体修完之后仍然会平铺，把清单交给产品决定是否手工指定。
+		fmt.Printf("仍会平铺（故意不猜归属）：%s\n", strings.Join(stuck, ","))
+	}
+	if writeFailed > 0 {
+		return fmt.Errorf("%d 行归属写入失败", writeFailed)
+	}
+	return nil
+}
+
+// collectClaimants 反查每个候选账号的融云好友列表，构造「谁把这个节点加为好友」。
+// 单个账号失败只跳过并计数（一个坏 token 不该让整张表失去归属），失败数由调用方
+// 决定能不能写库。
+func collectClaimants(ctx context.Context, lister claimsFriendLister, candidates []string) (map[string]map[string]bool, int) {
+	claimants := make(map[string]map[string]bool, len(candidates))
+	if len(candidates) == 0 || lister == nil {
+		return claimants, 0
+	}
+	ctx, cancel := context.WithTimeout(ctx, claimsLookupTimeout)
+	defer cancel()
+
+	type answer struct {
+		friends []string
+		err     error
+	}
+	answers := make([]answer, len(candidates))
+	g, gctx := errgroup.WithContext(ctx)
+	sem := make(chan struct{}, claimsLookupConcurrency)
+	for i, userID := range candidates {
+		i, userID := i, userID
+		g.Go(func() error {
+			select {
+			case sem <- struct{}{}:
+			case <-gctx.Done():
+				answers[i] = answer{err: gctx.Err()}
+				return nil
+			}
+			defer func() { <-sem }()
+			friends, err := lister.FriendIDs(gctx, userID)
+			answers[i] = answer{friends: friends, err: err}
+			return nil
+		})
+	}
+	// 单个账号的错误已经落在 answers 里，这里不需要从 errgroup 取错误。
+	_ = g.Wait()
+
+	failed := 0
+	for i, userID := range candidates {
+		if answers[i].err != nil {
+			failed++
+			fmt.Printf("lookup FAILED user=%s error=%v\n", userID, answers[i].err)
+			continue
+		}
+		for _, friend := range answers[i].friends {
+			friend = strings.TrimSpace(friend)
+			if friend == "" {
+				continue
+			}
+			if claimants[friend] == nil {
+				claimants[friend] = make(map[string]bool, 2)
+			}
+			claimants[friend][userID] = true
+		}
+	}
+	return claimants, failed
+}
+
+// listClaimNodes 返回待填归属的节点，跳过隐藏节点由判定层负责（保证报表能说明
+// 「为什么跳过」）。只取空值行，已填行连读都不读，天然幂等。
+func listClaimNodes(ctx context.Context, pool *pgxpool.Pool) ([]nodeRow, error) {
+	rows, err := pool.Query(ctx, `
+		SELECT rongcloud_user_id,
+		       COALESCE(machine_id, ''),
+		       COALESCE(ai_type, ''),
+		       COALESCE(claimed_by_user_id, '')
+		FROM rongcloud_node
+		WHERE rongcloud_user_id <> ''
+		  AND (claimed_by_user_id IS NULL OR btrim(claimed_by_user_id) = '')
+		ORDER BY machine_id, rongcloud_user_id`)
+	if err != nil {
+		return nil, fmt.Errorf("list nodes without a claim: %w", err)
+	}
+	defer rows.Close()
+	var out []nodeRow
+	for rows.Next() {
+		var r nodeRow
+		if err := rows.Scan(&r.RCUserID, &r.MachineID, &r.AiType, &r.Claimed); err != nil {
+			return nil, fmt.Errorf("scan node: %w", err)
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
 // resolveWorkspaces returns the workspace UUIDs to scan: the explicit flag when
