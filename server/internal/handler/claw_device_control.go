@@ -38,6 +38,17 @@ type clawDeviceControlState struct {
 	AllowChatroom   bool   `json:"allowChatroom"`
 	AllowFs         bool   `json:"allowFs"`
 	BehaviorPrompt  string `json:"behaviorPrompt"`
+	// ClaimedBy 是**这一个 agent** 的认领者（融云 id），未认领时为空。
+	//
+	// 顶层那个 ownerUserId 是**设备级**的（优先机器主节点的认领者），私聊闸门
+	// 一直拿它当「主人」。一台机器绑了分属两个账号的 agent 时，设备级单值必然
+	// 判错一半：A 被当成 B 那台 agent 的主人（越权豁免），B 私聊自己的 agent
+	// 反而被判陌生人。逐行下发认领者，设备端才能按「这条消息发给谁」判，而不是
+	// 按「这台机器归谁」判。
+	//
+	// 语义与顶层 ownerUserId 保持兼容：老 CLI 只读顶层，行为不变；新 CLI 优先
+	// 用本行，本行为空（老服务端没下发 / 确实未认领）时退回顶层。
+	ClaimedBy string `json:"claimedBy"`
 }
 
 // ClawDeviceControl POST /api/claw/device/control —— clawmessenger supervisor 轮询
@@ -119,7 +130,19 @@ func (h *Handler) ClawDeviceControl(w http.ResponseWriter, r *http.Request) {
 	// ownerUserId 是 CLI 判定「这条私聊是不是主人发的」的唯一依据（私聊派发不经
 	// 服务端，见上方 allowPrivate 的说明）。未认领时给空串：CLI 对空串按「不是
 	// 主人」处理，也就是私聊闸门默认关闭 —— 与新绑定 agent 权限默认全关一致。
-	payload := map[string]interface{}{"agents": states, "ownerUserId": ownerUserID}
+	//
+	// systemNodeId 是服务端**系统账号**的融云 id。服务端下发的 command 帧
+	// （your_turn / recommend_roles）全部由它发出（registration.go 里
+	// sendPrivateMessage(systemNodeID, ...)），而 chat_stop / card_action 是
+	// 用户用自己的账号发的。设备端拿它来校验「这条 command 到底是不是服务端
+	// 发的」—— 在此之前 command 分支完全不校验发送方，任何持有融云账号的人都
+	// 能伪造一条 your_turn 让 agent 以任意人设跑。空串表示未装配（老服务端 /
+	// 集成未启用），CLI 这时保持放行以免升级即哑。
+	payload := map[string]interface{}{
+		"agents":       states,
+		"ownerUserId":  ownerUserID,
+		"systemNodeId": h.RongCloudSystemNodeID,
+	}
 	if h.DB != nil {
 		version := strings.TrimSpace(req.Version)
 		platform := strings.TrimSpace(req.Platform)
@@ -285,6 +308,11 @@ func applyDevicePermissions(states []clawDeviceControlState, refs []rongcloud.Ag
 		states[i].AllowDiscussion = row.AllowDiscussion
 		states[i].AllowChatroom = row.AllowChatroom
 		states[i].AllowFs = row.AllowFs
+		// 逐行认领者：私聊闸门要用「这台 agent 归谁」而不是「这台机器归谁」。
+		// 未认领时留空串，与顶层 ownerUserId 的「空串 = 不是主人」同口径。
+		if row.ClaimedByUserID.Valid {
+			states[i].ClaimedBy = row.ClaimedByUserID.String
+		}
 		// 下发的是**生效值**：设备端不该知道「默认模板」这个概念，也不该各自
 		// 维护一份文案（三端漂移会让同一个 agent 在不同场景有两套准则）。
 		states[i].BehaviorPrompt = rongcloud.EffectiveAgentBehaviorPrompt(row.BehaviorPrompt)

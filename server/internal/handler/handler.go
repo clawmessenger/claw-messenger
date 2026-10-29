@@ -384,6 +384,15 @@ type Handler struct {
 	RongCloudChatroom   *rongcloud.ChatroomService
 	RongCloudPairing    *rongcloud.PairingService
 	RongCloudDiscussion *rongcloud.DiscussionService
+	// RongCloudSystemNodeID 是融云系统账号的 user id（通道安装配置里的
+	// system_node_id）。服务端下发的 command 帧全部由这个账号发出，所以它是
+	// 设备端判断「这条 command 是不是服务端发的」的唯一依据。
+	//
+	// 由 channel 工厂在凭据解析后经 ChannelDeps.OnCredentials 回填 —— 它只存在
+	// 于集成层的私有 credentials 里，handler 不该依赖那个类型。集成未启用时为
+	// 空串，此时 /api/claw/device/control 不下发该字段，设备端保持放行（否则
+	// 一次未装配就把所有设备的 command 通道掐掉）。
+	RongCloudSystemNodeID string
 	// clawNodeOpsForTest replaces the node-service methods ClawUpdateNode /
 	// ClawDeleteNode call. NodeService cannot be constructed outside the
 	// rongcloud package (its API client parameter is unexported), so the

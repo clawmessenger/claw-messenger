@@ -1278,6 +1278,12 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				// 的 sqlc 查询（新表 / 新列），所以直接给集成层一个 DBTX；
 				// *pgxpool.Pool 满足 db.DBTX。为 nil 时这三个 service 回 503。
 				DB: pool,
+				// 系统账号 id 会随设备控制轮询下发，设备端据此拒绝伪造的 command
+				// 帧（your_turn 的 role_prompt 能直接进 prompt）。这里只存下来，
+				// 不参与任何判定。
+				OnCredentials: func(systemNodeID string) {
+					h.RongCloudSystemNodeID = systemNodeID
+				},
 			})
 
 			// Phase 2a: construct service-layer dependencies.

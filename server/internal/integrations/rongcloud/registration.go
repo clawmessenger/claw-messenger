@@ -44,6 +44,15 @@ type ChannelDeps struct {
 	// 查询（新表 / 新列），因此直接在集成层用参数化 SQL 走 DBTX。
 	// Nil 时三个 store 保持 nil，对应 service 回 503 而不是 panic。
 	DB db.DBTX
+	// OnCredentials 在凭据解析成功后收到系统账号的融云 id（system_node_id）。
+	//
+	// 为什么需要这个回调：服务端下发的 command 帧（your_turn / recommend_roles）
+	// 全部以系统账号身份发出，设备端必须知道这个 id 才能拒绝伪造的 command ——
+	// 但 id 只存在于本包的私有 credentials 里，HTTP 层拿不到，也不该依赖这个
+	// 类型。装配处用回调把它接走，再随 /api/claw/device/control 下发给设备。
+	//
+	// Nil 时不做事（集成未启用 / 测试），设备端拿不到该字段就保持放行。
+	OnCredentials func(systemNodeID string)
 }
 
 func RegisterRongCloud(reg *channel.Registry, deps ChannelDeps) {
@@ -55,6 +64,12 @@ func newRongCloudFactory(deps ChannelDeps) channel.Factory {
 		creds, err := decodeCredentials(cfg.Raw, deps.Decrypt)
 		if err != nil {
 			return nil, err
+		}
+		// 系统账号 id 交给装配处（见 ChannelDeps.OnCredentials 的说明）。放在
+		// 这里而不是构造函数里：同一工厂可能被多次调用（重装 / 轮换），每次都
+		// 以最新解析出的值为准。
+		if deps.OnCredentials != nil {
+			deps.OnCredentials(creds.SystemNodeID)
 		}
 		logger := deps.Logger
 		if logger == nil {

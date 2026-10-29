@@ -357,10 +357,17 @@ func TestClawDeviceControl_DeliversAgentPermissions(t *testing.T) {
 	agent, _ := agents[0].(map[string]any)
 	for _, key := range []string{
 		"allowPrivate", "allowGroup", "allowDiscussion", "allowChatroom", "allowFs", "behaviorPrompt",
+		// claimedBy 是**逐行**认领者：设备端用它判「这条私聊/这条 chat_stop 是不是
+		// 这台 agent 的主人发的」。少下发它，多主人同机的设备就会退回设备级口径
+		// （A 被当成 B 那台 agent 的主人、B 私聊自己的 agent 反被判陌生人）。
+		"claimedBy",
 	} {
 		if _, ok := agent[key]; !ok {
 			t.Fatalf("agents[0] missing %q: %v", key, agent)
 		}
+	}
+	if agent["claimedBy"] != "claw-user-device" {
+		t.Fatalf("claimedBy = %v, want this agent's own claimed_by_user_id", agent["claimedBy"])
 	}
 	if agent["allowPrivate"] != true || agent["allowGroup"] != false ||
 		agent["allowDiscussion"] != true || agent["allowChatroom"] != false || agent["allowFs"] != true {
@@ -414,5 +421,57 @@ func TestClawDeviceControl_DefaultPromptWhenUnconfigured(t *testing.T) {
 	}
 	if agent["allowPrivate"] != false || agent["allowFs"] != false {
 		t.Fatalf("unconfigured agent must keep fail-closed defaults: %v", agent)
+	}
+}
+
+// TestClawDeviceControl_DeliversSystemNodeID 钉住顶层的 systemNodeId。
+//
+// 设备端靠它区分「服务端让我干活」与「某个融云账号伪造了一条 command」：
+// 服务端派发的 your_turn / recommend_roles 全部以**系统账号**身份私发
+// （registration.go 里 sendPrivateMessage(systemNodeID, …)），而 chat_stop /
+// card_action 是用户用自己的账号发的。这个字段不下发，command 闸门只能保持
+// 放行（fail-open），伪造 your_turn 把那句 role_prompt 喂进 prompt 的路就还开着。
+func TestClawDeviceControl_DeliversSystemNodeID(t *testing.T) {
+	h := permissionTestHandler(t)
+	box := fixedTestBox(t)
+	h.RongCloudNode = rongcloud.NewNodeService(testHandler.Queries, nil, box, nil)
+	// 生产里由 channel 工厂经 ChannelDeps.OnCredentials 回填；测试直接注入。
+	h.RongCloudSystemNodeID = "rc-system-node"
+
+	suffix := strings.ReplaceAll(t.Name(), "/", "-")
+	machineID := "sys-machine-" + suffix
+	machineNodeID := "sys-machine-node-" + suffix
+	seedClawUserRow(t, "claw-user-device", "token-device")
+	machineNodeRowID := seedPermissionNode(t, machineNodeID, "rc_node_"+machineID, "claw-user-device", machineID, "")
+
+	const credentialID = "dc_sys_test"
+	secret := "sys-device-secret"
+	sealed, err := box.Seal([]byte(secret))
+	if err != nil {
+		t.Fatalf("seal credential: %v", err)
+	}
+	seedDeviceCredential(t, machineNodeRowID, credentialID, sealed)
+
+	req := testutil.JSONRequest(http.MethodPost, "/api/claw/device/control", map[string]any{
+		"nodeId": machineNodeID, "credentialId": credentialID, "secret": secret,
+	})
+	body := testutil.Decode[clawEnvelope](t, h.ClawDeviceControl, req, http.StatusOK)
+	data, _ := body.Data.(map[string]any)
+
+	if data["systemNodeId"] != "rc-system-node" {
+		t.Fatalf("systemNodeId = %v, want the channel's system node id", data["systemNodeId"])
+	}
+
+	// 集成未装配时下发空串：设备端据此保持放行 —— 「不知道」不等于「可以伪造」，
+	// 但也绝不能因为服务端没配好就把所有设备的讨论组掐死。这条是刻意的。
+	h.RongCloudSystemNodeID = ""
+	// 必须重新构造 request：体是一次性 reader，复用会退化成「缺少设备凭据」。
+	req2 := testutil.JSONRequest(http.MethodPost, "/api/claw/device/control", map[string]any{
+		"nodeId": machineNodeID, "credentialId": credentialID, "secret": secret,
+	})
+	body = testutil.Decode[clawEnvelope](t, h.ClawDeviceControl, req2, http.StatusOK)
+	data, _ = body.Data.(map[string]any)
+	if data["systemNodeId"] != "" {
+		t.Fatalf("systemNodeId = %v, want empty when the integration is not wired", data["systemNodeId"])
 	}
 }
