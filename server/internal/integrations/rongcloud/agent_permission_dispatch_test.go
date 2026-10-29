@@ -478,8 +478,11 @@ func TestAgentPermissions_FailsClosedOnQueryError(t *testing.T) {
 	if len(set) != 0 {
 		t.Fatalf("permission set must be empty on query failure, got %+v", set)
 	}
+	// actor 故意传这个节点的认领者（"owner-1"）：主人豁免也**不能**越过 fail-closed。
+	// 读不到权限行 = 不知道有没有主人，此时按「主人来了就放行」猜，等于用一次
+	// 查库故障给所有被关掉的 agent 开门。
 	for _, scene := range []agentPermissionScene{sceneGroup, sceneChatroom, sceneDiscussion} {
-		if set.allows(node.RongcloudUserID, scene) {
+		if set.allows(node.RongcloudUserID, scene, "owner-1") {
 			t.Fatalf("scene %d must deny on query failure (fail-open!)", scene)
 		}
 	}
@@ -539,5 +542,265 @@ func TestRelayGate_RoomTypeLookupFailureIsFailClosed(t *testing.T) {
 	}
 	if !strings.Contains(result.message, "无法确认房间类型") {
 		t.Fatalf("message = %q, want 无法确认房间类型", result.message)
+	}
+}
+
+// ---- A6：主人豁免（设备主人自己发起时不受自己的开关限制）---------------------
+//
+// 口径：这五个开关管的是「**别的账号**能不能用我的 agent」。主人自己发起时不该被
+// 自己的开关挡住 —— 与设备端私聊闸门 `decidePrivateChat` 的 `reason: "owner"` 同口径。
+//
+// 为什么这批用例必须存在：豁免是**放宽**，写错的方向全是「本该拒绝的也放行了」，
+// 而这类错误没有任何报错，只表现为「别人也能拉走我的 agent」。所以每一条放行
+// 断言都配一条同场景的拒绝断言，另外三条负控（未认领 / 认领者为空 / 拿不到
+// 发起人）专门保护既有语义不被这次放宽冲掉。
+
+// TestAgentPermissionSet_OwnerExemption 是豁免判定的纯函数用例：不碰库，覆盖
+// 三种场景 × 主人/别人，外加四条必须保持原状的负控。
+func TestAgentPermissionSet_OwnerExemption(t *testing.T) {
+	const (
+		owner    = "rc_owner"
+		stranger = "rc_stranger"
+		node     = "rc_node"
+	)
+	cases := []struct {
+		name  string
+		perm  agentPermission
+		scene agentPermissionScene
+		actor string
+		want  bool
+		why   string
+	}{
+		{
+			name:  "a. 群聊关闭 + 发起人是主人 → 放行",
+			perm:  agentPermission{claimed: true, claimedBy: owner, allowGroup: false},
+			scene: sceneGroup, actor: owner, want: true,
+			why: "主人关掉「允许群聊发言」后，他自己在群里说话仍然该有回应",
+		},
+		{
+			name:  "b. 群聊关闭 + 发起人是别人 → 拒绝",
+			perm:  agentPermission{claimed: true, claimedBy: owner, allowGroup: false},
+			scene: sceneGroup, actor: stranger, want: false,
+			why: "开关的本职：别的账号不能把主人关掉的 agent 拉进群聊",
+		},
+		{
+			name:  "c. 讨论组关闭 + 组是主人建的（actor=d.CreatedBy）→ 放行",
+			perm:  agentPermission{claimed: true, claimedBy: owner, allowDiscussion: false},
+			scene: sceneDiscussion, actor: owner, want: true,
+			why: "主人自己建的讨论组里，他自己关掉的开关不该让他开不了口",
+		},
+		{
+			name:  "c'. 讨论组关闭 + 组是别人建的 → 拒绝",
+			perm:  agentPermission{claimed: true, claimedBy: owner, allowDiscussion: false},
+			scene: sceneDiscussion, actor: stranger, want: false,
+			why: "别人建的讨论组里没有豁免，这是 allow_discussion 唯一真正拦住的东西",
+		},
+		{
+			name:  "d. 聊天室关闭 + 发起人是主人 → 放行",
+			perm:  agentPermission{claimed: true, claimedBy: owner, allowChatroom: false},
+			scene: sceneChatroom, actor: owner, want: true,
+			why: "同上，聊天室场景按发起人判",
+		},
+		{
+			name:  "d'. 聊天室关闭 + 发起人是别人 → 拒绝",
+			perm:  agentPermission{claimed: true, claimedBy: owner, allowChatroom: false},
+			scene: sceneChatroom, actor: stranger, want: false,
+			why: "同上，场景开关对陌生账号仍然生效",
+		},
+		{
+			name:  "e. 负控：未认领节点即使全关也放行（存量兼容 fail-open）",
+			perm:  agentPermission{claimed: false, claimedBy: ""},
+			scene: sceneGroup, actor: stranger, want: true,
+			why: "没有主人就没有能点开关的人，按「关」处理会把历史节点永久锁死",
+		},
+		{
+			name:  "e'. 负控：未认领节点 + 拿不到发起人 也放行",
+			perm:  agentPermission{claimed: false, claimedBy: ""},
+			scene: sceneDiscussion, actor: "", want: true,
+			why: "未认领的 fail-open 必须在豁免之前判定，缺 actor 不能把它变成拒绝",
+		},
+		{
+			name:  "f. 负控：已认领但认领者为空 → 不豁免，按开关拒绝",
+			perm:  agentPermission{claimed: true, claimedBy: "", allowGroup: false},
+			scene: sceneGroup, actor: owner, want: false,
+			why: "理论上不可达（claimed 由 claimedBy 非空推出），一旦出现只能 fail-closed，" +
+				"不能让「空串 == 空串」把所有人的 agent 都放行",
+		},
+		{
+			name:  "g. 负控：actorRCID 为空 → 不豁免，按开关拒绝",
+			perm:  agentPermission{claimed: true, claimedBy: owner, allowChatroom: false},
+			scene: sceneChatroom, actor: "", want: false,
+			why: "拿不到发起人时不猜，缺参数不是放行理由",
+		},
+		{
+			name:  "g'. 负控：actorRCID 为空 + 开关开着 → 照常放行",
+			perm:  agentPermission{claimed: true, claimedBy: owner, allowChatroom: true},
+			scene: sceneChatroom, actor: "", want: true,
+			why: "缺 actor 只是「不豁免」，不是「一律拒绝」——正文口径由开关决定",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			set := agentPermissionSet{node: tc.perm}
+			if got := set.allows(node, tc.scene, tc.actor); got != tc.want {
+				t.Fatalf("allows(%q, scene=%d, actor=%q) = %v, want %v（%s）",
+					node, tc.scene, tc.actor, got, tc.want, tc.why)
+			}
+		})
+	}
+
+	// 查不到节点行永远是拒绝：豁免只对「查得到、且认领者就是发起人」的行生效。
+	t.Run("h. 负控：快照里没有这个 rc id → 即使 actor 是主人也拒绝", func(t *testing.T) {
+		empty := agentPermissionSet{}
+		for _, scene := range []agentPermissionScene{sceneGroup, sceneChatroom, sceneDiscussion} {
+			if empty.allows(node, scene, owner) {
+				t.Fatalf("scene %d must stay fail-closed for unknown rc id", scene)
+			}
+		}
+	})
+}
+
+// TestFilterMembersByPermission_PassesActor 钉住「actor 真的透传下去了」。
+//
+// 上面那条纯函数用例只证明 allows 会豁免；如果 filterMembersByPermission 忘了把
+// actorRCID 传给 allows（或调用点传了空串），线上表现是「豁免完全不生效」，
+// 而 allows 的单测仍然全绿。这里用一次过滤把接线钉住。
+func TestFilterMembersByPermission_PassesActor(t *testing.T) {
+	const (
+		ownerRC = "rc_owner"
+		otherRC = "rc_other"
+	)
+	members := []relayMember{{rcID: ownerRC}, {rcID: otherRC}}
+	set := agentPermissionSet{
+		ownerRC: {claimed: true, claimedBy: ownerRC, allowGroup: false},
+		otherRC: {claimed: true, claimedBy: otherRC, allowGroup: false},
+	}
+
+	kept := filterMembersByPermission(members, set, sceneGroup, ownerRC)
+	if len(kept) != 1 || kept[0].rcID != ownerRC {
+		t.Fatalf("kept = %+v, want only the owner's own node", kept)
+	}
+
+	// 没有 actor（拿不到发起人）：两个都该被开关挡掉。
+	if kept := filterMembersByPermission(members, set, sceneGroup, ""); len(kept) != 0 {
+		t.Fatalf("kept = %+v, want empty when actor is unknown", kept)
+	}
+}
+
+// TestGroupRelayPermissionGate_OwnerExemptionApplies 是群聊入口的接线验证：
+// 同一条消息，发起人是主人 → 200，发起人是别人 → 409。
+//
+// 两组各自的 hub 是新建的（sessions 空）：同一个 hub 上第二次调用会因为「上一条
+// 中继还在跑」走排队分支返回 200，让负向断言假绿。
+func TestGroupRelayPermissionGate_OwnerExemptionApplies(t *testing.T) {
+	env := newPermEnv(t)
+	ownerRC := "rc_owner_" + uniqueID("t")
+	// 开关全关，但认领者就是下面那个发起人。
+	node := env.seedAgent(t, "perm-grp-owner-"+uniqueID("t"), ownerRC, permFlags{}, "")
+	resetAgentPermissionCache()
+
+	const strangerRC = "rc_someone_else"
+	aiMembers := []GroupMember{{UserID: node.RongcloudUserID}}
+	// 陌生人**也是群成员**：否则会先被「仅群成员可以发起对话」403 拦下，
+	// 走到 409 就证明它确实穿过了成员校验、被权限闸门挡住了。
+	allMembers := append([]GroupMember{{UserID: ownerRC}, {UserID: strangerRC}}, aiMembers...)
+
+	t.Run("发起人是主人 → 放行", func(t *testing.T) {
+		hub := newPermHub(permRelayRuntime(env.queries, testLogger()))
+		result := hub.StartGroupRelay(context.Background(), "g-owner-exempt-"+uniqueID("t"),
+			ownerRC, "大家好", allMembers, aiMembers)
+		if result.code != 200 {
+			t.Fatalf("owner-initiated relay must pass the gate, got %d (%s)", result.code, result.message)
+		}
+		data, _ := result.data.(map[string]interface{})
+		if speakers, _ := data["speakers"].(int); speakers != 1 {
+			t.Fatalf("speakers = %v, want 1（主人的节点要留在列表里）", data["speakers"])
+		}
+	})
+
+	t.Run("发起人是别人 → 仍然拒绝", func(t *testing.T) {
+		hub := newPermHub(permRelayRuntime(env.queries, testLogger()))
+		result := hub.StartGroupRelay(context.Background(), "g-owner-exempt-x-"+uniqueID("t"),
+			strangerRC, "大家好", allMembers, aiMembers)
+		if result.code != 409 {
+			t.Fatalf("stranger-initiated relay must stay denied, got %d (%s)", result.code, result.message)
+		}
+	})
+}
+
+// TestRelayGate_ChatroomOwnerExemption 是聊天室入口的接线验证：发起人是主人时，
+// allow_chatroom=false 不再挡住他自己。
+//
+// 镜像（主人 ≠ 发起人 → 409）由 TestRelayGate_ChatroomSceneUsesChatroomSwitch 覆盖，
+// 那条用的是 "owner-1" 这个陌生认领者，正好是本用例的反面。
+func TestRelayGate_ChatroomOwnerExemption(t *testing.T) {
+	f := setupDiscussionFixture(t)
+	f.rt.interactiveEnabled = true
+	env := &permEnv{pool: f.pool, queries: f.queries, wsID: f.wsID}
+	env.setAgentPermission(t, f.memberNode.NodeID, f.ownerRCID, permFlags{Chatroom: false})
+	resetAgentPermissionCache()
+
+	hub := newPermHub(f.rt)
+	result := hub.StartRelay(context.Background(), f.roomRCID, f.ownerRCID, "随便聊聊")
+	if result.code != 200 {
+		t.Fatalf("owner-initiated chatroom relay must pass the gate, got %d (%s)", result.code, result.message)
+	}
+	data, _ := result.data.(map[string]interface{})
+	if speakers, _ := data["speakers"].(int); speakers != 1 {
+		t.Fatalf("speakers = %v, want 1", data["speakers"])
+	}
+}
+
+// TestInteractiveNext_OwnerCreatedDiscussionNotSkipped 是讨论组 v3 正式轮次的
+// 接线验证：allow_discussion=false，但讨论组是主人建的（d.CreatedBy == 认领者），
+// 该成员必须照常被派发，不能出 member_skipped{permission_denied}。
+//
+// 这条替的是「用 d.CreatedBy 而不是本轮触发者」的取舍：v3 的轮次由系统推进，
+// 第 2 轮的触发者是 AI，如果按触发者判，豁免会在中途失效 —— 本用例断言的是
+// 语义（主人建的局里他的 agent 能说话），而不是某个具体实现细节。
+func TestInteractiveNext_OwnerCreatedDiscussionNotSkipped(t *testing.T) {
+	f := setupDiscussionFixture(t)
+	ctx := context.Background()
+	env := &permEnv{pool: f.pool, queries: f.queries, wsID: f.wsID}
+	// 认领者 = fixture 的真人 owner = newFixtureDiscussion 里的 CreatedBy。
+	env.setAgentPermission(t, f.memberNode.NodeID, f.ownerRCID, permFlags{Discussion: false})
+	resetAgentPermissionCache()
+
+	created := newFixtureDiscussion(t, f)
+	memberRC := f.memberNode.RongcloudUserID
+
+	if err := f.rt.interactiveNext(ctx, created); err != nil {
+		t.Fatalf("interactiveNext: %v", err)
+	}
+
+	events, err := f.rt.repo.ListEventsAfter(ctx, created.DiscussionID, 0)
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	dispatched := false
+	for _, e := range events {
+		if e.EventType == "member_skipped" {
+			var payload map[string]interface{}
+			if err := json.Unmarshal(e.Payload, &payload); err != nil {
+				t.Fatalf("decode member_skipped payload: %v", err)
+			}
+			if payload["memberId"] == memberRC && payload["reason"] == "permission_denied" {
+				t.Fatalf("owner-created discussion must not skip the owner's node by permission; events=%v",
+					eventTypes(events))
+			}
+		}
+		if e.EventType == "assignment_created" {
+			var payload map[string]interface{}
+			if err := json.Unmarshal(e.Payload, &payload); err != nil {
+				t.Fatalf("decode assignment_created payload: %v", err)
+			}
+			if payload["targetId"] == memberRC {
+				dispatched = true
+			}
+		}
+	}
+	if !dispatched {
+		t.Fatalf("owner's node must be dispatched in an owner-created discussion; events=%v",
+			eventTypes(events))
 	}
 }
