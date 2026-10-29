@@ -121,10 +121,15 @@ func roleCandidateNodes(eligible map[string]db.RongcloudNode, requested []string
 	return ids, ""
 }
 
-// roleCandidateNodesFor 取候选设备的运行时封装（查归属 + 在线判定）。
+// roleCandidateNodesFor 取候选设备的运行时封装（查归属 + 在线判定 + 权限闸门）。
+//
+// 权限闸门放在**候选池**这一层，而不是只在 confirm 拦：写进推荐卡的角色必须是
+// 用户真能确认的。只拦 confirm 的后果是「推荐成功 → 点开始 → 整单 400」，用户
+// 只会一路重试，且界面上没有任何东西显示哪台设备有问题。
 func (s *roundtableCreationService) roleCandidateNodesFor(ctx context.Context, userID string, host roundtableHostConfig, requested []string, requestedGiven bool) ([]string, string) {
 	_, eligible := s.ownedAndEligibleNodes(ctx, userID, host)
-	return roleCandidateNodes(eligible, requested, requestedGiven)
+	allowed, _ := filterDiscussionJoinNodes(eligible, userID)
+	return roleCandidateNodes(allowed, requested, requestedGiven)
 }
 
 // ensureChatroom 对齐 _ensure_chatroom：融云侧建房 + DB 行 + owner/host 成员行。

@@ -719,6 +719,10 @@ func (rt *discussionRuntime) actionConfirmRoundtableSetup(ctx context.Context, c
 		}
 	}
 	owned, eligible := rt.roundtable.ownedAndEligibleNodes(ctx, actor.RcID, host)
+	// 加入侧权限闸门（discussion_join_gate.go）：owned 是按融云好友边算的，里面
+	// 既有自己的 agent，也有别人分享过来的 —— 后者可能已经被主人关掉了讨论组
+	// 权限。不在这里拦，它会照常被写进成员表，然后派发侧 fail-closed 不吭声。
+	allowed, blocked := filterDiscussionJoinNodes(eligible, actor.RcID)
 	for i, role := range roles {
 		if !recommendedIDs[role.RoleID] {
 			return commandResult{code: 400, message: "INVALID_ROUNDTABLE_REQUEST", data: map[string]interface{}{"role_index": i}}
@@ -726,7 +730,12 @@ func (rt *discussionRuntime) actionConfirmRoundtableSetup(ctx context.Context, c
 		if role.NodeID == host.nodeID || !owned[role.NodeID] {
 			return commandResult{code: 400, message: "ROLE_DEVICE_NOT_OWNED", data: map[string]interface{}{"role_index": i}}
 		}
-		if _, ok := eligible[role.NodeID]; !ok {
+		// 先判权限再判可用：两者的用户动作完全不同（前者去开开关，后者去启动设备），
+		// 混成一句「设备当前不可用」会把人引到错误的排查方向。
+		if _, ok := blocked[role.NodeID]; ok {
+			return commandResult{code: 400, message: "ROLE_DEVICE_PERMISSION_DENIED", data: map[string]interface{}{"role_index": i}}
+		}
+		if _, ok := allowed[role.NodeID]; !ok {
 			return commandResult{code: 400, message: "ROLE_DEVICE_UNAVAILABLE", data: map[string]interface{}{"role_index": i}}
 		}
 	}
@@ -739,7 +748,9 @@ func (rt *discussionRuntime) actionConfirmRoundtableSetup(ctx context.Context, c
 		RoundPolicy:      RoundPolicyUserConfirmed,
 		Roles:            roles,
 	}
-	validated := roundtableValidated{host: host, nodes: eligible}
+	// nodes 只带**过闸的**那些：ensureMembers 从这里取节点行落成员，多带一个
+	// 被权限拒的节点就等于把它写进成员表，而上面的循环已经保证没有这种角色。
+	validated := roundtableValidated{host: host, nodes: allowed}
 	if cerr := rt.roundtable.ensureMembers(ctx, chatroomID, canonical, validated); cerr != nil {
 		return roundtableErrorResult(cerr)
 	}
