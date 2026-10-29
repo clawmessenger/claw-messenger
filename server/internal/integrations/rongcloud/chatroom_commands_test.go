@@ -158,7 +158,7 @@ func TestChatroomCommandGetInfoOnMissingRoom(t *testing.T) {
 	r := h.actionChatroomGetInfo(context.Background(), CommandContent{
 		Service: "chatroom", Action: "getInfo",
 		Params: map[string]interface{}{"chatroomId": "rc_missing_" + uniqueID("t")},
-	})
+	}, "")
 	if r.code != 404 {
 		t.Fatalf("expected 404, got %d (%s)", r.code, r.message)
 	}
@@ -173,7 +173,7 @@ func TestChatroomCommandCreateAndGetInfo(t *testing.T) {
 	r := f.h.actionChatroomGetInfo(ctx, CommandContent{
 		Service: "chatroom", Action: "getInfo",
 		Params: map[string]interface{}{"chatroomId": f.roomRCID},
-	})
+	}, f.owner.RongcloudUserID)
 	if r.code != 200 {
 		t.Fatalf("getInfo failed: %d %s", r.code, r.message)
 	}
@@ -325,7 +325,7 @@ func TestChatroomCommandDestroy(t *testing.T) {
 	r = f.h.actionChatroomGetInfo(ctx, CommandContent{
 		Service: "chatroom", Action: "getInfo",
 		Params: map[string]interface{}{"chatroomId": f.roomRCID},
-	})
+	}, f.owner.RongcloudUserID)
 	if r.code != 404 {
 		t.Fatalf("expected 404 after destroy, got %d", r.code)
 	}

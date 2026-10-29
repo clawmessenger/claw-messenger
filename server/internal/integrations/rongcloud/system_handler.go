@@ -197,7 +197,9 @@ func (h *systemHandler) handleChatroomCommand(ctx context.Context, msg Normalize
 		return h.commitResult(ctx, msg, cmd, h.actionChatroomGetList(ctx, cmd, actor))
 
 	case "get", "info", "getInfo":
-		return h.commitResult(ctx, msg, cmd, h.actionChatroomGetInfo(ctx, cmd))
+		// getInfo 是只读、不校验身份，但 isOwner 需要观察者视角 ——
+		// 直接把发送者的融云 id 透传进去（拿不到就是空串 → isOwner=false）。
+		return h.commitResult(ctx, msg, cmd, h.actionChatroomGetInfo(ctx, cmd, strings.TrimSpace(msg.FromUserID)))
 
 	case "update":
 		actor, err := h.resolveActor(ctx, msg.FromUserID)

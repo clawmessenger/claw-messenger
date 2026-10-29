@@ -301,6 +301,28 @@ func (h *systemHandler) handleGroupInfo(ctx context.Context, msg NormalizedMessa
 	return h.sendWebOK(ctx, msg, cmd, groupProfileView(profiles[0], strings.TrimSpace(msg.FromUserID)))
 }
 
+// ownerViewpoint 判定「观察者本人是否就是这个会话的群主 / 房主」。
+//
+// 群聊（getInfo/getProfiles/getMyGroups）与讨论组/聊天室（getList/getInfo/update/
+// create/setHost/setDiscussionTeam）都下发 isOwner，判定必须只有这一处实现 ——
+// 两个地方各写一遍，早晚会有一边漏掉空值判断。
+//
+// fail-closed 三条：
+//   - owner 为空 → false。老群/老聊天室的 owner 列可能是 NULL，取出来是空串；
+//     此时**不能**说「谁都不是群主」，但更**不能**说「谁都是」。客户端拿不到
+//     true 只是少一个入口（还能走服务端 403 兜底），给错了是把管理入口白送。
+//   - viewer 为空 → false。未登录、内部调用、取不到发送者时没有观察者，无从判定。
+//   - 两侧都空 → false。这一条单列出来是因为 `"" == ""` 天然成立：少了前两条的
+//     任意一条，都会把「空 owner + 空 viewer」判成 true，正好是最坏的情况。
+//
+// 两侧都先 TrimSpace：镜像列与消息头都可能带空白，一个空格就会让真群主变成
+// 非群主 —— 那正是我们要修的那类「功能看起来没了」。
+func ownerViewpoint(ownerID, viewerID string) bool {
+	owner := strings.TrimSpace(ownerID)
+	viewer := strings.TrimSpace(viewerID)
+	return owner != "" && viewer != "" && owner == viewer
+}
+
 // groupProfileViews 组装 getProfiles/getMyGroups 的数组。
 //
 // viewerID 是**观察者**（本条命令的发送者）：isOwner 是「相对视角」的字段，同一条
@@ -339,9 +361,8 @@ func groupProfileView(profile GroupProfile, viewerID string) map[string]interfac
 	if rounds <= 0 {
 		rounds = defaultGroupRounds
 	}
-	ownerID := strings.TrimSpace(profile.OwnerID)
-	viewer := strings.TrimSpace(viewerID)
-	isOwner := ownerID != "" && viewer != "" && ownerID == viewer
+	// 判定只走 ownerViewpoint（群聊与聊天室共用一处实现，见其注释）。
+	isOwner := ownerViewpoint(profile.OwnerID, viewerID)
 	return map[string]interface{}{
 		"id":                profile.GroupID,
 		"groupId":           profile.GroupID,

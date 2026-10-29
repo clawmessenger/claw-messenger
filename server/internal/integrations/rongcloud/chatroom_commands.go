@@ -237,12 +237,32 @@ func capsToInterface(caps []byte) interface{} {
 
 // chatroomViewData builds the response record from a chatroom "view" row (one
 // that already carries owner_rc_user_id / host_business_node_id via JOIN).
-func chatroomViewData(room chatroomView, members []map[string]interface{}, includeMembers bool) map[string]interface{} {
+//
+// viewerRCID 是**观察者**（本条命令的发送者）的融云 id；isOwner 是相对视角的
+// 字段，同一间房对不同调用者答案不同，所以必须逐次按 viewer 判定。
+//
+// 为什么要由服务端下发（与群聊 groupProfileView 同一取舍）：客户端原先是拿
+// `ownerId` 与本地两套 id（平台 userId / 融云 imUserId）做字符串比对来猜群主。
+// `owner_rc_user_id` 在这一列被 JOIN 出来之前是 NULL，`ownerRCID()` 返回空串 ——
+// 这些老聊天室/讨论组上，真正的房主会被判成非房主，「移除成员」入口整块消失，
+// 而「添加成员」不判权限所以还在，用户看到的就是「群主没有移除成员的功能」。
+//
+// 重要边界：isOwner 只用于**显示侧**开关（决定要不要把入口画出来）。真正的写
+// 操作仍由服务端校验 —— `actionChatroomRemoveMember` 用 `room.OwnerUserID !=
+// actor.ID` 挡 403，`actionChatroomSetHost` 同理。前端不得把 isOwner 当授权凭据。
+//
+// viewerRCID 为空（内部调用、取不到发送者）时一律 false：没有观察者就无从判定，
+// 绝不能因为 owner 也空就把 `"" == ""` 当成「观察者就是房主」。
+func chatroomViewData(room chatroomView, members []map[string]interface{}, includeMembers bool, viewerRCID string) map[string]interface{} {
+	// ownerId 保留原值（可能是空串）：别的端/老客户端还靠它显示「房主：xxx」，
+	// 抹成空或改写成 viewer 只会让它们更困惑。判定只走 ownerViewpoint，
+	// 与群聊共用一个实现（理由见 ownerViewpoint 的注释）。
 	rec := map[string]interface{}{
 		"chatroomId":        room.rcChatroomID(),
 		"chatroomName":      room.name(),
 		"portraitUri":       room.portraitUri(),
 		"ownerId":           room.ownerRCID(),
+		"isOwner":           ownerViewpoint(room.ownerRCID(), viewerRCID),
 		"hostNodeId":        room.hostBusinessNodeID(),
 		"openclawMaxRounds": room.maxRounds(),
 		"createTime":        room.createdAt(),
@@ -390,7 +410,7 @@ func (h *systemHandler) actionChatroomGetList(ctx context.Context, cmd CommandCo
 	pageRooms := rooms[start:end]
 	list := make([]map[string]interface{}, 0, len(pageRooms))
 	for _, r := range pageRooms {
-		list = append(list, chatroomViewData(listViewRow{r}, nil, false))
+		list = append(list, chatroomViewData(listViewRow{r}, nil, false, actor.RongcloudUserID))
 	}
 	// 附上每间房「最后一条消息」（见 chatroom_last_message.go）：聊天室不存历史，
 	// 会话列表没有它就只剩占位文案。批量查一页，失败不影响列表本身。
@@ -403,7 +423,10 @@ func (h *systemHandler) actionChatroomGetList(ctx context.Context, cmd CommandCo
 	})
 }
 
-func (h *systemHandler) actionChatroomGetInfo(ctx context.Context, cmd CommandContent) commandResult {
+// actionChatroomGetInfo 是只读接口：不校验身份、不解析 actor（getInfo 对谁都能读），
+// 但**仍然需要知道观察者是谁**才能下发 isOwner —— 所以这里收的是发送者的融云 id，
+// 而不是 db.RongcloudUser（不需要查库，也不需要它一定是个已注册用户）。
+func (h *systemHandler) actionChatroomGetInfo(ctx context.Context, cmd CommandContent, viewerRCID string) commandResult {
 	rcID := getStringAny(cmd.Params, "chatroom_id", "chatroomId")
 	if rcID == "" {
 		return errResult(400, "聊天室 ID 不能为空")
@@ -423,7 +446,7 @@ func (h *systemHandler) actionChatroomGetInfo(ctx context.Context, cmd CommandCo
 		h.logger.Error("rongcloud: chatroom getInfo load members", "error", err)
 		return errResult(500, "获取聊天室信息失败")
 	}
-	return okResult(chatroomViewData(viewRow{room}, members, true))
+	return okResult(chatroomViewData(viewRow{room}, members, true, viewerRCID))
 }
 
 func (h *systemHandler) actionChatroomUpdate(ctx context.Context, cmd CommandContent, actor db.RongcloudUser) commandResult {
@@ -491,7 +514,7 @@ func (h *systemHandler) actionChatroomUpdate(ctx context.Context, cmd CommandCon
 		}
 	}
 	members, _ := h.loadMembers(ctx, view.ID)
-	return okResult(chatroomViewData(viewRow{view}, members, true))
+	return okResult(chatroomViewData(viewRow{view}, members, true, actor.RongcloudUserID))
 }
 
 func (h *systemHandler) actionChatroomDestroy(ctx context.Context, cmd CommandContent, actor db.RongcloudUser) commandResult {
@@ -930,7 +953,7 @@ func (h *systemHandler) actionChatroomCreate(ctx context.Context, cmd CommandCon
 	view, _ := h.queries.GetActiveRongCloudChatroomViewByRongCloudID(ctx, rcID)
 	members, _ := h.loadMembers(ctx, room.ID)
 	if view.ID.Valid {
-		return okResult(chatroomViewData(viewRow{view}, members, true))
+		return okResult(chatroomViewData(viewRow{view}, members, true, actor.RongcloudUserID))
 	}
 	return okResult(map[string]interface{}{"chatroomId": rcID, "chatroomName": name})
 }
@@ -994,7 +1017,7 @@ func (h *systemHandler) actionChatroomSetHost(ctx context.Context, cmd CommandCo
 		}
 	}
 	members, _ := h.loadMembers(ctx, view.ID)
-	return okResult(chatroomViewData(viewRow{view}, members, true))
+	return okResult(chatroomViewData(viewRow{view}, members, true, actor.RongcloudUserID))
 }
 
 func (h *systemHandler) actionChatroomSetMemberRole(ctx context.Context, cmd CommandContent, actor db.RongcloudUser) commandResult {
@@ -1165,7 +1188,7 @@ func (h *systemHandler) actionChatroomSetDiscussionTeam(ctx context.Context, cmd
 	view, _ := h.queries.GetActiveRongCloudChatroomViewByRongCloudID(ctx, rcID)
 	updatedMembers, _ := h.loadMembers(ctx, room.ID)
 	if view.ID.Valid {
-		return okResult(chatroomViewData(viewRow{view}, updatedMembers, true))
+		return okResult(chatroomViewData(viewRow{view}, updatedMembers, true, actor.RongcloudUserID))
 	}
 	return okResult(map[string]interface{}{"chatroomId": rcID})
 }
