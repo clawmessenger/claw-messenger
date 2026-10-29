@@ -49,6 +49,10 @@ type discussionRuntime struct {
 	// quota 是用户级创建配额（讨论组/群聊/聊天室三入口统一硬校验）。
 	// nil 时放行（未装配数据库的部署不引入新失败面）。
 	quota *quota.Service
+	// recommendGate 保证同一 discussion 同时只有一批角色推荐在跑：
+	// 一次推荐 = 设备端一整轮 LLM，叠加派发只会多排一轮、更慢，角色还可能翻倍。
+	// 零值可用，见 discussion_roundtable_recommend_gate.go。
+	recommendGate setupRecommendGate
 }
 
 // DiscussionSystemHostConfig 是管理端 system_host 配置的运行时视图（P4）。

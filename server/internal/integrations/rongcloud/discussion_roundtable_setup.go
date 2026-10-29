@@ -231,7 +231,14 @@ func (rt *discussionRuntime) actionSubmitSetupTopic(ctx context.Context, cmd Com
 	// 重提时，新推荐卡的幂等键才不会撞上旧卡（撞键会被当重放丢弃，前端永远
 	// 等不到新角色）。
 	attempt := rt.setupRecommendAttempt(ctx, row.DiscussionID) + 1
-	go rt.recommendForSetupAsync(context.Background(), row.DiscussionID, attempt)
+	// 首推也占同一把在途闸门：S1 的批次还在跑时，用户在 S2 点「换一批 / 重试」会被
+	// actionRequestRoleRecommend 挡住，不会叠第二批设备端回合。
+	// 这里的「占不到」实际打不到（同 topic 重提走幂等早退、改 topic 走 CAS 409），
+	// 所以回包形状保持 {accepted:true} 不变。
+	if !rt.dispatchSetupRecommend(row.DiscussionID, attempt, setupRecommendRequest{}) && rt.logger != nil {
+		rt.logger.Info("discussion: setup 首推已在途，议题已受理但不再派发",
+			"discussionId", row.DiscussionID, "attempt", attempt)
+	}
 	return okResult(map[string]interface{}{"accepted": true})
 }
 
@@ -350,8 +357,43 @@ func (rt *discussionRuntime) actionRequestRoleRecommend(ctx context.Context, cmd
 	}
 	rt.touchSetup(ctx, row.DiscussionID)
 	attempt := rt.setupRecommendAttempt(ctx, row.DiscussionID) + 1
-	go rt.recommendForSetupBatch(context.Background(), row.DiscussionID, attempt, req)
+	// 在途去重：这个 discussion 已经有一批在跑（用户在「比通常慢」的软提示里点了
+	// 重试 / 换一批 / 自动续推），**不再派发新命令**。叠加派发不会更快 —— 设备端是
+	// 单槽串行队列，只会多排一整轮 LLM，角色还可能翻倍。
+	//
+	// 注意 appendMode 一样受这层约束：续推叠加同样是双批。回包的 code 与失败码
+	// 严格区分，前端据此保持等待态，不切失败卡、不诱导再次重试。
+	if !rt.dispatchSetupRecommend(row.DiscussionID, attempt, req) {
+		if rt.logger != nil {
+			rt.logger.Info("discussion: setup 推荐已在进行中，忽略本次派发",
+				"discussionId", row.DiscussionID, "attempt", attempt, "append", req.appendMode)
+		}
+		return okResult(map[string]interface{}{
+			"accepted":        true,
+			"already_running": true,
+			"code":            setupRecommendInProgressCode,
+		})
+	}
 	return okResult(map[string]interface{}{"accepted": true})
+}
+
+// dispatchSetupRecommend 是角色推荐的唯一派发口：先占「在途」位，占不到就返回
+// false（调用方回「已在进行中」），占到了才起后台 goroutine。
+//
+// 释放放在 goroutine 的 defer 里，因此**所有**出口都会清标记：8 条早退分支、
+// 成功、以及每一种 fail(code)（setup_recommend_failed 落事件后照样清）。失败后
+// 用户点重试必须立刻能重新派发 —— 一个清不掉的标记比现在的重复派发更糟。
+func (rt *discussionRuntime) dispatchSetupRecommend(discussionID string, attempt int, req setupRecommendRequest) bool {
+	acquiredAt, ok := rt.recommendGate.tryAcquire(discussionID)
+	if !ok {
+		return false
+	}
+	go func() {
+		// detached context：命令回调早已 200，后台管线不随回调取消。
+		defer rt.recommendGate.release(discussionID, acquiredAt)
+		rt.recommendForSetupBatch(context.Background(), discussionID, attempt, req)
+	}()
+	return true
 }
 
 // setupRecommendAttempt 数已发出的 roles 推荐卡条数（含失败卡），得出当前 attempt。
@@ -411,8 +453,9 @@ type setupRecommendRequest struct {
 	appendMode bool
 }
 
-// recommendForSetupAsync 是首推（S1）用的入口：没有候选收敛/续推参数，等价于零值
-// setupRecommendRequest。保留这个形状，调用方（含既有用例）无需跟着改。
+// recommendForSetupAsync 是首推（S1）形状的入口：没有候选收敛/续推参数，等价于
+// 零值 setupRecommendRequest。S1 现在统一走 dispatchSetupRecommend（要先占在途闸门），
+// 这里保留下来给用例**同步**驱动整条管线（异步版本在用例里不好断言顺序）。
 func (rt *discussionRuntime) recommendForSetupAsync(ctx context.Context, discussionID string, attempt int) {
 	rt.recommendForSetupBatch(ctx, discussionID, attempt, setupRecommendRequest{})
 }
