@@ -6,6 +6,10 @@ import {
   detectDiscussionStyle,
   parseRoleRecommendRequest,
   parseRoleRecommendationOutput,
+  ROLE_RECOMMEND_MAX_PROMPT,
+  ROLE_RECOMMEND_ROLE_PROMPT_CHARS,
+  ROLE_RECOMMEND_TARGET_ROLES,
+  roleRecommendTargetRoleCount,
   STALE_ROLE_RECOMMEND_REQUEST_MS,
   type RoleRecommendRequest,
 } from "./role-recommend.js";
@@ -82,7 +86,9 @@ describe("buildRoleRecommendPrompt", () => {
     expect(prompt.startsWith("用中文，角色要具体")).toBe(true);
     expect(prompt).toContain("Topic: AI 与就业");
     expect(prompt).toContain("Goal: 找平衡");
-    expect(prompt).toContain("Return between 1 and 4 roles.");
+    // 产品口径 3 个角色：max_roles=4 时目标仍是 3（min(3, max_roles)）。
+    expect(prompt).toContain("Return exactly 3 roles.");
+    expect(prompt).not.toContain("Return exactly 4 roles.");
     expect(prompt).toContain('"speaking_order"');
   });
 
@@ -95,6 +101,55 @@ describe("buildRoleRecommendPrompt", () => {
       recommendationPrompt: "",
     });
     expect(prompt).not.toContain("Goal:");
+  });
+
+  it("pins role_prompt to one short paragraph in the prompt only", () => {
+    const prompt = buildRoleRecommendPrompt({
+      requestId: "r",
+      topic: "t",
+      goal: "",
+      maxRoles: 3,
+      recommendationPrompt: "",
+    });
+    expect(prompt).toContain(String(ROLE_RECOMMEND_ROLE_PROMPT_CHARS));
+    expect(prompt).toContain("不写小标题、不分点、不举例");
+    // 提示词里的尺寸口径与本地拒收闸门是两件事：闸门必须依旧宽松，
+    // 否则模型正常的长回答会被判成「错误回复」。
+    expect(ROLE_RECOMMEND_MAX_PROMPT).toBe(8000);
+    expect(ROLE_RECOMMEND_MAX_PROMPT).toBeGreaterThan(ROLE_RECOMMEND_ROLE_PROMPT_CHARS);
+  });
+});
+
+// 提示词里的角色数 = min(产品口径 3, 服务端下发的 max_roles)。
+describe("roleRecommendTargetRoleCount", () => {
+  it("takes the smaller of the product target and max_roles", () => {
+    expect(ROLE_RECOMMEND_TARGET_ROLES).toBe(3);
+    expect(roleRecommendTargetRoleCount(1)).toBe(1);
+    expect(roleRecommendTargetRoleCount(2)).toBe(2);
+    expect(roleRecommendTargetRoleCount(3)).toBe(3);
+    expect(roleRecommendTargetRoleCount(4)).toBe(3);
+    expect(roleRecommendTargetRoleCount(8)).toBe(3);
+    // 非法/缺省不该产出 0 或 NaN 个角色。
+    expect(roleRecommendTargetRoleCount(Number.NaN)).toBe(3);
+    expect(roleRecommendTargetRoleCount(0)).toBe(1);
+  });
+
+  it("asks for max_roles roles when the pool is smaller than the target", () => {
+    const two = buildRoleRecommendPrompt({
+      requestId: "r",
+      topic: "t",
+      goal: "",
+      maxRoles: 2,
+      recommendationPrompt: "",
+    });
+    expect(two).toContain("Return exactly 2 roles.");
+    // 校验闸门跟着 max_roles 走（不是产品口径）：少于 equal 不拦。
+    expect(parseRoleRecommendationOutput(JSON.stringify({
+      roles: [
+        { role_name: "A", role_prompt: "p", speaking_order: 0 },
+        { role_name: "B", role_prompt: "p", speaking_order: 1 },
+      ],
+    }), 2)).not.toBeNull();
   });
 });
 
@@ -212,13 +267,14 @@ describe("discussion style steering", () => {
     const owner = new Map<string, string>();
     for (const id of styleIds) {
       const names = [...promptFor(id, { maxRoles: 8 }).matchAll(/^\d+\. (.+)$/gm)].map((m) => m[1]);
-      expect(names.length, `${id} 至少要给出一个角色`).toBeGreaterThan(0);
+      // 产品口径 3 个角色：max_roles 再大也只列前三名（见 roleRecommendTargetRoleCount）。
+      expect(names.length, `${id} 应给出 ${ROLE_RECOMMEND_TARGET_ROLES} 个角色`).toBe(ROLE_RECOMMEND_TARGET_ROLES);
       for (const name of names) {
         expect(owner.has(name), `角色「${name}」在 ${id} 与 ${owner.get(name)} 之间重复`).toBe(false);
         owner.set(name, id);
       }
     }
-    expect(owner.size).toBe(20);
+    expect(owner.size).toBe(styleIds.length * ROLE_RECOMMEND_TARGET_ROLES);
   });
 
   it("writes each style's own speaking voice into the prompt", () => {
@@ -239,16 +295,20 @@ describe("discussion style steering", () => {
   });
 
   it("caps the cast at max_roles and asks for the shortfall", () => {
+    // 候选设备只有 2 台：只能要 2 个角色（一个 agent 演一个角色）。
     const tight = promptFor("debate", { maxRoles: 2 });
     expect(tight).toContain("1. 正方主辩");
     expect(tight).toContain("2. 反方主辩");
     expect(tight).not.toContain("3. 证据审查员");
     expect(tight).not.toContain("add up to");
+    expect(tight).toContain("Return exactly 2 roles.");
 
+    // 候选再宽也只按产品口径 3 个走，第 4 个角色（裁判）不进提示词。
     const roomy = promptFor("debate", { maxRoles: 8 });
     expect(roomy).toContain("3. 证据审查员");
-    expect(roomy).toContain("4. 裁判");
-    expect(roomy).toContain("add up to 4 role(s)");
+    expect(roomy).not.toContain("4. 裁判");
+    expect(roomy).not.toContain("add up to");
+    expect(roomy).toContain("Return exactly 3 roles.");
   });
 
   it("matches the explicit style with the goal-only fallback", () => {
@@ -265,6 +325,6 @@ describe("discussion style steering", () => {
       recommendationPrompt: "",
     });
     expect(prompt).not.toContain("Discussion style:");
-    expect(prompt).toContain("Return between 1 and 3 roles.");
+    expect(prompt).toContain("Return exactly 3 roles.");
   });
 });
