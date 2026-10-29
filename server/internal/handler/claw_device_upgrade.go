@@ -46,6 +46,21 @@ const (
 	clawUpgradeStatusCancelled   = "cancelled"
 )
 
+// 动作中失联的判定与错误码。
+const (
+	// clawUpgradeStallLease 是「设备多久没上报进度就算失联」。
+	//
+	// 为什么是 15 分钟：一次 88MB 下载在慢出口上要几分钟，交换 + 重启再要 1-3
+	// 分钟，中间还有「等空闲」被 force 打断之类的情况。10 分钟会把「正在慢慢下」
+	// 误判成失联；半小时又会让管理员盯着一行永远不动的「下载中」发呆。15 分钟
+	// 足够覆盖正常的一次升级，也短到能在一个工作时段内自愈。
+	clawUpgradeStallLease = 15 * time.Minute
+	// clawUpgradeOfflineErrorCode 是「动作中失联」的错误码。管理端按它翻译文案
+	// （UpgradeModal 的 upgradeErrorText），纠偏逻辑也靠它区分「失联判死」与
+	// 「真的失败」（swap_failed 之类）。
+	clawUpgradeOfflineErrorCode = "device_offline"
+)
+
 // 设备可回传的状态（” 与 pending 都是服务端写入的，设备不得自己回到 pending）。
 var clawUpgradeDeviceReportable = map[string]bool{
 	clawUpgradeStatusWaitingIdle: true,
@@ -188,6 +203,105 @@ func clawUpgradeTerminal(status string) bool {
 	}
 }
 
+// clawUpgradeStallDetail 是失联判死时写给管理端看的一句话。
+//
+// 必须说清三件事：怎么判的（15 分钟没有进度）、现在能不能救（重新下发）、
+// 设备现状（原版本未受影响）。否则管理员只能看到一行「失败」，然后去猜设备是
+// 不是已经被升坏了。
+func clawUpgradeStallDetail() string {
+	return fmt.Sprintf(
+		"设备已超过 %d 分钟没有上报进度；设备恢复后可重新下发；原版本未受影响",
+		int(clawUpgradeStallLease.Minutes()))
+}
+
+// clawUpgradeSweepStalled 把「动作中失联」的行收尾成 failed(device_offline)。
+//
+// 为什么需要它（这是本轮要修的第二个缺陷）：升级只在设备主动轮询时才往前走，
+// 没有任何后台调度器。设备在 downloading / verifying / restarting 阶段掉线
+// （断电、断网、进程被杀、换盘后卡在重启），那一行就会**永远**停在「下载中」，
+// 页面上是一行转圈转到天荒地老，管理员既看不出失败也无法重试 —— 因为「重新
+// 下发」按钮只对终态开放时才有意义，而它压根没进终态。
+//
+// 判据只用 `updated_at`，这是安全的，且必须写清楚为什么：
+//   - 设备每 10 秒的 control 轮询都会走 clawDeviceRecordUpgradeState，那里有
+//     `updated_at = now()`；设备每报一次进度也会刷新它。所以**在线**设备永远
+//     不会被判失联，哪怕它正在慢慢地下一份 88MB。
+//   - 反过来，`pending` / `waiting_idle` **绝不能**被 sweep 碰：那两个状态的
+//     语义就是「等设备来领」，离线设备上线后第一轮轮询就该把它领走。按时间判死
+//     会把「排队的指令」直接作废，那正是波次闸与离线下发存在的理由。
+//     succeeded / cancelled 同理不能被改写。
+//
+// lease 通过参数传进 SQL（不把分钟数硬编进语句）：单测与运维调参都要能改它，
+// 而 SQL 里出现字面量就等于把策略藏进字符串。
+//
+// batchID 非空按批次收尾（弹窗一次刷一整批），否则按 machineID（单台查询）。
+// 需要「不管属于谁，全表一起收」的场景走 clawUpgradeSweepStalledFleet。
+// clawUpgradeStalledSweepSet 是两个 sweep（按作用域 / 全量）共用的 SET 与 WHERE
+// 主干。抽出来是为了让「判死的状态集合」「租约怎么算」「写哪些字段」只有一份 ——
+// 两处各抄一遍的话，某天只改一边，症状是「列表自愈了、弹窗不自愈」这种毫无头绪
+// 的不一致。
+const clawUpgradeStalledSweepSet = `
+		UPDATE rongcloud_node_upgrade
+		   SET status = $1, error_code = $2, error_detail = $3, updated_at = now()
+		 WHERE status IN ($4, $5, $6)
+		   AND updated_at < now() - ($7::double precision * interval '1 second')`
+
+// clawUpgradeStalledSweepArgs 是对应的固定参数前缀（$1..$7）。
+func clawUpgradeStalledSweepArgs() []interface{} {
+	return []interface{}{
+		clawUpgradeStatusFailed, clawUpgradeOfflineErrorCode, clawUpgradeStallDetail(),
+		clawUpgradeStatusDownloading, clawUpgradeStatusVerifying, clawUpgradeStatusRestarting,
+		clawUpgradeStallLease.Seconds(),
+	}
+}
+
+func (h *Handler) clawUpgradeSweepStalled(ctx context.Context, batchID, machineID string) error {
+	if h.DB == nil {
+		return nil
+	}
+	// 两个键都空 = 没有任何范围，一条 UPDATE 就能把全表动作中的行判死。这不该
+	// 发生，但「靠 `machine_id = ''` 恰好匹配不到任何行」是巧合而不是保证 ——
+	// 老数据里 machine_id 真为空的话，这个巧合就会变成一次静默的批量误杀。
+	// 需要全量收尾时走下面那个专门的函数（它的名字和注释都写明了自己无作用域）。
+	if batchID == "" && machineID == "" {
+		return nil
+	}
+	query := clawUpgradeStalledSweepSet
+	args := clawUpgradeStalledSweepArgs()
+	if batchID != "" {
+		query += ` AND batch_id = $8`
+		args = append(args, batchID)
+	} else {
+		query += ` AND machine_id = $8`
+		args = append(args, machineID)
+	}
+	_, err := h.DB.Exec(ctx, query, args...)
+	return err
+}
+
+// clawUpgradeSweepStalledFleet 是全量版本的失联收尾：一次覆盖所有卡在动作中的行，
+// 不管它属于哪个批次、哪台机器。
+//
+// 为什么必须有它（这是「页面上那行永远转圈」真正发生的地方）：管理端**主列表**
+// （GET /api/admin/nodes）走的是 clawAdminNodeUpgrades —— 一条 `SELECT ... FROM
+// rongcloud_node_upgrade` 全表读，把 status 贴到行的 UpgradeStatus 上，前端
+// src/pages/Nodes/index.tsx 直接拿它渲染「下载中」标签。只给单台/批次查询挂 sweep
+// 的话，设备掉线后主列表那一列会永久停在「下载中」，只有有人恰好点开升级弹窗才自愈
+// —— 而那正是用户截图里那台「1.3.7 / 下载中 / 10-24 21:14」。
+//
+// 为什么不加节流（刻意）：这张表是一机一行，`status` 上有索引（迁移 601 的
+// rongcloud_node_upgrade_status_idx），命中的行通常是 0 —— 一次几十行的管理端列表
+// 请求后面跟一条走索引的 UPDATE，比引入一个包级的「上次 sweep 时间」状态更便宜，
+// 也少一个「多副本各算各的」的坑。而弹窗那条按批次收窄，是因为它天然知道自己只关心
+// 一个 batch_id；两者各有一个明确的判据，不需要共用一套节流。
+func (h *Handler) clawUpgradeSweepStalledFleet(ctx context.Context) error {
+	if h.DB == nil {
+		return nil
+	}
+	_, err := h.DB.Exec(ctx, clawUpgradeStalledSweepSet, clawUpgradeStalledSweepArgs()...)
+	return err
+}
+
 // upgradeWaveOpen 是批量波次的放行判据：同批次里任何更低编号的波次还有活跃
 // 机器时，本波次不下发。纯函数，便于单测（DB 那份计数在
 // clawDeviceUpgradePending).
@@ -294,23 +408,45 @@ func (h *Handler) clawDeviceUpgradeFailPlatform(ctx context.Context, machineID s
 //
 // 条件更新（desired_generation 仍是读到的那次 + 状态仍非终态），所以管理员此刻
 // 又下发了一次的话不会被这条覆盖。
+//
+// 为什么允许纠正 `failed`：失联判死（clawUpgradeSweepStalled，error_code =
+// device_offline）会把一行标成 failed，但设备其实可能已经把盘换完、正在重启，
+// 只是重启期间超过了 15 分钟租约。它上线时版本已经是目标版本 —— 这是**事实**，
+// 比服务端那行 failed 更权威。不允许纠正的话，页面会永远显示「升级中途失联」，
+// 而设备明明已经升级成功，管理员接下来只能靠人肉确认。
+//
+// 但只放开 device_offline 这一种 failed：`(status <> 'failed' OR error_code =
+// device_offline)`。swap_failed / checksum_mismatch / restart_failed 是设备自己
+// 报上来的真失败，把它们抹成 succeeded 等于用「版本号碰巧对上」掩盖一次失败
+// （例如设备装的是同一个版本的另一个构建）。
 func (h *Handler) clawDeviceUpgradeCompleteInPlace(ctx context.Context, machineID string, upgrade clawNodeUpgrade, currentVersion string) {
 	if h.DB == nil {
 		return
 	}
-	if _, err := h.DB.Exec(ctx, `
+	tag, err := h.DB.Exec(ctx, `
 		UPDATE rongcloud_node_upgrade
 		   SET status = $3, error_code = '', error_detail = '', updated_at = now()
 		 WHERE machine_id = $1 AND desired_generation = $2
-		   AND status NOT IN ($4, $5, $6)`,
+		   AND status NOT IN ($4, $5)
+		   AND (status <> $6 OR error_code = $7)`,
 		machineID, upgrade.DesiredGeneration, clawUpgradeStatusSucceeded,
-		clawUpgradeStatusSucceeded, clawUpgradeStatusFailed, clawUpgradeStatusCancelled); err != nil {
+		clawUpgradeStatusSucceeded, clawUpgradeStatusCancelled,
+		clawUpgradeStatusFailed, clawUpgradeOfflineErrorCode)
+	if err != nil {
 		slog.Warn("claw: failed to close an already-installed upgrade",
 			"machine", machineID, "version", currentVersion, "error", err)
 		return
 	}
+	// 只有真的改到了行才打「marked succeeded」。`cancelled`（以及并发下已经变成
+	// 终态的行）会让上面的 WHERE 一行都不匹配 —— 那种情况下再打一条
+	// 「已标成成功」的日志，等于在日志里制造一次不存在的成功：事后排查的人会看到
+	// 「服务端说成功了」和「页面显示已取消」，然后开始怀疑哪边在撒谎。
+	if tag.RowsAffected() == 0 {
+		return
+	}
 	slog.Info("claw: upgrade already installed on the device, marked succeeded",
-		"machine", machineID, "version", currentVersion, "generation", upgrade.DesiredGeneration)
+		"machine", machineID, "version", currentVersion,
+		"generation", upgrade.DesiredGeneration, "previous_status", upgrade.Status)
 }
 
 // clawDeviceUpgradeIntent 决定本轮要不要给这台机器下发升级指令。
@@ -332,6 +468,20 @@ func (h *Handler) clawDeviceUpgradeIntent(
 		return nil, err
 	}
 	if clawUpgradeTerminal(upgrade.Status) || upgrade.Status == "" {
+		// 终态里唯一还要看一眼的是 failed：失联判死（device_offline）之后设备可能
+		// 其实已经升成功了 —— 它换完盘、在重启窗口里超过了 15 分钟租约，被
+		// clawUpgradeSweepStalled 标成 failed。设备此刻上报的版本就是**事实**：
+		// 只要它等于目标版本，就把这一行纠正成 succeeded。
+		//
+		// 不做这一步的后果不是「页面难看」，而是**永远错**：设备已经是新版，
+		// 管理员看到的是「升级中途失联」，再点一次「下发」时服务端会按
+		// `current >= latest` 跳过（页面提示「已是最新」）—— 那条 failed 行再也
+		// 没有任何路径能变成 succeeded。设备没有能力自己纠正：它的 succeeded
+		// 回传在升级那一次就已经发过（或被判 409 丢弃），之后不会再发。
+		if upgrade.TargetVersion != "" && currentVersion == upgrade.TargetVersion &&
+			upgrade.Status != clawUpgradeStatusSucceeded {
+			h.clawDeviceUpgradeCompleteInPlace(ctx, machineID, upgrade, currentVersion)
+		}
 		return nil, nil
 	}
 	if !clawUpgradePlatformSupported(upgrade.ReportedPlatform) {

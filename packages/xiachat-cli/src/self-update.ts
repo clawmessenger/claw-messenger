@@ -129,6 +129,16 @@ export function assetNameForPlatform(platform: string, arch: string): string {
 export type FetchLike = (url: string, init?: {
   headers?: Record<string, string>;
   redirect?: "follow" | "manual" | "error";
+  /**
+   * Abort signal, so a mirror that never answers cannot pin the whole upgrade.
+   *
+   * Why this is part of the fetch contract: on a restricted egress the TCP
+   * connect to github.com often just black-holes — nothing refuses, nothing
+   * times out at the OS level for minutes. Without a per-mirror deadline the
+   * supervisor sits on "downloading" and never falls through to the next
+   * source, which is exactly the bug this signature exists to prevent.
+   */
+  signal?: AbortSignal;
 }) => Promise<{
   ok: boolean;
   status: number;
@@ -454,12 +464,84 @@ export interface MirrorStageResult extends StageResult {
 }
 
 /**
+ * 直连源的**连接**超时：从发请求到拿到响应头为止。
+ *
+ * 15 秒是给「连不上」这一种情况用的：受限出口打到 github.com 往往是黑洞（既不
+ * 拒绝也不返回），没有这个上限就会一直卡在 fetch 上，页面停在「下载中」而设备端
+ * 一条日志都没有。
+ *
+ * 它**不能**是整个下载的上限。曾经的实现用一个 `AbortSignal.timeout(15_000)`
+ * 覆盖全程，等于要求 88MB 在 15 秒内传完（持续 ≥47Mbps）—— GitHub 在企业出口
+ * 上通常只有 1–10MB/s，于是「服务端没外网时直连是唯一活路」这条兜底实际必然
+ * 失败，设备只会拿到 download_failed。连接快 ≠ 传得快，这两件事必须分开计时。
+ */
+export const DIRECT_CONNECT_TIMEOUT_MS = 15_000;
+
+/**
+ * 直连源的**传输**上限：连接建立之后把 body 读完。
+ *
+ * 10 分钟：88MB 在 1MB/s 的出口上要 90 秒，10MB/s 只要 9 秒；给到 10 分钟是为了
+ * 让「慢但通」的出口能传完。这是防挂死的墙钟，不是期望耗时。
+ */
+export const DIRECT_TRANSFER_TIMEOUT_MS = 600_000;
+
+/**
+ * 服务端代理（相对路径）的总墙钟：15 分钟。
+ *
+ * 为什么必须比 `upgrade_download.go` 里 `clawUpgradeCachedAsset` 的
+ * `http.Client{Timeout: 10 * time.Minute}` **更长**：那个端点是「先回源落盘、再
+ * ServeContent」，不是边拉边发。冷缓存时首台设备的等待 = 服务端自己去 GitHub 拉
+ * 完 88MB 的全程。如果设备这边和服务端同量级（曾经都是 10 分钟），慢出口上就是
+ * 「服务端还在拉，设备先把自己掐了」—— 表现成 download_failed，而正确做法是等
+ * 服务端把文件落盘，之后所有设备都命中缓存。
+ *
+ * 代理这一跳没有「连接快」的假设：那一跳是设备自己正在用的业务域名，连接本身
+ * 不是问题，只有一个总时限。
+ */
+export const PROXY_MIRROR_TIMEOUT_MS = 900_000;
+
+/**
+ * 一个下载源的两阶段时间预算。
+ *
+ * `connectMs` 只覆盖「等到响应头」，`totalMs` 覆盖「整个源」。
+ */
+export interface MirrorTimeoutPlan {
+  connectMs: number;
+  totalMs: number;
+}
+
+/**
+ * 某个下载源应该怎么计时。
+ *
+ * 判据是「这个源是不是服务端代理」：服务端下发的代理是相对路径（以 `/` 开头），
+ * 设备用自己 serverUrl 拼出来；绝对 http(s) 则是直连外部。判据**必须用服务端
+ * 下发的原始项**，不能用拼好之后的 URL —— 代理拼上 serverUrl 之后也是一个 https
+ * 地址，用它判断会把代理也套上直连那套计时。
+ *
+ * 导出是为了能被单测钉住数量级：端到端测一个 15 秒/15 分钟超时，要么让测试真跑
+ * 十几分钟，要么只能靠假时钟，两者都不值得。
+ */
+export function mirrorTimeoutPlan(mirror: string): MirrorTimeoutPlan {
+  if (/^https?:\/\//i.test(mirror)) {
+    return { connectMs: DIRECT_CONNECT_TIMEOUT_MS, totalMs: DIRECT_TRANSFER_TIMEOUT_MS };
+  }
+  return { connectMs: PROXY_MIRROR_TIMEOUT_MS, totalMs: PROXY_MIRROR_TIMEOUT_MS };
+}
+
+/**
  * 按 mirrors 顺序下载并校验一个指定版本，写成暂存件。
  *
  * 与 stageUpdate 的区别：目标不是「GitHub 上的 latest」，而是服务端点名要装的
- * 那个版本 + 它给的 sha256；下载源也不止一个（先直连 GitHub，失败回退服务端
- * 代理）。任何一个源拿到的字节 sha256 不符都换下一个源 —— 校验失败可能是镜像
- * 缓存坏了，不该因为第一个源坏了就放弃整次升级。
+ * 那个版本 + 它给的 sha256；下载源也不止一个（**先服务端代理，失败再直连**，
+ * 服务端可以按 CLAW_UPGRADE_DIRECT_FIRST 改回直连优先）。任何一个源拿到的字节
+ * sha256 不符都换下一个源 —— 校验失败可能是镜像缓存坏了，不该因为第一个源坏了
+ * 就放弃整次升级。
+ *
+ * 每个源都是**两阶段**计时（见 mirrorTimeoutPlan）：连接一个预算、整个源一个
+ * 预算。两个定时器都在发请求那一刻起算，所以「连接 + 传输」天然不会超过
+ * totalMs，不需要再减去已经花掉的连接时间。超时/中断走同一条 failures 通道：
+ * AbortError 被下面的 catch 兜住，记一条带阶段的失败后继续下一个源，而不是让
+ * 整次升级停在一个连不上的地址上。
  */
 export async function stageUpdateFromMirrors(
   plan: MirrorPlan,
@@ -472,18 +554,80 @@ export async function stageUpdateFromMirrors(
   for (const mirror of plan.mirrors) {
     if (!mirror) continue;
     const url = mirror.startsWith("/") ? serverUrl.replace(/\/+$/, "") + mirror : mirror;
+    const budget = mirrorTimeoutPlan(mirror);
+    // 两个定时器都在「发请求」这一刻起算：
+    //   · connectTimer —— 只活到拿到响应头；
+    //   · totalTimer   —— 整个源的硬上限，跨连接与传输两段。
+    // 这样「连接 + 传输」永远不超过 totalMs，也就不需要在第二段里减去已经花掉的
+    // 时间（那种减法在时钟精度和重试面前很容易算成 0）。
+    // AbortController 在某些嵌入式运行时里可能不存在，拿不到就退化成「没有超时」，
+    // 而不是让整次升级在这里抛异常。
+    const controller = typeof AbortController !== "undefined" ? new AbortController() : undefined;
+    let phase: "connect" | "transfer" = "connect";
+    // 「谁掐的」与「现在在哪个阶段」是两件事，必须分开记：
+    //   · phase 会在拿到响应头时翻成 transfer（它描述**进行到哪**）；
+    //   · firedPhase 只在**定时器真的烧到点**时置位（它描述**谁掐的**）。
+    // 只按 phase 归因会把两种完全不同的情况都说成「超时」——
+    //   1. 连一个没人监听的端口（ECONNREFUSED，立刻失败，根本没等 15 秒）会被写成
+    //      "connect timeout 15000ms"，把人引去调那个超时数字；
+    //   2. 连接预算掐断的那一刻 phase 可能已被翻成 transfer，写成
+    //      "transfer timeout 600000ms"，更离谱。
+    // 所以：firedPhase 有值才叫 timeout，否则叫 failed。
+    let firedPhase: "connect" | "transfer" | null = null;
+    let connectTimer: ReturnType<typeof setTimeout> | undefined;
+    let totalTimer: ReturnType<typeof setTimeout> | undefined;
+    if (controller) {
+      // totalTimer 先注册：它必须在任何阶段都能兜住。归因取**掐断那一刻**的阶段 ——
+      // 代理那一支唯一的墙钟就是这个定时器：还没等到响应头就是 connect，
+      // 头之后是 transfer，两种情况的处置完全不同（换出口 vs 预热缓存）。
+      totalTimer = setTimeout(() => {
+        firedPhase = phase;
+        controller.abort();
+      }, budget.totalMs);
+      // 代理那一支 connectMs === totalMs（它没有「连接快」的假设），就不必再挂一个
+      // 同时到点的连接定时器 —— 两个 abort 同时到点，谁先跑谁定义文案，等于掷硬币。
+      if (budget.connectMs < budget.totalMs) {
+        connectTimer = setTimeout(() => {
+          firedPhase = "connect";
+          controller.abort();
+        }, budget.connectMs);
+      }
+    }
     let bytes: Buffer;
     try {
       onStage?.("downloading", url);
-      const res = await fetchImpl(url, { headers: { "User-Agent": "clawmessenger-cli" } });
+      const init = { headers: { "User-Agent": "clawmessenger-cli" }, ...(controller ? { signal: controller.signal } : {}) };
+      const res = await fetchImpl(url, init);
+      // 头到了：连接这一阶段结束，剩下的时间全部留给 body。这一句是两阶段能成立的
+      // 关键 —— 少了它，body 读取会被 15 秒的连接预算顺带掐掉（那正是上一版的 bug）。
+      if (connectTimer !== undefined) {
+        clearTimeout(connectTimer);
+        connectTimer = undefined;
+      }
+      phase = "transfer";
       if (!res.ok) {
         failures.push(`${url}: HTTP ${res.status}`);
         continue;
       }
       bytes = Buffer.from(await res.arrayBuffer());
     } catch (err) {
-      failures.push(`${url}: ${err instanceof Error ? err.message : String(err)}`);
+      // 这里同时兜住网络错误与 abort：两者对调用方是同一件事 —— 这个源没拿到字节，
+      // 换下一个。文案里要能分出三件事：被连接预算掐、被总预算掐、以及对端自己失败。
+      // 只留一句 "This operation was aborted" 的话，运维既不知道是哪一跳，
+      // 也不知道该去换出口（连不上）还是预热缓存/等更久（传不完）。
+      const reason = err instanceof Error ? err.message : String(err);
+      const attribution = firedPhase === "connect"
+        ? `(connect timeout ${budget.connectMs}ms)`
+        : firedPhase === "transfer"
+          ? `(transfer timeout ${budget.totalMs}ms)`
+          // 没有定时器到点 = 网络层自己失败（ECONNREFUSED / ENOTFOUND / TLS /
+          // 连接被 reset）。这一支绝不能写 timeout：它一秒都没等。
+          : `(${phase} failed)`;
+      failures.push(`${url}: ${reason} ${attribution}`);
       continue;
+    } finally {
+      if (connectTimer !== undefined) clearTimeout(connectTimer);
+      if (totalTimer !== undefined) clearTimeout(totalTimer);
     }
     onStage?.("verifying", url);
     const actual = createHash("sha256").update(bytes).digest("hex");

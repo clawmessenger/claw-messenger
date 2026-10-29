@@ -1801,7 +1801,19 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
     ?? upgradeTargetPath(devicePlatform, process.argv[1], process.execPath, os.homedir());
   const inflightPath = supervisor.upgradeInflightPath ?? defaultUpgradeInflightPath();
   const upgradeFetch: UpgradeFetch = supervisor.upgradeFetch
-    ?? ((url) => fetch(url, { headers: { "User-Agent": "clawmessenger-cli" } }) as unknown as ReturnType<FetchLike>);
+    // 这里是 FetchLike 契约的忠实转发，**三个字段都要透**：
+    //   · signal  —— self-update.ts 的两阶段超时（连接 15 秒 / 整个源 10 分钟或
+    //                15 分钟）全靠它生效，丢掉就等于「受限出口直连黑洞时永远卡在
+    //                下载中」；它同时也是 body 读取唯一的中断手段。
+    //   · redirect —— 今天没人传，但它是契约的一部分：将来谁传 redirect:"manual"
+    //                （比如要自己看 302 去判断镜像可用性），静默丢掉会让那段逻辑
+    //                永远拿到 followed 的响应，而且错得很安静。
+    //   · headers  —— 缺省补 User-Agent（GitHub 对空 UA 直接 403）。
+    ?? ((url, init) => fetch(url, {
+      ...(init?.signal ? { signal: init.signal } : {}),
+      ...(init?.redirect ? { redirect: init.redirect } : {}),
+      headers: init?.headers ?? { "User-Agent": "clawmessenger-cli" },
+    }) as unknown as ReturnType<FetchLike>);
   const relaunch = supervisor.relaunch ?? ((target: string, waitPid: number, passthroughArgs: string[] = []) => {
     // helper 是**新** exe：交换已经完成，process.execPath 现在指向新镜像。
     // `--args` 用 JSON 数组而不是把它摊成多个 argv：参数里可能有以 `-` 开头的

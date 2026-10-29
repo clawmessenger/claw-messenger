@@ -468,9 +468,36 @@ func mustHexDecode(s string) []byte {
 	return raw
 }
 
-// clawUpgradeMirrors 给出设备下载该版本资产的顺序：先直连 GitHub（CDN 不限流、
-// 不过服务端带宽），失败再回退服务端代理。代理地址是 **服务端相对路径** ——
-// 设备自己知道它的 serverUrl（凭据里就有），不需要服务端配置公网域名。
+// clawUpgradeDirectFirst 让运维把下载顺序切回「直连优先」（历史顺序）。
+//
+// 默认是**代理优先**，这个开关只用于两种情况：服务端本身没有外网出口（代拉不了，
+// 只能让设备自己想办法），或者运维明确不希望安装包过服务端。取值 "1" / "true"
+// 打开，其它一切值（含空）保持默认。
+func clawUpgradeDirectFirst() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("CLAW_UPGRADE_DIRECT_FIRST"))) {
+	case "1", "true":
+		return true
+	default:
+		return false
+	}
+}
+
+// clawUpgradeMirrors 给出设备下载该版本资产的顺序：**先服务端代理，再直连**。
+// 代理地址是 **服务端相对路径** —— 设备自己知道它的 serverUrl（凭据里就有），
+// 不需要服务端配置公网域名。
+//
+// 为什么默认顺序是代理优先（而不是「CDN 更快所以先直连」）：
+//
+//  1. 受限出口的设备（内网、白名单出口、只放行业务域名）到 github.com 是**黑洞**
+//     而不是「快速失败」。设备先白试一次直连，要一直等到 undici 的默认超时才会
+//     换下一个源，页面就长时间停在「下载中」——管理员看到的是「升级卡住了」，而
+//     服务端日志一条错误都没有。先走代理，第一跳就是可达的业务域名。
+//  2. 带宽是可控的取舍，不是不可控的浪费：代理端点有落盘缓存
+//     （<cache>/<version>/<asset>，见 upgrade_download.go），同一版本只回源 GitHub
+//     一次，之后 N 台设备共享同一份文件；而 100 台设备各自直连 GitHub 是 100 份
+//     88MB 打在同一条企业出口上 —— 那才是会打满带宽的那种用法。
+//  3. 直连地址仍然排在后面，不是删掉：服务端自己没外网（代拉必然 502）时，设备
+//     的出口反而可能是通的，回退到直连就是那条路的唯一活路。
 //
 // token 为空（服务端没配 MULTICA_CLAW_UPGRADE_TOKEN_SECRET）时只给直连地址：
 // 代理端点此刻是 503，把它排在 mirrors 里只会让设备多等一次必然失败的尝试。
@@ -484,13 +511,15 @@ func clawUpgradeMirrors(release *clawUpgradeRelease, asset, token string) (mirro
 		// 按「没有可下载地址」处理，而不是给设备一个 404 的 URL。
 		return nil, ""
 	}
-	mirrors = []string{direct}
 	if token == "" {
-		return mirrors, direct
+		return []string{direct}, direct
 	}
-	mirrors = append(mirrors, fmt.Sprintf("/api/agent/upgrade/download?version=%s&asset=%s&token=%s",
-		release.Version, asset, token))
-	return mirrors, direct
+	proxy := fmt.Sprintf("/api/agent/upgrade/download?version=%s&asset=%s&token=%s",
+		release.Version, asset, token)
+	if clawUpgradeDirectFirst() {
+		return []string{direct, proxy}, direct
+	}
+	return []string{proxy, direct}, direct
 }
 
 // clawUpgradeAssetsByPlatform 是「设备上报的 <os>-<arch>」→ Release 资产名的唯一

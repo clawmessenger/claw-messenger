@@ -623,6 +623,13 @@ func (h *Handler) ClawAdminGetNodeUpgrade(w http.ResponseWriter, r *http.Request
 		clawAdminFail(w, 400, "缺少机器标识")
 		return
 	}
+	// 读库之前先把「动作中失联」的行收尾：页面上那行不能永远转圈（见
+	// clawUpgradeSweepStalled 的注释）。sweep 失败只记日志 —— 查询本身不该因为
+	// 一次收尾写失败而 500，管理员至少还能看到当前状态。
+	if err := h.clawUpgradeSweepStalled(r.Context(), "", machineID); err != nil {
+		slog.Warn("claw admin: failed to sweep a stalled upgrade",
+			"machine", machineID, "error", err)
+	}
 	upgrade, found, err := h.clawNodeUpgradeByMachine(r.Context(), machineID)
 	if err != nil {
 		clawAdminFail(w, 500, "查询升级进度失败")
@@ -653,6 +660,12 @@ func (h *Handler) ClawAdminListNodeUpgrades(w http.ResponseWriter, r *http.Reque
 	if batchID == "" {
 		clawAdminFail(w, 400, "缺少批次标识")
 		return
+	}
+	// 同单台查询：先收尾失联行再读。这里的弹窗每 4 秒刷一次，所以「设备掉线后
+	// 15 分钟内自动变成可读懂的失败」不需要任何后台定时器。
+	if err := h.clawUpgradeSweepStalled(r.Context(), batchID, ""); err != nil {
+		slog.Warn("claw admin: failed to sweep stalled upgrades in a batch",
+			"batch", batchID, "error", err)
 	}
 	rows, err := h.DB.Query(r.Context(), `SELECT `+clawNodeUpgradeColumns+`
 		  FROM rongcloud_node_upgrade WHERE batch_id = $1

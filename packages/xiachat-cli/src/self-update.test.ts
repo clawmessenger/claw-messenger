@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
@@ -9,9 +9,13 @@ import {
   checkForUpdate,
   cleanupStaleBackups,
   compareVersions,
+  DIRECT_CONNECT_TIMEOUT_MS,
+  DIRECT_TRANSFER_TIMEOUT_MS,
   findStaged,
   healInstall,
+  mirrorTimeoutPlan,
   parseSha256Sums,
+  PROXY_MIRROR_TIMEOUT_MS,
   stageUpdate,
   stageUpdateFromMirrors,
   stagedPath,
@@ -505,5 +509,161 @@ describe("stageUpdateFromMirrors", () => {
     await expect(
       stageUpdateFromMirrors(plan, target, "https://srv.example.com", fetchImpl as never),
     ).rejects.toThrow(/no checksum supplied/);
+  });
+
+  // 超时必须按**阶段**分开，而不是给整个下载一个数字。两个方向都会出事：
+  //   · 全程套 15 秒 —— 88MB 要在 15 秒内传完（≥47Mbps），企业出口到 GitHub 通常
+  //     只有 1–10MB/s，于是「服务端没外网时直连是唯一活路」这条兜底必然失败；
+  //   · 全程套 15 分钟 —— 受限出口打到 GitHub 是黑洞，页面在「下载中」躺一刻钟。
+  // 代理则只有一个总墙钟，且必须长于服务端回源（先落盘再发）的 10 分钟。
+  it("budgets the direct mirror in two phases and the server proxy as one long wall clock", () => {
+    expect(DIRECT_CONNECT_TIMEOUT_MS).toBe(15_000);
+    expect(DIRECT_TRANSFER_TIMEOUT_MS).toBe(600_000);
+    expect(PROXY_MIRROR_TIMEOUT_MS).toBe(900_000);
+
+    const direct = mirrorTimeoutPlan(
+      "https://github.com/clawmessenger/claw-messenger/releases/download/x/y.exe",
+    );
+    expect(direct.connectMs).toBe(DIRECT_CONNECT_TIMEOUT_MS);
+    expect(direct.totalMs).toBe(DIRECT_TRANSFER_TIMEOUT_MS);
+    // 传输预算必须比连接预算大得多，否则「连接 15 秒」会顺带把 body 也掐掉。
+    expect(direct.totalMs).toBeGreaterThan(direct.connectMs * 10);
+
+    // 服务端代理是相对路径：设备用自己 serverUrl 拼，仍然按「代理」的预算走，
+    // 且比服务端 client.Timeout（10 分钟）长 —— 否则冷缓存时服务端还在拉，
+    // 设备先把自己掐了。
+    const proxy = mirrorTimeoutPlan("/api/agent/upgrade/download?version=1.3.0&asset=x&token=t");
+    expect(proxy.connectMs).toBe(PROXY_MIRROR_TIMEOUT_MS);
+    expect(proxy.totalMs).toBe(PROXY_MIRROR_TIMEOUT_MS);
+    expect(proxy.totalMs).toBeGreaterThan(10 * 60_000);
+  });
+
+  // 受限出口的现场：直连那一跳既不拒绝也不返回，唯一让它结束的办法是我们自己
+  // 掐断。掐断的异常必须计入 failures 并继续下一个源，否则整次升级就停在「下载
+  // 中」，服务端那边什么都看不到。
+  it("aborts a black-holed direct mirror and falls back to the proxy", async () => {
+    const plan = {
+      version: "1.3.0",
+      assetName: "clawmessenger-windows-x64.exe",
+      sha256: sum(binary),
+      mirrors: [
+        "https://github.com/clawmessenger/claw-messenger/releases/download/clawmessenger-v1.3.0/clawmessenger-windows-x64.exe",
+        "/api/agent/upgrade/download?version=1.3.0&asset=clawmessenger-windows-x64.exe&token=t",
+      ],
+    };
+    const seen: { url: string; signal?: AbortSignal }[] = [];
+    const fetchImpl = (async (url: string, init?: { signal?: AbortSignal }) => {
+      seen.push({ url, signal: init?.signal });
+      if (url === plan.mirrors[0]) {
+        // 与实现里 `controller.abort()` 触发的形状一致：name=AbortError。
+        // 注意别跟 `AbortSignal.timeout()` 搞混 —— 后者抛的是 name=TimeoutError
+        // （实测 Node 20+/22 都是），所以实现不能按 name 判断「是不是超时」，
+        // 只能按我们自己记的阶段判断（见 stageUpdateFromMirrors 的 catch）。
+        const abort = new Error("This operation was aborted");
+        abort.name = "AbortError";
+        throw abort;
+      }
+      return { ok: true, status: 200, arrayBuffer: async () => binary } as never;
+    }) as never;
+
+    const staged = await stageUpdateFromMirrors(plan, target, "https://srv.example.com", fetchImpl as never);
+
+    expect(staged.version).toBe("1.3.0");
+    expect(staged.source).toBe(`https://srv.example.com${plan.mirrors[1]}`);
+    expect(readFileSync(staged.path, "utf8")).toBe("BRAND-NEW-EXE");
+    // 两个源都必须拿到 signal —— 少了它，超时只是注释里的一句话。
+    expect(seen.map((call) => call.url)).toEqual([
+      plan.mirrors[0],
+      `https://srv.example.com${plan.mirrors[1]}`,
+    ]);
+    for (const call of seen) expect(call.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  // 每一个源都失败时，文案必须点名**每个源**、**失败发生在哪一阶段**、以及**是不是
+  // 我们掐的**：设备日志里只留一句 "fetch failed" 的话，运维分不清是连不上（换出口）
+  // 还是传不完（预热缓存 / 等更久）。
+  //
+  // 这条钉的是「不是超时」那一支：ECONNREFUSED / DNS / TLS 这类对端立刻失败的错误，
+  // 绝不能写成 "(connect timeout 15000ms)" —— 那会把运维引去调一个根本没参与的数字。
+  it("attributes a real failure to its phase instead of calling it a timeout", async () => {
+    const plan = {
+      version: "1.3.0",
+      assetName: "clawmessenger-windows-x64.exe",
+      sha256: sum(binary),
+      mirrors: [
+        "/api/agent/upgrade/download?version=1.3.0&asset=x&token=t",
+        "https://example.test/binary",
+      ],
+    };
+    const fetchImpl = (async (url: string) => {
+      if (url.includes("/api/agent/upgrade/download")) {
+        // 代理：头返回了，body 传输中断（连接被对端 reset）。
+        return {
+          ok: true,
+          status: 200,
+          arrayBuffer: async () => { throw new Error("socket hang up"); },
+        } as never;
+      }
+      // 直连：连一个没人监听的端口，立刻 ECONNREFUSED。
+      throw new Error("fetch failed");
+    }) as never;
+
+    await expect(
+      stageUpdateFromMirrors(plan, target, "https://srv.example.com", fetchImpl as never),
+    ).rejects.toThrow(
+      /socket hang up \(transfer failed\)[\s\S]*fetch failed \(connect failed\)/,
+    );
+    expect(findStaged(target)).toHaveLength(0);
+  });
+
+  // 两阶段的**接线**必须被钉住：头一到就清 connect 定时器，之后 body 只受总预算
+  // 约束。上面那条用例里的 fetch 是立刻抛的，真实定时器根本没参与，删掉
+  // `clearTimeout(connectTimer)` 它照样绿 —— 所以这里用假时钟真推进。
+  it("clears the connect budget once headers arrive and only the total budget can abort the body", async () => {
+    vi.useFakeTimers();
+    try {
+      const plan = {
+        version: "1.3.0",
+        assetName: "clawmessenger-windows-x64.exe",
+        sha256: sum(binary),
+        mirrors: ["https://example.test/binary"],
+      };
+      const fetchImpl = (async (_url: string, init?: { signal?: AbortSignal }) => ({
+        ok: true,
+        status: 200,
+        arrayBuffer: () => new Promise<ArrayBuffer>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            const err = new Error("This operation was aborted");
+            err.name = "TimeoutError";
+            reject(err);
+          });
+        }),
+      })) as never;
+
+      let settled: string | undefined;
+      void stageUpdateFromMirrors(plan, target, "https://srv.example.com", fetchImpl as never).then(
+        () => { settled = "resolved"; },
+        (err: Error) => { settled = err.message; },
+      );
+
+      // 先空转一次让「头已到达」的续体落地：`await fetchImpl` 的 resumption 是一个
+      // 微任务，它才会执行 `clearTimeout(connectTimer)`。假时钟推进（哪怕 0ms）
+      // 会先把定时器调到点再 flush 微任务，所以直接 `advanceTimersByTimeAsync(20_000)`
+      // 会让 15s 的连接定时器抢在续体之前触发 —— 那不是接线的问题，是测试自己没给
+      // 续体执行机会（见下方变异自证：清掉 clearTimeout 这条仍会红）。
+      await vi.advanceTimersByTimeAsync(0);
+      // 推过连接预算（15s）：头早就回来了，这条不能掐任何东西。
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(settled).toBeUndefined();
+
+      // 推过总预算（600s）：这才该 abort，而且归因必须是 transfer。
+      await vi.advanceTimersByTimeAsync(600_000);
+      expect(settled).toMatch(/transfer timeout 600000ms/);
+      // 反向自证：如果 connect 定时器没被清掉，上面那条 20s 处就会以
+      // "(connect timeout 15000ms)" 落定。
+      expect(settled).not.toMatch(/connect timeout/);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

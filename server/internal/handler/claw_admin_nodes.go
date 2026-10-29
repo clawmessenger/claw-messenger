@@ -310,10 +310,23 @@ func (h *Handler) clawAdminMachineNames(records []clawAdminNodeRecord, names map
 
 // clawAdminNodeUpgrades 取全部机器的升级/版本行，键是 machine_id。
 // 表量级 = 机器数（一台一行），全量取比在页面循环里逐台查便宜。
+//
+// 读之前先做一次**全量**失联收尾（clawUpgradeSweepStalledFleet）：这一列的 status
+// 就是前端主列表渲染「下载中」标签的依据，不收尾的话设备掉线后它会永远转圈，只有
+// 有人点开升级弹窗（走批次接口）才自愈。放在这个函数里而不是调用点，是为了让两个
+// 调用方（列表、单节点详情）都自动覆盖；失败只记日志 —— 版本列读不出来比「状态
+// 晚一轮自愈」严重得多。
+//
+// 顺带说明一个读代码时容易愣住的点：单节点详情也走这里，所以「看一台机器的详情」
+// 会顺带把全表卡住的行收尾。行为无害 —— 这个 UPDATE 幂等、走 status 索引、命中的
+// 行通常为 0 —— 而且它本来就是「谁先读到谁负责收尾」的语义，不是副作用意外。
 func (h *Handler) clawAdminNodeUpgrades(ctx context.Context) map[string]clawNodeUpgrade {
 	out := make(map[string]clawNodeUpgrade, 4)
 	if h.DB == nil {
 		return out
+	}
+	if err := h.clawUpgradeSweepStalledFleet(ctx); err != nil {
+		slog.Warn("claw admin: failed to sweep stalled upgrades before listing nodes", "error", err)
 	}
 	rows, err := h.DB.Query(ctx, `SELECT `+clawNodeUpgradeColumns+`
 		  FROM rongcloud_node_upgrade`)

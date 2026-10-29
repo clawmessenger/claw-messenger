@@ -178,7 +178,14 @@ func TestClawUpgradeTokenIsBoundToVersionAndAsset(t *testing.T) {
 	}
 }
 
-func TestClawUpgradeMirrorsPreferGitHubThenServerProxy(t *testing.T) {
+// 顺序是「代理优先，直连兜底」。
+//
+// 为什么钉死的是代理在前：受限出口的设备到 github.com 往往是黑洞（不是拒绝），
+// 先直连会一直等到 undici 默认超时才换源，页面长时间停在「下载中」；而代理的
+// 第一跳就是设备正在用的业务域名，必定可达。直连仍然排在后面 —— 服务端自己
+// 没有外网时，那是唯一活路。带宽层面：代理有落盘缓存，同版本只回源一次。
+func TestClawUpgradeMirrorsPreferServerProxyThenGitHub(t *testing.T) {
+	t.Setenv("CLAW_UPGRADE_DIRECT_FIRST", "")
 	release := &clawUpgradeRelease{
 		Version: "1.3.0",
 		Tag:     "clawmessenger-v1.3.0",
@@ -189,16 +196,47 @@ func TestClawUpgradeMirrorsPreferGitHubThenServerProxy(t *testing.T) {
 	if len(mirrors) != 2 {
 		t.Fatalf("mirrors = %v", mirrors)
 	}
-	if mirrors[0] != "https://github.example/asset" || direct != mirrors[0] {
-		t.Fatalf("the direct GitHub URL must come first, got %v", mirrors)
-	}
 	// 代理是服务端相对路径：设备用它自己的 serverUrl 拼，服务端不需要知道自己的
 	// 公网地址。
-	if !strings.HasPrefix(mirrors[1], "/api/agent/upgrade/download?") {
-		t.Fatalf("proxy mirror must be server-relative, got %q", mirrors[1])
+	if !strings.HasPrefix(mirrors[0], "/api/agent/upgrade/download?") {
+		t.Fatalf("the server proxy must come first, got %v", mirrors)
 	}
-	if !strings.Contains(mirrors[1], "version=1.3.0") || !strings.Contains(mirrors[1], "token=tok") {
-		t.Fatalf("proxy mirror must carry version and token, got %q", mirrors[1])
+	if !strings.Contains(mirrors[0], "version=1.3.0") || !strings.Contains(mirrors[0], "token=tok") {
+		t.Fatalf("proxy mirror must carry version and token, got %q", mirrors[0])
+	}
+	if mirrors[1] != "https://github.example/asset" || direct != mirrors[1] {
+		t.Fatalf("the direct GitHub URL must stay as the last resort, got %v", mirrors)
+	}
+}
+
+// 运维回退开关：服务端自己没外网（代拉必然 502）时，管理端把顺序切回直连优先。
+func TestClawUpgradeMirrorsHonourTheDirectFirstSwitch(t *testing.T) {
+	t.Setenv("CLAW_UPGRADE_DIRECT_FIRST", "1")
+	release := &clawUpgradeRelease{
+		Version: "1.3.0",
+		Tag:     "clawmessenger-v1.3.0",
+		Assets:  map[string]string{clawUpgradeWindowsAsset: "https://github.example/asset"},
+	}
+	mirrors, direct := clawUpgradeMirrors(release, clawUpgradeWindowsAsset, "tok")
+	if len(mirrors) != 2 || mirrors[0] != "https://github.example/asset" || direct != mirrors[0] {
+		t.Fatalf("CLAW_UPGRADE_DIRECT_FIRST=1 must restore the direct-first order, got %v", mirrors)
+	}
+	if !strings.HasPrefix(mirrors[1], "/api/agent/upgrade/download?") {
+		t.Fatalf("the proxy must remain as the fallback, got %q", mirrors[1])
+	}
+
+	// "true" 与 "1" 等价；其余值（含拼错）一律保持默认的代理优先 —— 开关读错一个
+	// 字母就静默换顺序，比没有开关更危险。
+	t.Setenv("CLAW_UPGRADE_DIRECT_FIRST", "true")
+	if mirrors, _ := clawUpgradeMirrors(release, clawUpgradeWindowsAsset, "tok"); mirrors[0] != "https://github.example/asset" {
+		t.Fatalf(`CLAW_UPGRADE_DIRECT_FIRST="true" must restore the direct-first order, got %v`, mirrors)
+	}
+	for _, value := range []string{"", "0", "yes", "panic", "false"} {
+		t.Setenv("CLAW_UPGRADE_DIRECT_FIRST", value)
+		mirrors, _ := clawUpgradeMirrors(release, clawUpgradeWindowsAsset, "tok")
+		if !strings.HasPrefix(mirrors[0], "/api/agent/upgrade/download?") {
+			t.Fatalf("CLAW_UPGRADE_DIRECT_FIRST=%q must keep the proxy first, got %v", value, mirrors)
+		}
 	}
 }
 
@@ -945,5 +983,276 @@ func TestClawUpgradeDoesNotMarkInstalledWhenTheDeviceReportsAnOldVersion(t *test
 	if after.Status != before.Status || !after.UpdatedAt.Equal(before.UpdatedAt) {
 		t.Fatalf("a not-yet-upgraded row must be left untouched (%q -> %q, %v -> %v)",
 			before.Status, after.Status, before.UpdatedAt, after.UpdatedAt)
+	}
+}
+
+// ---- 动作中失联（device_offline） -------------------------------------------
+
+// 失联租约必须比波次租约长：先按 10 分钟把「还在占着波次」的机器放行、再按
+// 15 分钟把它判成失联 —— 反过来（先判死再放行）就会出现「设备正当地在下载，
+// 却被判失败」，而它下一轮轮询回来时会拿到一条早已过期的 failed。
+func TestClawUpgradeStallLeaseIsLongerThanTheWaveLease(t *testing.T) {
+	if clawUpgradeStallLease <= clawUpgradeWaveLease {
+		t.Fatalf("the stall lease (%v) must outlast the wave lease (%v)",
+			clawUpgradeStallLease, clawUpgradeWaveLease)
+	}
+	if int(clawUpgradeStallLease.Minutes()) != 15 {
+		t.Fatalf("the operator-facing copy says 15 minutes; the constant must match, got %v", clawUpgradeStallLease)
+	}
+	detail := clawUpgradeStallDetail()
+	for _, want := range []string{"15 分钟", "重新下发", "原版本未受影响"} {
+		if !strings.Contains(detail, want) {
+			t.Fatalf("device_offline detail must contain %q, got %q", want, detail)
+		}
+	}
+}
+
+// TestClawUpgradeSweepClosesOnlyStalledInFlightRows 钉住失联收尾的边界。
+//
+// 三件必须同时成立：
+//   - downloading / verifying / restarting 且 15 分钟没有进度 → failed(device_offline)；
+//   - pending / waiting_idle **绝不能被碰** —— 离线设备上线后还要靠它领走指令；
+//   - 刚上报过进度（updated_at 是 now）的行不能被判死 —— 慢出口上下载 88MB 是
+//     正常行为，把「正在慢慢下」判成失联就是这条修复自己制造的故障。
+func TestClawUpgradeSweepClosesOnlyStalledInFlightRows(t *testing.T) {
+	if testPool == nil || testHandler == nil {
+		t.Skip("handler test database is not available")
+	}
+	ctx := context.Background()
+	batch := clawUpgradeTestMachine("upg-stall")
+	machines := []string{
+		batch + "-downloading",
+		batch + "-verifying",
+		batch + "-restarting",
+		batch + "-pending",
+		batch + "-waiting",
+		batch + "-succeeded",
+		batch + "-fresh",
+	}
+	statuses := []string{
+		clawUpgradeStatusDownloading,
+		clawUpgradeStatusVerifying,
+		clawUpgradeStatusRestarting,
+		clawUpgradeStatusPending,
+		clawUpgradeStatusWaitingIdle,
+		clawUpgradeStatusSucceeded,
+		clawUpgradeStatusDownloading,
+	}
+	rcs := make([]string, 0, len(machines))
+	for i, machine := range machines {
+		rc := "rc_node_" + machine
+		rcs = append(rcs, rc)
+		insertClawUpgradeTestNode(t, testWorkspaceID, machine, rc)
+		insertClawUpgradeTestReport(t, testWorkspaceID, machine, clawUpgradePlatformWindows, "1.2.0")
+		// 最后一条（fresh）故意保持在 now()：它是「正在下载」的正控。
+		stale := i != len(machines)-1
+		if _, err := testPool.Exec(ctx, `
+			UPDATE rongcloud_node_upgrade
+			   SET target_version = '1.3.0', desired_generation = 3, status = $2,
+			       error_code = '', error_detail = '',
+			       batch_id = $3, wave = 1, requested_at = now(),
+			       updated_at = CASE WHEN $4 THEN now() - interval '20 minutes' ELSE now() END
+			 WHERE machine_id = $1`, machine, statuses[i], batch, stale); err != nil {
+			t.Fatalf("seed upgrade row (%s): %v", statuses[i], err)
+		}
+	}
+	cleanupClawUpgradeTestRows(t, machines, rcs)
+
+	// 别的批次的行不能被顺带收尾（按 batch_id 过滤）。
+	otherMachine := batch + "-other-batch"
+	otherRC := "rc_node_" + otherMachine
+	insertClawUpgradeTestNode(t, testWorkspaceID, otherMachine, otherRC)
+	insertClawUpgradeTestReport(t, testWorkspaceID, otherMachine, clawUpgradePlatformWindows, "1.2.0")
+	if _, err := testPool.Exec(ctx, `
+		UPDATE rongcloud_node_upgrade
+		   SET target_version = '1.3.0', desired_generation = 3, status = $2,
+		       batch_id = 'upg-somebody-else', wave = 1,
+		       updated_at = now() - interval '20 minutes'
+		 WHERE machine_id = $1`, otherMachine, clawUpgradeStatusDownloading); err != nil {
+		t.Fatalf("seed other-batch row: %v", err)
+	}
+	cleanupClawUpgradeTestRows(t, []string{otherMachine}, []string{otherRC})
+
+	if err := testHandler.clawUpgradeSweepStalled(ctx, batch, ""); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+
+	want := map[string]struct {
+		status string
+		code   string
+	}{
+		batch + "-downloading": {clawUpgradeStatusFailed, clawUpgradeOfflineErrorCode},
+		batch + "-verifying":   {clawUpgradeStatusFailed, clawUpgradeOfflineErrorCode},
+		batch + "-restarting":  {clawUpgradeStatusFailed, clawUpgradeOfflineErrorCode},
+		// 下面四个必须原样不动：离线设备的排队指令、终态、以及正在下载的那台。
+		batch + "-pending":   {clawUpgradeStatusPending, ""},
+		batch + "-waiting":   {clawUpgradeStatusWaitingIdle, ""},
+		batch + "-succeeded": {clawUpgradeStatusSucceeded, ""},
+		batch + "-fresh":     {clawUpgradeStatusDownloading, ""},
+	}
+	for machine, expected := range want {
+		up, found, err := testHandler.clawNodeUpgradeByMachine(ctx, machine)
+		if err != nil || !found {
+			t.Fatalf("read back %s: found=%v err=%v", machine, found, err)
+		}
+		if up.Status != expected.status || up.ErrorCode != expected.code {
+			t.Fatalf("%s: status/code = (%q,%q), want (%q,%q)",
+				machine, up.Status, up.ErrorCode, expected.status, expected.code)
+		}
+		if expected.code == clawUpgradeOfflineErrorCode && !strings.Contains(up.ErrorDetail, "原版本未受影响") {
+			t.Fatalf("%s: device_offline must explain the device still runs the old version, got %q",
+				machine, up.ErrorDetail)
+		}
+	}
+
+	other, found, err := testHandler.clawNodeUpgradeByMachine(ctx, otherMachine)
+	if err != nil || !found {
+		t.Fatalf("read back other batch: found=%v err=%v", found, err)
+	}
+	if other.Status != clawUpgradeStatusDownloading {
+		t.Fatalf("a row in another batch must not be swept, got %q", other.Status)
+	}
+
+	// 单台路径（machineID 非空）同样要生效：单台查询接口用的是这条路。
+	if err := testHandler.clawUpgradeSweepStalled(ctx, "", otherMachine); err != nil {
+		t.Fatalf("sweep by machine: %v", err)
+	}
+	other, _, err = testHandler.clawNodeUpgradeByMachine(ctx, otherMachine)
+	if err != nil {
+		t.Fatalf("read back other batch again: %v", err)
+	}
+	if other.Status != clawUpgradeStatusFailed || other.ErrorCode != clawUpgradeOfflineErrorCode {
+		t.Fatalf("sweeping by machine_id must close the row, got (%q,%q)", other.Status, other.ErrorCode)
+	}
+}
+
+// TestClawUpgradeOfflineFailureIsCorrectedWhenTheDeviceIsActuallyUpdated 钉住纠偏。
+//
+// 场景（线上真会撞上）：设备换完盘、在重启窗口里超过 15 分钟租约，被
+// clawUpgradeSweepStalled 判成 failed(device_offline)；它随后上线，版本就是目标
+// 版本。设备自己不会再报 succeeded（那次回传早发过了，或被 409 丢弃），所以只能
+// 由服务端用「它上报的版本」自证成功 —— 不纠正的话那一行永远是 failed，
+// 而管理员重新下发又会被「已是最新」跳过。
+//
+// 反向同样必须成立：swap_failed 这类**真失败**不能被版本号碰巧对上就抹成成功。
+func TestClawUpgradeOfflineFailureIsCorrectedWhenTheDeviceIsActuallyUpdated(t *testing.T) {
+	if testPool == nil || testHandler == nil {
+		t.Skip("handler test database is not available")
+	}
+	ctx := context.Background()
+
+	// (a) 失联判死 + 版本已是目标 → 纠正成 succeeded。
+	healed := clawUpgradeTestMachine("upg-heal")
+	healedRC := "rc_node_" + healed
+	cleanupClawUpgradeTestRows(t, []string{healed}, []string{healedRC})
+	insertClawUpgradeTestNode(t, testWorkspaceID, healed, healedRC)
+	insertClawUpgradeTestReport(t, testWorkspaceID, healed, clawUpgradePlatformWindows, "1.3.0")
+	if _, err := testPool.Exec(ctx, `
+		UPDATE rongcloud_node_upgrade
+		   SET target_version = '1.3.0', desired_generation = 7, status = $2,
+		       error_code = $3, error_detail = $4, batch_id = 'upg-heal', wave = 1,
+		       requested_at = now(), updated_at = now() - interval '40 minutes'
+		 WHERE machine_id = $1`,
+		healed, clawUpgradeStatusFailed, clawUpgradeOfflineErrorCode, clawUpgradeStallDetail()); err != nil {
+		t.Fatalf("seed healed row: %v", err)
+	}
+	if _, err := testHandler.clawDeviceUpgradeIntent(ctx, dbNodeForTest(healed, healedRC), "1.3.0"); err != nil {
+		t.Fatalf("intent (healed): %v", err)
+	}
+	up, _, err := testHandler.clawNodeUpgradeByMachine(ctx, healed)
+	if err != nil {
+		t.Fatalf("read back healed: %v", err)
+	}
+	if up.Status != clawUpgradeStatusSucceeded || up.ErrorCode != "" {
+		t.Fatalf("an offline-killed row whose device already runs the target must be corrected, got (%q,%q)",
+			up.Status, up.ErrorCode)
+	}
+
+	// (b) 真失败（swap_failed）+ 版本碰巧等于目标 → 必须原样留在 failed。
+	kept := clawUpgradeTestMachine("upg-swapfail")
+	keptRC := "rc_node_" + kept
+	cleanupClawUpgradeTestRows(t, []string{kept}, []string{keptRC})
+	insertClawUpgradeTestNode(t, testWorkspaceID, kept, keptRC)
+	insertClawUpgradeTestReport(t, testWorkspaceID, kept, clawUpgradePlatformWindows, "1.3.0")
+	if _, err := testPool.Exec(ctx, `
+		UPDATE rongcloud_node_upgrade
+		   SET target_version = '1.3.0', desired_generation = 8, status = $2,
+		       error_code = 'swap_failed', error_detail = 'EBUSY', batch_id = 'upg-swapfail', wave = 1,
+		       requested_at = now()
+		 WHERE machine_id = $1`, kept, clawUpgradeStatusFailed); err != nil {
+		t.Fatalf("seed swap_failed row: %v", err)
+	}
+	if _, err := testHandler.clawDeviceUpgradeIntent(ctx, dbNodeForTest(kept, keptRC), "1.3.0"); err != nil {
+		t.Fatalf("intent (swap_failed): %v", err)
+	}
+	keptRow, _, err := testHandler.clawNodeUpgradeByMachine(ctx, kept)
+	if err != nil {
+		t.Fatalf("read back swap_failed: %v", err)
+	}
+	if keptRow.Status != clawUpgradeStatusFailed || keptRow.ErrorCode != "swap_failed" {
+		t.Fatalf("a real failure must never be rewritten to succeeded, got (%q,%q)",
+			keptRow.Status, keptRow.ErrorCode)
+	}
+}
+
+// TestClawUpgradeSweepLeaseBoundaries 钉住 15 分钟租约的**下沿**。
+//
+// 为什么这条必须单独存在：TestClawUpgradeSweepClosesOnlyStalledInFlightRows 只用了
+// 「now」和「20 分钟」两档，把 lease 改成 1 秒它**仍然全绿** —— 而 1 秒会把每 10
+// 秒才上报一次进度的在线设备全部判死，那正是这条修复自己会制造的故障。这里贴着
+// 15 分钟的两侧各放一行：lease 被调小（哪怕调到秒级），14 分钟那行就会被误收；
+// 调大到 15 分钟以上，16 分钟那行就收不掉。
+//
+// 两档都取整分钟且离边界 1 分钟，seed 与扫描之间只隔毫秒级，不会因执行耗时抖动。
+func TestClawUpgradeSweepLeaseBoundaries(t *testing.T) {
+	if testPool == nil || testHandler == nil {
+		t.Skip("handler test database is not available")
+	}
+	ctx := context.Background()
+	batch := clawUpgradeTestMachine("upg-lease")
+	inside, outside := 14*time.Minute, 16*time.Minute
+	machines := []string{batch + "-inside", batch + "-outside"}
+	ages := []time.Duration{inside, outside}
+	rcs := make([]string, 0, len(machines))
+	for i, machine := range machines {
+		rc := "rc_node_" + machine
+		rcs = append(rcs, rc)
+		insertClawUpgradeTestNode(t, testWorkspaceID, machine, rc)
+		insertClawUpgradeTestReport(t, testWorkspaceID, machine, clawUpgradePlatformWindows, "1.2.0")
+		if _, err := testPool.Exec(ctx, `
+			UPDATE rongcloud_node_upgrade
+			   SET target_version = '1.3.0', desired_generation = 3, status = $2,
+			       error_code = '', error_detail = '',
+			       batch_id = $3, wave = 1, requested_at = now(),
+			       updated_at = now() - ($4::double precision * interval '1 second')
+			 WHERE machine_id = $1`,
+			machine, clawUpgradeStatusDownloading, batch, ages[i].Seconds()); err != nil {
+			t.Fatalf("seed %s (%v): %v", machine, ages[i], err)
+		}
+	}
+	cleanupClawUpgradeTestRows(t, machines, rcs)
+
+	if err := testHandler.clawUpgradeSweepStalled(ctx, batch, ""); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+
+	// 14 分钟 = 还在租约内：设备可能正慢慢下一份 88MB，判死它就是误杀。
+	stillDownloading, found, err := testHandler.clawNodeUpgradeByMachine(ctx, machines[0])
+	if err != nil || !found {
+		t.Fatalf("read back %s: found=%v err=%v", machines[0], found, err)
+	}
+	if stillDownloading.Status != clawUpgradeStatusDownloading || stillDownloading.ErrorCode != "" {
+		t.Fatalf("a row %v into a download is still inside the %v lease and must survive, got (%q,%q)",
+			inside, clawUpgradeStallLease, stillDownloading.Status, stillDownloading.ErrorCode)
+	}
+
+	// 16 分钟 = 已出租约：必须收成 failed(device_offline)。
+	swept, found, err := testHandler.clawNodeUpgradeByMachine(ctx, machines[1])
+	if err != nil || !found {
+		t.Fatalf("read back %s: found=%v err=%v", machines[1], found, err)
+	}
+	if swept.Status != clawUpgradeStatusFailed || swept.ErrorCode != clawUpgradeOfflineErrorCode {
+		t.Fatalf("a row %v without progress is past the %v lease and must be swept, got (%q,%q)",
+			outside, clawUpgradeStallLease, swept.Status, swept.ErrorCode)
 	}
 }
