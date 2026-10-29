@@ -727,6 +727,13 @@ func (s *NodeService) UpdateUserProfile(ctx context.Context, id pgtype.UUID, nam
 // ListUserFriends returns a claw/IM user's RongCloud friend list mapped to the
 // legacy UserInfo shape the web client's contact list expects. This backs the
 // HTTP /api/user/friends fallback the frontend calls alongside the IM SDK.
+//
+// `ownerId` / `ownerName` 只对**节点**（agent）好友出现：联系人列表把人与
+// agent 混在一起平铺，用户看不出「这几个智能体是东风的」。归属的真相是融云
+// 好友边（owner → node 的单向边），本地投影是 rongcloud_node.claimed_by_user_id
+// （migrations/600）。这里一次 SELECT 批量读投影，**绝不能对每个 agent 好友各
+// 反查一次**（那是 O(N) 次 /friend/get.json）。投影缺失（老数据尚未自愈）时
+// 干脆不带这两个键：前端会退回「不分组」，而不是把 agent 硬塞到某个真人下面。
 func (s *NodeService) ListUserFriends(ctx context.Context, rongCloudUserID string) ([]map[string]interface{}, error) {
 	if s.client == nil {
 		return nil, errors.New("rongcloud: API client not configured")
@@ -735,20 +742,89 @@ func (s *NodeService) ListUserFriends(ctx context.Context, rongCloudUserID strin
 	if err != nil {
 		return nil, err
 	}
+	ids := make([]string, 0, len(friends))
+	for _, f := range friends {
+		if id := strings.TrimSpace(f.UserID); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	owners := s.friendOwnerProjection(ctx, ids)
 	list := make([]map[string]interface{}, 0, len(friends))
 	for _, f := range friends {
 		nickname := f.Name
 		if nickname == "" {
 			nickname = f.UserID
 		}
-		list = append(list, map[string]interface{}{
+		record := map[string]interface{}{
 			"userId":      f.UserID,
 			"username":    f.UserID,
 			"nickname":    nickname,
 			"portraitUri": f.PortraitURI,
-		})
+		}
+		// 自己认领自己的情况（owner == 好友本人）没有分组意义，只是噪声。
+		if owner, ok := owners[f.UserID]; ok && owner.id != "" && owner.id != f.UserID {
+			record["ownerId"] = owner.id
+			if owner.name != "" {
+				record["ownerName"] = owner.name
+			}
+		}
+		list = append(list, record)
 	}
 	return list, nil
+}
+
+// friendOwner is the claimant of one node: 认领者的融云 id + 展示名。
+type friendOwner struct {
+	id   string
+	name string
+}
+
+// friendOwnerProjection batch-reads rongcloud_node.claimed_by_user_id for the
+// given node ids, plus the claimant's display name for the group header the
+// contact list draws when that owner is not itself a contact.
+//
+// 读投影而不是反查好友边：反查是每个 C 端账号一次 /friend/get.json，放在
+// 「打开通讯录」这条最高频的路径上会把页面拖死。投影未命中就当作「不知道」，
+// 前端退化为不分组 —— 归属不会答错，只是暂时不展示分组。
+func (s *NodeService) friendOwnerProjection(ctx context.Context, nodeRCIDs []string) map[string]friendOwner {
+	out := make(map[string]friendOwner, len(nodeRCIDs))
+	if len(nodeRCIDs) == 0 {
+		return out
+	}
+	dbtx := s.claimStore()
+	if dbtx == nil {
+		// 没注入 DBTX（单测 / 未接线的实例）：静默跳过，好友列表照常可用。
+		return out
+	}
+	rows, err := dbtx.Query(ctx, `
+		SELECT n.rongcloud_user_id,
+		       n.claimed_by_user_id,
+		       COALESCE(NULLIF(u.nickname, ''), NULLIF(u.username, ''), '') AS owner_name
+		FROM rongcloud_node n
+		LEFT JOIN claw_im_users u ON u.user_id = n.claimed_by_user_id
+		WHERE n.rongcloud_user_id = ANY($1)
+		  AND n.claimed_by_user_id IS NOT NULL
+		  AND n.claimed_by_user_id <> ''`, nodeRCIDs)
+	if err != nil {
+		s.log().Debug("rongcloud: read friend owners failed", "error", err)
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var nodeRC, ownerRC, ownerName string
+		if err := rows.Scan(&nodeRC, &ownerRC, &ownerName); err != nil {
+			s.log().Debug("rongcloud: scan friend owner failed", "error", err)
+			return out
+		}
+		if nodeRC == "" || ownerRC == "" {
+			continue
+		}
+		out[nodeRC] = friendOwner{id: ownerRC, name: ownerName}
+	}
+	if err := rows.Err(); err != nil {
+		s.log().Debug("rongcloud: iterate friend owners failed", "error", err)
+	}
+	return out
 }
 
 // BackfillFriendsOptions tunes BackfillAgentFriends.
