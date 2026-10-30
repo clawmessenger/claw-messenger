@@ -501,6 +501,13 @@ func (rt *discussionRuntime) recommendForSetupBatch(ctx context.Context, discuss
 	// 且没有耗时，用户报「点了很久没反应」时无法判断慢在 presence、broker 往返
 	// 还是设备端模型回合。
 	startedAt := time.Now()
+	// 候选池的观测值随失败日志一起打出来。外面对「没有可用设备」只有一句文案，
+	// 但内因有三种、下一步动作完全相反：presenceNodes=0 说明没有设备过能力位那一关
+	// （去查设备注册时上报的 capabilities）；presenceOnline=0 说明能力齐备但融云判
+	// 离线（去启动设备）；两者都非 0 而 candidates=0 说明在线设备被续推的历史角色
+	// 占完了（去换设备池）。没有这三个数就只能靠猜。
+	var observed nodePresenceStats
+	candidatesSeen := -1
 	// code 是唯一权威，文案由它派生：主持设备「在线但跑不出推荐」有三种完全
 	// 不同的内因（设备端轮次超时 / 应答无法解析 / 通道未装配），过去全部落在
 	// 同一句「角色推荐失败，请重试」上，用户只能反复点重试。见
@@ -523,7 +530,9 @@ func (rt *discussionRuntime) recommendForSetupBatch(ctx context.Context, discuss
 		}
 		logger.Warn("discussion: setup 角色推荐失败",
 			"discussionId", discussionID, "attempt", attempt, "code", code, "message", message,
-			"elapsedMs", time.Since(startedAt).Milliseconds())
+			"elapsedMs", time.Since(startedAt).Milliseconds(),
+			"presenceNodes", observed.nodes, "presenceOnline", observed.online,
+			"presenceMs", observed.duration.Milliseconds(), "candidates", candidatesSeen)
 	}
 
 	d, err := rt.repo.Get(ctx, discussionID)
@@ -540,6 +549,8 @@ func (rt *discussionRuntime) recommendForSetupBatch(ctx context.Context, discuss
 		return
 	}
 	candidates, candCode, presenceStats := rt.roundtable.roleCandidateNodesForWithStats(ctx, d.CreatedBy, host, req.nodeIDs, req.nodeIDsGiven)
+	// 观测值要在 fail 之前落进去：candCode 非空时 fail(candCode) 就在下面两行。
+	observed, candidatesSeen = presenceStats, len(candidates)
 	if candCode != "" {
 		fail(candCode)
 		return
@@ -555,7 +566,12 @@ func (rt *discussionRuntime) recommendForSetupBatch(ctx context.Context, discuss
 			appendRec, appendOK = rec, true
 			candidates = appendCandidateNodes(candidates, rec.Roles, req.nodeIDsGiven)
 			if len(candidates) == 0 {
-				// 剩余设备都已被上一批占满：没有可推荐的对象，按「没有可用设备」处理。
+				// 续推候选被历史角色排完：这时候「没有可用于讨论的在线设备」是误导
+				// —— 设备在线，只是这一行推荐里的角色已经把它们占满了。单独打一行，
+				// candidatesBeforeExclude 是排除前的候选数（0 说明本来就空，与续推无关）。
+				logger.Warn("discussion: setup 续推候选被历史角色排完",
+					"discussionId", discussionID, "attempt", attempt,
+					"candidatesBeforeExclude", candidatesSeen, "trustNodeIDs", req.nodeIDsGiven)
 				fail("NO_ELIGIBLE_USER_DEVICES")
 				return
 			}
