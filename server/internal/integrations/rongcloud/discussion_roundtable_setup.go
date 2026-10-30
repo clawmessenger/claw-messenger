@@ -544,15 +544,16 @@ func (rt *discussionRuntime) recommendForSetupBatch(ctx context.Context, discuss
 		fail(candCode)
 		return
 	}
-	// 续推：把上一批已绑定的设备从候选里剔掉。assignRoleNodes 只在 candidates 里
-	// 挑设备，一旦挑中已占用的那台，confirm 就会以 ROLE_DEVICE_DUPLICATED 整单拒绝，
-	// 而用户看到的只是一句看不懂的报错。前端本就只传「剩余未参与」，这里是兜底。
+	// 续推：把上一批已绑定的设备从候选里剔掉（仅在前端没给 node_ids 时兜底，
+	// 理由见 appendCandidateNodes）。assignRoleNodes 只在 candidates 里挑设备，一旦
+	// 挑中已占用的那台，confirm 就会以 ROLE_DEVICE_DUPLICATED 整单拒绝，而用户看到
+	// 的只是一句看不懂的报错。
 	var appendRec db.RongcloudRoleRecommendation
 	appendOK := false
 	if req.appendMode {
 		if rec, ok := rt.currentSetupRecommendation(ctx, discussionID); ok {
 			appendRec, appendOK = rec, true
-			candidates = excludeNodeIDs(candidates, recommendationRoleNodeIDs(rec.Roles))
+			candidates = appendCandidateNodes(candidates, rec.Roles, req.nodeIDsGiven)
 			if len(candidates) == 0 {
 				// 剩余设备都已被上一批占满：没有可推荐的对象，按「没有可用设备」处理。
 				fail("NO_ELIGIBLE_USER_DEVICES")
@@ -722,6 +723,24 @@ func (rt *discussionRuntime) currentSetupRecommendation(ctx context.Context, dis
 		return rec, true
 	}
 	return db.RongcloudRoleRecommendation{}, false
+}
+
+// appendCandidateNodes 计算续推这一轮的候选设备。
+//
+// 前端给了 node_ids（trustNodeIDs）时直接信任它：那份列表已经是「剩余未参与」
+// 的精确集合。因为一轮推荐会给出 3-5 个角色（各绑一台设备），而用户每轮只采纳
+// 1 个角色 —— 若这里再按**整行历史所有批次**的角色设备排除，上一批没被采纳的
+// 那几台设备会被永久排除，三五轮之后候选清零，用户会看到「没有可用于讨论的在线
+// 设备」而设备明明都在线。这是本次修掉的缺陷。
+//
+// 没给 node_ids 时（老前端 / 服务端自动选候选）保留原来的整行排除兜底：那条路径
+// 下候选由服务端自己从全部 eligible 设备里挑，不排除就有机会挑中历史角色已占用的
+// 设备，confirm 会以 ROLE_DEVICE_DUPLICATED 整单拒绝。
+func appendCandidateNodes(candidates []string, recRoles []byte, trustNodeIDs bool) []string {
+	if trustNodeIDs {
+		return candidates
+	}
+	return excludeNodeIDs(candidates, recommendationRoleNodeIDs(recRoles))
 }
 
 // recommendationRoleNodeIDs 取出推荐行里各角色已绑定的设备（续推时要避开）。
