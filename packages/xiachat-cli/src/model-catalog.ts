@@ -461,6 +461,10 @@ export function createModelCatalogLoader(opts: ModelCatalogLoaderOpts): ModelCat
         });
       const raced = await withBudget(pending, cliBudget);
       if (raced === "timeout") {
+        // 别让「这次没等到」把已知目录缩小：缓存里那份做底并进来。否则 TTL 到期
+        // 的那次后台刷新只要撞上冷启，就会把上一版完整的 93 条覆盖成配置里的 1 条 ——
+        // 用户刷新页面看到的模型反而变少。
+        if (cached) mergeFromCli(grouped, cached);
         opts.logger?.(
           `model catalog: ${label} not ready in ${cliBudget}ms; serving ${declaredAdded} declared model(s), merging when it lands`,
         );

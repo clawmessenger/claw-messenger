@@ -542,6 +542,42 @@ describe("createModelCatalogLoader with config-declared models", () => {
     expect(runCommand).toHaveBeenCalledTimes(1);
   });
 
+  // TTL 到期的那次后台刷新如果撞上冷启（枚举超预算），绝不能把已缓存的完整目录
+  // 缩小成配置里那几条 —— 否则用户刷新页面，模型反而变少。
+  it("never lets an overrun refresh shrink a catalog that is already cached", async () => {
+    let calls = 0;
+    const runCommand = vi.fn(() => {
+      calls += 1;
+      if (calls === 1) return Promise.resolve("opencode/claude-sonnet-5\nquukk/glm-5.2\n");
+      return new Promise<string>(() => {
+        /* 第二次起永不返回，模拟冷启卡住 */
+      });
+    });
+    let clock = 0;
+    const loader = createModelCatalogLoader({
+      agentName: "opencode",
+      runCommand,
+      cliBudgetMs: 20,
+      ttlMs: 1_000,
+      now: () => clock,
+      readConfig: () => ({
+        endpoints: [],
+        defaultModel: null,
+        declaredModels: { quukk: ["glm-5.2"] },
+      }),
+    });
+
+    const first = await loader.load();
+    expect(first.providers.map((provider) => provider.id)).toEqual(["opencode", "quukk"]);
+
+    clock = 5_000; // TTL 过期 → 后台刷新
+    await loader.load();
+    await new Promise((resolve) => setTimeout(resolve, 60));
+
+    const third = await loader.load();
+    expect(third.providers.map((provider) => provider.id)).toEqual(["opencode", "quukk"]);
+  });
+
   // 配置是用户手写的，provider key 里带空格完全可能。wire 上的 id 必须能拼成
   // `provider/model` 路由（与 groupRoutes / mergeEndpointModels 同一把尺子），
   // 否则前端既存不下也回传不了。
