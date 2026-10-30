@@ -300,6 +300,13 @@ export interface ModelCatalogLoaderOpts {
   logger?: (message: string) => void;
   /** How long a cached catalog is served before a background refresh kicks in. */
   ttlMs?: number;
+  /**
+   * 等 agent 自己的模型列举命令等多久。
+   *
+   * 它不是子进程的超时（那个由 spec.timeoutMs 管，30–60s），而是**这一次请求**
+   * 愿意为它等的时间：超了就先把手上有的交出去，命令继续在后台跑完并补进缓存。
+   */
+  cliBudgetMs?: number;
   now?: () => number;
 }
 
@@ -311,6 +318,27 @@ export interface ModelCatalogLoader {
 }
 
 const DEFAULT_CACHE_TTL_MS = 5 * 60_000;
+// 5.5s：C 端「设备管理 → 默认模型」面板只等 8s，留 2.5s 给融云往返与端点探测。
+// 现场实测 `opencode models` 热态 1–3s、冷态能到 30s；预算内回不来就先交手头这份。
+const DEFAULT_CLI_BUDGET_MS = 5_500;
+
+// 等一个 promise 最多 ms 毫秒；超时返回 "timeout"，由调用方决定「先交货、后补」。
+function withBudget<T>(promise: Promise<T>, ms: number): Promise<T | "timeout"> {
+  if (!(ms > 0)) return promise;
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve("timeout"), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      () => {
+        clearTimeout(timer);
+        resolve("timeout");
+      },
+    );
+  });
+}
 
 function groupsFromCatalog(catalog: DiscussionModelCatalog): GroupedProviders {
   const grouped: GroupedProviders = new Map();
@@ -331,12 +359,53 @@ export function createModelCatalogLoader(opts: ModelCatalogLoaderOpts): ModelCat
   const readConfig = opts.readConfig ?? ((name: string | undefined) => readAgentConfig(name));
   const probe = opts.probe ?? ((endpoint: ProviderEndpoint) => probeProviderModels(endpoint));
   const ttlMs = opts.ttlMs ?? DEFAULT_CACHE_TTL_MS;
+  const cliBudget = opts.cliBudgetMs ?? DEFAULT_CLI_BUDGET_MS;
   const now = opts.now ?? Date.now;
   let cached: DiscussionModelCatalog | null = null;
   let cachedAt = 0;
   let inflight: Promise<DiscussionModelCatalog> | null = null;
+  // 预算内没等到的 CLI 结果，落到这里等下一次机会（见 applyLate）。
+  let lateStash: DiscussionModelCatalog | null = null;
 
   const describe = (err: unknown): string => (err instanceof Error ? err.message : String(err));
+
+  const countModels = (catalog: DiscussionModelCatalog): number =>
+    catalog.providers.reduce((total, provider) => total + provider.models.length, 0);
+
+  // 并集而不是覆盖：同一个 provider 既在配置里声明了清单、CLI 又回报了一份时，
+  // 覆盖会把配置里那份**更完整**的清单缩成 CLI 那份子集。
+  const mergeFromCli = (target: GroupedProviders, fromCli: DiscussionModelCatalog): void => {
+    for (const [id, group] of groupsFromCatalog(fromCli)) {
+      const existing = target.get(id);
+      if (!existing) {
+        target.set(id, group);
+        continue;
+      }
+      for (const [modelId, name] of group.models) {
+        if (existing.models.size >= MAX_MODELS_PER_PROVIDER) break;
+        if (!existing.models.has(modelId)) existing.models.set(modelId, name);
+      }
+    }
+  };
+
+  // 晚到的列举结果补进缓存。cached 还没落定时先暂存：refresh 的 .then 会紧接着
+  // 写入缓存，那里再合并一次，避免把一次刚跑完的枚举丢掉。
+  const applyLate = (late: DiscussionModelCatalog): void => {
+    if (!cached) {
+      lateStash = late;
+      return;
+    }
+    const groupedLate = groupsFromCatalog(cached);
+    mergeFromCli(groupedLate, late);
+    const next = finalizeCatalog(groupedLate, cached.defaultModel ?? late.defaultModel);
+    // 什么都没多出来就别动缓存，免得多发一次变更、多刷一次页面。
+    if (countModels(next) <= countModels(cached)) return;
+    cached = next;
+    cachedAt = now();
+    opts.logger?.(
+      `model catalog: ${opts.agentName} late merge -> ${next.providers.length} provider(s) in cache`,
+    );
+  };
 
   // Never rejects: a failing CLI command or an unreachable endpoint degrades to
   // whatever we already know rather than taking the panel down with it.
@@ -371,40 +440,39 @@ export function createModelCatalogLoader(opts: ModelCatalogLoaderOpts): ModelCat
       );
     }
 
-    // 配置里已经有合法清单时，不再等 CLI 列举：`opencode models` 热启动就要 3–5s、
-    // 未登录/配置异常时能拖满 30s 超时，而 web 只等 8s。配置清单是同步拿到手的，
-    // 让它先出目录是本轮修复的全部意义；为了多列几个内置 provider 而把 8s 窗口
-    // 输掉，是本末倒置。
-    const hasDeclared = declaredAdded > 0;
-    if (spec && hasDeclared) {
-      opts.logger?.(
-        `model catalog: ${opts.agentName} skipping \`${spec.argv.join(" ")}\` — ${declaredAdded} model(s) already declared in config`,
-      );
-    }
-
-    if (spec && !hasDeclared) {
+    // CLI 列举**总是**跑，但只等预算内的时间。
+    //
+    // 这里曾经是 `if (spec && !hasDeclared)` ——「配置声明了清单就别再问 CLI」。
+    // 那个捷径在线上闯了祸：一台 opencode 节点的 opencode.json 里
+    // `provider.custom.models` 只写了 1 个模型，于是能列出 93 条、覆盖整个
+    // `opencode/*` 的 `opencode models` 一次都没被执行，面板上就只剩 `custom (1)`。
+    // 声明是**下限**而不是全集：配置里写的是「我常用的」，不是「我只能用这些」。
+    //
+    // 但也不能无限等（冷启能拖到 30s，而面板只等 8s）。所以给一个预算：超时先
+    // 交出手头这份（声明 + 端点探测），命令继续在后台跑，结果在 applyLate 里补进
+    // 缓存 —— 下一次请求（面板重开、换台浏览器、另一个用户）拿到的就是完整的。
+    if (spec) {
       const label = `${opts.agentName} ${spec.argv.join(" ")}`;
-      try {
-        const stdout = await opts.runCommand(spec.argv, spec.timeoutMs, spec.maxOutputBytes);
-        const fromCli = parseModelCatalogOutput(opts.agentName, stdout);
-        // 并集而不是覆盖：同一个 provider 既在配置里声明了清单、CLI 又回报了
-        // 一份时（opencode 两条路都会命中），覆盖会把配置里那份**更完整**的
-        // 清单缩成 CLI 那份子集。
-        for (const [id, group] of groupsFromCatalog(fromCli)) {
-          const existing = grouped.get(id);
-          if (!existing) {
-            grouped.set(id, group);
-            continue;
-          }
-          for (const [modelId, name] of group.models) {
-            if (existing.models.size >= MAX_MODELS_PER_PROVIDER) break;
-            if (!existing.models.has(modelId)) existing.models.set(modelId, name);
-          }
-        }
-        if (!defaultModel) defaultModel = fromCli.defaultModel;
-        opts.logger?.(`model catalog: ${label} -> ${fromCli.providers.length} provider(s)`);
-      } catch (err) {
-        opts.logger?.(`model catalog: ${label} failed: ${describe(err)}`);
+      const pending = opts.runCommand(spec.argv, spec.timeoutMs, spec.maxOutputBytes)
+        .then((stdout) => parseModelCatalogOutput(opts.agentName, stdout))
+        .catch((err: unknown) => {
+          opts.logger?.(`model catalog: ${label} failed: ${describe(err)}`);
+          return null;
+        });
+      const raced = await withBudget(pending, cliBudget);
+      if (raced === "timeout") {
+        opts.logger?.(
+          `model catalog: ${label} not ready in ${cliBudget}ms; serving ${declaredAdded} declared model(s), merging when it lands`,
+        );
+        void pending.then((late) => {
+          if (!late || late.providers.length === 0) return;
+          opts.logger?.(`model catalog: ${label} -> ${late.providers.length} provider(s) (late)`);
+          applyLate(late);
+        });
+      } else if (raced) {
+        mergeFromCli(grouped, raced);
+        if (!defaultModel) defaultModel = raced.defaultModel;
+        opts.logger?.(`model catalog: ${label} -> ${raced.providers.length} provider(s)`);
       }
     }
 
@@ -446,7 +514,14 @@ export function createModelCatalogLoader(opts: ModelCatalogLoaderOpts): ModelCat
         opts.logger?.(
           `model catalog: ${opts.agentName} -> ${catalog.providers.length} provider(s) in ${cachedAt - startedAt}ms`,
         );
-        return catalog;
+        // 列举结果在「返回目录」和「写入缓存」之间落地的情况：此时 cached 刚被
+        // 赋上，applyLate 会直接把那份结果并进去，调用方拿到的是合并后的版本。
+        if (lateStash) {
+          const stash = lateStash;
+          lateStash = null;
+          applyLate(stash);
+        }
+        return cached;
       })
       .catch((err: unknown) => {
         opts.logger?.(

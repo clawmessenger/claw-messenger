@@ -478,12 +478,14 @@ describe("createModelCatalogLoader with config-declared models", () => {
     expect(catalog.providers[1].models.map((model) => model.id)).toEqual(["glm-5.2"]);
   });
 
-  // 配置声明了清单时，CLI 列举**完全不必跑**：它既可能只回报一部分（把面板
-  // 缩小），也可能把 30s 超时拖进 web 的 8s 窗口。声明即权威。
-  it("treats the declaration as authoritative and never lets the CLI shrink it", async () => {
-    // 真实现场：配置声明 6 个，`opencode models` 只回报其中 2 个。整组替换会把
-    // 面板从 6 个缩成 2 个 —— 声明式目录的价值就是「配置说了算」。
-    const runCommand = vi.fn().mockResolvedValue("quukk/glm-5.2\nquukk/beam-free\n");
+  // 「配置声明了清单就别再问 CLI」这条捷径在 1.3.10 线上闯过祸：一台 opencode
+  // 节点的 opencode.json 里只声明了 1 个模型，而 `opencode models` 能列出 93 条、
+  // 覆盖整个 `opencode/*`，却一次都没被执行 —— 面板上只剩 `custom (1)`，用户看到
+  // 的是「供应商只有一个」。声明是**下限**，CLI 的并集必须进来。
+  it("unions the CLI list into the declared models instead of skipping the command", async () => {
+    const runCommand = vi.fn().mockResolvedValue(
+      "quukk/glm-5.2\nquukk/beam-free\nopencode/claude-sonnet-5\nopencode/gpt-5\n",
+    );
     const loader = createModelCatalogLoader({
       agentName: "opencode",
       runCommand,
@@ -495,28 +497,28 @@ describe("createModelCatalogLoader with config-declared models", () => {
     });
 
     const catalog = await loader.load();
-    expect(runCommand).not.toHaveBeenCalled();
-    expect(catalog.providers).toHaveLength(1);
-    expect(catalog.providers[0].models.map((model) => model.id)).toEqual([
-      "glm-5.2", "glm-5.3", "k3",
+    expect(runCommand).toHaveBeenCalledTimes(1);
+    expect(catalog.providers.map((provider) => provider.id)).toEqual(["opencode", "quukk"]);
+    // 声明的 3 个一个都不能少（CLI 只回报了其中 1 个），也不会被 CLI 那份覆盖。
+    expect(catalog.providers[1].models.map((model) => model.id)).toEqual([
+      "beam-free", "glm-5.2", "glm-5.3", "k3",
     ]);
-    // CLI 独有但配置没声明的模型不会混进来：这一轮目录的来源只有配置。
-    expect(catalog.providers[0].models.map((model) => model.id)).not.toContain("beam-free");
     expect(catalog.defaultModel).toBe("quukk/glm-5.2");
   });
 
-  // 这条钉的是**延迟语义**，不是结果：web 只等 8s，而 `opencode models` 冷启
-  // 3-5s、超时上限 30s。只要 `if (spec && !hasDeclared)` 被改回 `if (spec)`，
-  // 结果类断言依然全绿，但线上会重新变成「拿不到模型列表」—— 所以这里必须
-  // 断言「一个子进程都没起」且「毫秒级返回」。
-  it("returns declared models without spawning the list command at all", async () => {
-    const runCommand = vi.fn(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 5_000));
-      return "quukk/from-cli";
-    });
+  // 预算语义：CLI 再慢也不能把**这一次请求**拖过面板的 8s 窗口。超时就先交声明
+  // 的那份；命令在后台跑完，结果补进缓存，下一次请求就是完整的。
+  it("serves the declared models when the list command overruns the budget", async () => {
+    let release: ((stdout: string) => void) | undefined;
+    const runCommand = vi.fn(
+      () => new Promise<string>((resolve) => {
+        release = resolve;
+      }),
+    );
     const loader = createModelCatalogLoader({
       agentName: "opencode",
       runCommand,
+      cliBudgetMs: 20,
       readConfig: () => ({
         endpoints: [],
         defaultModel: "quukk/glm-5.2",
@@ -525,15 +527,19 @@ describe("createModelCatalogLoader with config-declared models", () => {
     });
 
     const startedAt = Date.now();
-    const catalog = await loader.load();
-    const elapsedMs = Date.now() - startedAt;
-
-    expect(elapsedMs).toBeLessThan(100);
-    expect(runCommand).not.toHaveBeenCalled();
-    expect(catalog.providers).toEqual([
+    const first = await loader.load();
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+    expect(first.providers).toEqual([
       { id: "quukk", name: "quukk", models: [{ id: "glm-5.2", name: "glm-5.2" }] },
     ]);
-    expect(catalog.defaultModel).toBe("quukk/glm-5.2");
+
+    release?.("opencode/claude-sonnet-5\nquukk/glm-5.2\n");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    // 缓存已被晚到的结果补齐，且没有再起一次子进程。
+    const second = await loader.load();
+    expect(second.providers.map((provider) => provider.id)).toEqual(["opencode", "quukk"]);
+    expect(runCommand).toHaveBeenCalledTimes(1);
   });
 
   // 配置是用户手写的，provider key 里带空格完全可能。wire 上的 id 必须能拼成
