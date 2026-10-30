@@ -1093,12 +1093,172 @@ export function syncAgentPermissionConfig(
   });
 }
 
-/** 起 `opencode serve` 并等它把监听地址打到 stdout，然后跑完一轮。 */
-async function runOpenCodeServerTurn(
+// --- opencode serve 进程池 ---------------------------------------------------
+//
+// 以前每一轮 agent 回合都 spawn 一个 `opencode serve`，跑完再整棵杀掉。冷启动要
+// 加载派生配置、初始化 provider、再打 listening 行（实测 3-8s），这笔开销**每轮
+// 都白付一遍** —— 聊三轮就白等三个冷启动，角色推荐这种「用户盯着转圈」的入口
+// 感受最直接。
+//
+// 现在按「配置指纹」常驻复用：同一份派生配置的后续回合直接接到已经热起来的进程
+// 上，只有指纹变了才重建。回合结束**不杀**，改由空闲回收（SERVE_IDLE_MS）与池
+// 上限（SERVE_POOL_MAX）兜住内存。
+//
+// 指纹里必须带 behaviorPrompt 与 fsRestricted：这两项在 serve 启动时被写进
+// OPENCODE_CONFIG 指向的派生配置，进程一起来就固定了。指纹不同却共用进程，表现
+// 是「管理员明明关了文件读写，这一轮还能写」这类静默错配 —— 比慢更难查。
+//
+// CLAWMESSENGER_OPENCODE_SERVE_REUSE=0 可关掉复用，回到每轮新建的老行为（排障用）。
+const SERVE_IDLE_MS = 10 * 60_000;
+const SERVE_POOL_MAX = 4;
+
+export function opencodeServeReuseEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = (env.CLAWMESSENGER_OPENCODE_SERVE_REUSE ?? "").trim();
+  if (!raw) return true;
+  return !/^(0|false|no|off)$/i.test(raw);
+}
+
+interface OpencodeServeHandle {
+  key: string;
+  /** false = 本轮专用（复用被关），回合结束立刻杀。 */
+  pooled: boolean;
+  child: ReturnType<typeof spawn>;
+  baseUrl: string;
+  password?: string;
+  /** 正在用它的回合数。>0 时绝不能被空闲回收或淘汰掉。 */
+  inUse: number;
+  lastUsedAt: number;
+  idleTimer?: NodeJS.Timeout;
+}
+
+interface ServePoolEntry {
+  promise: Promise<OpencodeServeHandle>;
+  handle?: OpencodeServeHandle;
+}
+
+const servePool = new Map<string, ServePoolEntry>();
+
+/** 配置指纹：任何一项不同都不能共用进程（见本节开头的说明）。 */
+function servePoolKey(opts: RunAgentTurnOpts): string {
+  return [
+    opts.execPath,
+    opts.cwd ?? "",
+    opts.agentName ?? "",
+    opts.fsRestricted ? "fs1" : "fs0",
+    opts.behaviorPrompt ?? "",
+  ].join("\u0000");
+}
+
+function serveAlive(handle: OpencodeServeHandle): boolean {
+  return handle.child.exitCode === null && !handle.child.killed;
+}
+
+function retireOpencodeServe(handle: OpencodeServeHandle): void {
+  if (handle.idleTimer) {
+    clearTimeout(handle.idleTimer);
+    handle.idleTimer = undefined;
+  }
+  const entry = servePool.get(handle.key);
+  // 只删「这一条 handle 还是池里那个」的 entry：旧进程被淘汰后同 key 可能已经
+  // 建了新进程，无条件 delete 会把新的也摘掉。
+  if (entry?.handle === handle) servePool.delete(handle.key);
+  killProcessTree(handle.child);
+}
+
+/** 池满时淘汰最久未用且当前没人用的那个。 */
+function evictIdleServes(): void {
+  const idle: OpencodeServeHandle[] = [];
+  for (const entry of servePool.values()) {
+    if (entry.handle && entry.handle.inUse === 0) idle.push(entry.handle);
+  }
+  if (idle.length <= SERVE_POOL_MAX - 1) return;
+  idle.sort((a, b) => a.lastUsedAt - b.lastUsedAt);
+  for (const handle of idle.slice(0, idle.length - (SERVE_POOL_MAX - 1))) {
+    retireOpencodeServe(handle);
+  }
+}
+
+async function acquireOpencodeServe(
   opts: RunAgentTurnOpts,
-  timeoutMs: number,
-  hardLimit: number,
-): Promise<string> {
+  pooled: boolean,
+): Promise<OpencodeServeHandle> {
+  if (!pooled) {
+    const handle = await spawnOpencodeServe(opts, false);
+    handle.inUse = 1;
+    return handle;
+  }
+  const key = servePoolKey(opts);
+  const existing = servePool.get(key);
+  if (existing) {
+    // 启动失败的 promise 留在池里会让后续每一轮都继承同一个失败：拿到结果就
+    // 校验一次存活，死的当场摘掉。
+    const alive = await existing.promise.catch(() => null);
+    if (!alive || !serveAlive(alive)) servePool.delete(key);
+  }
+  let entry = servePool.get(key);
+  if (!entry) {
+    entry = { promise: spawnOpencodeServe(opts, true) };
+    const created = entry;
+    servePool.set(key, created);
+    void created.promise.then(
+      (handle) => {
+        created.handle = handle;
+        // 建起来就没人接（比如所有等待方都被 abort 了）：交给空闲回收。
+        if (handle.inUse === 0) scheduleServeIdle(handle);
+      },
+      () => {
+        if (servePool.get(key) === created) servePool.delete(key);
+      },
+    );
+  }
+  const handle = await entry.promise;
+  handle.inUse += 1;
+  handle.lastUsedAt = Date.now();
+  if (handle.idleTimer) {
+    clearTimeout(handle.idleTimer);
+    handle.idleTimer = undefined;
+  }
+  evictIdleServes();
+  return handle;
+}
+
+function scheduleServeIdle(handle: OpencodeServeHandle): void {
+  if (!handle.pooled) return;
+  if (handle.idleTimer) clearTimeout(handle.idleTimer);
+  handle.idleTimer = setTimeout(() => {
+    handle.idleTimer = undefined;
+    if (handle.inUse > 0) return;
+    retireOpencodeServe(handle);
+  }, SERVE_IDLE_MS);
+  // 别让空闲计时器吊住进程退出（daemon 停止时要能立刻走）。
+  handle.idleTimer.unref?.();
+}
+
+function releaseOpencodeServe(handle: OpencodeServeHandle): void {
+  handle.inUse = Math.max(0, handle.inUse - 1);
+  if (!handle.pooled) {
+    killProcessTree(handle.child);
+    return;
+  }
+  handle.lastUsedAt = Date.now();
+  // 还有别的回合在用：计时交给最后一个 release 的人。
+  if (handle.inUse > 0) return;
+  scheduleServeIdle(handle);
+}
+
+/** 仅供测试与进程收尾：清空池并杀掉所有常驻进程。 */
+export function resetOpencodeServePoolForTest(): void {
+  for (const entry of [...servePool.values()]) {
+    if (entry.handle) retireOpencodeServe(entry.handle);
+  }
+  servePool.clear();
+}
+
+/** 起一个 `opencode serve` 并等它把监听地址打到 stdout。 */
+async function spawnOpencodeServe(
+  opts: RunAgentTurnOpts,
+  pooled: boolean,
+): Promise<OpencodeServeHandle> {
   const { file, args } = buildSpawnInvocation(opts.execPath, [
     "serve",
     // 端口 0 = 让内核挑空闲端口，多台设备/多个 agent 不会撞。
@@ -1168,10 +1328,37 @@ async function runOpenCodeServerTurn(
     });
   });
 
+  const handle: OpencodeServeHandle = {
+    key: servePoolKey(opts),
+    pooled,
+    child,
+    baseUrl: serve.baseUrl,
+    ...(serve.password ? { password: serve.password } : {}),
+    inUse: 0,
+    lastUsedAt: Date.now(),
+  };
+  // 进程自己退出就从池里摘掉，下一轮自然重建。退出码只在这里留痕：常驻之后
+  // 「用着用着就没了」只能靠这段 stderr 尾部定位。
+  child.once("exit", (code) => {
+    const entry = servePool.get(handle.key);
+    if (entry?.handle === handle) servePool.delete(handle.key);
+    if (pooled && code !== null && code !== 0) {
+      console.warn(`opencode serve 退出 code=${code}: ${stderr.slice(-400)}`);
+    }
+  });
+  return handle;
+}
+
+async function runOpenCodeServerTurn(
+  opts: RunAgentTurnOpts,
+  timeoutMs: number,
+  hardLimit: number,
+): Promise<string> {
+  const handle = await acquireOpencodeServe(opts, opencodeServeReuseEnabled());
   try {
     const result = await runServerSession({
-      baseUrl: serve.baseUrl,
-      password: serve.password,
+      baseUrl: handle.baseUrl,
+      password: handle.password,
       prompt: opts.prompt,
       model: opts.model,
       timeoutMs,
@@ -1206,8 +1393,8 @@ async function runOpenCodeServerTurn(
     }
     return result.text;
   } finally {
-    // serve 是本轮专用进程，收尾必须整棵杀掉：留着就是下一个孤儿端口。
-    killProcessTree(child);
+    // 复用时**不杀**：交给空闲回收。复用被关时才整棵杀掉（孤儿端口）。
+    releaseOpencodeServe(handle);
   }
 }
 

@@ -18,7 +18,7 @@
 declare const __CLAWMESSENGER_VERSION__: string | undefined;
 
 /** 与 packages/xiachat-cli/package.json 的 version 手工同步（有测试盯着）。 */
-export const CLAWMESSENGER_VERSION_FALLBACK = "1.3.11";
+export const CLAWMESSENGER_VERSION_FALLBACK = "1.3.12";
 
 /** 本进程的 CLI 版本：构建期注入优先，否则用兜底字面量。 */
 export function cliVersion(): string {

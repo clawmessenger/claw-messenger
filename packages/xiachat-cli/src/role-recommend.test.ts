@@ -45,6 +45,29 @@ describe("parseRoleRecommendRequest", () => {
     expect(parsed?.timestamp).toBeUndefined();
   });
 
+  // model 只在服务端确实配了模型时下发。缺失/空串必须落成 undefined，否则
+  // im.ts 会把一个空串当「显式指定模型」传给 agent，`--model ""` 直接让这一轮
+  // 起不来 —— 表现是「角色推荐忽然全红」，比用默认模型慢严重得多。
+  it("takes the model route when present and drops blanks", () => {
+    expect(parseRoleRecommendRequest({
+      ...base,
+      params: { ...base.params, model: "anthropic/claude-haiku-5-5" },
+    })?.model).toBe("anthropic/claude-haiku-5-5");
+    expect(parseRoleRecommendRequest({
+      ...base,
+      params: { ...base.params, model: "   " },
+    })?.model).toBeUndefined();
+    expect(parseRoleRecommendRequest({
+      ...base,
+      params: { ...base.params, model: 42 },
+    })?.model).toBeUndefined();
+    // 超长串当脏数据丢掉：让它进 argv 只会得到一个必然失败的回合。
+    expect(parseRoleRecommendRequest({
+      ...base,
+      params: { ...base.params, model: "x".repeat(201) },
+    })?.model).toBeUndefined();
+  });
+
   it("rejects a missing/blank topic", () => {
     expect(parseRoleRecommendRequest({ ...base, params: { max_roles: 3 } })).toBeNull();
     expect(parseRoleRecommendRequest({ ...base, params: { topic: "   " } })).toBeNull();

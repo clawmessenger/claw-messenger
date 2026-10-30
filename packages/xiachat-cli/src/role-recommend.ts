@@ -158,6 +158,15 @@ export interface RoleRecommendRequest {
    * 会显式下发；不认识的取值会被忽略，退回 goal 兜底识别。
    */
   style?: string;
+  /**
+   * 这一轮要用的模型 route（`provider/slug`），来自主持节点在后台配的
+   * 「讨论主持 AI 模型」。
+   *
+   * 空 = 不指定，走设备默认模型。这个字段是推荐速度的主要杠杆：推荐是一次
+   * 短输出任务（3 段 120 字的人设 + 一层 JSON），用旗舰模型要二三十秒，换一个
+   * 快模型通常 2-3 秒 —— 链路本身并没有那么慢。
+   */
+  model?: string;
   timestamp?: number;
 }
 
@@ -189,6 +198,14 @@ export function parseRoleRecommendRequest(cmd: CommandContent): RoleRecommendReq
     typeof rawStyle === "string" && rawStyle.trim().length > 0 && rawStyle.length <= 64
       ? rawStyle.trim()
       : undefined;
+  // 模型 route 只做「非空且不长」的粗校验：认不认识由设备端 agent 自己决定，
+  // 传一个它不认识的 route 会让这一轮直接失败 —— 所以服务端只在确实配了模型时
+  // 才下发这个键，缺省（空串/缺字段）一律走节点默认模型。
+  const rawModel = params.model;
+  const model =
+    typeof rawModel === "string" && rawModel.trim().length > 0 && rawModel.length <= 200
+      ? rawModel.trim()
+      : undefined;
   return {
     requestId: cmd.request_id,
     topic: params.topic,
@@ -197,6 +214,7 @@ export function parseRoleRecommendRequest(cmd: CommandContent): RoleRecommendReq
     recommendationPrompt:
       typeof params.recommendation_prompt === "string" ? params.recommendation_prompt : "",
     style,
+    model,
     timestamp,
   };
 }

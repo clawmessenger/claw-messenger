@@ -1531,11 +1531,15 @@ export class MessageDispatcher {
 
     const startedAt = Date.now();
     console.log(
-      `role recommend: request ${request.requestId} max_roles=${request.maxRoles} from ${msg.fromUserId}`,
+      `role recommend: request ${request.requestId} max_roles=${request.maxRoles}`
+        + ` model=${request.model ?? "<node default>"} from ${msg.fromUserId}`,
     );
     let reply: string;
     try {
-      const output = await turns.runTurn(buildRoleRecommendPrompt(request));
+      // model 是主持节点在后台配的那个（服务端只在非空时下发）。它决定这轮用
+      // 什么模型出角色 —— 旗舰模型做这件「3 段人设 + 一层 JSON」的短任务要
+      // 二三十秒，快模型通常 2-3 秒，链路本身没那么慢。
+      const output = await turns.runTurn(buildRoleRecommendPrompt(request), request.model);
       const roles = parseRoleRecommendationOutput(output, request.maxRoles);
       reply = roles
         ? buildRoleRecommendationResponse(request.requestId, roles)
