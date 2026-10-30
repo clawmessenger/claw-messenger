@@ -34,11 +34,14 @@ export const ROLE_RECOMMEND_TARGET_ROLES = 3;
 /** 产品口径：每个 role_prompt 的字数上限（中文按字数算，标点也算一个字）。
  *
  * 只出现在提示词里，**不参与**本地校验（见 ROLE_RECOMMEND_MAX_PROMPT）。
- * 为什么钉这么短：role_prompt 是每轮发言都注入给 agent 的人设，一段人设越长，
- * 设备端一次完整 LLM 回合就越慢，讨论组「推荐角色」等十几秒到 100s+ 的主因之一
- * 就是产出量太大。
+ *
+ * 产品口径（2026-10-30 定）：人设就是**一句话**，C 端不再提供编辑入口。理由有两条：
+ *   · 速度：这份 JSON 是推荐的全部输出，角色数 × 人设字数 = 生成时间。120 字的口径
+ *     下设备端单轮 12s 起，几个角色叠加后用户等过 100 秒（线上现场「已等待 104s」）；
+ *   · 用处：一句话已经能定调，用户改不了也用不上更长的版本，而它每轮发言都要
+ *     注入 context —— 越长越拖慢整场讨论。
  */
-export const ROLE_RECOMMEND_ROLE_PROMPT_CHARS = 120;
+export const ROLE_RECOMMEND_ROLE_PROMPT_CHARS = 40;
 
 /**
  * 本轮实际要几个角色：产品口径 3 个，服务端下发的 max_roles 更小时按 max_roles
@@ -245,7 +248,7 @@ function buildStyleSection(profile: StyleProfile, targetRoles: number): string[]
   }
   lines.push(
     "",
-    "Write this style's speaking voice INTO every role_prompt, as an instruction that role must follow on every single turn:",
+    "Fold this style's speaking voice into each role_prompt's ONE sentence (do not paste the voice text verbatim, and do not spend a second sentence on it):",
     profile.voice,
     "role_prompt is handed to that participant verbatim when it speaks, so the voice has to live there — it is what keeps two different styles from sounding alike.",
   );
@@ -284,10 +287,10 @@ export function buildRoleRecommendPrompt(request: RoleRecommendRequest): string 
     '{"roles":[{"role_name":"...","role_prompt":"...","speaking_order":0}]}',
     "",
     "- role_name: a short distinct label (<= 80 characters)",
-    `- role_prompt: ONE continuous paragraph of a natural persona, at most ${ROLE_RECOMMEND_ROLE_PROMPT_CHARS} Chinese characters (中文按字数算，标点也算一个字). 不写小标题、不分点、不举例、不换行 —— 就一段话，说清这个角色是谁、关心什么、发言时怎么做。`,
+    `- role_prompt: ONE sentence, at most ${ROLE_RECOMMEND_ROLE_PROMPT_CHARS} Chinese characters (中文按字数算，标点也算一个字). 一句话说清「这个角色是谁 + 怎么发言」即可：不写小标题、不分点、不举例、不换行、不复述议题。`,
     "- speaking_order: 0-based, and across the roles exactly 0,1,2,… with no gaps or repeats",
     "",
-    `Keep role_prompt at or under ${ROLE_RECOMMEND_ROLE_PROMPT_CHARS} characters on purpose: it is injected into that participant's context on every speaking turn, so a long one slows the whole roundtable down. 一段话写清人设即可，不要为了显得完整而展开。`,
+    `One sentence, and stop: role_prompt is injected into that participant's context on every speaking turn, so length buys nothing and costs both this request's latency and every later round. 不要为了显得完整而展开。`,
   );
   return lines.join("\n");
 }

@@ -6,6 +6,8 @@ import { MessageDispatcher, planReadReceipt } from "./im.js";
 import { runAgentTurn, runAgentCommand } from "./agents.js";
 import { buildChatStreamFrame } from "./chat-stream.js";
 import { createModelCatalogLoader, parseModelCatalogRequest } from "./model-catalog.js";
+import { decodeCommandContent } from "./protocol.js";
+import { ROLE_RECOMMEND_ACTION } from "./role-recommend.js";
 import { createAnsweredTurnStore } from "./answered-turns.js";
 import {
   createRuntimeProber,
@@ -552,6 +554,20 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
       if (recoveryRequest) {
         void dispatcher.handleRuntimeRecovery(msg, recoveryRequest).catch((err: unknown) => {
           console.error("runtime recovery failed:", err instanceof Error ? err.message : err);
+        });
+        return;
+      }
+    }
+    // 角色推荐同样必须绕过会话队列。它在配置向导里是**高频、可叠加**的请求：
+    // 用户每配完一个角色就要下一批，而队列并发 1、等待位 1 —— 第三个请求到达时
+    // 直接被 sendBusyDropNotice 丢掉，且丢在私聊会话里，向导根本收不到，界面于是
+    // 无限转圈（2026-10-30 现场：已等待 104s 仍未出现）。推荐回合本身只有几秒，
+    // 没有理由为它排队。
+    if (msg.objectName === "command") {
+      const recommendCmd = decodeCommandContent(msg.content);
+      if (recommendCmd?.service === "discussion" && recommendCmd.action === ROLE_RECOMMEND_ACTION) {
+        void dispatcher.handle(msg, turns).catch((err: unknown) => {
+          console.error("role recommend failed:", err instanceof Error ? err.message : err);
         });
         return;
       }
