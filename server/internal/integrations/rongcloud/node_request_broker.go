@@ -613,17 +613,36 @@ func (c DiscussionModelCatalog) CatalogHasRoute(provider, model string) bool {
 	if provider == "" || model == "" {
 		return false
 	}
-	for _, candidate := range c.Providers {
-		if candidate.ID != provider {
-			continue
-		}
-		for _, entry := range candidate.Models {
-			if entry.ID == model {
-				return true
-			}
+	models, found := c.ProviderModels(provider)
+	if !found {
+		return false
+	}
+	for _, entry := range models {
+		if entry.ID == model {
+			return true
 		}
 	}
 	return false
+}
+
+// ProviderModels 返回目录里该 provider 声明的模型清单，以及这个 provider 是否
+// 出现在目录中。
+//
+// 两者必须分开返回，调用方要靠它区分两种完全不同的「查不到」：
+//   - provider 不在目录里 → 明确不存在，可以拒绝；
+//   - provider 在、模型清单却是空的 → 节点没上报（自建 OpenAI 兼容端点的模型
+//     常由服务端动态给出，节点侧只报得出 provider 名），这是「没有信息」而不是
+//     「信息说没有」，据此拒绝会让这类节点的模型永远配不上。
+func (c DiscussionModelCatalog) ProviderModels(provider string) ([]DiscussionModelEntry, bool) {
+	if provider == "" {
+		return nil, false
+	}
+	for _, candidate := range c.Providers {
+		if candidate.ID == provider {
+			return candidate.Models, true
+		}
+	}
+	return nil, false
 }
 
 // AcceptResponse hands an inbound node `command_result` to the broker. It

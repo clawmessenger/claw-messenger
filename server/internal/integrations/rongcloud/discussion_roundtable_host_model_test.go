@@ -160,3 +160,50 @@ func cloneCatalogPayload(in map[string]interface{}) map[string]interface{} {
 	}
 	return out
 }
+
+// TestProviderModelsDistinguishesSilenceFromAbsence 钉住「没有信息」与「信息说没有」
+// 的区别 —— 这正是管理端保存时三态判定的分水岭：
+//
+//	provider 不在目录   → found=false       → rejected（provider 明确不存在）
+//	provider 在、清单空 → found=true, 0 条  → unverified（节点没上报，不是不存在）
+//	provider 在、有清单 → found=true, N 条  → 再按 CatalogHasRoute 复核具体模型
+//
+// 早先只判 `CatalogHasRoute`，第二类会和第三类的「模型不在清单里」混成同一个
+// rejected：自建 OpenAI 兼容端点的模型由服务端动态给出、节点侧只报得出 provider
+// 名，于是这类节点上任何模型都存不进去 —— 前端级联是空列表，手填撞 400
+// MODEL_NOT_AVAILABLE，表现就是「设置讨论主持 AI 模型的功能不可用」。
+func TestProviderModelsDistinguishesSilenceFromAbsence(t *testing.T) {
+	catalog := DiscussionModelCatalog{Providers: []DiscussionModelProvider{
+		{ID: "custom", Name: "custom"},
+		{ID: "openai", Name: "OpenAI", Models: []DiscussionModelEntry{{ID: "gpt-5.6-sol"}}},
+	}}
+
+	models, found := catalog.ProviderModels("custom")
+	if !found {
+		t.Fatal("provider 在目录里却没被认出来，会被误判成 provider 不存在")
+	}
+	if len(models) != 0 {
+		t.Fatalf("custom 的模型清单应为空，got %d 条", len(models))
+	}
+	if catalog.CatalogHasRoute("custom", "anything") {
+		t.Fatal("空清单的 provider 不该命中任何 route")
+	}
+
+	if _, found := catalog.ProviderModels("ghost"); found {
+		t.Fatal("不在目录里的 provider 不该被认作 found")
+	}
+
+	models, found = catalog.ProviderModels("openai")
+	if !found || len(models) != 1 {
+		t.Fatalf("openai = (%d 条, found=%v), want (1, true)", len(models), found)
+	}
+	if !catalog.CatalogHasRoute("openai", "gpt-5.6-sol") {
+		t.Fatal("有清单的 provider 应能定位到清单内的模型")
+	}
+
+	// 空 provider id 不该匹配到任何条目（NormalizeModel 已保证传入非空，
+	// 这里只是把契约钉死，防止将来有人放宽校验）。
+	if _, found := catalog.ProviderModels(""); found {
+		t.Fatal("空 provider id 不该被认作 found")
+	}
+}

@@ -943,8 +943,9 @@ func (h *Handler) clawAdminDiscussionHostFetchCatalog(
 
 // clawAdminDiscussionHostCheckModel 判断刚保存的模型在主持节点上是否可用。
 //
-// 三态：verified / unverified / rejected。只有「目录确实拿到了、且里面没有这个
-// model」才 rejected；离线、超时、目录为空、broker 未装配一律 unverified（放行）。
+// 三态：verified / unverified / rejected。只有「目录确实拿到了、且里面明确没有
+// 这个 model（或没有这个 provider）」才 rejected；离线、超时、目录为空、
+// provider 没上报模型清单、broker 未装配一律 unverified（放行）。
 func (h *Handler) clawAdminDiscussionHostCheckModel(
 	ctx context.Context, nodeUUID pgtype.UUID, aiUserID, provider, model string,
 ) (string, string) {
@@ -961,8 +962,17 @@ func (h *Handler) clawAdminDiscussionHostCheckModel(
 		// 读不出来），按未核验处理并让页面提示一句。
 		return clawAdminModelCheckUnverified, "empty catalog"
 	}
-	// 走到这里 provider 与 model 一定都非空（NormalizeModel 保证），所以目录里
-	// 一定能按 `provider/model` 定位到具体条目，不存在「裸 id 无法定位」的兜底。
+	// provider 在目录里、却一个模型都没上报：这与「目录全空」是同一种情形 ——
+	// 节点给不出可核验的清单，而不是「清单里没有这个模型」。自建的 OpenAI 兼容
+	// 端点常这样：模型由服务端动态给出，节点侧只报得出 provider 名。若在此拒绝，
+	// 这类节点的模型永远配不上：前端级联下拉是空列表，手填又撞 400。
+	models, providerFound := catalog.ProviderModels(provider)
+	if !providerFound {
+		return clawAdminModelCheckRejected, "provider is not available on the host node"
+	}
+	if len(models) == 0 {
+		return clawAdminModelCheckUnverified, "provider has no model list"
+	}
 	if !catalog.CatalogHasRoute(provider, model) {
 		return clawAdminModelCheckRejected, "model is not available on the host node"
 	}
