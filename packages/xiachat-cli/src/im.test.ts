@@ -717,6 +717,41 @@ describe("MessageDispatcher self-echo loop guard", () => {
     expect(body.requestId).toBe("req-1");
     expect(body.providers).toHaveLength(1);
   });
+
+  it("forwards the admin's refresh flag into the catalog loader", async () => {
+    const deps = makeDeps();
+    const calls: Array<{ force?: boolean } | undefined> = [];
+    const dispatcher = new MessageDispatcher({
+      send: deps.send,
+      selfUserId: "rc_node_self",
+      loadModelCatalog: async (loadOpts) => {
+        calls.push(loadOpts);
+        return {
+          defaultModel: null,
+          providers: [{ id: "prov", name: "prov", models: [{ id: "m", name: "m" }] }],
+        };
+      },
+    });
+    const request = (requestId: string, extra: Record<string, unknown>) => ({
+      objectName: "command",
+      fromUserId: "user_1",
+      toUserId: "",
+      targetId: "user_1",
+      conversationType: 1,
+      content: JSON.stringify({
+        msg_type: "discussion_model_catalog_request",
+        protocolVersion: 2,
+        requestId,
+        timestamp: Date.now(),
+        ...extra,
+      }),
+    });
+    await dispatcher.handle(request("req-plain", {}), { runTurn: async () => "unused" });
+    await dispatcher.handle(request("req-force", { refresh: true }), { runTurn: async () => "unused" });
+    // 普通请求传 force:false 而不是 undefined：解析端与加载器对「没提」和「明确
+    // 不刷」处理一致，但显式给值让日志与测试都能看出这一次是谁要求的。
+    expect(calls).toEqual([{ force: false }, { force: true }]);
+  });
 });
 
 describe("MessageDispatcher model catalog replay guards", () => {

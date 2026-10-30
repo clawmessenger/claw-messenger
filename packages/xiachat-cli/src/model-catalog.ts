@@ -247,6 +247,10 @@ export interface ModelCatalogRequest {
   // replay would otherwise fire dozens of responses at once and trip
   // RongCloud's SEND_FREQUENCY_TOO_FAST (20604), losing all of them.
   timestamp?: number;
+  // 管理端「重新检测」要求的强制重枚举。只在缓存判定为过期时才有意义（见
+  // ModelCatalogLoader.load），这里透传过去即可；老服务端不发这个键，等价于
+  // false，行为与从前一致。
+  refresh?: boolean;
 }
 
 export function parseModelCatalogRequest(content: string): ModelCatalogRequest | null {
@@ -271,6 +275,7 @@ export function parseModelCatalogRequest(content: string): ModelCatalogRequest |
     protocolVersion: 2,
     requestId,
     ...(timestamp !== undefined ? { timestamp } : {}),
+    ...(record.refresh === true ? { refresh: true } : {}),
   };
 }
 
@@ -298,7 +303,17 @@ export interface ModelCatalogLoaderOpts {
   // Probes one OpenAI-compatible endpoint; `null` = unusable.
   probe?: (endpoint: ProviderEndpoint) => Promise<string[] | null>;
   logger?: (message: string) => void;
-  /** How long a cached catalog is served before a background refresh kicks in. */
+  /**
+   * 缓存最多「直接拿来答」多久（毫秒）。
+   *
+   * 超过这个年龄就不再秒回缓存，而是**等这次重枚举**再答（见下面的 load）。
+   * 取值要在「管理端改完设备模型多久能看到」与「打开面板要不要等一次列举」
+   * 之间取平衡：太小则每次开面板都付 3–6s 的列举，太大则改完配置看到的是旧清单。
+   * 服务端等 20s（clawAdminDiscussionHostCatalogTimeout）、前端等 25s，
+   * 所以这里等一次列举完全在预算内。
+   */
+  maxStaleMs?: number;
+  /** @deprecated 旧名，等价于 maxStaleMs（当时语义是「后台刷新的阈值」）。 */
   ttlMs?: number;
   /**
    * 等 agent 自己的模型列举命令等多久。
@@ -311,13 +326,18 @@ export interface ModelCatalogLoaderOpts {
 }
 
 export interface ModelCatalogLoader {
-  /** Catalog for the current request; never rejects. */
-  load(): Promise<DiscussionModelCatalog>;
+  /**
+   * Catalog for the current request; never rejects.
+   *
+   * `force` 跳过「缓存还新鲜就直接答」的捷径，强制等一次重枚举 —— 管理端
+   * 「重新检测」用它：用户在设备上刚改了模型，点一下就必须看到新的。
+   */
+  load(opts?: { force?: boolean }): Promise<DiscussionModelCatalog>;
   /** Kick off a background refresh so the first panel open is served warm. */
   warm(): void;
 }
 
-const DEFAULT_CACHE_TTL_MS = 5 * 60_000;
+const DEFAULT_MAX_STALE_MS = 20_000;
 // 5.5s：C 端「设备管理 → 默认模型」面板只等 8s，留 2.5s 给融云往返与端点探测。
 // 现场实测 `opencode models` 热态 1–3s、冷态能到 30s；预算内回不来就先交手头这份。
 const DEFAULT_CLI_BUDGET_MS = 5_500;
@@ -358,7 +378,7 @@ export function createModelCatalogLoader(opts: ModelCatalogLoaderOpts): ModelCat
   const spec = modelListSpec(opts.agentName);
   const readConfig = opts.readConfig ?? ((name: string | undefined) => readAgentConfig(name));
   const probe = opts.probe ?? ((endpoint: ProviderEndpoint) => probeProviderModels(endpoint));
-  const ttlMs = opts.ttlMs ?? DEFAULT_CACHE_TTL_MS;
+  const maxStaleMs = opts.maxStaleMs ?? opts.ttlMs ?? DEFAULT_MAX_STALE_MS;
   const cliBudget = opts.cliBudgetMs ?? DEFAULT_CLI_BUDGET_MS;
   const now = opts.now ?? Date.now;
   let cached: DiscussionModelCatalog | null = null;
@@ -477,6 +497,15 @@ export function createModelCatalogLoader(opts: ModelCatalogLoaderOpts): ModelCat
         mergeFromCli(grouped, raced);
         if (!defaultModel) defaultModel = raced.defaultModel;
         opts.logger?.(`model catalog: ${label} -> ${raced.providers.length} provider(s)`);
+      } else if (cached) {
+        // 列举失败（命令不存在、退出码非零、输出解析不出来）：这次「等重枚举」
+        // 不该把上一版目录冲成空的。旧缓存做底 —— 只报 config 声明的那几条，
+        // 用户会看到列表突然缩水，比看到旧的更糟。与上面 timeout 分支同一个理由。
+        mergeFromCli(grouped, cached);
+        if (!defaultModel) defaultModel = cached.defaultModel ?? null;
+        opts.logger?.(
+          `model catalog: ${label} failed; falling back to the cached ${cached.providers.length} provider(s)`,
+        );
       }
     }
 
@@ -540,11 +569,20 @@ export function createModelCatalogLoader(opts: ModelCatalogLoaderOpts): ModelCat
   };
 
   return {
-    async load() {
+    async load(loadOpts) {
+      const force = loadOpts?.force === true;
+      // 「新鲜就秒回」只用于**真的新鲜**的缓存。老实现是 5 分钟 TTL + 后台刷新，
+      // 而且这一轮**仍然返回旧的那份**：管理端改完设备模型，要么看到 5 分钟前的
+      // 清单，要么在过期后的第一次请求里还是旧的（刷新在后台跑），必须点第二次。
+      // 现在的取舍是——过期就等这一次枚举（服务端 20s / 前端 25s 都等得起，
+      // 列举本身还有 cliBudgetMs 兜底），拿不到才回落到缓存。
+      if (cached && !force && now() - cachedAt < maxStaleMs) {
+        return cached;
+      }
       if (cached) {
-        const served = cached;
-        if (now() - cachedAt >= ttlMs) void refresh();
-        return served;
+        opts.logger?.(
+          `model catalog: ${opts.agentName} cache ${now() - cachedAt}ms old${force ? " (forced)" : ""} — re-enumerating before answering`,
+        );
       }
       return refresh();
     },

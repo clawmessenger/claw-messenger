@@ -406,7 +406,7 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
   const dispatcher = new MessageDispatcher({
     send: (toUserId, objectName, content) => opts.transport.sendMessage(toUserId, objectName, content),
     answeredTurns,
-    loadModelCatalog: () => catalogLoader.load(),
+    loadModelCatalog: (loadOpts) => catalogLoader.load(loadOpts),
     userModels,
     probeRuntime,
     agentName: opts.agentName,

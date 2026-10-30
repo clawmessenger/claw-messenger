@@ -55,6 +55,20 @@ describe("parseModelCatalogRequest", () => {
     });
   });
 
+  it("carries an explicit refresh flag, and omits it otherwise", () => {
+    const base = {
+      msg_type: "discussion_model_catalog_request",
+      protocolVersion: 2,
+      requestId: "req-9",
+    };
+    // 老服务端不发这个键：解析结果里不该凭空多出一个 false，否则响应/日志/diff
+    // 都会与历史记录不一致。
+    expect(parseModelCatalogRequest(JSON.stringify(base))?.refresh).toBeUndefined();
+    expect(parseModelCatalogRequest(JSON.stringify({ ...base, refresh: true }))?.refresh).toBe(true);
+    // 非布尔一律当没提：一个 "yes" 不该让设备跳过缓存判定。
+    expect(parseModelCatalogRequest(JSON.stringify({ ...base, refresh: "yes" }))?.refresh).toBeUndefined();
+  });
+
   it("accepts a request without a timestamp and rejects a malformed one", () => {
     expect(parseModelCatalogRequest(JSON.stringify({
       msg_type: "discussion_model_catalog_request", protocolVersion: 2, requestId: "req-2",
@@ -242,8 +256,90 @@ describe("createModelCatalogLoader", () => {
     expect(runCommand).toHaveBeenCalledTimes(2);
   });
 
-  it("never rejects and stays empty for agents without a list command", async () => {
-    const runCommand = vi.fn();
+  // 管理端「设备改了模型但后台不更新」的根因就在这里：老实现是 cache-first +
+  // 5 分钟 TTL 的后台刷新，而且**这一轮仍返回旧的那份**，所以要么看到 5 分钟前的
+  // 清单，要么过期后第一次请求还是旧的（刷新在后台跑），得点第二次。
+  it("re-enumerates before answering once the cache outlives maxStaleMs", async () => {
+    let clock = 1_000;
+    let output = OPENCODE_OUTPUT;
+    const runCommand = vi.fn().mockImplementation(async () => output);
+    const loader = createModelCatalogLoader({
+      agentName: "opencode",
+      runCommand,
+      readConfig: noConfig,
+      maxStaleMs: 20_000,
+      now: () => clock,
+    });
+
+    const first = await loader.load();
+    expect(first.providers.map((provider) => provider.id)).toEqual(["agent-plan", "opencode", "quukk"]);
+
+    // 设备上新增了一个供应商。缓存过期后，**这一轮**就必须看到它。
+    output = `${OPENCODE_OUTPUT}newco/new-model\n`;
+    clock += 21_000;
+    const second = await loader.load();
+    expect(second.providers.map((provider) => provider.id)).toContain("newco");
+    expect(runCommand).toHaveBeenCalledTimes(2);
+  });
+
+  it("still serves a fresh cache without re-enumerating", async () => {
+    let clock = 1_000;
+    const runCommand = vi.fn().mockResolvedValue(OPENCODE_OUTPUT);
+    const loader = createModelCatalogLoader({
+      agentName: "opencode",
+      runCommand,
+      readConfig: noConfig,
+      maxStaleMs: 20_000,
+      now: () => clock,
+    });
+
+    await loader.load();
+    clock += 5_000;
+    await loader.load();
+    expect(runCommand).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-enumerates on demand even when the cache is fresh (force)", async () => {
+    let output = OPENCODE_OUTPUT;
+    const runCommand = vi.fn().mockImplementation(async () => output);
+    const loader = createModelCatalogLoader({
+      agentName: "opencode",
+      runCommand,
+      readConfig: noConfig,
+      maxStaleMs: 20_000,
+    });
+
+    await loader.load();
+    output = `${OPENCODE_OUTPUT}newco/new-model\n`;
+    const forced = await loader.load({ force: true });
+    expect(forced.providers.map((provider) => provider.id)).toContain("newco");
+    expect(runCommand).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps the previous catalog when the awaited re-enumeration fails", async () => {
+    let clock = 1_000;
+    const runCommand = vi
+      .fn()
+      .mockImplementationOnce(async () => OPENCODE_OUTPUT)
+      .mockRejectedValueOnce(new Error("opencode models timed out"));
+    const loader = createModelCatalogLoader({
+      agentName: "opencode",
+      runCommand,
+      readConfig: noConfig,
+      maxStaleMs: 20_000,
+      now: () => clock,
+    });
+
+    const first = await loader.load();
+    expect(first.providers).toHaveLength(3);
+
+    clock += 21_000;
+    const second = await loader.load();
+    // 一次失败的重枚举不能把已知目录冲成空的：宁可给旧清单，也不能让面板突然空掉。
+    expect(second.providers.map((provider) => provider.id)).toEqual(["agent-plan", "opencode", "quukk"]);
+  });
+
+  it("never rejects and stays empty for agents without a list command", async () => {    const runCommand = vi.fn();
     const loader = createModelCatalogLoader({
       agentName: "codex",
       runCommand,

@@ -142,7 +142,8 @@ export interface DispatcherDeps {
   // Enumerates this node's model catalog for the web's 设备管理 → 默认模型 panel.
   // Omitted (or resolving to an empty catalog) still answers the request, so
   // the panel degrades to "use the node default model" instead of hanging.
-  loadModelCatalog?: () => Promise<DiscussionModelCatalog>;
+  // `force` 来自管理端「重新检测」：跳过缓存新鲜度判定，当轮必须给出新枚举结果。
+  loadModelCatalog?: (opts?: { force?: boolean }) => Promise<DiscussionModelCatalog>;
   // 按用户持久化的模型偏好（见 user-models.ts）。用户在私聊里发
   // `/use-model <provider>/<model>` 时写进来的就是它，下一轮该用户的 turn
   // 从它取模型。省略时 `/use-model` 只回一句「本节点不支持」，不会静默吞掉
@@ -1411,9 +1412,12 @@ export class MessageDispatcher {
     }
     let catalog = EMPTY_MODEL_CATALOG;
     const startedAt = Date.now();
-    console.log(`model catalog: request ${request.requestId} from ${msg.fromUserId}`);
+    const force = request.refresh === true;
+    console.log(
+      `model catalog: request ${request.requestId} from ${msg.fromUserId}${force ? " (refresh)" : ""}`,
+    );
     try {
-      catalog = (await this.deps.loadModelCatalog?.()) ?? EMPTY_MODEL_CATALOG;
+      catalog = (await this.deps.loadModelCatalog?.({ force })) ?? EMPTY_MODEL_CATALOG;
     } catch (err) {
       console.error("model catalog lookup failed:", err instanceof Error ? err.message : err);
     }
