@@ -28,7 +28,8 @@ import {
   buildRoleRecommendationError,
   buildRoleRecommendationResponse,
   parseRoleRecommendRequest,
-  parseRoleRecommendationOutput,
+  parseRoleRecommendationOutputDetailed,
+  roleRecommendationOutputSample,
   ROLE_RECOMMEND_ACTION,
   STALE_ROLE_RECOMMEND_REQUEST_MS,
 } from "./role-recommend.js";
@@ -1544,16 +1545,34 @@ export class MessageDispatcher {
       // 什么模型出角色 —— 旗舰模型做这件「3 段人设 + 一层 JSON」的短任务要
       // 二三十秒，快模型通常 2-3 秒，链路本身没那么慢。
       const output = await turns.runTurn(buildRoleRecommendPrompt(request), request.model);
-      const roles = parseRoleRecommendationOutput(output, request.maxRoles);
-      reply = roles
-        ? buildRoleRecommendationResponse(request.requestId, roles)
-        : buildRoleRecommendationError(request.requestId, "role recommendation invalid");
-      if (roles) {
+      const parsed = parseRoleRecommendationOutputDetailed(output, request.maxRoles);
+      if (parsed.ok) {
+        if (parsed.repairs.length > 0) {
+          // 修正过就要留痕：否则「模型答对了」与「我们替模型圆过去了」在日志里
+          // 长得一模一样，下一轮排查会把修过的偏差当成正常产出。
+          console.warn(
+            `role recommend: repaired ${request.requestId}`
+              + ` repairs=${parsed.repairs.join(",")}`,
+          );
+        }
+        reply = buildRoleRecommendationResponse(request.requestId, parsed.roles);
         console.log(
-          `role recommend: answered ${request.requestId} with ${roles.length} role(s) in ${Date.now() - startedAt}ms`,
+          `role recommend: answered ${request.requestId} with ${parsed.roles.length} role(s)`
+            + ` in ${Date.now() - startedAt}ms`,
         );
       } else {
-        console.error(`role recommend: could not parse an answer for ${request.requestId}`);
+        // 失败必须自证：reason 是稳定短标识，raw 是压成单行的原文片段。
+        // 两者同时进日志和回执的 detail —— 服务端只记日志、不参与判定。
+        const sample = roleRecommendationOutputSample(output);
+        console.error(
+          `role recommend: could not parse an answer for ${request.requestId}`
+            + ` reason=${parsed.reason} raw="${sample}"`,
+        );
+        reply = buildRoleRecommendationError(
+          request.requestId,
+          "role recommendation invalid",
+          { reason: parsed.reason, sample },
+        );
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : "agent turn failed";

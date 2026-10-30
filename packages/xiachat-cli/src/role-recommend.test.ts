@@ -4,11 +4,15 @@ import {
   buildRoleRecommendationError,
   buildRoleRecommendationResponse,
   detectDiscussionStyle,
+  extractJsonObject,
   parseRoleRecommendRequest,
   parseRoleRecommendationOutput,
+  parseRoleRecommendationOutputDetailed,
   ROLE_RECOMMEND_MAX_PROMPT,
   ROLE_RECOMMEND_ROLE_PROMPT_CHARS,
+  ROLE_RECOMMEND_SAMPLE_CHARS,
   ROLE_RECOMMEND_TARGET_ROLES,
+  roleRecommendationOutputSample,
   roleRecommendTargetRoleCount,
   STALE_ROLE_RECOMMEND_REQUEST_MS,
   type RoleRecommendRequest,
@@ -217,7 +221,7 @@ describe("parseRoleRecommendationOutput", () => {
     expect(parseRoleRecommendationOutput(JSON.stringify({ roles: gap }), 3)).toBeNull();
   });
 
-  it("rejects duplicate names, empty fields and too many roles", () => {
+  it("rejects duplicate names and empty fields", () => {
     const dupName = [
       { role_name: "A", role_prompt: "p", speaking_order: 0 },
       { role_name: "A", role_prompt: "p", speaking_order: 1 },
@@ -225,11 +229,282 @@ describe("parseRoleRecommendationOutput", () => {
     expect(parseRoleRecommendationOutput(JSON.stringify({ roles: dupName }), 3)).toBeNull();
     const emptyPrompt = [{ role_name: "A", role_prompt: "  ", speaking_order: 0 }];
     expect(parseRoleRecommendationOutput(JSON.stringify({ roles: emptyPrompt }), 3)).toBeNull();
-    expect(parseRoleRecommendationOutput(JSON.stringify({ roles }), 1)).toBeNull();
+  });
+
+  // 行为变更（2026-10-30）：超过 max_roles 不再一律判死。提示词要 3 个、模型给
+  // 4 个是最常见的偏差之一，按 speaking_order 保留前 max_roles 个即可用。
+  it("truncates an over-count answer instead of rejecting it", () => {
+    expect(parseRoleRecommendationOutput(JSON.stringify({ roles }), 1)).toEqual([roles[0]]);
+    // 截断也救不回来的（留下的那条 speaking_order 不是 0）仍然拒收。
+    const unfixable = [
+      { role_name: "A", role_prompt: "p", speaking_order: 2 },
+      { role_name: "B", role_prompt: "p", speaking_order: 3 },
+    ];
+    expect(parseRoleRecommendationOutput(JSON.stringify({ roles: unfixable }), 1)).toBeNull();
   });
 
   it("returns null for prose with no JSON at all", () => {
     expect(parseRoleRecommendationOutput("I cannot help with that.", 3)).toBeNull();
+  });
+});
+
+// 失败原因必须能被机器读、能被日志直接打：现场「无法解析」全靠它定位。
+describe("parseRoleRecommendationOutputDetailed", () => {
+  const twoRoles = [
+    { role_name: "A", role_prompt: "p", speaking_order: 0 },
+    { role_name: "B", role_prompt: "p", speaking_order: 1 },
+  ];
+  const reasonOf = (output: string, maxRoles = 3): string => {
+    const result = parseRoleRecommendationOutputDetailed(output, maxRoles);
+    return result.ok ? "ok" : result.reason;
+  };
+
+  it("reports empty-output and no-json instead of a bare null", () => {
+    expect(reasonOf("")).toBe("empty-output");
+    expect(reasonOf("   \n ")).toBe("empty-output");
+    expect(reasonOf("I cannot help with that.")).toBe("no-json");
+    // 有花括号但配对不成立（生成被截断）也算 no-json。
+    expect(reasonOf('{"roles":[{"role_name":"A"')).toBe("no-json");
+  });
+
+  it("reports a malformed roles field", () => {
+    expect(reasonOf(JSON.stringify({ roles: "nope" }))).toBe("roles-not-array");
+    expect(reasonOf(JSON.stringify({ role_list: twoRoles }))).toBe("roles-not-array");
+    expect(reasonOf(JSON.stringify({ roles: [] }))).toBe("roles-empty");
+  });
+
+  it("reports roles-too-many when truncation cannot rescue the answer", () => {
+    // 3 个角色、只要 2 个，且 speaking_order 从 2 起（既超量又不是排列）。
+    const tooMany = [
+      { role_name: "A", role_prompt: "p", speaking_order: 2 },
+      { role_name: "B", role_prompt: "p", speaking_order: 3 },
+      { role_name: "C", role_prompt: "p", speaking_order: 4 },
+    ];
+    expect(reasonOf(JSON.stringify({ roles: tooMany }), 2)).toBe("roles-too-many");
+  });
+
+  it("reports per-field failures", () => {
+    expect(reasonOf(JSON.stringify({ roles: ["nope"] }))).toBe("role-not-object");
+    expect(reasonOf(JSON.stringify({ roles: [{ role_prompt: "p", speaking_order: 0 }] })))
+      .toBe("role-name-invalid");
+    expect(reasonOf(JSON.stringify({ roles: [{ role_name: "  ", role_prompt: "p", speaking_order: 0 }] })))
+      .toBe("role-name-invalid");
+    const dupName = [twoRoles[0], { ...twoRoles[1], role_name: "A" }];
+    expect(reasonOf(JSON.stringify({ roles: dupName }))).toBe("role-name-duplicate");
+    expect(reasonOf(JSON.stringify({ roles: [{ role_name: "A", role_prompt: "", speaking_order: 0 }] })))
+      .toBe("role-prompt-invalid");
+    expect(reasonOf(JSON.stringify({ roles: [{ role_name: "A", role_prompt: "p", speaking_order: "first" }] })))
+      .toBe("speaking-order-not-integer");
+    // 1.5 不是整数：不能靠 Math.trunc 蒙过去。
+    expect(reasonOf(JSON.stringify({ roles: [{ role_name: "A", role_prompt: "p", speaking_order: 1.5 }] })))
+      .toBe("speaking-order-not-integer");
+    const gap = [{ role_name: "A", role_prompt: "p", speaking_order: 0 },
+      { role_name: "B", role_prompt: "p", speaking_order: 2 }];
+    expect(reasonOf(JSON.stringify({ roles: gap }))).toBe("speaking-order-not-permutation");
+  });
+
+  it("returns no repairs for a clean answer", () => {
+    const result = parseRoleRecommendationOutputDetailed(JSON.stringify({ roles: twoRoles }), 3);
+    expect(result).toEqual({ ok: true, roles: twoRoles, repairs: [] });
+  });
+
+  // 良性偏差 1：模型从 1 开始数（"第 1 个发言"）。
+  it("repairs a 1-based speaking_order and records it", () => {
+    const oneBased = [
+      { role_name: "B", role_prompt: "p", speaking_order: 2 },
+      { role_name: "A", role_prompt: "p", speaking_order: 1 },
+    ];
+    const result = parseRoleRecommendationOutputDetailed(JSON.stringify({ roles: oneBased }), 3);
+    expect(result).toEqual({
+      ok: true,
+      roles: [
+        { role_name: "A", role_prompt: "p", speaking_order: 0 },
+        { role_name: "B", role_prompt: "p", speaking_order: 1 },
+      ],
+      repairs: ["speaking_order-1-based"],
+    });
+  });
+
+  // 良性偏差 2：提示词要 3 个、模型给了 4 个。
+  it("repairs an over-count answer by truncating and records it", () => {
+    const four = [
+      { role_name: "D", role_prompt: "p", speaking_order: 3 },
+      { role_name: "B", role_prompt: "p", speaking_order: 1 },
+      { role_name: "A", role_prompt: "p", speaking_order: 0 },
+      { role_name: "C", role_prompt: "p", speaking_order: 2 },
+    ];
+    const result = parseRoleRecommendationOutputDetailed(JSON.stringify({ roles: four }), 3);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.repairs).toEqual(["roles-truncated"]);
+    expect(result.roles.map((role) => role.role_name)).toEqual(["A", "B", "C"]);
+    expect(result.roles.map((role) => role.speaking_order)).toEqual([0, 1, 2]);
+  });
+
+  it("records both repairs when the model over-counts and counts from 1", () => {
+    const mixed = [
+      { role_name: "A", role_prompt: "p", speaking_order: 1 },
+      { role_name: "B", role_prompt: "p", speaking_order: 2 },
+      { role_name: "C", role_prompt: "p", speaking_order: 3 },
+    ];
+    const result = parseRoleRecommendationOutputDetailed(JSON.stringify({ roles: mixed }), 2);
+    expect(result).toEqual({
+      ok: true,
+      roles: [
+        { role_name: "A", role_prompt: "p", speaking_order: 0 },
+        { role_name: "B", role_prompt: "p", speaking_order: 1 },
+      ],
+      repairs: ["roles-truncated", "speaking_order-1-based"],
+    });
+  });
+});
+
+// 推理型模型的散文/思考里常带花括号：提取必须按配对括号切，不能「第一个 { 到
+// 最后一个 }」。
+describe("extractJsonObject", () => {
+  it("ignores a brace-bearing sentence before the answer", () => {
+    const answer = { roles: [{ role_name: "A", role_prompt: "p", speaking_order: 0 }] };
+    const output = '先想一下：示例格式是 {"roles":[...]}，按这个填。\n' + JSON.stringify(answer);
+    expect(extractJsonObject(output)).toEqual(answer);
+    expect(parseRoleRecommendationOutput(output, 3)).toEqual(answer.roles);
+  });
+
+  it("does not end the object inside a string that contains a brace", () => {
+    const answer = { roles: [{ role_name: "A", role_prompt: "用 } 收尾", speaking_order: 0 }] };
+    const output = "思考结束。\n" + JSON.stringify(answer) + "\n以上。";
+    expect(parseRoleRecommendationOutput(output, 3)).toEqual(answer.roles);
+  });
+
+  it("still prefers the bare object and the fenced block", () => {
+    const answer = { roles: [] };
+    expect(extractJsonObject(JSON.stringify(answer))).toEqual(answer);
+    expect(extractJsonObject("```json\n" + JSON.stringify(answer) + "\n```")).toEqual(answer);
+    expect(extractJsonObject("no json here")).toBeNull();
+  });
+
+  // R2 回归：思考里那个示例对象**完整可解析**、还比答案长，答案在后面。只按
+  // 「第一个/最长的能 parse 的」取就会拿到示例，reason 变成 roles-not-array ——
+  // 这正是现场「推理模型偶发无法解析」的主要形态之一。
+  it("takes the object that carries roles when the thinking block has a parsable one", () => {
+    const example = JSON.stringify({ analysis: "先".repeat(400), confidence: 0.6 });
+    const answer = {
+      roles: [
+        { role_name: "主持人", role_prompt: "引导", speaking_order: 0 },
+        { role_name: "质疑者", role_prompt: "反驳", speaking_order: 1 },
+        { role_name: "总结者", role_prompt: "收束", speaking_order: 2 },
+      ],
+    };
+    const output = `思考：先看 ${example} 这种形状对不对\n答案：${JSON.stringify(answer)}`;
+
+    // 老规则（无 prefer）在同样输入下会撞上那个更长的示例对象 —— 必须记下来，
+    // 否则「改了但没修好」这种回归没人发现。
+    const naive = extractJsonObject(output) as Record<string, unknown>;
+    expect(naive.roles).toBeUndefined();
+
+    const result = parseRoleRecommendationOutputDetailed(output, 3);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.roles).toHaveLength(3);
+    expect(result.roles.map((role) => role.role_name)).toEqual(["主持人", "质疑者", "总结者"]);
+  });
+
+  // 假示例：思考里给了一个**带 roles 键、但不是数组**的占位对象（`{"roles":"..."}`
+  // 是推理模型示例里的常见写法）。比答案长也不能赢，否则真答案被它盖掉。
+  it("ignores a parsable example whose roles is not an array", () => {
+    const fakeExample = JSON.stringify({
+      roles: "example-please-replace",
+      note: "先".repeat(200),
+    });
+    const answer = {
+      roles: [
+        { role_name: "主持人", role_prompt: "引导", speaking_order: 0 },
+        { role_name: "质疑者", role_prompt: "反驳", speaking_order: 1 },
+        { role_name: "总结者", role_prompt: "收束", speaking_order: 2 },
+      ],
+    };
+    const output = `思考：示例 {"roles":"..."} 大致如此，即 ${fakeExample}\n答案：${JSON.stringify(answer)}`;
+
+    // 无 prefer 的裸提取拿到的是那个更长的假示例（roles 不是数组）。
+    const naive = extractJsonObject(output) as { roles?: unknown };
+    expect(Array.isArray(naive.roles)).toBe(false);
+
+    const result = parseRoleRecommendationOutputDetailed(output, 3);
+    // 不能退化成「拿到假示例 → roles-not-array」。
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.roles.map((role) => role.role_name)).toEqual(["主持人", "质疑者", "总结者"]);
+    expect(result.repairs).toEqual([]);
+  });
+
+  // prefer 必须压过长度，也必须压过位置：答案是先给的、更短的，思考对象在它
+  // 后面且更长。
+  it("prefers the shorter roles object even when a longer object comes later", () => {
+    const thinking = JSON.stringify({ analysis: "长".repeat(400) });
+    const answer = {
+      roles: [
+        { role_name: "A", role_prompt: "p", speaking_order: 0 },
+        { role_name: "B", role_prompt: "p", speaking_order: 1 },
+        { role_name: "C", role_prompt: "p", speaking_order: 2 },
+      ],
+    };
+    expect(thinking.length).toBeGreaterThan(JSON.stringify(answer).length);
+    const output = `${JSON.stringify(answer)}\n\n再自检一遍：${thinking}`;
+
+    expect(extractJsonObject(output)).toEqual(JSON.parse(thinking));
+
+    const result = parseRoleRecommendationOutputDetailed(output, 3);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.roles.map((role) => role.role_name)).toEqual(["A", "B", "C"]);
+  });
+
+  it("falls back to the plain object when nothing carries roles", () => {
+    const onlyAnalysis = { analysis: "只有分析，没有角色" };
+    const output = `想了想：${JSON.stringify(onlyAnalysis)}`;
+    // 提取器退回老行为（第一个可解析的对象）……
+    expect(extractJsonObject(output)).toEqual(onlyAnalysis);
+    // ……调用方于是如实报 roles-not-array，而不是 no-json。
+    expect(parseRoleRecommendationOutputDetailed(output, 3)).toEqual({
+      ok: false,
+      reason: "roles-not-array",
+    });
+  });
+
+  // R1 回归：单趟栈扫描。数千个花括号 + 末尾才是答案，必须仍能取出正确的那份，
+  // 且不得抛栈溢出。O(n) 性质由实现保证，这里不做耗时断言（避免抖动）。
+  it("survives thousands of unbalanced braces before the answer", () => {
+    const answer = {
+      roles: [
+        { role_name: "A", role_prompt: "p", speaking_order: 0 },
+        { role_name: "B", role_prompt: "p", speaking_order: 1 },
+      ],
+    };
+    const output = "{".repeat(5000) + "提示：以上都不对。\n" + JSON.stringify(answer);
+    const result = parseRoleRecommendationOutputDetailed(output, 3);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.roles.map((role) => role.role_name)).toEqual(["A", "B"]);
+  });
+
+  it("handles deep nesting without overflowing the stack", () => {
+    let nested = "{}";
+    for (let depth = 0; depth < 1000; depth += 1) nested = `{"a":${nested}}`;
+    expect(extractJsonObject(`思考：${nested} 完毕。`)).toEqual(JSON.parse(nested));
+    // 嵌套 1000 层里没有 roles，调用方按老规则报 roles-not-array（不是 no-json）。
+    expect(parseRoleRecommendationOutputDetailed(`思考：${nested} 完毕。`, 3))
+      .toEqual({ ok: false, reason: "roles-not-array" });
+  });
+});
+
+describe("roleRecommendationOutputSample", () => {
+  it("clips to 400 characters and flattens newlines into one line", () => {
+    // 先截前 400 个字符，再把换行压成字面量 `\n`（转义后比原文长，日志可接受）。
+    expect(roleRecommendationOutputSample("a".repeat(1000))).toHaveLength(ROLE_RECOMMEND_SAMPLE_CHARS);
+    expect(roleRecommendationOutputSample("x\ny")).toBe("x\\ny");
+    expect(roleRecommendationOutputSample("x\r\ny")).toBe("x\\ny");
+    const multiline = roleRecommendationOutputSample("a\nb\nc".repeat(500));
+    expect(multiline).not.toContain("\n");
+    expect(multiline.length).toBeGreaterThan(ROLE_RECOMMEND_SAMPLE_CHARS);
   });
 });
 
@@ -254,6 +529,17 @@ describe("reply builders", () => {
       msg_type: "command_result",
       payload: { kind: "error", error: "boom" },
     });
+  });
+
+  it("carries the diagnostic detail without touching the error text", () => {
+    const reply = JSON.parse(buildRoleRecommendationError(
+      "roles_1",
+      "role recommendation invalid",
+      { reason: "no-json", sample: "I would rather not." },
+    ));
+    // error 的文本是服务端 mapNodeError 的分类依据，必须一字不改。
+    expect(reply.payload.error).toBe("role recommendation invalid");
+    expect(reply.payload.detail).toEqual({ reason: "no-json", sample: "I would rather not." });
   });
 
   it("keeps the staleness window at least the max host timeout (600s)", () => {

@@ -1016,6 +1016,57 @@ describe("MessageDispatcher discussion recommend_roles", () => {
     expect(parsed.payload.kind).toBe("error");
   });
 
+  // 失败必须自证：error 文本是服务端的分类依据（不能改），原因走 detail。
+  it("carries the parse reason and the raw sample in the error reply", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    await dispatcher.handle(roleRequest("roles_detail"), {
+      runTurn: async () => "想了想：\n{\"roles\": [ 坏掉的 JSON",
+    });
+
+    const parsed = JSON.parse(deps.sent[0].content);
+    expect(parsed.payload.kind).toBe("error");
+    expect(parsed.payload.error).toBe("role recommendation invalid");
+    expect(parsed.payload.detail.reason).toBe("no-json");
+    // 片段压成单行，带换行字面量，长度不超过上限。
+    expect(parsed.payload.detail.sample).toContain("\\n");
+    expect(parsed.payload.detail.sample).not.toContain("\n");
+    expect(typeof parsed.payload.detail.sample).toBe("string");
+  });
+
+  it("reports a per-field reason when the model answers with the wrong shape", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    await dispatcher.handle(roleRequest("roles_shape"), {
+      runTurn: async () => JSON.stringify({
+        roles: [
+          { role_name: "A", role_prompt: "p", speaking_order: 0 },
+          { role_name: "A", role_prompt: "p", speaking_order: 1 },
+        ],
+      }),
+    });
+
+    expect(JSON.parse(deps.sent[0].content).payload.detail.reason).toBe("role-name-duplicate");
+  });
+
+  it("still answers when a benign 1-based speaking order comes back", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    await dispatcher.handle(roleRequest("roles_onebased"), {
+      runTurn: async () => JSON.stringify({
+        roles: [
+          { role_name: "A", role_prompt: "p", speaking_order: 1 },
+          { role_name: "B", role_prompt: "p", speaking_order: 2 },
+        ],
+      }),
+    });
+
+    const parsed = JSON.parse(deps.sent[0].content);
+    expect(parsed.payload.kind).toBe("text");
+    expect(parsed.payload.roles.map((role: { speaking_order: number }) => role.speaking_order))
+      .toEqual([0, 1]);
+  });
+
   it("answers a replayed requestId exactly once", async () => {
     const deps = makeDeps();
     const dispatcher = new MessageDispatcher({ send: deps.send });
