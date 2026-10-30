@@ -62,11 +62,20 @@ const (
 	// 与设备端（xiachat-cli/src/model-catalog.ts 的 ROUTE_RE）以及 web 的
 	// segment() 一致：超过这个长度设备侧本来也解析不出 route。
 	clawAdminDiscussionHostMaxModelSegment = 128
-	// 向主持节点要一次模型目录的等待上限。目录是设备本机的快跑查询（CLI 侧还有
-	// 5 分钟缓存），8s 与 C 端浏览器的超时同值；查询接口放宽到 12s，因为那是一
-	// 次显式的人工操作，而保存路径要短——离线节点不能让「改个提示词」卡 12 秒。
-	clawAdminDiscussionHostCatalogTimeout = 12 * time.Second
-	clawAdminDiscussionHostVerifyTimeout  = 8 * time.Second
+	// 向主持节点要一次模型目录的等待上限。
+	//
+	// 这两个值曾经是 12s / 8s（与 C 端浏览器同值）。实测不够：设备端的目录**首次**
+	// 构造要跑一次 agent 自己的列举命令 —— `openclaw models list --json` 冷启动
+	// 约 10s、`opencode models` 热启动 3–5s 未登录时能拖满 30s —— 而 CLI 的预热
+	// （run.ts 的 catalogLoader.warm()）是后台跑、不保证在请求到达前完成。落在
+	// 8s 窗口外的结果就是「节点明明有模型，管理端却只拿到一张空目录」，用户看到
+	// 的下拉框一片空白，还以为是功能坏了。
+	//
+	// 放宽到 20s / 15s：目录查询是一次显式的人工操作，多等十秒换来「下拉里真的有
+	// 东西」是划算的；保存路径仍比查询短，免得离线节点把「改个提示词」一起拖住。
+	// 前端 axios 的超时按这两个值 +5s 夹逼（见 api/discussion-host.ts）。
+	clawAdminDiscussionHostCatalogTimeout = 20 * time.Second
+	clawAdminDiscussionHostVerifyTimeout  = 15 * time.Second
 )
 
 // clawAdminModelSegmentCharset 是 provider / model 单段允许的字符集。`@` 保留在
@@ -91,6 +100,10 @@ const (
 	clawAdminModelCheckUnverified = "unverified"
 	clawAdminModelCheckRejected   = "rejected"
 )
+
+// clawAdminCatalogReasonNoModels 是「设备答了、但一个可用模型都没有」的 reason。
+// 与 503 MODEL_CATALOG_UNAVAILABLE 分开：那一个是「问不到」，这一个「问到了、是空的」。
+const clawAdminCatalogReasonNoModels = "node_reported_no_models"
 
 // clawAdminRequiredHostCapabilities mirrors REQUIRED_HOST_CAPABILITIES in the
 // legacy discussion/system_host.py: a node advertising anything less than all
@@ -780,6 +793,12 @@ func (h *Handler) ClawAdminDiscussionHostPut(w http.ResponseWriter, r *http.Requ
 // 注意门控是 system:write 而不是 system:read：只读管理员不该能动用这条有副作用的通道。
 
 // clawAdminDiscussionHostCatalog 是目录接口的响应体。
+//
+// Reason 只在「设备答了、但一个可用模型都没报」时出现（node_reported_no_models）。
+// 不能让这种情形和「接口 503」共用一个出口：503 会让页面只说一句「取不到目录」，
+// 而这种情形下设备是通的、协议也是对的，缺的是设备端自己的模型清单 —— 多半是
+// 该节点的 agent 配置里只有 baseUrl、`/models` 探不通，或者 agent 没有列举命令。
+// 两者的处置完全不同（前者重试可能就好，后者要去设备上修配置），前端据此给不同文案。
 type clawAdminDiscussionHostCatalog struct {
 	ProtocolVersion int                           `json:"protocolVersion"`
 	NodeID          string                        `json:"node_id"`
@@ -787,6 +806,7 @@ type clawAdminDiscussionHostCatalog struct {
 	Providers       []clawAdminDiscussionHostProv `json:"providers"`
 	FetchedAt       string                        `json:"fetched_at"`
 	Source          string                        `json:"source"`
+	Reason          string                        `json:"reason,omitempty"`
 }
 
 type clawAdminDiscussionHostProv struct {
@@ -875,9 +895,21 @@ func (h *Handler) ClawAdminDiscussionHostModelCatalog(w http.ResponseWriter, r *
 		for _, entry := range provider.Models {
 			models = append(models, clawAdminDiscussionHostMdl{ID: entry.ID, Name: entry.Name})
 		}
+		// 没有模型的 provider 不进目录：前端把这份清单直接当下拉选项，留一个空壳
+		// 供应商只会让人选中它、然后卡在「选择供应商后必须选择模型」上 —— 而这
+		// 条校验用户永远满足不了。C 端的 normalizeCatalog 也是这么做的。
+		if len(models) == 0 {
+			continue
+		}
 		providers = append(providers, clawAdminDiscussionHostProv{
 			ID: provider.ID, Name: provider.Name, Models: models,
 		})
+	}
+	reason := ""
+	if len(providers) == 0 {
+		reason = clawAdminCatalogReasonNoModels
+		slog.Warn("claw admin: discussion host reported no usable models",
+			"node_id", nodeID, "raw_provider_count", len(catalog.Providers))
 	}
 	h.auditCatalogFetch(r, ident, nodeID, "", "source", "device",
 		"provider_count", len(providers))
@@ -888,6 +920,7 @@ func (h *Handler) ClawAdminDiscussionHostModelCatalog(w http.ResponseWriter, r *
 		Providers:       providers,
 		FetchedAt:       time.Now().UTC().Format(time.RFC3339),
 		Source:          "device",
+		Reason:          reason,
 	})
 }
 

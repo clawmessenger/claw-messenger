@@ -45,6 +45,14 @@ const otherCatalogProviders = `[
 	{"id":"anthropic","name":"Anthropic","models":[{"id":"claude-x","name":"Claude X"}]}
 ]`
 
+// emptyModelsCatalogProviders 模拟「供应商报得出、模型一个都没有」的设备：自建的
+// OpenAI 兼容端点常见这种形状（模型清单由服务端动态给出，节点侧只认得出 provider
+// 名，`/models` 又探不通）。这份清单不能原样进下拉 —— 选中它必然卡在「选择供应商
+// 后必须选择模型」上，而那条校验用户永远满足不了。
+const emptyModelsCatalogProviders = `[
+	{"id":"custom","name":"custom","models":[]}
+]`
+
 // switchableCatalogProviders 是「同一台设备上有两个供应商」的目录：用来验证
 // 「只改 provider」与「只改 model」都必须重新核验（同一模型 id 在两个供应商下
 // 都存在，这样两种改动都是合法保存，能把「跳过核验」的判据钉死在两个字段上）。
@@ -481,6 +489,53 @@ func TestClawAdminDiscussionHostModelCatalog(t *testing.T) {
 	}
 	if data["source"] != "device" || data["node_id"] != f.nodeUUID {
 		t.Fatalf("envelope = %#v", data)
+	}
+}
+
+// TestClawAdminDiscussionHostModelCatalogDropsEmptyProviderModels：设备报了一个
+// 供应商、却一个模型都没报时，这份空壳不能进下拉。留在下拉里，选中它就会卡在
+// 「选择供应商后必须选择模型」这条**用户永远满足不了**的校验上 —— 现场反馈的
+// 「这个功能用不了」正是这个形状。空壳被剥掉后目录变成空的，此时要靠 reason
+// 把「问到了、是空的」与 503「问不到」分开，页面才能给出不同的下一步。
+func TestClawAdminDiscussionHostModelCatalogDropsEmptyProviderModels(t *testing.T) {
+	f := setupDiscussionHostFixture(t, emptyModelsCatalogProviders)
+
+	rr := f.catalog(t, f.token, f.nodeUUID)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("GET model-catalog = %d (%s), want 200", rr.Code, rr.Body.String())
+	}
+	data := dataOf(t, rr)
+	if providers, _ := data["providers"].([]interface{}); len(providers) != 0 {
+		t.Fatalf("providers = %v, want empty", data["providers"])
+	}
+	if data["reason"] != clawAdminCatalogReasonNoModels {
+		t.Fatalf("reason = %v, want %s", data["reason"], clawAdminCatalogReasonNoModels)
+	}
+}
+
+// TestClawAdminDiscussionHostModelCatalogKeepsFullProvider：空壳只剥自己，别把
+// 同一份目录里真正有模型的供应商一起带走；目录非空时不该带 reason（没有异常）。
+func TestClawAdminDiscussionHostModelCatalogKeepsFullProvider(t *testing.T) {
+	f := setupDiscussionHostFixture(t, `[
+		{"id":"custom","name":"custom","models":[]},
+		{"id":"openai","name":"OpenAI","models":[{"id":"gpt-5.6-sol","name":"GPT 5.6 Sol"}]}
+	]`)
+
+	rr := f.catalog(t, f.token, f.nodeUUID)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("GET model-catalog = %d (%s), want 200", rr.Code, rr.Body.String())
+	}
+	data := dataOf(t, rr)
+	providers, _ := data["providers"].([]interface{})
+	if len(providers) != 1 {
+		t.Fatalf("providers = %v, want only the one with models", data["providers"])
+	}
+	provider, _ := providers[0].(map[string]interface{})
+	if provider["id"] != "openai" {
+		t.Fatalf("provider = %#v, want openai", provider)
+	}
+	if reason, ok := data["reason"]; ok && reason != "" {
+		t.Fatalf("reason = %v, want absent for a non-empty catalog", reason)
 	}
 }
 
