@@ -585,6 +585,9 @@ func (rt *discussionRuntime) recommendForSetupBatch(ctx context.Context, discuss
 		RecommendationPrompt: rt.roundtable.recommendationPrompt(ctx),
 		TimeoutSeconds:       timeout,
 		ConfigVersion:        configVersionInt(host.configVersion),
+		// 与 roundtable_actions 同一口径：推荐用主持配的模型，配置为空则沿用
+		// 节点默认模型。
+		Model: host.model,
 	}, d.Topic, d.Goal, min(recommendRoleCountCap, len(candidates)), "")
 	if code != "" {
 		fail(code)

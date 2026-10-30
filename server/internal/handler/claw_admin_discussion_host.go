@@ -1172,6 +1172,9 @@ func (h *Handler) ClawAdminDiscussionHostTestRecommendation(w http.ResponseWrite
 		RecommendationPrompt: cfg.RoleRecommendationPrompt,
 		TimeoutSeconds:       cfg.TimeoutSeconds,
 		ConfigVersion:        cfg.ConfigVersion,
+		// 「测试角色推荐」与真实推荐走同一个模型：运营在这个页面上点一次测试，
+		// 看到的速度应该就是用户实际会等的时间，不能一个用配置模型、一个用默认。
+		Model: clawAdminDiscussionHostModelRoute(cfg.ModelProvider, cfg.Model),
 	}
 
 	// 等待期间不要被服务端自己的读超时打断：设备端可能要跑完一次完整的

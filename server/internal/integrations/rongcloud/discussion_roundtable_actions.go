@@ -109,6 +109,9 @@ func (rt *discussionRuntime) actionRecommendRoles(ctx context.Context, cmd Comma
 		RecommendationPrompt: rt.roundtable.recommendationPrompt(ctx),
 		TimeoutSeconds:       timeout,
 		ConfigVersion:        configVersionInt(host.configVersion),
+		// 推荐这一轮用主持配的模型，而不是节点默认：短任务上旗舰模型与快模型
+		// 差一个数量级，设备端每轮还要付一次冷启动，两个都省下来才看得见。
+		Model: host.model,
 	}, topic, goal, maxRoles, style)
 	if code != "" {
 		return errResult(503, code)

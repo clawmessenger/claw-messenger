@@ -480,3 +480,51 @@ func TestNodeRequestBrokerOmitsEmptyStyle(t *testing.T) {
 		t.Fatalf("the rest of the envelope must be unchanged: %#v", envelope.Params)
 	}
 }
+
+// 推荐用哪个模型是它快慢的主要杠杆：同一条「3 段人设 + 一层 JSON」的短任务，
+// 旗舰模型二十几秒、快模型 2-3 秒。所以只验两件事 —— 配了就必须下发（顺带去掉
+// 手填带进来的空白），没配就**不下发这个键**（让设备端沿用节点默认；发空串等于
+// 让设备端把「没指定」当成「指定了空模型」，那样整轮直接起不来）。
+func TestNodeRequestBrokerRecommendationCarriesHostModel(t *testing.T) {
+	readParams := func(t *testing.T, sent *string, mu *sync.Mutex) map[string]interface{} {
+		t.Helper()
+		mu.Lock()
+		wire := *sent
+		mu.Unlock()
+		idx := strings.Index(wire, "|")
+		if idx < 0 {
+			t.Fatalf("wire payload has no separator: %q", wire)
+		}
+		var envelope struct {
+			Params map[string]interface{} `json:"params"`
+		}
+		if err := json.Unmarshal([]byte(wire[idx+1:]), &envelope); err != nil {
+			t.Fatalf("unmarshal wire payload: %v", err)
+		}
+		return envelope.Params
+	}
+
+	broker, sent, mu := startBroker(t)
+	if _, code := broker.StartRecommendation(context.Background(), NodeRequestHost{
+		AIUserID:       "rc_node_host",
+		TimeoutSeconds: 30,
+		Model:          "  anthropic/claude-haiku-5-5  ",
+	}, "t", "", 3, ""); code != "" {
+		t.Fatalf("StartRecommendation failed: %s", code)
+	}
+	if got := readParams(t, sent, mu)["model"]; got != "anthropic/claude-haiku-5-5" {
+		t.Fatalf("model = %#v, want the host route with surrounding blanks trimmed", got)
+	}
+
+	blank, blankSent, blankMu := startBroker(t)
+	if _, code := blank.StartRecommendation(context.Background(), NodeRequestHost{
+		AIUserID:       "rc_node_host",
+		TimeoutSeconds: 30,
+		Model:          "   ",
+	}, "t", "", 3, ""); code != "" {
+		t.Fatalf("StartRecommendation failed: %s", code)
+	}
+	if _, ok := readParams(t, blankSent, blankMu)["model"]; ok {
+		t.Fatal("an unset host model must not put a model key on the wire")
+	}
+}

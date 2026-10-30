@@ -54,6 +54,13 @@ type NodeRequestHost struct {
 	RecommendationPrompt string
 	TimeoutSeconds       int
 	ConfigVersion        int
+	// Model 是主持节点在后台配的模型 route（`provider/slug`），空串 = 不指定、
+	// 沿用设备默认模型。
+	//
+	// 推荐的耗时几乎全在设备端那一次 agent 回合里：3 段 120 字人设 + 一层 JSON
+	// 的短任务，旗舰模型要二三十秒，快模型 2-3 秒。不改配置的话这里恒空，
+	// 运营在「讨论主持 AI 模型」里选的东西对推荐不生效，只能干等默认模型。
+	Model string
 }
 
 // Public error codes the admin page is allowed to see. Mirrors
@@ -171,6 +178,12 @@ func (b *NodeRequestBroker) StartRecommendation(ctx context.Context, host NodeRe
 	}
 	if style != "" {
 		params["style"] = style
+	}
+	// 只在配了模型时才下发这个键：老 CLI 不认识未知键（忽略即可），但把一个空串
+	// 发过去会让它把「没指定」当成「指定了空模型」—— 设备端据非空判定，空串会被
+	// 它自己过滤掉，这里不发更明确。
+	if model := strings.TrimSpace(host.Model); model != "" {
+		params["model"] = model
 	}
 
 	content, err := json.Marshal(map[string]interface{}{
