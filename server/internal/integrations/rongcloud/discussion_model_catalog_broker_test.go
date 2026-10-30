@@ -2,6 +2,7 @@ package rongcloud
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -54,7 +55,7 @@ func startCatalog(t *testing.T, b *NodeRequestBroker, aiUserID string, timeoutSe
 	requestID, code := b.StartModelCatalog(context.Background(), NodeRequestHost{
 		AIUserID:       aiUserID,
 		TimeoutSeconds: timeoutSeconds,
-	})
+	}, false)
 	if code != "" {
 		t.Fatalf("StartModelCatalog = %q, want sent", code)
 	}
@@ -71,6 +72,47 @@ func (b *NodeRequestBroker) expireNowForTest(requestID string) {
 	}
 }
 
+// TestModelCatalogRequestCarriesRefreshOnlyWhenForced 钉住「重新检测」的最后一环。
+//
+// 管理端点一下「重新检测」，要真的让设备重枚举，靠的就是报文里这个 refresh 键
+// （设备端 ModelCatalogLoader.load 见到它就跳过缓存判定）。普通请求**不能**带它：
+// 报文要与历史版本逐字节一致，免得老设备解析出意外。
+func TestModelCatalogRequestCarriesRefreshOnlyWhenForced(t *testing.T) {
+	var contents []string
+	b := catalogBroker(t, func(_ context.Context, _ string, content string) error {
+		contents = append(contents, content)
+		return nil
+	})
+
+	startCatalog(t, b, catalogTestHostA, 5)
+	if _, code := b.StartModelCatalog(context.Background(), NodeRequestHost{
+		AIUserID: catalogTestHostA, TimeoutSeconds: 5,
+	}, true); code != "" {
+		t.Fatalf("forced StartModelCatalog = %q, want sent", code)
+	}
+	if len(contents) != 2 {
+		t.Fatalf("sent %d messages, want 2", len(contents))
+	}
+
+	var plain, forced map[string]interface{}
+	if err := json.Unmarshal([]byte(contents[0]), &plain); err != nil {
+		t.Fatalf("unmarshal plain request: %v", err)
+	}
+	if _, ok := plain["refresh"]; ok {
+		t.Fatalf("普通请求不该带 refresh 键：%s", contents[0])
+	}
+	if err := json.Unmarshal([]byte(contents[1]), &forced); err != nil {
+		t.Fatalf("unmarshal forced request: %v", err)
+	}
+	if forced["refresh"] != true {
+		t.Fatalf("强制请求的 refresh = %#v, want true（报文：%s）", forced["refresh"], contents[1])
+	}
+	// 协议其余字段两版一致，只多这一个键。
+	if forced["msg_type"] != plain["msg_type"] || forced["protocolVersion"] != plain["protocolVersion"] {
+		t.Fatalf("强制请求改动了协议字段：%s vs %s", contents[1], contents[0])
+	}
+}
+
 // TestModelCatalogBrokerReleasesPendingOnSendFailure 是 M1 的回归：发送失败时
 // 调用方直接拿到错误码、不会走 AwaitModelCatalog，所以清理必须发生在 send 失败
 // 分支里，否则每条失败请求都会永久驻留 pending。
@@ -81,7 +123,7 @@ func TestModelCatalogBrokerReleasesPendingOnSendFailure(t *testing.T) {
 
 	_, code := b.FetchModelCatalog(context.Background(), NodeRequestHost{
 		AIUserID: catalogTestHostA, TimeoutSeconds: 5,
-	})
+	}, false)
 	if code != NodeRequestCodeCatalogInvalid {
 		t.Fatalf("code = %q, want %q", code, NodeRequestCodeCatalogInvalid)
 	}

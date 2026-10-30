@@ -882,8 +882,12 @@ func (h *Handler) ClawAdminDiscussionHostModelCatalog(w http.ResponseWriter, r *
 		return
 	}
 
+	// refresh=1：「重新检测」要求的强制重枚举。设备端对「缓存还新鲜」的请求会直接
+	// 回旧清单（packages/xiachat-cli 的 ModelCatalogLoader），不带这个标志的话，
+	// 用户在设备上刚改了模型、点一下「重新检测」拿到的还是旧的那份。
 	catalog, code := h.clawAdminDiscussionHostFetchCatalog(
-		r.Context(), nodeUUIDValue, node.RongcloudUserID, clawAdminDiscussionHostCatalogTimeout)
+		r.Context(), nodeUUIDValue, node.RongcloudUserID,
+		clawAdminDiscussionHostCatalogTimeout, clawAdminCatalogRefreshRequested(r))
 	if code != "" {
 		unavailable(code, "node_id", nodeID)
 		return
@@ -949,8 +953,11 @@ func (h *Handler) auditCatalogFetch(
 
 // clawAdminDiscussionHostFetchCatalog 向主持节点要一次模型目录。
 // 返回空 code 表示拿到了；否则是可直接回给前端的具名错误码。
+//
+// force 语义见 NodeRequestBroker.StartModelCatalog：为 true 时设备跳过「缓存还
+// 新鲜就直接答」，当轮重新枚举。
 func (h *Handler) clawAdminDiscussionHostFetchCatalog(
-	ctx context.Context, nodeUUID pgtype.UUID, aiUserID string, timeout time.Duration,
+	ctx context.Context, nodeUUID pgtype.UUID, aiUserID string, timeout time.Duration, force bool,
 ) (rongcloud.DiscussionModelCatalog, string) {
 	if aiUserID == "" {
 		return rongcloud.DiscussionModelCatalog{}, rongcloud.NodeRequestCodeHostNotConfigured
@@ -971,7 +978,20 @@ func (h *Handler) clawAdminDiscussionHostFetchCatalog(
 		AIUserID:       aiUserID,
 		TimeoutSeconds: int(timeout / time.Second),
 	}
-	return h.RongCloudNodeRequests.FetchModelCatalog(ctx, host)
+	return h.RongCloudNodeRequests.FetchModelCatalog(ctx, host, force)
+}
+
+// clawAdminCatalogRefreshRequested 解析目录接口上的 refresh 标记。
+//
+// 接受 1/true/yes（大小写与空白都容忍）：这是运维手点的动作，多认几种写法比让
+// 他因为 "true" 不生效而反复点要好。其余一律当 false。
+func clawAdminCatalogRefreshRequested(r *http.Request) bool {
+	switch strings.ToLower(strings.TrimSpace(r.URL.Query().Get("refresh"))) {
+	case "1", "true", "yes":
+		return true
+	default:
+		return false
+	}
 }
 
 // clawAdminDiscussionHostCheckModel 判断刚保存的模型在主持节点上是否可用。
@@ -985,8 +1005,11 @@ func (h *Handler) clawAdminDiscussionHostCheckModel(
 	if model == "" {
 		return clawAdminModelCheckVerified, ""
 	}
+	// force=true：保存时的核验必须看**设备现在**的清单。设备端会拿缓存兜 20s，
+	// 而「刚在设备上加了模型、马上回后台保存」正是最典型的操作顺序 —— 用缓存核验
+	// 会把这个新模型判成 MODEL_NOT_AVAILABLE，用户永远存不上。
 	catalog, code := h.clawAdminDiscussionHostFetchCatalog(
-		ctx, nodeUUID, aiUserID, clawAdminDiscussionHostVerifyTimeout)
+		ctx, nodeUUID, aiUserID, clawAdminDiscussionHostVerifyTimeout, true)
 	if code != "" {
 		return clawAdminModelCheckUnverified, code
 	}

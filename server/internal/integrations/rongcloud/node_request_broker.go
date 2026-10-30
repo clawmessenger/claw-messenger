@@ -330,7 +330,13 @@ type DiscussionModelEntry struct {
 }
 
 // StartModelCatalog records a pending catalog request and sends it to the host.
-func (b *NodeRequestBroker) StartModelCatalog(ctx context.Context, host NodeRequestHost) (string, string) {
+//
+// force=true 表示「别拿缓存糊弄我」：管理端点「重新检测」时用。设备端据此跳过
+// 「缓存还新鲜就直接答」的判定（packages/xiachat-cli 的 ModelCatalogLoader.load），
+// 当轮重新枚举本机模型。老设备不认这个键、行为与从前一致，所以它可以随时下发。
+func (b *NodeRequestBroker) StartModelCatalog(
+	ctx context.Context, host NodeRequestHost, force bool,
+) (string, string) {
 	if host.AIUserID == "" {
 		return "", NodeRequestCodeHostNotConfigured
 	}
@@ -341,14 +347,19 @@ func (b *NodeRequestBroker) StartModelCatalog(ctx context.Context, host NodeRequ
 		timeout = 60 * time.Second
 	}
 
-	// 设备的 `parseModelCatalogRequest` 只认这四个键，多一个键它也不拒（它不
-	// 做键集白名单），但保持与 web 逐字节同构能省掉一次联调排查。
-	content, err := json.Marshal(map[string]interface{}{
+	// 设备的 `parseModelCatalogRequest` 只认这几个键，多一个键它也不拒（它不
+	// 做键集白名单），但保持与 web 逐字节同构能省掉一次联调排查 —— 所以
+	// refresh 只在真的要强制时才出现，普通请求的报文与历史版本逐字节一致。
+	payload := map[string]interface{}{
 		"msg_type":        catalogRequestMsgType,
 		"protocolVersion": catalogProtocolVersion,
 		"requestId":       requestID,
 		"timestamp":       b.now().UnixMilli(),
-	})
+	}
+	if force {
+		payload["refresh"] = true
+	}
+	content, err := json.Marshal(payload)
 	if err != nil {
 		return "", NodeRequestCodeCatalogInvalid
 	}
@@ -427,8 +438,10 @@ func (b *NodeRequestBroker) AwaitModelCatalog(ctx context.Context, requestID str
 //
 // 它**只是**一次尽力而为的往返：调用方（管理端保存/目录查询）必须自己决定
 // 「拿不到目录」时是否降级，而不是把这个错误当致命错误——主持节点常常离线。
-func (b *NodeRequestBroker) FetchModelCatalog(ctx context.Context, host NodeRequestHost) (DiscussionModelCatalog, string) {
-	requestID, code := b.StartModelCatalog(ctx, host)
+func (b *NodeRequestBroker) FetchModelCatalog(
+	ctx context.Context, host NodeRequestHost, force bool,
+) (DiscussionModelCatalog, string) {
+	requestID, code := b.StartModelCatalog(ctx, host, force)
 	if code != "" {
 		return DiscussionModelCatalog{}, code
 	}
